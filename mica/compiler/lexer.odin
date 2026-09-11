@@ -424,6 +424,18 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 				append_token(&tokens, .Membership, source[start:pos], start_line, start_column)
 				continue
 			}
+			// Non-ASCII text can appear inside DOM markup. The lexer keeps
+			// it as one error token without a diagnostic so the parser can
+			// decide whether the position accepts raw text.
+			if ch >= 0x80 {
+				length := utf8_sequence_length(ch)
+				if pos + length > len(source) {
+					length = len(source) - pos
+				}
+				advance(source, &pos, &line, &column, length)
+				append_token(&tokens, .Error, source[start:pos], start_line, start_column)
+				continue
+			}
 			advance(source, &pos, &line, &column, 1)
 			append_token(&tokens, .Error, source[start:pos], start_line, start_column)
 			append(&errors, Lex_Error {
@@ -459,6 +471,19 @@ is_ident_start :: proc(ch: byte) -> bool {
 @(private)
 is_ident_continue :: proc(ch: byte) -> bool {
 	return is_ident_start(ch) || is_digit(ch) || ch == '_'
+}
+
+@(private)
+utf8_sequence_length :: proc(lead: byte) -> int {
+	switch {
+	case lead & 0xe0 == 0xc0:
+		return 2
+	case lead & 0xf0 == 0xe0:
+		return 3
+	case lead & 0xf8 == 0xf0:
+		return 4
+	}
+	return 1
 }
 
 @(private)
