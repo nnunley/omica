@@ -436,3 +436,69 @@ test_parse_multiline_rule :: proc(t: ^testing.T) {
 	testing.expect(t, second_ok)
 	testing.expect_value(t, len(second.body), 1)
 }
+
+@(test)
+test_parse_return_as_operand :: proc(t: ^testing.T) {
+	source := "verb check(value)\n  value > 0 || return false\n  return true\nend"
+	program := parse_ok(t, source)
+	item, item_ok := program.items[0].(Verb_Item)
+	testing.expect(t, item_ok)
+	testing.expect_value(t, len(item.body), 2)
+	guard, guard_ok := item.body[0]^.(Binary)
+	testing.expect(t, guard_ok)
+	testing.expect_value(t, guard.op, Binary_Op.Or)
+	_, return_ok := guard.right^.(Return)
+	testing.expect(t, return_ok)
+}
+
+@(test)
+test_parse_match_case_guard :: proc(t: ^testing.T) {
+	source := "let result = match value\ncase ok(inner) if inner >= 0\n  inner\ncase err(problem)\n  0\nend"
+	program := parse_ok(t, source)
+	expr := first_item_expr(t, program)
+	binding, _ := expr^.(Binding)
+	match, match_ok := binding.value^.(Match)
+	testing.expect(t, match_ok)
+	testing.expect_value(t, len(match.cases), 2)
+	testing.expect(t, match.cases[0].has_guard)
+	testing.expect(t, !match.cases[1].has_guard)
+}
+
+@(test)
+test_parse_try_catch_finally :: proc(t: ^testing.T) {
+	source := "let result\ntry\n  result = risky()\ncatch err\n  result = none\ncatch\n  result = none\nfinally\n  cleanup()\nend"
+	program := parse_ok(t, source)
+	testing.expect_value(t, len(program.items), 2)
+
+	declaration, declaration_ok := program.items[0].(Expr_Item)
+	testing.expect(t, declaration_ok)
+	binding, binding_ok := declaration.expr^.(Binding)
+	testing.expect(t, binding_ok)
+	testing.expect(t, !binding.has_value)
+
+	try_item, try_ok := program.items[1].(Expr_Item)
+	testing.expect(t, try_ok)
+	try_expr, try_expr_ok := try_item.expr^.(Try)
+	testing.expect(t, try_expr_ok)
+	testing.expect_value(t, len(try_expr.body), 1)
+	testing.expect_value(t, len(try_expr.catches), 2)
+	testing.expect(t, try_expr.catches[0].has_name)
+	testing.expect_value(t, try_expr.catches[0].name, "err")
+	testing.expect(t, !try_expr.catches[1].has_name)
+	testing.expect(t, try_expr.has_finally)
+}
+
+@(test)
+test_parse_spawn :: proc(t: ^testing.T) {
+	source := "let task = spawn :button_resolves(actor: actor, target: target) after 0.25"
+	program := parse_ok(t, source)
+	expr := first_item_expr(t, program)
+	binding, _ := expr^.(Binding)
+	spawn, spawn_ok := binding.value^.(Spawn)
+	testing.expect(t, spawn_ok)
+	testing.expect(t, spawn.has_delay)
+	_, call_ok := spawn.call^.(Call)
+	testing.expect(t, call_ok)
+	_, delay_ok := spawn.delay^.(Float_Literal)
+	testing.expect(t, delay_ok)
+}

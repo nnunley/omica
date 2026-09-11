@@ -168,6 +168,7 @@ Binding :: struct {
 	kind:       string,
 	has_kind:   bool,
 	value:      ^Expr,
+	has_value:  bool,
 }
 
 Unary :: struct {
@@ -307,13 +308,36 @@ Dom_Element :: struct {
 }
 
 Match_Case :: struct {
-	pattern: ^Pattern,
-	body:    []^Expr,
+	pattern:   ^Pattern,
+	guard:     ^Expr,
+	has_guard: bool,
+	body:      []^Expr,
 }
 
 Match :: struct {
 	value: ^Expr,
 	cases: []Match_Case,
+}
+
+Catch_Clause :: struct {
+	code:     string,
+	has_code: bool,
+	name:     string,
+	has_name: bool,
+	body:     []^Expr,
+}
+
+Try :: struct {
+	body:         []^Expr,
+	catches:      []Catch_Clause,
+	finally_body: []^Expr,
+	has_finally:  bool,
+}
+
+Spawn :: struct {
+	call:      ^Expr,
+	delay:     ^Expr,
+	has_delay: bool,
 }
 
 Fn :: struct {
@@ -359,6 +383,8 @@ Expr :: union {
 	Require,
 	Raise,
 	Match,
+	Try,
+	Spawn,
 	Structural_Literal,
 	Dom_Text,
 	Dom_Element,

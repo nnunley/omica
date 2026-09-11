@@ -451,8 +451,11 @@ parse_binding :: proc(parser: ^Parser, is_const: bool) -> ^Expr {
 		binding.kind = parse_type_text(parser)
 		binding.has_kind = true
 	}
-	expect(parser, .Eq, "expected '=' in binding")
-	binding.value = parse_expression(parser)
+	if at(parser, .Eq) {
+		advance(parser)
+		binding.value = parse_expression(parser)
+		binding.has_value = true
+	}
 	return expr_node(parser, binding)
 }
 
@@ -611,9 +614,15 @@ parse_match :: proc(parser: ^Parser) -> ^Expr {
 	for is_contextual_keyword(parser, "case") {
 		advance(parser)
 		pattern := parse_pattern(parser)
+		case_clause := Match_Case{pattern = pattern}
+		if at(parser, .If) {
+			advance(parser)
+			case_clause.guard = parse_expression(parser)
+			case_clause.has_guard = true
+		}
 		skip_separators(parser)
-		body := parse_case_body(parser)
-		append(&cases, Match_Case{pattern = pattern, body = body})
+		case_clause.body = parse_case_body(parser)
+		append(&cases, case_clause)
 	}
 	expect(parser, .End, "expected 'end' to close match")
 	return expr_node(parser, Match{value = value, cases = to_slice(parser, cases)})
@@ -1162,6 +1171,57 @@ parse_map_literal :: proc(parser: ^Parser) -> ^Expr {
 
 @(private)
 parse_primary :: proc(parser: ^Parser) -> ^Expr {
+	if is_contextual_keyword(parser, "match") {
+		next := peek_at(parser, 1)
+		#partial switch next.kind {
+		case .LParen, .Eq, .Dot, .LBracket, .Colon, .Slash, .Colon_Dash:
+		case:
+			return parse_match(parser)
+		}
+	}
+
+	// Statement forms are expressions, so they are valid operands of `&&`,
+	// `||`, and the binary operators.
+	#partial switch peek(parser).kind {
+	case .Return:
+		return parse_return(parser)
+	case .Break:
+		advance(parser)
+		return expr_node(parser, Break{})
+	case .Continue:
+		advance(parser)
+		return expr_node(parser, Continue{})
+	case .Raise:
+		return parse_raise(parser)
+	case .Assert:
+		advance(parser)
+		return expr_node(parser, Assert{atom = parse_expression(parser)})
+	case .Retract:
+		advance(parser)
+		return expr_node(parser, Retract{atom = parse_expression(parser)})
+	case .Require:
+		advance(parser)
+		return expr_node(parser, Require{condition = parse_expression(parser)})
+	case .Let:
+		return parse_binding(parser, false)
+	case .Const:
+		return parse_binding(parser, true)
+	case .If:
+		return parse_if(parser)
+	case .While:
+		return parse_while(parser)
+	case .For:
+		return parse_for(parser)
+	case .Begin:
+		return parse_begin(parser)
+	case .Try:
+		return parse_try(parser)
+	case .Spawn:
+		return parse_spawn(parser)
+	case .Fn:
+		return parse_fn(parser)
+	}
+
 	// `dom <tag ...>` is markup when a tag name follows the `<`. `dom < 2`
 	// remains an ordinary comparison.
 	if is_contextual_keyword(parser, "dom") {
@@ -1249,6 +1309,27 @@ make_name_parts :: proc(parser: ^Parser, name: string) -> [dynamic]string {
 
 // --- DOM markup ------------------------------------------------------------
 
+// DOM tag and attribute names accept keyword spellings, such as the HTML
+// attribute `method`.
+@(private)
+token_is_name :: proc(token: Token) -> bool {
+	if token.kind == .Ident {
+		return true
+	}
+	if len(token.text) == 0 {
+		return false
+	}
+	if !is_ident_start(token.text[0]) {
+		return false
+	}
+	for index in 1 ..< len(token.text) {
+		if !is_ident_continue(token.text[index]) {
+			return false
+		}
+	}
+	return true
+}
+
 @(private)
 parse_dom :: proc(parser: ^Parser) -> ^Expr {
 	advance(parser) // dom
@@ -1259,7 +1340,7 @@ parse_dom :: proc(parser: ^Parser) -> ^Expr {
 @(private)
 parse_dom_element :: proc(parser: ^Parser) -> Dom_Element {
 	element := Dom_Element{}
-	if !at(parser, .Ident) {
+	if !token_is_name(peek(parser)) {
 		error_here(parser, "expected a tag name")
 		for !at(parser, .Gt) && !at(parser, .Eof) {
 			advance(parser)
@@ -1294,7 +1375,7 @@ parse_dom_name_segments :: proc(parser: ^Parser, first: Token) -> string {
 	for at(parser, .Minus) || at(parser, .Colon) {
 		separator := peek(parser)
 		next := peek_at(parser, 1)
-		if next.kind != .Ident ||
+		if !token_is_name(next) ||
 		   !tokens_adjacent(last, separator) ||
 		   !tokens_adjacent(separator, next) {
 			break
@@ -1322,7 +1403,7 @@ parse_dom_attributes :: proc(parser: ^Parser) -> []Dom_Attribute {
 		if at(parser, .Slash) && peek_at(parser, 1).kind == .Gt {
 			break
 		}
-		if !at(parser, .Ident) {
+		if !token_is_name(peek(parser)) {
 			error_here(parser, "expected an attribute name")
 			advance(parser)
 			skip_newlines(parser)
@@ -1366,9 +1447,13 @@ parse_dom_children :: proc(parser: ^Parser, tag: string) -> []^Expr {
 			if peek_at(parser, 1).kind == .Slash {
 				advance(parser)
 				advance(parser)
-				closing := expect(parser, .Ident, "expected a closing tag name")
-				if closing.text != tag {
-					error_here(parser, "closing tag does not match the opening tag")
+				if !token_is_name(peek(parser)) {
+					error_here(parser, "expected a closing tag name")
+				} else {
+					closing := advance(parser)
+					if closing.text != tag {
+						error_here(parser, "closing tag does not match the opening tag")
+					}
 				}
 				expect(parser, .Gt, "expected '>' after the closing tag")
 				return to_slice(parser, children)
@@ -1411,4 +1496,61 @@ dom_text_between :: proc(parser: ^Parser, start: int, end: int) -> string {
 		return ""
 	}
 	return strings.trim_space(parser.source[start:end])
+}
+
+// --- Try and spawn ---------------------------------------------------------
+
+@(private)
+parse_try :: proc(parser: ^Parser) -> ^Expr {
+	advance(parser)
+	result := Try{}
+	skip_separators(parser)
+	result.body = parse_block_until(parser, []Token_Kind{.Catch, .Finally, .End})
+
+	catches: [dynamic]Catch_Clause
+	for at(parser, .Catch) {
+		advance(parser)
+		clause := Catch_Clause{}
+		if at(parser, .Error_Code) {
+			clause.code = advance(parser).text
+			clause.has_code = true
+		}
+		if at(parser, .As) {
+			advance(parser)
+			name := expect(parser, .Ident, "expected a name after 'as'")
+			clause.name = name.text
+			clause.has_name = true
+		} else if at(parser, .Ident) {
+			name := advance(parser)
+			clause.name = name.text
+			clause.has_name = true
+		}
+		skip_separators(parser)
+		clause.body = parse_block_until(parser, []Token_Kind{.Catch, .Finally, .End})
+		append(&catches, clause)
+	}
+	result.catches = to_slice(parser, catches)
+
+	if at(parser, .Finally) {
+		advance(parser)
+		skip_separators(parser)
+		result.finally_body = parse_block_until(parser, []Token_Kind{.End})
+		result.has_finally = true
+	}
+
+	expect(parser, .End, "expected 'end' to close try")
+	return expr_node(parser, result)
+}
+
+@(private)
+parse_spawn :: proc(parser: ^Parser) -> ^Expr {
+	advance(parser)
+	result := Spawn{}
+	result.call = parse_unary(parser)
+	if at(parser, .After) {
+		advance(parser)
+		result.delay = parse_unary(parser)
+		result.has_delay = true
+	}
+	return expr_node(parser, result)
 }
