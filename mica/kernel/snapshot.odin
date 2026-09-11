@@ -54,7 +54,7 @@ snapshot_create :: proc(kernel: ^Kernel, version: u64, parent: ^Snapshot) -> ^Sn
 	snapshot.catalog = make([]Relation_Metadata, 0, snapshot.allocator)
 	snapshot.blocks = make([]^Relation_Block, 0, snapshot.allocator)
 	snapshot.rules = make([]Rule_Definition, 0, snapshot.allocator)
-	snapshot.derived = make([]Derived_Relation, 0, snapshot.allocator)
+	snapshot.derived = nil
 	return snapshot
 }
 
@@ -371,7 +371,7 @@ derived_relations_from :: proc(alloc: mem.Allocator, derived: ^Rule_Derived) -> 
 // surviving tuples are deep-copied into the snapshot arena.
 snapshot_compute_derived :: proc(snapshot: ^Snapshot) {
 	if len(snapshot.rules) == 0 {
-		snapshot.derived = make([]Derived_Relation, 0, snapshot.allocator)
+		snapshot.derived = nil
 		return
 	}
 
@@ -387,7 +387,7 @@ snapshot_compute_derived :: proc(snapshot: ^Snapshot) {
 
 	derived, err := rules_evaluate(alloc, snapshot.rules, snapshot)
 	if err != .None {
-		snapshot.derived = make([]Derived_Relation, 0, snapshot.allocator)
+		snapshot.derived = nil
 		return
 	}
 	snapshot.derived = derived_relations_from(snapshot.allocator, &derived)
