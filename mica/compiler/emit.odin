@@ -53,8 +53,9 @@ Scope :: struct {
 // its index.
 @(private)
 Pending_Function :: struct {
-	index: int,
-	fn:    Fn,
+	index:    int,
+	fn:       Fn,
+	captures: []Local,
 }
 
 @(private)
@@ -199,11 +200,20 @@ compile_program :: proc(
 		saved_max := emitter.max_register
 		saved_locals := len(emitter.locals)
 		resize(&emitter.locals, 0)
-		emitter.next_register = len(pending.fn.params)
+		capture_count := len(pending.captures)
+		for capture, capture_index in pending.captures {
+			declare_local(&emitter, capture.name, capture_index, false)
+		}
+		emitter.next_register = capture_count + len(pending.fn.params)
 		emitter.max_register = emitter.next_register
 		scope_enter(&emitter)
 		for param, param_index in pending.fn.params {
-			declare_local(&emitter, param.name, param_index, false)
+			declare_local(
+				&emitter,
+				param.name,
+				capture_count + param_index,
+				false,
+			)
 		}
 		return_register := -1
 		if pending.fn.has_expression_body {
@@ -227,6 +237,9 @@ compile_program :: proc(
 		resize(&emitter.locals, saved_locals)
 		emitter.next_register = saved_next
 		emitter.max_register = saved_max
+		if pending.captures != nil {
+			delete(pending.captures, emitter.allocator)
+		}
 	}
 
 	program := vm.builder_build(&builder, allocator)
@@ -1348,16 +1361,30 @@ emit_fn_literal :: proc(emitter: ^Emitter, fn: Fn) -> (int, bool) {
 	builder.open_function = saved_function
 	builder.open_offset = saved_offset
 
-	append(&emitter.pending_functions, Pending_Function{index = index, fn = fn})
+	// Capture every visible local by value. Captures land in the callee's
+	// first registers, before the parameters.
+	captures := make([]Local, len(emitter.locals), emitter.allocator)
+	copy(captures, emitter.locals[:])
+	capture_registers := make([]int, len(captures), emitter.allocator)
+	defer delete(capture_registers)
+	for capture, capture_index in captures {
+		capture_registers[capture_index] = capture.register
+	}
+	first_capture := marshal_arguments(emitter, capture_registers)
+	append(&emitter.pending_functions, Pending_Function {
+		index    = index,
+		fn       = fn,
+		captures = captures,
+	})
 
 	destination := alloc_register(emitter)
 	vm.builder_emit(
 		builder,
 		.Make_Function,
-		0,
+		u8(len(captures)),
 		i32(destination),
 		i32(index),
-		0,
+		i32(first_capture),
 	)
 	return destination, true
 }

@@ -686,6 +686,11 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if instr.b < 0 || int(instr.b) >= len(program.functions) {
 					return .Bad_Function
 				}
+				for offset in 0 ..< int(instr.flags) {
+					if !valid_register(instr.c + i32(offset), register_count) {
+						return .Bad_Register
+					}
+				}
 			case .Call_Value:
 				if !valid_register(instr.a, register_count) ||
 				   !valid_register(instr.b, register_count) {

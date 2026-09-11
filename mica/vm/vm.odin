@@ -59,6 +59,13 @@ Frame :: struct {
 	caller_dst:    i32,
 }
 
+// An interned callable: a program function plus the values captured when its
+// fn literal was evaluated.
+Callable_Info :: struct {
+	function: i32,
+	captures: []v.Value,
+}
+
 // A compiled exception handler: errors raised at or below `frame` jump to the
 // absolute code offset `target` with the error delivered to `error_register`
 // (-1 when the handler takes no value).
@@ -94,6 +101,8 @@ VM :: struct {
 	pending_resume: i32,
 	// Active exception handlers, innermost last.
 	handlers: [dynamic]Handler,
+	// Interned callable values, addressed by Function_ID payload.
+	callables: [dynamic]Callable_Info,
 	// Free slot for host data, for example a builtin environment.
 	user:        rawptr,
 	// Values copied into the entry function's parameter registers before the
@@ -117,12 +126,19 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.pending_resume = -1
 	state.entry_function = -1
 	state.handlers = make([dynamic]Handler)
+	state.callables = make([dynamic]Callable_Info)
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
 	state.status = .Ready
 }
 
 vm_destroy :: proc(state: ^VM) {
+	for callable in state.callables {
+		if callable.captures != nil {
+			delete(callable.captures)
+		}
+	}
+	delete(state.callables)
 	delete(state.handlers)
 	delete(state.registers)
 	delete(state.frames)
@@ -498,9 +514,19 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			return .Boundary
 
 		case .Make_Function:
-			function, function_ok := v.value_function_raw(u64(instr.b))
-			if !function_ok {
+			if instr.b < 0 || int(instr.b) >= len(program.functions) {
 				vm_fail(state, "E_TYPE", "function index is out of range")
+				break
+			}
+			capture_count := int(instr.flags)
+			captures := make([]v.Value, capture_count, state.allocator)
+			for index in 0 ..< capture_count {
+				captures[index] = state.registers[base + int(instr.c) + index]
+			}
+			callable_id := vm_intern_callable(state, instr.b, captures)
+			function, function_ok := v.value_function_raw(u64(callable_id))
+			if !function_ok {
+				vm_fail(state, "E_TYPE", "callable index is out of range")
 				break
 			}
 			state.registers[base + int(instr.a)] = function
@@ -512,16 +538,31 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				vm_fail(state, "E_TYPE", "call target is not a function")
 				break
 			}
-			function_index := int(v.function_id_raw(function_id))
+			callable_index := int(v.function_id_raw(function_id))
+			if callable_index < 0 || callable_index >= len(state.callables) {
+				vm_fail(state, "E_DISPATCH", "callable index is invalid")
+				break
+			}
+			callable := state.callables[callable_index]
+			function_index := int(callable.function)
 			if function_index < 0 || function_index >= len(program.functions) {
 				vm_fail(state, "E_DISPATCH", "function index is invalid")
 				break
 			}
 			callee := program.functions[function_index]
+			capture_count := len(callable.captures)
+			argument_count := int(instr.flags)
+			if argument_count < callee.param_count {
+				vm_fail(state, "E_ARITY", "not enough arguments for function call")
+				break
+			}
 			callee_base := len(state.registers)
 			resize(&state.registers, callee_base + callee.register_count)
+			for capture, index in callable.captures {
+				state.registers[callee_base + index] = capture
+			}
 			for index in 0 ..< callee.param_count {
-				state.registers[callee_base + index] =
+				state.registers[callee_base + capture_count + index] =
 					state.registers[base + int(instr.c) + index]
 			}
 			append(&state.frames, Frame {
@@ -1263,6 +1304,34 @@ vm_raised_error :: proc(state: ^VM, base: int, instr: Instruction) -> v.Value {
 	}
 	vm_fail(state, "E_TYPE", "raise expects an error code or error value")
 	return state.error
+}
+
+// Interns a callable, reusing an existing entry with the same function and
+// captured values. Takes ownership of `captures`.
+@(private)
+vm_intern_callable :: proc(state: ^VM, function: i32, captures: []v.Value) -> i32 {
+	for callable, index in state.callables {
+		if callable.function != function || len(callable.captures) != len(captures) {
+			continue
+		}
+		matches := true
+		for capture, capture_index in captures {
+			if !v.value_eq(callable.captures[capture_index], capture) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			delete(captures)
+			return i32(index)
+		}
+	}
+	index := len(state.callables)
+	append(&state.callables, Callable_Info {
+		function = function,
+		captures = captures,
+	})
+	return i32(index)
 }
 
 // Records an error and marks the VM failed. Available to builtins.

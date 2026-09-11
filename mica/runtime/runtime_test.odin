@@ -905,3 +905,44 @@ assert Result(4, nested(14))
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Result", 4)
 }
+
+@(test)
+test_run_fn_captures :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Result, 2)
+let base = 10
+let add = fn(x) => x + base
+assert Result(1, add(5))
+base = 100
+assert Result(2, add(5))
+verb apply(f, x)
+  return f(x)
+end
+assert Result(3, apply(add, 5))
+let outer = fn(x)
+  let scale = 3
+  return fn(y) => (x + y) * scale
+end
+assert Result(4, outer(2)(4))
+let makers = []
+for i in [1, 2]
+  makers = [@makers, fn() => i]
+end
+assert Result(5, makers[0]())
+assert Result(6, makers[1]())
+assert Result(7, [{:f -> add}][0][:f](5))
+`
+	path, path_ok := write_temp_source(t, "mica_fn_capture_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Result", 7)
+}
