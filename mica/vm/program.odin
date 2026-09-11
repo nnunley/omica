@@ -61,6 +61,13 @@ Op :: enum u8 {
 	Build_Relation,
 	// Index: a = dst, b = collection register, c = key register.
 	Index,
+	// Collection_Key_At: a = dst, b = collection register, c = ordinal index
+	// register. Yields the map key at that position, or the ordinal itself for
+	// lists and relations.
+	Collection_Key_At,
+	// Collection_Value_At: a = dst, b = collection register, c = ordinal index
+	// register.
+	Collection_Value_At,
 	// Builtin_Call: a = dst, b = builtin index, c = first argument register.
 	Builtin_Call,
 	// Commit: requests a transaction commit from the host.
@@ -70,6 +77,9 @@ Op :: enum u8 {
 	// Scan_One: a = dst (bool), b = pattern index. Fails unless exactly one
 	// row matches, then writes output cells.
 	Scan_One,
+	// Dispatch: a = dst, b = dispatch spec index. Resolves a method from the
+	// selector and role arguments, then calls its program.
+	Dispatch,
 }
 
 // A cell in a relation scan pattern.
@@ -100,6 +110,19 @@ Scan_Pattern :: struct {
 // The heading of a relation value built at runtime.
 Relation_Shape :: struct {
 	heading: []v.Symbol,
+}
+
+// A role binding at a dispatch site. `register` is relative to the function
+// frame.
+Dispatch_Role :: struct {
+	role:     v.Symbol,
+	register: i32,
+}
+
+// A dispatch site: a selector symbol plus its role arguments.
+Dispatch_Spec :: struct {
+	selector: v.Symbol,
+	roles:    []Dispatch_Role,
 }
 
 Bin_Op :: enum u8 {
@@ -143,8 +166,14 @@ Program :: struct {
 	functions: []Function,
 	patterns:        []Scan_Pattern,
 	relation_shapes: []Relation_Shape,
+	dispatch_specs:  []Dispatch_Spec,
 	builtins:        []v.Symbol,
 	entry:           int,
+	// Kernel relation ids used to resolve dispatch. Zero disables dispatch.
+	dispatch_method_selector_relation: u32,
+	dispatch_param_relation:           u32,
+	dispatch_delegates_relation:       u32,
+	dispatch_method_program_relation:  u32,
 }
 
 Program_Error :: enum {
@@ -165,10 +194,15 @@ Builder :: struct {
 	functions:     [dynamic]Function,
 	patterns:        [dynamic]Scan_Pattern,
 	relation_shapes: [dynamic]Relation_Shape,
+	dispatch_specs:  [dynamic]Dispatch_Spec,
 	builtins:        [dynamic]v.Symbol,
 	entry:           int,
 	open_function:   int,
 	open_offset:     int,
+	dispatch_method_selector_relation: u32,
+	dispatch_param_relation:           u32,
+	dispatch_delegates_relation:       u32,
+	dispatch_method_program_relation:  u32,
 }
 
 builder_init :: proc(builder: ^Builder) {
@@ -177,6 +211,7 @@ builder_init :: proc(builder: ^Builder) {
 	builder.functions = make([dynamic]Function)
 	builder.patterns = make([dynamic]Scan_Pattern)
 	builder.relation_shapes = make([dynamic]Relation_Shape)
+	builder.dispatch_specs = make([dynamic]Dispatch_Spec)
 	builder.builtins = make([dynamic]v.Symbol)
 	builder.entry = -1
 	builder.open_function = -1
@@ -195,6 +230,10 @@ builder_destroy :: proc(builder: ^Builder) {
 		delete(shape.heading)
 	}
 	delete(builder.relation_shapes)
+	for spec in builder.dispatch_specs {
+		delete(spec.roles)
+	}
+	delete(builder.dispatch_specs)
 	delete(builder.builtins)
 }
 
@@ -229,6 +268,20 @@ builder_add_pattern :: proc(
 		cells        = pattern_cells,
 	})
 	return i32(len(builder.patterns) - 1)
+}
+
+builder_add_dispatch_spec :: proc(
+	builder: ^Builder,
+	selector: v.Symbol,
+	roles: []Dispatch_Role,
+) -> i32 {
+	owned := make([]Dispatch_Role, len(roles))
+	copy(owned, roles)
+	append(&builder.dispatch_specs, Dispatch_Spec {
+		selector = selector,
+		roles    = owned,
+	})
+	return i32(len(builder.dispatch_specs) - 1)
 }
 
 builder_add_constant :: proc(builder: ^Builder, value: v.Value) -> int {
@@ -299,9 +352,22 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 		copy(heading, shape.heading)
 		program.relation_shapes[i] = Relation_Shape{heading = heading}
 	}
+	program.dispatch_specs = make([]Dispatch_Spec, len(builder.dispatch_specs), alloc)
+	for spec, i in builder.dispatch_specs {
+		roles := make([]Dispatch_Role, len(spec.roles), alloc)
+		copy(roles, spec.roles)
+		program.dispatch_specs[i] = Dispatch_Spec {
+			selector = spec.selector,
+			roles    = roles,
+		}
+	}
 	program.builtins = make([]v.Symbol, len(builder.builtins), alloc)
 	copy(program.builtins, builder.builtins[:])
 	program.entry = builder.entry
+	program.dispatch_method_selector_relation = builder.dispatch_method_selector_relation
+	program.dispatch_param_relation = builder.dispatch_param_relation
+	program.dispatch_delegates_relation = builder.dispatch_delegates_relation
+	program.dispatch_method_program_relation = builder.dispatch_method_program_relation
 	return program
 }
 
@@ -318,6 +384,10 @@ program_destroy :: proc(program: ^Program, alloc: mem.Allocator) {
 		free(raw_data(shape.heading), alloc)
 	}
 	free(raw_data(program.relation_shapes), alloc)
+	for spec in program.dispatch_specs {
+		free(raw_data(spec.roles), alloc)
+	}
+	free(raw_data(program.dispatch_specs), alloc)
 	free(raw_data(program.builtins), alloc)
 	free(program, alloc)
 }
@@ -474,6 +544,12 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				   !valid_register(instr.c, register_count) {
 					return .Bad_Register
 				}
+			case .Collection_Key_At, .Collection_Value_At:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.b, register_count) ||
+				   !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
 			case .Builtin_Call:
 				if !valid_register(instr.a, register_count) {
 					return .Bad_Register
@@ -489,6 +565,18 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if !valid_register(instr.a, register_count) ||
 				   !valid_register(instr.b, register_count) {
 					return .Bad_Register
+				}
+			case .Dispatch:
+				if !valid_register(instr.a, register_count) {
+					return .Bad_Register
+				}
+				if instr.b < 0 || int(instr.b) >= len(program.dispatch_specs) {
+					return .Bad_Function
+				}
+				for role in program.dispatch_specs[instr.b].roles {
+					if !valid_register(role.register, register_count) {
+						return .Bad_Register
+					}
 				}
 			}
 		}
@@ -585,6 +673,8 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d shape%d r%d..", instr.a, instr.b, instr.c)
 			case .Index:
 				fmt.sbprintf(&builder, " r%d r%d r%d", instr.a, instr.b, instr.c)
+			case .Collection_Key_At, .Collection_Value_At:
+				fmt.sbprintf(&builder, " r%d r%d r%d", instr.a, instr.b, instr.c)
 			case .Builtin_Call:
 				builtin_name, _ := v.symbol_name(program.builtins[instr.b])
 				fmt.sbprintf(&builder, " r%d %s args@r%d", instr.a, builtin_name, instr.c)
@@ -594,6 +684,8 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d r%d", instr.a, instr.b)
 			case .Scan_One:
 				fmt.sbprintf(&builder, " r%d pat%d", instr.a, instr.b)
+			case .Dispatch:
+				fmt.sbprintf(&builder, " r%d spec%d", instr.a, instr.b)
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -644,6 +736,10 @@ op_name :: proc(op: Op) -> string {
 		return "build_relation"
 	case .Index:
 		return "index"
+	case .Collection_Key_At:
+		return "collection_key_at"
+	case .Collection_Value_At:
+		return "collection_value_at"
 	case .Builtin_Call:
 		return "builtin_call"
 	case .Commit:
@@ -652,6 +748,8 @@ op_name :: proc(op: Op) -> string {
 		return "is_truthy"
 	case .Scan_One:
 		return "scan_one"
+	case .Dispatch:
+		return "dispatch"
 	}
 	return "?"
 }

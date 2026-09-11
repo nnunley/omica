@@ -90,6 +90,12 @@ run_files :: proc(
 		next_identity = 0x1000,
 		next_rule     = 1,
 	}
+
+	dispatch_result := install_dispatch_relations(&env)
+	if !dispatch_result.ok {
+		return dispatch_result
+	}
+
 	for ast in asts {
 		result := prescan_file(&env, ast, &declarations)
 		if !result.ok {
@@ -101,6 +107,11 @@ run_files :: proc(
 		if !result.ok {
 			return result
 		}
+	}
+
+	method_result := install_methods(&env, asts[:], &declarations)
+	if !method_result.ok {
+		return method_result
 	}
 
 	items := make([dynamic]c.Item, allocator)

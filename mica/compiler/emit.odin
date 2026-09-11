@@ -23,6 +23,11 @@ Compile_Context :: struct {
 	builtins:   map[string]bool,
 	relations:  map[string]u32,
 	identities: map[string]v.Value,
+	// Kernel relation ids for relation-driven dispatch. Zero disables it.
+	dispatch_method_selector_relation: u32,
+	dispatch_param_relation:           u32,
+	dispatch_delegates_relation:       u32,
+	dispatch_method_program_relation:  u32,
 }
 
 Compiled_Program :: struct {
@@ -56,6 +61,7 @@ Emitter :: struct {
 	functions:     map[string]int,
 	break_patches: [dynamic]int,
 	continue_targets: [dynamic]int,
+	loop_depth: int,
 	empty_constant: int,
 }
 
@@ -70,6 +76,12 @@ compile_program :: proc(
 	builder: vm.Builder
 	vm.builder_init(&builder)
 	defer vm.builder_destroy(&builder)
+	if ctx != nil {
+		builder.dispatch_method_selector_relation = ctx.dispatch_method_selector_relation
+		builder.dispatch_param_relation = ctx.dispatch_param_relation
+		builder.dispatch_delegates_relation = ctx.dispatch_delegates_relation
+		builder.dispatch_method_program_relation = ctx.dispatch_method_program_relation
+	}
 
 	emitter := Emitter {
 		builder   = &builder,
@@ -379,7 +391,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return emit_return(emitter, n)
 
 	case Break:
-		if len(emitter.break_patches) == 0 {
+		if emitter.loop_depth == 0 {
 			push_error(emitter, "break outside a loop")
 			return -1, false
 		}
@@ -725,6 +737,9 @@ binary_op :: proc(op: Binary_Op) -> vm.Bin_Op {
 emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 	callee, is_name := call.callee^.(Name)
 	if !is_name {
+		if symbol, is_symbol := call.callee^.(Symbol_Literal); is_symbol {
+			return emit_role_dispatch(emitter, symbol, call)
+		}
 		push_error(emitter, "call target must be a name")
 		return -1, false
 	}
@@ -732,7 +747,11 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 
 	for argument in call.args {
 		if argument.has_role {
-			push_error(emitter, "named-role calls are not lowered yet")
+			push_error(emitter, fmt.aprintf(
+				"call to %s uses role arguments without a symbol selector",
+				text,
+				allocator = emitter.allocator,
+			))
 			return -1, false
 		}
 		if _, is_splice := argument.expr^.(Splice); is_splice {
@@ -957,6 +976,45 @@ emit_frob :: proc(emitter: ^Emitter, frob: Structural_Literal) -> (int, bool) {
 }
 
 @(private)
+emit_role_dispatch :: proc(
+	emitter: ^Emitter,
+	selector: Symbol_Literal,
+	call: Call,
+) -> (int, bool) {
+	roles := make([dynamic]vm.Dispatch_Role, 0, len(call.args), emitter.allocator)
+	defer delete(roles)
+	for argument in call.args {
+		if !argument.has_role {
+			push_error(emitter, "dispatch arguments must use explicit role names")
+			return -1, false
+		}
+		register, has_value := emit_expr(emitter, argument.expr)
+		if !has_value {
+			return -1, false
+		}
+		append(&roles, vm.Dispatch_Role {
+			role     = v.symbol_intern(argument.role),
+			register = i32(register),
+		})
+	}
+	spec := vm.builder_add_dispatch_spec(
+		emitter.builder,
+		v.symbol_intern(selector.name),
+		roles[:],
+	)
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Dispatch,
+		0,
+		i32(destination),
+		spec,
+		0,
+	)
+	return destination, true
+}
+
+@(private)
 emit_standard_constructor :: proc(
 	emitter: ^Emitter,
 	name: string,
@@ -1089,6 +1147,8 @@ emit_if :: proc(emitter: ^Emitter, conditional: If) -> (int, bool) {
 emit_while :: proc(emitter: ^Emitter, loop: While) -> (int, bool) {
 	result := alloc_register(emitter)
 	break_mark := len(emitter.break_patches)
+	emitter.loop_depth += 1
+	defer emitter.loop_depth -= 1
 
 	loop_start := current_offset(emitter)
 	append(&emitter.continue_targets, loop_start)
@@ -1122,8 +1182,8 @@ emit_while :: proc(emitter: ^Emitter, loop: While) -> (int, bool) {
 
 @(private)
 emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
-	if len(loop.names) != 1 {
-		push_error(emitter, "only single-name for loops are lowered yet")
+	if len(loop.names) != 1 && len(loop.names) != 2 {
+		push_error(emitter, "for loops take one or two bindings")
 		return -1, false
 	}
 
@@ -1131,6 +1191,9 @@ emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 	if !iterable_ok {
 		return -1, false
 	}
+
+	emitter.loop_depth += 1
+	defer emitter.loop_depth -= 1
 
 	scope_enter(emitter)
 	defer scope_leave(emitter)
@@ -1160,16 +1223,39 @@ emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 	patch_jump(emitter, body_jump, current_offset(emitter))
 
 	scope_enter(emitter)
-	item_register := alloc_register(emitter)
-	vm.builder_emit(
-		emitter.builder,
-		.Index,
-		0,
-		i32(item_register),
-		i32(iterable),
-		i32(index_register),
-	)
-	declare_local(emitter, loop.names[0], item_register, false)
+	if len(loop.names) == 2 {
+		key_register := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Collection_Key_At,
+			0,
+			i32(key_register),
+			i32(iterable),
+			i32(index_register),
+		)
+		value_register := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Collection_Value_At,
+			0,
+			i32(value_register),
+			i32(iterable),
+			i32(index_register),
+		)
+		declare_local(emitter, loop.names[0], key_register, false)
+		declare_local(emitter, loop.names[1], value_register, false)
+	} else {
+		item_register := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Collection_Value_At,
+			0,
+			i32(item_register),
+			i32(iterable),
+			i32(index_register),
+		)
+		declare_local(emitter, loop.names[0], item_register, false)
+	}
 
 	result, has_result := emit_block(emitter, loop.body)
 	scope_leave(emitter)

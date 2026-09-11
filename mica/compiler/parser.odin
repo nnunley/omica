@@ -931,7 +931,10 @@ parse_postfix :: proc(parser: ^Parser) -> ^Expr {
 		case .Dot:
 			advance(parser)
 			name := expect(parser, .Ident, "expected field name after '.'")
-			node = expr_node(parser, Field{receiver = node, name = name.text})
+			node = expr_node(parser, Field {
+				receiver = node,
+				name     = parse_qualified_name(parser, name),
+			})
 		case .Lt:
 			// `#id<[...]>` and `#id<{...}>` are variants when the `<` is
 			// adjacent to the head. `a < b` stays a comparison.

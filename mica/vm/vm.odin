@@ -300,6 +300,16 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				return .Failed
 			}
 
+		case .Collection_Key_At:
+			if !vm_collection_key_at(state, base, instr) {
+				return .Failed
+			}
+
+		case .Collection_Value_At:
+			if !vm_collection_value_at(state, base, instr) {
+				return .Failed
+			}
+
 		case .Builtin_Call:
 			if !vm_builtin_call(state, base, instr) {
 				return .Failed
@@ -316,6 +326,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Scan_One:
 			if !vm_scan_one(state, base, instr) {
+				return .Failed
+			}
+
+		case .Dispatch:
+			if !vm_dispatch(state, base, instr) {
 				return .Failed
 			}
 		}
@@ -336,6 +351,98 @@ vm_build_relation :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		return false
 	}
 	state.registers[base + int(instr.a)] = result
+	return true
+}
+
+@(private)
+vm_collection_key_at :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	collection := state.registers[base + int(instr.b)]
+	index, is_int := v.value_as_int(state.registers[base + int(instr.c)])
+	if !is_int || index < 0 {
+		vm_fail(state, "E_TYPE", "collection index is not a non-negative integer")
+		return false
+	}
+
+	#partial switch v.value_kind(collection) {
+	case .List:
+		values, _ := v.value_as_list(collection)
+		if int(index) >= len(values) {
+			vm_fail(state, "E_INDEX", "collection index out of range")
+			return false
+		}
+		result, _ := v.value_int(index)
+		state.registers[base + int(instr.a)] = result
+
+	case .Map:
+		entries, _ := v.value_as_map(collection)
+		if int(index) >= len(entries) {
+			vm_fail(state, "E_INDEX", "collection index out of range")
+			return false
+		}
+		state.registers[base + int(instr.a)] = entries[index].key
+
+	case .Relation:
+		relation, _ := v.value_as_relation(collection)
+		if int(index) >= len(relation.rows) {
+			vm_fail(state, "E_INDEX", "collection index out of range")
+			return false
+		}
+		result, _ := v.value_int(index)
+		state.registers[base + int(instr.a)] = result
+
+	case:
+		vm_fail(state, "E_TYPE", "collection key iteration needs a list, map, or relation")
+		return false
+	}
+	return true
+}
+
+@(private)
+vm_collection_value_at :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	collection := state.registers[base + int(instr.b)]
+	index, is_int := v.value_as_int(state.registers[base + int(instr.c)])
+	if !is_int || index < 0 {
+		vm_fail(state, "E_TYPE", "collection index is not a non-negative integer")
+		return false
+	}
+
+	#partial switch v.value_kind(collection) {
+	case .List:
+		values, _ := v.value_as_list(collection)
+		if int(index) >= len(values) {
+			vm_fail(state, "E_INDEX", "collection index out of range")
+			return false
+		}
+		state.registers[base + int(instr.a)] = values[index]
+
+	case .Map:
+		entries, _ := v.value_as_map(collection)
+		if int(index) >= len(entries) {
+			vm_fail(state, "E_INDEX", "collection index out of range")
+			return false
+		}
+		state.registers[base + int(instr.a)] = entries[index].value
+
+	case .Relation:
+		relation, _ := v.value_as_relation(collection)
+		if int(index) >= len(relation.rows) {
+			vm_fail(state, "E_INDEX", "collection index out of range")
+			return false
+		}
+		row := v.tuple_values(relation.rows[index])
+		entries := make([]v.Map_Entry, len(relation.heading), context.temp_allocator)
+		for column, column_index in relation.heading {
+			entries[column_index] = v.Map_Entry {
+				key   = v.value_symbol(column),
+				value = row[column_index],
+			}
+		}
+		state.registers[base + int(instr.a)] = v.value_map(state.allocator, entries)
+
+	case:
+		vm_fail(state, "E_TYPE", "collection value iteration needs a list, map, or relation")
+		return false
+	}
 	return true
 }
 
@@ -628,6 +735,84 @@ vm_apply_write :: proc(
 		vm_fail(state, kernel_error_code(err), "relation write failed")
 		return false
 	}
+	return true
+}
+
+@(private)
+vm_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	program := state.program
+	if state.source == nil {
+		vm_fail(state, "E_NO_SOURCE", "dispatch has no relation source")
+		return false
+	}
+	if program.dispatch_method_selector_relation == 0 ||
+	   program.dispatch_param_relation == 0 ||
+	   program.dispatch_delegates_relation == 0 ||
+	   program.dispatch_method_program_relation == 0 {
+		vm_fail(state, "E_DISPATCH", "dispatch relations are not configured")
+		return false
+	}
+
+	spec := program.dispatch_specs[instr.b]
+	selector := v.value_symbol(spec.selector)
+	roles := make([]k.Role_Pair, len(spec.roles), context.temp_allocator)
+	for role, index in spec.roles {
+		roles[index] = k.Role_Pair {
+			role  = v.value_symbol(role.role),
+			value = state.registers[base + int(role.register)],
+		}
+	}
+
+	relations := k.Dispatch_Relations {
+		method_selector = k.Relation_ID(program.dispatch_method_selector_relation),
+		param           = k.Relation_ID(program.dispatch_param_relation),
+		delegates       = k.Relation_ID(program.dispatch_delegates_relation),
+	}
+	entries := k.applicable_method_entries(state.source, relations, selector, roles)
+	if len(entries) == 0 {
+		vm_fail(state, "E_DISPATCH", "no applicable method")
+		return false
+	}
+	if len(entries) > 1 {
+		vm_fail(state, "E_DISPATCH", "ambiguous method dispatch")
+		return false
+	}
+	entry := entries[0]
+
+	program_value, found := k.dispatch_method_program(
+		state.source,
+		k.Relation_ID(program.dispatch_method_program_relation),
+		entry.method,
+	)
+	if !found {
+		vm_fail(state, "E_DISPATCH", "method has no program")
+		return false
+	}
+	function_index, is_int := v.value_as_int(program_value)
+	if !is_int || function_index < 0 || int(function_index) >= len(program.functions) {
+		vm_fail(state, "E_DISPATCH", "method program index is invalid")
+		return false
+	}
+
+	args, args_ok := k.dispatch_method_args(entry.params, roles)
+	if !args_ok {
+		vm_fail(state, "E_DISPATCH", "method parameters cannot be bound")
+		return false
+	}
+
+	callee := program.functions[function_index]
+	callee_base := len(state.registers)
+	resize(&state.registers, callee_base + callee.register_count)
+	for index in 0 ..< min(callee.param_count, len(args)) {
+		state.registers[callee_base + index] = args[index]
+	}
+	append(&state.frames, Frame {
+		function      = int(function_index),
+		ip            = callee.code_offset,
+		register_base = callee_base,
+		caller_base   = base,
+		caller_dst    = instr.a,
+	})
 	return true
 }
 

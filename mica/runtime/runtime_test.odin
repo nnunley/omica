@@ -1,5 +1,6 @@
 package mica_runtime
 
+import "core:fmt"
 import "core:os"
 import "core:testing"
 import c "../compiler"
@@ -141,4 +142,45 @@ test_primitive_identity_prototypes :: proc(t: ^testing.T) {
 	identity, ok := v.value_as_identity(state.result)
 	testing.expect(t, ok)
 	testing.expect_value(t, v.identity_raw(identity), u64(v.STRING_PROTOTYPE))
+}
+
+@(test)
+test_run_dispatch_role_call :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:player)
+make_identity(:thing)
+make_identity(:alice)
+make_identity(:coin)
+make_relation(:Taken, 2)
+assert Delegates(#alice, #player, 0)
+assert Delegates(#coin, #thing, 0)
+verb take(actor @ #player, item @ #thing)
+  assert Taken(actor, item)
+end
+:take(actor: #alice, item: #coin)
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_dispatch_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the dispatch test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+
+	expect_relation_rows(t, &kernel, "Taken", 1)
 }
