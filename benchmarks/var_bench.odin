@@ -1,6 +1,7 @@
 // Microbenchmarks for the value layer.
 package main
 
+import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
 
@@ -25,6 +26,9 @@ Var_State :: struct {
 	tuple_a:          v.Tuple,
 	tuple_b:          v.Tuple,
 	list:             v.Value,
+	identity:         v.Identity,
+	symbol_value:     v.Value,
+	varied_names:     []string,
 
 	sink: u64,
 }
@@ -63,6 +67,15 @@ var_state_init :: proc() -> ^Var_State {
 	state.tuple_a = v.tuple_new(state.alloc, []v.Value{state.left, state.string_a})
 	state.tuple_b = v.tuple_new(state.alloc, []v.Value{state.right, state.different_string})
 	state.list = v.value_list(state.alloc, []v.Value{state.left, state.right, state.string_a})
+
+	identity, _ := v.identity_new(4096)
+	state.identity = identity
+	state.symbol_value = v.value_symbol(state.symbol)
+
+	state.varied_names = make([]string, 4096, state.alloc)
+	for index in 0 ..< len(state.varied_names) {
+		state.varied_names[index] = fmt.aprintf("selector_%d", index)
+	}
 	return state
 }
 
@@ -72,7 +85,7 @@ bench_int_construct :: proc(user: rawptr, chunk: int, _: int) {
 	accumulator := u64(0)
 	for i in 0 ..< chunk {
 		value, _ := v.value_int(i64(i))
-		accumulator += u64(value)
+		accumulator += u64(mm.black_box(value))
 	}
 	state.sink = mm.black_box(accumulator)
 }
@@ -80,11 +93,44 @@ bench_int_construct :: proc(user: rawptr, chunk: int, _: int) {
 @(private)
 bench_int_add :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Var_State)(user)
+	value := state.left
+	for _ in 0 ..< chunk {
+		value, _ = v.value_checked_add(value, state.right)
+		_ = mm.black_box(value)
+	}
+	state.sink = mm.black_box(u64(value))
+}
+
+@(private)
+bench_identity_construct :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Var_State)(user)
+	accumulator := u64(0)
+	for _ in 0 ..< chunk {
+		value := v.value_identity(state.identity)
+		accumulator += u64(mm.black_box(value))
+	}
+	state.sink = mm.black_box(accumulator)
+}
+
+@(private)
+bench_symbol_construct :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Var_State)(user)
+	accumulator := u64(0)
+	for _ in 0 ..< chunk {
+		value := v.value_symbol(state.symbol)
+		accumulator += u64(mm.black_box(value))
+	}
+	state.sink = mm.black_box(accumulator)
+}
+
+@(private)
+bench_intern_symbol_varied :: proc(user: rawptr, chunk: int, chunk_num: int) {
+	state := (^Var_State)(user)
 	accumulator := u64(0)
 	for i in 0 ..< chunk {
-		other, _ := v.value_int(i64(i & 0xff))
-		value, _ := v.value_checked_add(state.left, other)
-		accumulator += u64(value)
+		index := (chunk_num * chunk + i) % len(state.varied_names)
+		symbol := v.symbol_intern(state.varied_names[index])
+		accumulator += u64(mm.black_box(v.symbol_id(symbol)))
 	}
 	state.sink = mm.black_box(accumulator)
 }
@@ -92,13 +138,12 @@ bench_int_add :: proc(user: rawptr, chunk: int, _: int) {
 @(private)
 bench_float_add :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Var_State)(user)
-	accumulator := u64(0)
-	for i in 0 ..< chunk {
-		other, _ := v.value_float(f32(i & 0x3f))
-		value, _ := v.value_checked_add(state.float_left, other)
-		accumulator += u64(value)
+	value := state.float_left
+	for _ in 0 ..< chunk {
+		value, _ = v.value_checked_add(value, state.float_right)
+		_ = mm.black_box(value)
 	}
-	state.sink = mm.black_box(accumulator)
+	state.sink = mm.black_box(u64(value))
 }
 
 @(private)
@@ -107,7 +152,7 @@ bench_value_cmp_int :: proc(user: rawptr, chunk: int, _: int) {
 	accumulator := u64(0)
 	for _ in 0 ..< chunk {
 		order := v.value_cmp(state.left, state.right)
-		accumulator += u64(order)
+		accumulator += u64(mm.black_box(order))
 	}
 	state.sink = mm.black_box(accumulator)
 }
@@ -117,11 +162,8 @@ bench_value_eq_string :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Var_State)(user)
 	accumulator := u64(0)
 	for _ in 0 ..< chunk {
-		if v.value_eq(state.string_a, state.string_b) {
-			accumulator += 1
-		} else {
-			accumulator += 2
-		}
+		equal := mm.black_box(v.value_eq(state.string_a, state.string_b))
+		accumulator += equal ? 1 : 2
 	}
 	state.sink = mm.black_box(accumulator)
 }
@@ -132,7 +174,7 @@ bench_symbol_intern_hit :: proc(user: rawptr, chunk: int, _: int) {
 	accumulator := u64(0)
 	for _ in 0 ..< chunk {
 		symbol := v.symbol_intern(state.symbol_name)
-		accumulator += u64(v.symbol_id(symbol))
+		accumulator += u64(mm.black_box(v.symbol_id(symbol)))
 	}
 	state.sink = mm.black_box(accumulator)
 }
@@ -143,7 +185,7 @@ bench_tuple_cmp :: proc(user: rawptr, chunk: int, _: int) {
 	accumulator := u64(0)
 	for _ in 0 ..< chunk {
 		order := v.tuple_cmp(state.tuple_a, state.tuple_b)
-		accumulator += u64(order)
+		accumulator += u64(mm.black_box(order))
 	}
 	state.sink = mm.black_box(accumulator)
 }
@@ -209,11 +251,14 @@ register_var_benches :: proc(runner: ^mm.Runner) {
 
 	value_group := mm.group(runner, "var/value", mm.throughput_ops())
 	mm.bench(value_group, "int_construct", state, bench_int_construct)
+	mm.bench(value_group, "identity_construct", state, bench_identity_construct)
+	mm.bench(value_group, "symbol_construct", state, bench_symbol_construct)
 	mm.bench(value_group, "int_add", state, bench_int_add)
 	mm.bench(value_group, "float_add", state, bench_float_add)
 	mm.bench(value_group, "value_cmp_int", state, bench_value_cmp_int)
 	mm.bench(value_group, "value_eq_string", state, bench_value_eq_string)
 	mm.bench(value_group, "symbol_intern_hit", state, bench_symbol_intern_hit)
+	mm.bench(value_group, "symbol_intern_varied", state, bench_intern_symbol_varied)
 	mm.bench(value_group, "tuple_cmp", state, bench_tuple_cmp)
 
 	heap_group := mm.group(runner, "var/heap", mm.throughput_ops())
