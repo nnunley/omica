@@ -76,8 +76,8 @@ changes_record_writes :: proc(
 		feed.latest = version
 	}
 	for relation_writes in writes {
-		asserted: [dynamic]v.Tuple
-		retracted: [dynamic]v.Tuple
+		asserted := make([dynamic]v.Tuple, feed.allocator)
+		retracted := make([dynamic]v.Tuple, feed.allocator)
 		for pending in relation_writes.entries {
 			switch pending.kind {
 			case .Assert:

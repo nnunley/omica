@@ -482,6 +482,10 @@ optional_tuple_eq :: proc(a: v.Tuple, a_ok: bool, b: v.Tuple, b_ok: bool) -> boo
 // snapshot is caller-owned. The transaction must be destroyed by the caller.
 //
 // A task owns one thread and one transaction. Commits to the same relation are
+// Bounded rebuild-and-retry attempts when a publication fails under
+// contention.
+TRANSACTION_RETRY_LIMIT :: 8
+
 // serialised by striped relation locks so a candidate is prepared against a
 // stable relation block; commits to different relations proceed concurrently.
 // Publication happens in groups: whichever task thread arrives first drains
@@ -504,36 +508,46 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		}
 	}
 
-	current := kernel_snapshot(kernel)
-	if current.version != transaction.base.version {
-		if err := transaction_validate_conflicts(transaction, current); err != .None {
-			snapshot_release(current)
-			return nil, err
+	// A publication can fail after the committer's own rebase attempts are
+	// exhausted. Rebuild the candidate against the newest snapshot and retry a
+	// bounded number of times before reporting a conflict to the task.
+	published: ^Snapshot
+	for attempt in 0 ..< TRANSACTION_RETRY_LIMIT {
+		current := kernel_snapshot(kernel)
+		if current.version != transaction.base.version {
+			if err := transaction_validate_conflicts(transaction, current); err != .None {
+				snapshot_release(current)
+				return nil, err
+			}
+		}
+
+		transaction_prepare_writes(transaction)
+		candidate := transaction_build_candidate(kernel, transaction, current)
+
+		// The entry owns its own reference to the base so the committer can
+		// replace it while rebasing; the task keeps its `current` reference.
+		snapshot_retain(current)
+		entry := Commit_Entry {
+			transaction = transaction,
+			base        = current,
+			candidate   = candidate,
+		}
+		if kernel_commit_enqueue(kernel, &entry) {
+			kernel_committer_drain(kernel)
+		} else {
+			kernel_commit_wait(kernel, &entry)
+		}
+
+		snapshot_release(current)
+		if entry.published != nil {
+			published = entry.published
+			break
 		}
 	}
-
-	transaction_prepare_writes(transaction)
-	candidate := transaction_build_candidate(kernel, transaction, current)
-
-	// The entry owns its own reference to the base so the committer can
-	// replace it while rebasing; the task keeps its `current` reference.
-	snapshot_retain(current)
-	entry := Commit_Entry {
-		transaction = transaction,
-		base        = current,
-		candidate   = candidate,
-	}
-	if kernel_commit_enqueue(kernel, &entry) {
-		kernel_committer_drain(kernel)
-	} else {
-		kernel_commit_wait(kernel, &entry)
-	}
-
-	snapshot_release(current)
-	if entry.published == nil {
+	if published == nil {
 		return nil, .Conflict
 	}
-	return entry.published, .None
+	return published, .None
 }
 
 // Returns the lock stripes for the transaction's writes as a stack bitset.

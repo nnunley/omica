@@ -2,7 +2,10 @@
 // instead of accumulating with the commit count.
 package kernel
 
+import "base:runtime"
+import "core:sync"
 import "core:testing"
+import "core:thread"
 import v "../var"
 
 @(test)
@@ -170,4 +173,151 @@ test_cow_commit_shares_untouched_chunks :: proc(t: ^testing.T) {
 			testing.expect(t, block3.chunks[index] == block2.chunks[index])
 		}
 	}
+}
+
+@(test)
+test_snapshot_chain_stays_bounded :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 90, "Chain", 1)
+
+	// Hold a snapshot for the whole chain. It keeps blocks alive but must not
+	// keep superseded snapshots alive.
+	old := kernel_snapshot(&kernel)
+	defer snapshot_release(old)
+
+	for index in 0 ..< 100 {
+		commit_chain_row(t, &kernel, relation, index)
+	}
+	arenas_after_warmup := arena_pool_live_count(kernel.arena_pool) +
+		arena_pool_idle_count(kernel.arena_pool)
+
+	for index in 100 ..< 400 {
+		commit_chain_row(t, &kernel, relation, index)
+	}
+	arenas_after_chain := arena_pool_live_count(kernel.arena_pool) +
+		arena_pool_idle_count(kernel.arena_pool)
+
+	// Retired snapshots drain after every commit because the held snapshot is
+	// a block owner, not a chain member.
+	testing.expect_value(t, len(kernel.retired), 0)
+	testing.expectf(
+		t,
+		arenas_after_chain <= arenas_after_warmup + 4,
+		"arena count grew from %d to %d over 300 commits",
+		arenas_after_warmup,
+		arenas_after_chain,
+	)
+	testing.expect_value(t, old.version, u64(1))
+}
+
+@(private)
+commit_chain_row :: proc(t: ^testing.T, kernel: ^Kernel, relation: Relation_ID, index: int) {
+	tx := kernel_begin(kernel)
+	testing.expect_value(
+		t,
+		transaction_assert(&tx, relation, tuple_of(must_identity(u64(index) + 1))),
+		Kernel_Error.None,
+	)
+	published, err := transaction_commit(&tx)
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(published)
+	transaction_destroy(&tx)
+}
+
+@(private)
+Hazard_Writer :: struct {
+	kernel:   ^Kernel,
+	relation: Relation_ID,
+	count:    int,
+	done:     i32,
+	failed:   Kernel_Error,
+}
+
+@(private)
+hazard_writer :: proc(data: rawptr) {
+	context = runtime.default_context()
+	worker := (^Hazard_Writer)(data)
+	for index in 0 ..< worker.count {
+		tx := kernel_begin(worker.kernel)
+		if err := transaction_assert(
+			&tx,
+			worker.relation,
+			tuple_of(must_identity(u64(index) + 1)),
+		); err != .None {
+			worker.failed = err
+			transaction_destroy(&tx)
+			return
+		}
+		published, err := transaction_commit(&tx)
+		if err != .None {
+			worker.failed = err
+			transaction_destroy(&tx)
+			return
+		}
+		snapshot_release(published)
+		transaction_destroy(&tx)
+	}
+	sync.atomic_store(&worker.done, 1)
+}
+
+@(private)
+Hazard_Reader :: struct {
+	kernel:    ^Kernel,
+	writer_done: ^i32,
+	iterations: int,
+	last:      u64,
+	monotonic: bool,
+}
+
+@(private)
+hazard_reader :: proc(data: rawptr) {
+	context = runtime.default_context()
+	worker := (^Hazard_Reader)(data)
+	for _ in 0 ..< worker.iterations {
+		snapshot := kernel_snapshot_borrow(worker.kernel)
+		version := snapshot.version
+		kernel_hazard_clear(worker.kernel)
+		if version < worker.last {
+			worker.monotonic = false
+		}
+		worker.last = version
+		if sync.atomic_load(worker.writer_done) != 0 {
+			break
+		}
+	}
+}
+
+@(test)
+test_snapshot_hazard_borrow_scales :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 91, "Hazard", 1)
+	writer := Hazard_Writer {
+		kernel   = &kernel,
+		relation = relation,
+		count    = 500,
+	}
+	reader := Hazard_Reader {
+		kernel      = &kernel,
+		writer_done = &writer.done,
+		iterations  = 2_000_000,
+		monotonic   = true,
+	}
+	writer_thread := thread.create_and_start_with_data(&writer, hazard_writer)
+	reader_thread := thread.create_and_start_with_data(&reader, hazard_reader)
+	thread.join(writer_thread)
+	thread.destroy(writer_thread)
+	thread.join(reader_thread)
+	thread.destroy(reader_thread)
+
+	testing.expect_value(t, writer.failed, Kernel_Error.None)
+	testing.expect(t, reader.monotonic)
+	testing.expect(t, reader.last >= 1)
+	testing.expect(t, kernel.current.version >= u64(writer.count))
+	testing.expect_value(t, len(kernel.retired), 0)
 }

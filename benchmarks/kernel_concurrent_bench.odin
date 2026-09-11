@@ -542,6 +542,63 @@ bench_task_scale :: proc(user: rawptr, _: int, _: int) {
 	}
 }
 
+// --- Snapshot acquisition --------------------------------------------------
+
+SNAPSHOT_THREADS :: 8
+SNAPSHOT_PER_THREAD :: 2048
+SNAPSHOT_TOTAL :: SNAPSHOT_THREADS * SNAPSHOT_PER_THREAD
+
+@(private)
+Snapshot_Bench_Worker :: struct {
+	kernel: ^k.Kernel,
+	count:  int,
+}
+
+@(private)
+snapshot_bench_worker :: proc(data: rawptr) {
+	context = runtime.default_context()
+	worker := (^Snapshot_Bench_Worker)(data)
+	for _ in 0 ..< worker.count {
+		_ = k.kernel_snapshot_borrow(worker.kernel)
+		k.kernel_hazard_clear(worker.kernel)
+	}
+}
+
+@(private)
+bench_parallel_snapshot_acquires :: proc(_: rawptr, _: int, _: int) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	workers: [SNAPSHOT_THREADS]Snapshot_Bench_Worker
+	threads: [SNAPSHOT_THREADS]^thread.Thread
+	for index in 0 ..< SNAPSHOT_THREADS {
+		workers[index] = Snapshot_Bench_Worker {
+			kernel = &kernel,
+			count  = SNAPSHOT_PER_THREAD,
+		}
+		threads[index] = thread.create_and_start_with_data(
+			&workers[index],
+			snapshot_bench_worker,
+		)
+	}
+	for index in 0 ..< SNAPSHOT_THREADS {
+		thread.join(threads[index])
+		thread.destroy(threads[index])
+	}
+}
+
+@(private)
+bench_serial_snapshot_acquires :: proc(_: rawptr, _: int, _: int) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	for _ in 0 ..< SNAPSHOT_TOTAL {
+		_ = k.kernel_snapshot_borrow(&kernel)
+		k.kernel_hazard_clear(&kernel)
+	}
+}
+
 @(private)
 task_scale_states: [len(TASK_SCALE_THREAD_COUNTS)]Task_Scale_State
 
@@ -570,6 +627,20 @@ register_kernel_concurrent_benches :: proc(runner: ^mm.Runner) {
 	)
 	mm.bench_capped(begins, "parallel_8x256", nil, bench_parallel_begins, 1)
 	mm.bench_capped(begins, "serial_2048", nil, bench_serial_begins, 1)
+
+	snapshots := mm.group(
+		runner,
+		"kernel/concurrent/snapshot",
+		mm.throughput_per_op(SNAPSHOT_TOTAL, "acquire"),
+	)
+	mm.bench_capped(
+		snapshots,
+		"parallel_8x2048",
+		nil,
+		bench_parallel_snapshot_acquires,
+		1,
+	)
+	mm.bench_capped(snapshots, "serial_16384", nil, bench_serial_snapshot_acquires, 1)
 
 	relations_group := mm.group(
 		runner,

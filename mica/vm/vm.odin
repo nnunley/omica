@@ -112,6 +112,9 @@ VM :: struct {
 	handlers: [dynamic]Handler,
 	// Returns diverted through a finally body, innermost last.
 	pending_returns: [dynamic]Pending_Return,
+	// Execution limits. Zero means unlimited.
+	max_call_depth:     int,
+	instruction_budget: u64,
 	// Task authority. Nil means root access.
 	authority: ^k.Authority,
 	// Optional validator run before a Mailbox_Recv suspends, so an invalid
@@ -139,6 +142,7 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.request_value = v.Value(0)
 	state.request_payload = v.Value(0)
 	state.pending_resume = -1
+	state.max_call_depth = DEFAULT_MAX_CALL_DEPTH
 	state.entry_function = -1
 	state.handlers = make([dynamic]Handler)
 	state.pending_returns = make([dynamic]Pending_Return)
@@ -164,6 +168,20 @@ vm_resume_with :: proc(state: ^VM, value: v.Value) {
 	frame := state.frames[len(state.frames) - 1]
 	state.registers[frame.register_base + int(state.pending_resume)] = value
 	state.pending_resume = -1
+}
+
+// Default nesting limit for call frames.
+DEFAULT_MAX_CALL_DEPTH :: 1024
+
+// Limits the number of nested call frames. Zero means unlimited.
+vm_set_max_call_depth :: proc(state: ^VM, depth: int) {
+	state.max_call_depth = depth
+}
+
+// Limits how many instructions the VM may execute before failing. The budget
+// is not reset by boundaries. Zero means unlimited.
+vm_set_instruction_budget :: proc(state: ^VM, budget: u64) {
+	state.instruction_budget = budget
 }
 
 // Sets the authority used for permission checks. Nil means root access.
@@ -271,6 +289,17 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			return .Failed
 		}
 
+		if state.instruction_budget > 0 {
+			state.instruction_budget -= 1
+			if state.instruction_budget == 0 {
+				vm_fail(state, "E_BUDGET", "instruction budget exhausted")
+				if vm_unwind(state) {
+					continue
+				}
+				return .Failed
+			}
+		}
+
 		instr := program.code[frame.ip]
 		state.frames[top].ip = frame.ip + 1
 		base := frame.register_base
@@ -306,6 +335,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			state.frames[top].ip += int(instr.b)
 
 		case .Call:
+			if vm_depth_exceeded(state) {
+				break
+			}
 			callee := program.functions[instr.b]
 			argument_count := int(instr.flags)
 			args := make([]v.Value, argument_count, context.temp_allocator)
@@ -617,6 +649,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			state.registers[base + int(instr.a)] = function
 
 		case .Call_Value:
+			if vm_depth_exceeded(state) {
+				break
+			}
 			target := state.registers[base + int(instr.b)]
 			function_id, is_function := v.value_as_function(target)
 			if !is_function {
@@ -662,6 +697,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			})
 
 		case .Call_Splice:
+			if vm_depth_exceeded(state) {
+				break
+			}
 			args, args_ok := vm_list_args(state, base, instr.c)
 			if !args_ok {
 				break
@@ -719,6 +757,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 
 		case .Call_Value_Splice:
+			if vm_depth_exceeded(state) {
+				break
+			}
 			target := state.registers[base + int(instr.b)]
 			function_id, is_function := v.value_as_function(target)
 			if !is_function {
@@ -1399,6 +1440,9 @@ vm_call_function :: proc(
 	captures: []v.Value,
 	args: []v.Value,
 ) -> bool {
+	if vm_depth_exceeded(state) {
+		return false
+	}
 	program := state.program
 	callee := program.functions[function_index]
 	capture_count := len(captures)
@@ -1661,6 +1705,16 @@ vm_raised_error :: proc(state: ^VM, base: int, instr: Instruction) -> v.Value {
 	}
 	vm_fail(state, "E_TYPE", "raise expects an error code or error value")
 	return state.error
+}
+
+// Fails the VM when the frame stack is at the configured call-depth limit.
+@(private)
+vm_depth_exceeded :: proc(state: ^VM) -> bool {
+	if state.max_call_depth > 0 && len(state.frames) >= state.max_call_depth {
+		vm_fail(state, "E_DEPTH", "call depth exceeded")
+		return true
+	}
+	return false
 }
 
 // The `none` value: an empty relation headed by `value`, matching the literal.

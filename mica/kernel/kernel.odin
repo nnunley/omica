@@ -42,9 +42,12 @@ Kernel :: struct {
 	// snapshot to `retired`, and frees retired snapshots only while no reader
 	// is active. This closes the load-then-retain race without a lock on the
 	// read path.
-	readers:     i32,
+	readers:     [READER_SLOTS]Reader_Slot,
 	retire_lock: sync.Mutex,
 	retired:     [dynamic]^Snapshot,
+	// Number of snapshots awaiting reclamation. Zero lets reader exits skip
+	// the retire lock entirely.
+	retire_pending: i32,
 
 	// Relation metadata and rule definitions live here for the life of the
 	// kernel; blocks and snapshots reference their slices.
@@ -68,8 +71,61 @@ Kernel :: struct {
 // convoy on a single lock.
 ARENA_POOL_SHARDS :: 16
 
+// Padded reader counters. Each thread touches its own slot, so snapshot
+// acquisition under parallel load does not ping-pong one cache line.
+READER_SLOTS :: 16
+
 // Number of relation commit stripes.
 RELATION_LOCK_STRIPES :: 64
+
+@(private)
+Reader_Slot :: struct {
+	count:  i32,
+	// Hazard pointer for borrowed (non-retained) snapshot reads.
+	hazard: ^Snapshot,
+	_pad:   [14]i32,
+}
+
+@(private)
+global_reader_slot_counter: u32
+
+@(thread_local)
+reader_slot_hint: u32
+
+@(thread_local)
+reader_slot_ready: bool
+
+@(private)
+reader_slot_index :: proc() -> u32 {
+	if !reader_slot_ready {
+		assigned := sync.atomic_add(&global_reader_slot_counter, 1)
+		reader_slot_hint = assigned % READER_SLOTS
+		reader_slot_ready = true
+	}
+	return reader_slot_hint
+}
+
+// Reports whether any hazard slot pins `snapshot`.
+@(private)
+kernel_snapshot_hazarded :: proc(kernel: ^Kernel, snapshot: ^Snapshot) -> bool {
+	for &slot in kernel.readers {
+		if sync.atomic_load(&slot.hazard) == snapshot {
+			return true
+		}
+	}
+	return false
+}
+
+// Reports whether any reader is inside a load-and-retain window.
+@(private)
+kernel_readers_idle :: proc(kernel: ^Kernel) -> bool {
+	for &slot in kernel.readers {
+		if sync.atomic_load(&slot.count) != 0 {
+			return false
+		}
+	}
+	return true
+}
 
 Arena_Pool_Shard :: struct {
 	lock:   sync.Mutex,
@@ -78,6 +134,8 @@ Arena_Pool_Shard :: struct {
 
 Arena_Pool :: struct {
 	shards: [ARENA_POOL_SHARDS]Arena_Pool_Shard,
+	// Arenas currently checked out. Diagnostics only.
+	live_arenas: i32,
 }
 
 // Each thread is assigned a stable shard once, avoiding a `gettid` syscall on
@@ -124,6 +182,7 @@ arena_pool_take :: proc(pool: ^Arena_Pool) -> ^Frame_Arena {
 		if len(shard.arenas) > 0 {
 			arena := pop(&shard.arenas)
 			sync.mutex_unlock(&shard.lock)
+			sync.atomic_add(&pool.live_arenas, 1)
 			return arena
 		}
 		sync.mutex_unlock(&shard.lock)
@@ -131,7 +190,25 @@ arena_pool_take :: proc(pool: ^Arena_Pool) -> ^Frame_Arena {
 
 	arena := new(Frame_Arena, runtime.default_allocator())
 	frame_arena_init(arena)
+	sync.atomic_add(&pool.live_arenas, 1)
 	return arena
+}
+
+// Returns the number of arenas currently checked out of the pool.
+arena_pool_live_count :: proc(pool: ^Arena_Pool) -> int {
+	return int(sync.atomic_load(&pool.live_arenas))
+}
+
+// Returns the number of idle arenas held by the pool.
+arena_pool_idle_count :: proc(pool: ^Arena_Pool) -> int {
+	total := 0
+	for index in 0 ..< ARENA_POOL_SHARDS {
+		shard := &pool.shards[index]
+		sync.mutex_lock(&shard.lock)
+		total += len(shard.arenas)
+		sync.mutex_unlock(&shard.lock)
+	}
+	return total
 }
 
 arena_pool_return :: proc(pool: ^Arena_Pool, arena: ^Frame_Arena) {
@@ -139,6 +216,7 @@ arena_pool_return :: proc(pool: ^Arena_Pool, arena: ^Frame_Arena) {
 		return
 	}
 	frame_arena_reset(arena)
+	sync.atomic_sub(&pool.live_arenas, 1)
 
 	// Return to the local shard; a thread's arenas tend to be reused by it.
 	shard := arena_pool_shard(pool)
@@ -216,13 +294,38 @@ kernel_return_arena :: proc(kernel: ^Kernel, arena: ^Frame_Arena) {
 // release it. Lock-free: the reader is announced in `readers` while it loads
 // and retains, so a publisher cannot free the snapshot underneath it.
 kernel_snapshot :: proc(kernel: ^Kernel) -> ^Snapshot {
-	sync.atomic_add_explicit(&kernel.readers, 1, .Acq_Rel)
+	slot := &kernel.readers[reader_slot_index()]
+	sync.atomic_add_explicit(&slot.count, 1, .Acq_Rel)
 	current := sync.atomic_load(&kernel.current)
 	snapshot_retain(current)
-	if sync.atomic_sub_explicit(&kernel.readers, 1, .Acq_Rel) == 1 {
+	if sync.atomic_sub_explicit(&slot.count, 1, .Acq_Rel) == 1 &&
+	   sync.atomic_load(&kernel.retire_pending) > 0 &&
+	   kernel_readers_idle(kernel) {
 		kernel_reclaim(kernel)
 	}
 	return current
+}
+
+// Borrows the current snapshot without retaining it. The caller must use it
+// only until `kernel_hazard_clear`, and must not release it. Reclamation keeps
+// a hazard-pinned snapshot alive.
+kernel_snapshot_borrow :: proc(kernel: ^Kernel) -> ^Snapshot {
+	slot := &kernel.readers[reader_slot_index()]
+	for {
+		current := sync.atomic_load(&kernel.current)
+		sync.atomic_store_explicit(&slot.hazard, current, .Release)
+		// If a publisher swapped between the load and the hazard store, pin
+		// the newer snapshot instead.
+		if sync.atomic_load(&kernel.current) == current {
+			return current
+		}
+	}
+}
+
+// Clears the calling thread's hazard pointer.
+kernel_hazard_clear :: proc(kernel: ^Kernel) {
+	slot := &kernel.readers[reader_slot_index()]
+	sync.atomic_store_explicit(&slot.hazard, nil, .Release)
 }
 
 // Begins a transaction over the current snapshot.
@@ -437,10 +540,10 @@ kernel_retire :: proc(kernel: ^Kernel, snapshot: ^Snapshot) {
 	}
 	sync.mutex_lock(&kernel.retire_lock)
 	append(&kernel.retired, snapshot)
-	has_retired := len(kernel.retired) > 0
+	sync.atomic_add(&kernel.retire_pending, 1)
 	sync.mutex_unlock(&kernel.retire_lock)
 
-	if has_retired && sync.atomic_load(&kernel.readers) == 0 {
+	if kernel_readers_idle(kernel) {
 		kernel_reclaim(kernel)
 	}
 }
@@ -453,13 +556,22 @@ kernel_reclaim :: proc(kernel: ^Kernel) {
 	defer sync.mutex_unlock(&kernel.retire_lock)
 
 	// A reader may have entered while we waited for the lock.
-	if sync.atomic_load(&kernel.readers) != 0 {
+	if !kernel_readers_idle(kernel) {
 		return
 	}
+	write := 0
+	released := 0
 	for retired in kernel.retired {
+		if kernel_snapshot_hazarded(kernel, retired) {
+			kernel.retired[write] = retired
+			write += 1
+			continue
+		}
 		snapshot_release(retired)
+		released += 1
 	}
-	clear(&kernel.retired)
+	resize(&kernel.retired, write)
+	sync.atomic_sub(&kernel.retire_pending, i32(released))
 }
 
 // Creates a relation and publishes a new snapshot. The returned snapshot is
