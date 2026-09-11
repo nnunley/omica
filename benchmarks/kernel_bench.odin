@@ -36,6 +36,7 @@ scan_checksum_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
 // group and visit 128 rows.
 
 Store_State :: struct {
+	kernel:        k.Kernel,
 	arena:         virtual.Arena,
 	scratch:       virtual.Arena,
 	alloc:         mem.Allocator,
@@ -57,6 +58,8 @@ Store_State :: struct {
 
 @(private)
 setup_store_state :: proc(state: ^Store_State) {
+	k.kernel_init(&state.kernel)
+
 	GROUPS :: 128
 	ITEMS_PER_GROUP :: 128
 
@@ -93,8 +96,16 @@ setup_store_state :: proc(state: ^Store_State) {
 		}
 	}
 
-	state.primary_block = k.relation_block_build(state.alloc, state.primary_metadata, state.rows)
-	state.index_block = k.relation_block_build(state.alloc, state.index_metadata, state.rows)
+	state.primary_block = k.relation_block_build_pooled(
+		&state.kernel,
+		state.primary_metadata,
+		state.rows,
+	)
+	state.index_block = k.relation_block_build_pooled(
+		&state.kernel,
+		state.index_metadata,
+		state.rows,
+	)
 
 	state.unbound = make([]v.Binding, 3, state.alloc)
 
@@ -167,13 +178,44 @@ bench_scan_index :: proc(user: rawptr, chunk: int, _: int) {
 }
 
 @(private)
-bench_store_rebuild :: proc(user: rawptr, chunk: int, _: int) {
+bench_store_apply_delta :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Store_State)(user)
-	virtual.arena_free_all(&state.scratch)
+
+	entry_identity, _ := v.value_identity_raw(10_000_000)
+	item_identity, _ := v.identity_new(0)
+	entry_tuple := v.tuple_new(context.temp_allocator, []v.Value {
+		entry_identity,
+		v.value_identity(item_identity),
+		v.value_symbol(v.symbol_intern("bench_kind")),
+	})
+	entries := []k.Pending_Write{{tuple = entry_tuple, kind = .Assert}}
+
 	accumulator := u64(0)
 	for _ in 0 ..< chunk {
-		block := k.relation_block_build(state.scratch_alloc, state.index_metadata, state.rows)
+		block := k.relation_block_apply(
+			&state.kernel,
+			state.primary_block,
+			state.primary_metadata,
+			entries,
+		)
 		accumulator += u64(uintptr(block))
+		k.relation_block_release(block)
+	}
+	state.sink.value = mm.black_box(accumulator)
+}
+
+@(private)
+bench_store_rebuild :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Store_State)(user)
+	accumulator := u64(0)
+	for _ in 0 ..< chunk {
+		block := k.relation_block_build_pooled(
+			&state.kernel,
+			state.index_metadata,
+			state.rows,
+		)
+		accumulator += u64(uintptr(block))
+		k.relation_block_release(block)
 	}
 	state.sink.value = mm.black_box(accumulator)
 }
@@ -739,6 +781,7 @@ register_kernel_benches :: proc(runner: ^mm.Runner) {
 	mm.bench(store_group, "scan_prefix_16k", store_state, bench_scan_prefix)
 	mm.bench(store_group, "scan_prefix_checksum_16k", store_state, bench_scan_prefix_checksum)
 	mm.bench(store_group, "scan_index_16k", store_state, bench_scan_index)
+	mm.bench_capped(store_group, "apply_delta_16k", store_state, bench_store_apply_delta, 8)
 	mm.bench_capped(store_group, "rebuild_16k", store_state, bench_store_rebuild, 8)
 
 	txn_state := txn_state_init()

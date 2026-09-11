@@ -511,33 +511,26 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 			continue
 		}
 
-		rows := make([dynamic]v.Tuple, 0, context.temp_allocator)
-		if block, has_block := snapshot_relation_block(current, writes.relation); has_block {
-			for row in block.tuples {
-				append(&rows, row)
+		// A rebased retract only removes tuples the transaction's base
+		// actually held; a concurrent assert of a tuple the base lacked
+		// survives. Asserts always apply.
+		base_block, _ := snapshot_relation_block(transaction.base, writes.relation)
+		entries := make([dynamic]Pending_Write, 0, len(writes.entries), context.temp_allocator)
+		for entry in writes.entries {
+			if entry.kind == .Retract &&
+			   (base_block == nil || !relation_block_contains(base_block, entry.tuple)) {
+				continue
 			}
+			append(&entries, entry)
 		}
-
-		slice.sort_by(writes.entries[:], proc(a, b: Pending_Write) -> bool {
+		slice.sort_by(entries[:], proc(a, b: Pending_Write) -> bool {
 			return v.tuple_cmp(a.tuple, b.tuple) == .Less
 		})
 
-		base_block, has_base := snapshot_relation_block(transaction.base, writes.relation)
-		for entry in writes.entries {
-			switch entry.kind {
-			case .Assert:
-				// The owned block deep-copies its input rows, so the staged
-				// tuple can be referenced here even though the staging arena is
-				// recycled after commit.
-				append(&rows, entry.tuple)
-			case .Retract:
-				if has_base && relation_block_contains(base_block, entry.tuple) {
-					remove_tuple(&rows, entry.tuple)
-				}
-			}
-		}
-
-		block := relation_block_owned(kernel, metadata, rows[:])
+		// Copy-on-write against the block in the snapshot we are committing
+		// onto, so a rebase merges with the other transaction's changes.
+		current_block, _ := snapshot_relation_block(current, writes.relation)
+		block := relation_block_apply(kernel, current_block, metadata, entries[:])
 		snapshot_set_block(fork, block)
 	}
 

@@ -1,11 +1,16 @@
-// Immutable relation storage: a sorted tuple set with secondary indexes.
+// Immutable relation storage: a persistent sorted sequence of rows.
 //
-// A `Relation_Block` is materialized once and then read-only. The primary
-// store is sorted by canonical tuple order, which serves full-tuple lookups and
-// leading-position prefix scans. Secondary indexes are sorted row-index arrays
-// over selected argument positions.
+// A block is an ordered list of immutable, reference-counted chunks. Each
+// chunk owns deep copies of up to `CHUNK_CAPACITY` tuples in its own arena.
+// Commits build a new block by copy-on-write: chunks outside the changed key
+// range are shared, and only the chunks a change touches are rebuilt. This
+// replaces the previous model, which deep-copied every row on every commit.
+//
+// Secondary indexes are positional and are rebuilt per block when the relation
+// declares them. Relations without indexes pay no index cost.
 package kernel
 
+import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
@@ -13,22 +18,110 @@ import "core:sort"
 import "core:sync"
 import v "../var"
 
-// A relation's materialized tuple state.
-//
-// A block is immutable once built and reference-counted. Blocks built by the
-// commit path own their storage: the tuple graph and index arrays live in a
-// pooled arena that is returned when the last snapshot referencing the block
-// releases it. Caller-built blocks (tests, benchmarks) leave `arena` nil and
-// are freed by the caller's allocator.
-Relation_Block :: struct {
-	metadata: Relation_Metadata,
-	tuples:   []v.Tuple,
-	indexes:  []Secondary_Index,
-	refs:     i32,
-	arena:    ^virtual.Arena,
-	pool:     ^Arena_Pool,
-	storage:  mem.Allocator,
+// Maximum rows per chunk. Small enough that copy-on-write is cheap, large
+// enough that the spine stays short.
+CHUNK_CAPACITY :: 128
+
+// An immutable, reference-counted run of sorted tuples.
+Relation_Chunk :: struct {
+	tuples: []v.Tuple,
+	refs:   i32,
+	arena:  ^virtual.Arena,
+	pool:   ^Arena_Pool,
 }
+
+// A relation's materialized tuple state.
+Relation_Block :: struct {
+	metadata:    Relation_Metadata,
+	chunks:      []^Relation_Chunk,
+	chunk_rows:  []u32,
+	count:       int,
+	// Flat row view, built only when the relation declares indexes.
+	flat_rows:   []v.Tuple,
+	indexes:     []Secondary_Index,
+	refs:        i32,
+	arena:       ^virtual.Arena,
+	pool:        ^Arena_Pool,
+	storage:     mem.Allocator,
+}
+
+// A sorted row-index array over selected argument positions.
+Secondary_Index :: struct {
+	positions: []u16,
+	rows:      []u32,
+}
+
+// --- Chunks ----------------------------------------------------------------
+
+@(private)
+new_arena :: proc(pool: ^Arena_Pool) -> ^virtual.Arena {
+	if pool != nil {
+		return arena_pool_take(pool)
+	}
+	arena := new(virtual.Arena, runtime.default_allocator())
+	if err := virtual.arena_init_growing(arena); err != nil {
+		panic("failed to initialize a relation chunk arena")
+	}
+	return arena
+}
+
+// Creates a chunk owning deep copies of `rows`. With a pool, the chunk arena
+// is pooled and recycled; without one it is owned and destroyed on release.
+@(private)
+relation_chunk_create :: proc(pool: ^Arena_Pool, rows: []v.Tuple) -> ^Relation_Chunk {
+	arena := new_arena(pool)
+	alloc := virtual.arena_allocator(arena)
+
+	owned := make([]v.Tuple, len(rows), alloc)
+	for row, index in rows {
+		owned[index] = v.tuple_deep_copy(alloc, row)
+	}
+
+	chunk := new(Relation_Chunk, alloc)
+	chunk.tuples = owned
+	chunk.refs = 1
+	chunk.arena = arena
+	chunk.pool = pool
+	return chunk
+}
+
+@(private)
+relation_chunk_retain :: proc(chunk: ^Relation_Chunk) {
+	if chunk == nil {
+		return
+	}
+	sync.atomic_add_explicit(&chunk.refs, 1, .Relaxed)
+}
+
+@(private)
+relation_chunk_release :: proc(chunk: ^Relation_Chunk) {
+	if chunk == nil {
+		return
+	}
+	if sync.atomic_sub_explicit(&chunk.refs, 1, .Acq_Rel) != 1 {
+		return
+	}
+	if chunk.pool != nil {
+		// The chunk struct lives in the arena; nothing may touch it after the
+		// pooled arena is reset.
+		arena_pool_return(chunk.pool, chunk.arena)
+		return
+	}
+	virtual.arena_destroy(chunk.arena)
+	free(chunk.arena, runtime.default_allocator())
+}
+
+@(private)
+relation_chunk_first :: proc(chunk: ^Relation_Chunk) -> v.Tuple {
+	return chunk.tuples[0]
+}
+
+@(private)
+relation_chunk_last :: proc(chunk: ^Relation_Chunk) -> v.Tuple {
+	return chunk.tuples[len(chunk.tuples) - 1]
+}
+
+// --- Block construction ----------------------------------------------------
 
 // Increments a block's reference count. Thread-safe.
 relation_block_retain :: proc(block: ^Relation_Block) {
@@ -38,8 +131,8 @@ relation_block_retain :: proc(block: ^Relation_Block) {
 	sync.atomic_add_explicit(&block.refs, 1, .Relaxed)
 }
 
-// Decrements a block's reference count, returning its arena to the pool or
-// freeing a caller-owned block when the last reference is released.
+// Decrements a block's reference count, releasing its chunks and returning its
+// arena to the pool (or freeing it) when the last reference is released.
 relation_block_release :: proc(block: ^Relation_Block) {
 	if block == nil {
 		return
@@ -48,83 +141,150 @@ relation_block_release :: proc(block: ^Relation_Block) {
 		return
 	}
 
-	if block.arena != nil && block.pool != nil {
-		// The block struct itself lives in the arena, so nothing may touch it
-		// after the pooled arena is reset.
+	for chunk in block.chunks {
+		relation_chunk_release(chunk)
+	}
+	block.chunks = nil
+
+	if block.pool != nil {
+		// The block struct lives in the pooled arena.
 		arena_pool_return(block.pool, block.arena)
 		return
 	}
 	free(block, block.storage)
 }
 
-// Builds a block that owns deep copies of `tuples` in an arena from the
-// kernel's pool. The commit path uses this so old blocks can be reclaimed.
-relation_block_owned :: proc(
-	kernel: ^Kernel,
-	metadata: Relation_Metadata,
-	tuples: []v.Tuple,
-) -> ^Relation_Block {
-	arena := arena_pool_take(kernel.arena_pool)
-	alloc := virtual.arena_allocator(arena)
-
-	owned := make([]v.Tuple, len(tuples), alloc)
-	for tuple, index in tuples {
-		owned[index] = v.tuple_deep_copy(alloc, tuple)
-	}
-
-	block := relation_block_build(alloc, metadata, owned)
-	block.arena = arena
-	block.pool = kernel.arena_pool
-	return block
-}
-
-// A sorted row-index array over selected argument positions.
-Secondary_Index :: struct {
-	positions: []u16,
-	rows:      []u32,
-}
-
-// Creates an empty block for `metadata`.
-relation_block_empty :: proc(alloc: mem.Allocator, metadata: Relation_Metadata) -> ^Relation_Block {
-	block := new(Relation_Block, alloc)
-	block.metadata = metadata
-	block.storage = alloc
-	block.refs = 1
-	block.tuples = make([]v.Tuple, 0, alloc)
-
-	index_count := 0
-	for spec in metadata.indexes {
-		if !index_is_natural_full_tuple(spec, metadata.arity) {
-			index_count += 1
-		}
-	}
-	block.indexes = make([]Secondary_Index, index_count, alloc)
-	write := 0
-	for spec in metadata.indexes {
-		if index_is_natural_full_tuple(spec, metadata.arity) {
-			continue
-		}
-		block.indexes[write] = Secondary_Index {
-			positions = spec.positions,
-			rows      = make([]u32, 0, alloc),
-		}
-		write += 1
-	}
-	return block
-}
-
-// Builds a block from `tuples`, sorting and deduplicating the rows and
-// rebuilding all secondary indexes. The tuple values themselves are not
-// copied.
+// Builds a standalone block from `tuples`, sorting and deduplicating. Used by
+// tests and benchmarks; the commit path uses `relation_block_apply`.
 relation_block_build :: proc(
 	alloc: mem.Allocator,
 	metadata: Relation_Metadata,
 	tuples: []v.Tuple,
 ) -> ^Relation_Block {
-	block := relation_block_empty(alloc, metadata)
-
 	rows := make([]v.Tuple, len(tuples), alloc)
 	copy(rows, tuples)
+	rows = sorted_unique_rows(rows)
+
+	block := new(Relation_Block, alloc)
+	block.metadata = metadata
+	block.storage = alloc
+	block.refs = 1
+	block.count = len(rows)
+	block.chunks = chunks_from_rows(nil, rows, alloc)
+	block.chunk_rows = make([]u32, len(block.chunks), alloc)
+	fill_chunk_rows(block)
+	build_block_indexes(block, alloc)
+	return block
+}
+
+// Builds a pooled block from `tuples`, sorting and deduplicating. Chunks and
+// the block arena come from the kernel pool, so releasing the block recycles
+// them. Benchmarks use this for repeated builds.
+relation_block_build_pooled :: proc(
+	kernel: ^Kernel,
+	metadata: Relation_Metadata,
+	tuples: []v.Tuple,
+) -> ^Relation_Block {
+	rows := make([]v.Tuple, len(tuples), context.temp_allocator)
+	copy(rows, tuples)
+	rows = sorted_unique_rows(rows)
+
+	block_arena := arena_pool_take(kernel.arena_pool)
+	block_alloc := virtual.arena_allocator(block_arena)
+
+	block := new(Relation_Block, block_alloc)
+	block.metadata = metadata
+	block.refs = 1
+	block.count = len(rows)
+	block.chunks = chunks_from_rows(kernel.arena_pool, rows, block_alloc)
+	block.chunk_rows = make([]u32, len(block.chunks), block_alloc)
+	block.arena = block_arena
+	block.pool = kernel.arena_pool
+	fill_chunk_rows(block)
+	build_block_indexes(block, block_alloc)
+	return block
+}
+
+// Builds a new block that shares unaffected chunks with `base` and rebuilds
+// only the chunks touched by `entries`. Chunks and the block arena come from
+// the kernel pool so superseded blocks recycle.
+relation_block_apply :: proc(
+	kernel: ^Kernel,
+	base: ^Relation_Block,
+	metadata: Relation_Metadata,
+	entries: []Pending_Write,
+) -> ^Relation_Block {
+	chunks := base != nil ? base.chunks : []^Relation_Chunk{}
+	count := base != nil ? base.count : 0
+
+	// Locate the span of chunks the entries can affect.
+	lo := 0
+	if len(entries) > 0 {
+		first := entries[0].tuple
+		for lo < len(chunks) && v.tuple_cmp(relation_chunk_last(chunks[lo]), first) == .Less {
+			lo += 1
+		}
+	}
+	hi := len(chunks) - 1
+	if len(entries) > 0 {
+		last := entries[len(entries) - 1].tuple
+		for hi >= 0 && v.tuple_cmp(relation_chunk_first(chunks[hi]), last) == .Greater {
+			hi -= 1
+		}
+	}
+	suffix_start := max(hi + 1, lo)
+
+	base_rows := make([dynamic]v.Tuple, 0, context.temp_allocator)
+	if lo <= hi {
+		for index in lo ..= hi {
+			for row in chunks[index].tuples {
+				append(&base_rows, row)
+			}
+		}
+	}
+
+	merged := make([dynamic]v.Tuple, 0, len(base_rows) + len(entries), context.temp_allocator)
+	added, removed := merge_entries(&merged, base_rows[:], entries)
+	count = count + added - removed
+
+	new_chunks := chunks_from_rows(kernel.arena_pool, merged[:], context.temp_allocator)
+
+	block_arena := arena_pool_take(kernel.arena_pool)
+	block_alloc := virtual.arena_allocator(block_arena)
+
+	total := lo + len(new_chunks) + (len(chunks) - suffix_start)
+	spine := make([]^Relation_Chunk, total, block_alloc)
+	write := 0
+	for index in 0 ..< lo {
+		relation_chunk_retain(chunks[index])
+		spine[write] = chunks[index]
+		write += 1
+	}
+	for chunk in new_chunks {
+		spine[write] = chunk
+		write += 1
+	}
+	for index in suffix_start ..< len(chunks) {
+		relation_chunk_retain(chunks[index])
+		spine[write] = chunks[index]
+		write += 1
+	}
+
+	block := new(Relation_Block, block_alloc)
+	block.metadata = metadata
+	block.chunks = spine
+	block.count = count
+	block.refs = 1
+	block.arena = block_arena
+	block.pool = kernel.arena_pool
+	block.chunk_rows = make([]u32, len(spine), block_alloc)
+	fill_chunk_rows(block)
+	build_block_indexes(block, block_alloc)
+	return block
+}
+
+@(private)
+sorted_unique_rows :: proc(rows: []v.Tuple) -> []v.Tuple {
 	slice.sort_by(rows, proc(a, b: v.Tuple) -> bool {
 		return v.tuple_cmp(a, b) == .Less
 	})
@@ -136,117 +296,129 @@ relation_block_build :: proc(
 		rows[write] = row
 		write += 1
 	}
-	block.tuples = rows[:write]
-
-	for _, i in block.indexes {
-		index := &block.indexes[i]
-		index.rows = make([]u32, len(block.tuples), alloc)
-		for row_index in 0 ..< len(block.tuples) {
-			index.rows[row_index] = u32(row_index)
-		}
-		sort_secondary_index(block, index)
-	}
-	return block
+	return rows[:write]
 }
+
+@(private)
+chunks_from_rows :: proc(
+	pool: ^Arena_Pool,
+	rows: []v.Tuple,
+	alloc: mem.Allocator,
+) -> []^Relation_Chunk {
+	count := (len(rows) + CHUNK_CAPACITY - 1) / CHUNK_CAPACITY
+	chunks := make([]^Relation_Chunk, count, alloc)
+	for index in 0 ..< count {
+		start := index * CHUNK_CAPACITY
+		end := min(start + CHUNK_CAPACITY, len(rows))
+		chunks[index] = relation_chunk_create(pool, rows[start:end])
+	}
+	return chunks
+}
+
+@(private)
+merge_entries :: proc(
+	merged: ^[dynamic]v.Tuple,
+	base_rows: []v.Tuple,
+	entries: []Pending_Write,
+) -> (
+	added: int,
+	removed: int,
+) {
+	base_index := 0
+	entry_index := 0
+	for base_index < len(base_rows) || entry_index < len(entries) {
+		if entry_index >= len(entries) {
+			append(merged, base_rows[base_index])
+			base_index += 1
+			continue
+		}
+		if base_index >= len(base_rows) {
+			if entries[entry_index].kind == .Assert {
+				append(merged, entries[entry_index].tuple)
+				added += 1
+			}
+			entry_index += 1
+			continue
+		}
+
+		switch v.tuple_cmp(base_rows[base_index], entries[entry_index].tuple) {
+		case .Less:
+			append(merged, base_rows[base_index])
+			base_index += 1
+		case .Greater:
+			if entries[entry_index].kind == .Assert {
+				append(merged, entries[entry_index].tuple)
+				added += 1
+			}
+			entry_index += 1
+		case .Equal:
+			if entries[entry_index].kind == .Assert {
+				append(merged, base_rows[base_index])
+			} else {
+				removed += 1
+			}
+			base_index += 1
+			entry_index += 1
+		}
+	}
+	return added, removed
+}
+
+@(private)
+fill_chunk_rows :: proc(block: ^Relation_Block) {
+	row := u32(0)
+	for chunk, index in block.chunks {
+		block.chunk_rows[index] = row
+		row += u32(len(chunk.tuples))
+	}
+}
+
+// --- Block queries ---------------------------------------------------------
 
 // Returns the number of tuples in a block.
 relation_block_len :: proc(block: ^Relation_Block) -> int {
-	return len(block.tuples)
+	return block.count
 }
 
-@(private)
-Index_Sort_Context :: struct {
-	tuples:    []v.Tuple,
-	positions: []u16,
-	rows:      []u32,
-}
-
-@(private)
-index_sort_len :: proc(it: sort.Interface) -> int {
-	return len((^Index_Sort_Context)(it.collection).rows)
-}
-
-@(private)
-index_sort_less :: proc(it: sort.Interface, i, j: int) -> bool {
-	ctx := (^Index_Sort_Context)(it.collection)
-	return compare_index_rows(
-		ctx.tuples,
-		ctx.positions,
-		ctx.rows[i],
-		ctx.rows[j],
-	) == .Less
-}
-
-@(private)
-index_sort_swap :: proc(it: sort.Interface, i, j: int) {
-	ctx := (^Index_Sort_Context)(it.collection)
-	ctx.rows[i], ctx.rows[j] = ctx.rows[j], ctx.rows[i]
-}
-
-@(private)
-sort_secondary_index :: proc(block: ^Relation_Block, index: ^Secondary_Index) {
-	ctx := Index_Sort_Context {
-		tuples    = block.tuples,
-		positions = index.positions,
-		rows      = index.rows,
+// Returns the tuple at a logical row position.
+relation_block_row :: proc(block: ^Relation_Block, row_index: int) -> v.Tuple {
+	if row_index < 0 || row_index >= block.count {
+		return nil
 	}
-	sort.sort(sort.Interface {
-		collection = &ctx,
-		len = index_sort_len,
-		less = index_sort_less,
-		swap = index_sort_swap,
-	})
-}
-
-@(private)
-compare_index_rows :: proc(
-	tuples: []v.Tuple,
-	positions: []u16,
-	left: u32,
-	right: u32,
-) -> v.Ordering {
-	left_values := v.tuple_values(tuples[left])
-	right_values := v.tuple_values(tuples[right])
-	for position in positions {
-		order := v.value_cmp(left_values[int(position)], right_values[int(position)])
-		if order != .Equal {
-			return order
+	// Find the last chunk whose start is at or before the row.
+	lo, hi := 0, len(block.chunk_rows)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if int(block.chunk_rows[mid]) <= row_index {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	switch {
-	case left < right:
-		return .Less
-	case left > right:
-		return .Greater
+	if lo == 0 {
+		return nil
 	}
-	return .Equal
-}
-
-@(private)
-compare_index_prefix :: proc(
-	tuples: []v.Tuple,
-	positions: []u16,
-	row: u32,
-	bindings: []v.Binding,
-	count: int,
-) -> v.Ordering {
-	values := v.tuple_values(tuples[row])
-	for i in 0 ..< count {
-		position := int(positions[i])
-		order := v.value_cmp(values[position], bindings[position].value)
-		if order != .Equal {
-			return order
-		}
+	chunk := block.chunks[lo - 1]
+	offset := row_index - int(block.chunk_rows[lo - 1])
+	if offset < 0 || offset >= len(chunk.tuples) {
+		return nil
 	}
-	return .Equal
+	return chunk.tuples[offset]
 }
 
 // Reports whether a block contains an exact tuple.
 relation_block_contains :: proc(block: ^Relation_Block, tuple: v.Tuple) -> bool {
-	lo, hi := 0, len(block.tuples)
+	if block == nil {
+		return false
+	}
+	chunk := chunk_for_tuple(block, tuple)
+	if chunk == nil {
+		return false
+	}
+	lo, hi := 0, len(chunk.tuples)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		switch v.tuple_cmp(block.tuples[mid], tuple) {
+		switch v.tuple_cmp(chunk.tuples[mid], tuple) {
 		case .Equal:
 			return true
 		case .Less:
@@ -256,6 +428,25 @@ relation_block_contains :: proc(block: ^Relation_Block, tuple: v.Tuple) -> bool 
 		}
 	}
 	return false
+}
+
+@(private)
+chunk_for_tuple :: proc(block: ^Relation_Block, tuple: v.Tuple) -> ^Relation_Chunk {
+	lo, hi := 0, len(block.chunks)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		chunk := block.chunks[mid]
+		if v.tuple_cmp(relation_chunk_last(chunk), tuple) == .Less {
+			lo = mid + 1
+			continue
+		}
+		if v.tuple_cmp(relation_chunk_first(chunk), tuple) == .Greater {
+			hi = mid
+			continue
+		}
+		return chunk
+	}
+	return nil
 }
 
 // Returns the tuple matching an exact projected key over `positions`.
@@ -292,7 +483,7 @@ relation_block_visit :: proc(
 	visit: proc(user: rawptr, row: v.Tuple) -> bool,
 	user: rawptr,
 ) {
-	if len(bindings) != int(block.metadata.arity) {
+	if block == nil || len(bindings) != int(block.metadata.arity) {
 		return
 	}
 
@@ -323,7 +514,7 @@ relation_block_visit :: proc(
 		lo := index_lower_bound(block, index, bindings, best_count)
 		hi := index_upper_bound(block, index, bindings, best_count)
 		for row_index in lo ..< hi {
-			row := block.tuples[index.rows[row_index]]
+			row := block.flat_rows[index.rows[row_index]]
 			if v.tuple_matches_bindings(row, bindings) {
 				if !visit(user, row) {
 					return
@@ -334,23 +525,44 @@ relation_block_visit :: proc(
 	}
 
 	if primary_count > 0 {
-		lo := primary_lower_bound(block, bindings, primary_count)
-		hi := primary_upper_bound(block, bindings, primary_count)
-		for row_index in lo ..< hi {
-			row := block.tuples[row_index]
-			if v.tuple_matches_bindings(row, bindings) {
-				if !visit(user, row) {
-					return
+		start := 0
+		for start < len(block.chunks) {
+			order := compare_primary_prefix(
+				relation_chunk_last(block.chunks[start]),
+				bindings,
+				primary_count,
+			)
+			if order != .Less {
+				break
+			}
+			start += 1
+		}
+		for index in start ..< len(block.chunks) {
+			chunk := block.chunks[index]
+			if compare_primary_prefix(
+				relation_chunk_first(chunk),
+				bindings,
+				primary_count,
+			) == .Greater {
+				break
+			}
+			for row in chunk.tuples {
+				if v.tuple_matches_bindings(row, bindings) {
+					if !visit(user, row) {
+						return
+					}
 				}
 			}
 		}
 		return
 	}
 
-	for row in block.tuples {
-		if v.tuple_matches_bindings(row, bindings) {
-			if !visit(user, row) {
-				return
+	for chunk in block.chunks {
+		for row in chunk.tuples {
+			if v.tuple_matches_bindings(row, bindings) {
+				if !visit(user, row) {
+					return
+				}
 			}
 		}
 	}
@@ -373,44 +585,6 @@ compare_primary_prefix :: proc(
 }
 
 @(private)
-primary_lower_bound :: proc(
-	block: ^Relation_Block,
-	bindings: []v.Binding,
-	count: int,
-) -> int {
-	lo, hi := 0, len(block.tuples)
-	for lo < hi {
-		mid := (lo + hi) / 2
-		order := compare_primary_prefix(block.tuples[mid], bindings, count)
-		if order == .Less {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return lo
-}
-
-@(private)
-primary_upper_bound :: proc(
-	block: ^Relation_Block,
-	bindings: []v.Binding,
-	count: int,
-) -> int {
-	lo, hi := 0, len(block.tuples)
-	for lo < hi {
-		mid := (lo + hi) / 2
-		order := compare_primary_prefix(block.tuples[mid], bindings, count)
-		if order != .Greater {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return lo
-}
-
-@(private)
 binding_values :: proc(bindings: []v.Binding) -> []v.Value {
 	values := make([]v.Value, len(bindings), context.temp_allocator)
 	for binding, i in bindings {
@@ -424,14 +598,22 @@ relation_block_tuple_for_full :: proc(
 	block: ^Relation_Block,
 	bindings: []v.Binding,
 ) -> (v.Tuple, bool) {
+	if block == nil || len(bindings) == 0 {
+		return nil, false
+	}
 	values := binding_values(bindings)
-	lo, hi := 0, len(block.tuples)
+	tuple := v.tuple_new(context.temp_allocator, values)
+	chunk := chunk_for_tuple(block, tuple)
+	if chunk == nil {
+		return nil, false
+	}
+	lo, hi := 0, len(chunk.tuples)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		order := compare_tuple_values(block.tuples[mid], values)
+		order := compare_tuple_values(chunk.tuples[mid], values)
 		switch order {
 		case .Equal:
-			return block.tuples[mid], true
+			return chunk.tuples[mid], true
 		case .Less:
 			lo = mid + 1
 		case .Greater:
@@ -460,6 +642,138 @@ compare_tuple_values :: proc(row: v.Tuple, key: []v.Value) -> v.Ordering {
 	return .Equal
 }
 
+// --- Secondary indexes -----------------------------------------------------
+
+@(private)
+build_block_indexes :: proc(block: ^Relation_Block, alloc: mem.Allocator) {
+	index_count := 0
+	for spec in block.metadata.indexes {
+		if !index_is_natural_full_tuple(spec, block.metadata.arity) {
+			index_count += 1
+		}
+	}
+	block.indexes = make([]Secondary_Index, index_count, alloc)
+	if index_count == 0 {
+		return
+	}
+
+	// Indexed relations keep a flat row view so index comparisons are O(1)
+	// instead of walking the chunk spine.
+	block.flat_rows = make([]v.Tuple, block.count, alloc)
+	row_index := 0
+	for chunk in block.chunks {
+		for row in chunk.tuples {
+			block.flat_rows[row_index] = row
+			row_index += 1
+		}
+	}
+
+	write := 0
+	for spec in block.metadata.indexes {
+		if index_is_natural_full_tuple(spec, block.metadata.arity) {
+			continue
+		}
+		rows := make([]u32, block.count, alloc)
+		for row in 0 ..< block.count {
+			rows[row] = u32(row)
+		}
+		index := Secondary_Index {
+			positions = spec.positions,
+			rows      = rows,
+		}
+		sort_secondary_index(block, &index)
+		block.indexes[write] = index
+		write += 1
+	}
+}
+
+@(private)
+Index_Sort_Context :: struct {
+	block:     ^Relation_Block,
+	positions: []u16,
+	rows:      []u32,
+}
+
+@(private)
+index_sort_len :: proc(it: sort.Interface) -> int {
+	return len((^Index_Sort_Context)(it.collection).rows)
+}
+
+@(private)
+index_sort_less :: proc(it: sort.Interface, i, j: int) -> bool {
+	ctx := (^Index_Sort_Context)(it.collection)
+	return compare_index_rows(
+		ctx.block,
+		ctx.positions,
+		ctx.rows[i],
+		ctx.rows[j],
+	) == .Less
+}
+
+@(private)
+index_sort_swap :: proc(it: sort.Interface, i, j: int) {
+	ctx := (^Index_Sort_Context)(it.collection)
+	ctx.rows[i], ctx.rows[j] = ctx.rows[j], ctx.rows[i]
+}
+
+@(private)
+sort_secondary_index :: proc(block: ^Relation_Block, index: ^Secondary_Index) {
+	ctx := Index_Sort_Context {
+		block     = block,
+		positions = index.positions,
+		rows      = index.rows,
+	}
+	sort.sort(sort.Interface {
+		collection = &ctx,
+		len = index_sort_len,
+		less = index_sort_less,
+		swap = index_sort_swap,
+	})
+}
+
+@(private)
+compare_index_rows :: proc(
+	block: ^Relation_Block,
+	positions: []u16,
+	left: u32,
+	right: u32,
+) -> v.Ordering {
+	left_values := v.tuple_values(block.flat_rows[left])
+	right_values := v.tuple_values(block.flat_rows[right])
+	for position in positions {
+		order := v.value_cmp(left_values[int(position)], right_values[int(position)])
+		if order != .Equal {
+			return order
+		}
+	}
+	switch {
+	case left < right:
+		return .Less
+	case left > right:
+		return .Greater
+	}
+	return .Equal
+}
+
+@(private)
+compare_index_prefix :: proc(
+	block: ^Relation_Block,
+	positions: []u16,
+	row: u32,
+	bindings: []v.Binding,
+	count: int,
+) -> v.Ordering {
+	values := v.tuple_values(block.flat_rows[row])
+	for i in 0 ..< count {
+		position := int(positions[i])
+		order := v.value_cmp(values[position], bindings[position].value)
+		if order != .Equal {
+			return order
+		}
+	}
+	return .Equal
+}
+
 @(private)
 index_lower_bound :: proc(
 	block: ^Relation_Block,
@@ -470,7 +784,7 @@ index_lower_bound :: proc(
 	lo, hi := 0, len(index.rows)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		order := compare_index_prefix(block.tuples, index.positions, index.rows[mid], bindings, count)
+		order := compare_index_prefix(block, index.positions, index.rows[mid], bindings, count)
 		if order == .Less {
 			lo = mid + 1
 		} else {
@@ -490,7 +804,7 @@ index_upper_bound :: proc(
 	lo, hi := 0, len(index.rows)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		order := compare_index_prefix(block.tuples, index.positions, index.rows[mid], bindings, count)
+		order := compare_index_prefix(block, index.positions, index.rows[mid], bindings, count)
 		if order != .Greater {
 			lo = mid + 1
 		} else {

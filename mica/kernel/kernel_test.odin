@@ -1117,7 +1117,7 @@ test_store_search_paths_match_linear_filter :: proc(t: ^testing.T) {
 		{0, 0, 0}, // unbound
 	}
 
-	source_row := block.tuples[17]
+	source_row := relation_block_row(block, 17)
 	for pattern in patterns {
 		bindings: [3]v.Binding
 		for bound, i in pattern {
@@ -1130,7 +1130,8 @@ test_store_search_paths_match_linear_filter :: proc(t: ^testing.T) {
 		relation_block_scan_into(block, bindings[:], &visited)
 
 		expected: [dynamic]v.Tuple
-		for row in block.tuples {
+		for row_index in 0 ..< relation_block_len(block) {
+			row := relation_block_row(block, row_index)
 			if v.tuple_matches_bindings(row, bindings[:]) {
 				append(&expected, row)
 			}

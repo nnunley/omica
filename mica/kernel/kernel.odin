@@ -43,24 +43,67 @@ Kernel :: struct {
 }
 
 // A pool of reset-able virtual arenas shared by transactions, snapshots, and
-// relation blocks. Thread-safe.
-Arena_Pool :: struct {
+// relation blocks. Sharded by thread so concurrent take/return paths do not
+// convoy on a single lock.
+ARENA_POOL_SHARDS :: 16
+
+Arena_Pool_Shard :: struct {
 	lock:   sync.Mutex,
 	arenas: [dynamic]^virtual.Arena,
 }
 
+Arena_Pool :: struct {
+	shards: [ARENA_POOL_SHARDS]Arena_Pool_Shard,
+}
+
+// Each thread is assigned a stable shard once, avoiding a `gettid` syscall on
+// every take and return.
+@(private)
+global_arena_shard_counter: u32
+
+@(thread_local)
+arena_pool_hint: u32
+
+@(thread_local)
+arena_pool_hint_ready: bool
+
+@(private)
+arena_pool_shard_index :: proc() -> u32 {
+	if !arena_pool_hint_ready {
+		assigned := sync.atomic_add(&global_arena_shard_counter, 1)
+		arena_pool_hint = assigned % ARENA_POOL_SHARDS
+		arena_pool_hint_ready = true
+	}
+	return arena_pool_hint
+}
+
+@(private)
+arena_pool_shard :: proc(pool: ^Arena_Pool) -> ^Arena_Pool_Shard {
+	return &pool.shards[arena_pool_shard_index()]
+}
+
 arena_pool_init :: proc(pool: ^Arena_Pool) {
-	pool.arenas = make([dynamic]^virtual.Arena)
+	for index in 0 ..< ARENA_POOL_SHARDS {
+		pool.shards[index].arenas = make([dynamic]^virtual.Arena)
+	}
 }
 
 arena_pool_take :: proc(pool: ^Arena_Pool) -> ^virtual.Arena {
-	sync.mutex_lock(&pool.lock)
-	if len(pool.arenas) > 0 {
-		arena := pop(&pool.arenas)
-		sync.mutex_unlock(&pool.lock)
-		return arena
+	hint := arena_pool_shard_index()
+
+	// Prefer the local shard, then steal from siblings. Arenas are created and
+	// released by different committing threads, so without stealing the hot
+	// path falls back to a fresh arena (and mmap) on nearly every commit.
+	for offset in 0 ..< ARENA_POOL_SHARDS {
+		shard := &pool.shards[(hint + u32(offset)) % ARENA_POOL_SHARDS]
+		sync.mutex_lock(&shard.lock)
+		if len(shard.arenas) > 0 {
+			arena := pop(&shard.arenas)
+			sync.mutex_unlock(&shard.lock)
+			return arena
+		}
+		sync.mutex_unlock(&shard.lock)
 	}
-	sync.mutex_unlock(&pool.lock)
 
 	arena := new(virtual.Arena, runtime.default_allocator())
 	if err := virtual.arena_init_growing(arena); err != nil {
@@ -74,17 +117,23 @@ arena_pool_return :: proc(pool: ^Arena_Pool, arena: ^virtual.Arena) {
 		return
 	}
 	virtual.arena_free_all(arena)
-	sync.mutex_lock(&pool.lock)
-	append(&pool.arenas, arena)
-	sync.mutex_unlock(&pool.lock)
+
+	// Return to the local shard; a thread's arenas tend to be reused by it.
+	shard := arena_pool_shard(pool)
+	sync.mutex_lock(&shard.lock)
+	append(&shard.arenas, arena)
+	sync.mutex_unlock(&shard.lock)
 }
 
 arena_pool_destroy :: proc(pool: ^Arena_Pool) {
-	for arena in pool.arenas {
-		virtual.arena_destroy(arena)
-		free(arena, runtime.default_allocator())
+	for index in 0 ..< ARENA_POOL_SHARDS {
+		shard := &pool.shards[index]
+		for arena in shard.arenas {
+			virtual.arena_destroy(arena)
+			free(arena, runtime.default_allocator())
+		}
+		delete(shard.arenas)
 	}
-	delete(pool.arenas)
 }
 
 // Creates a kernel with an empty snapshot and an empty committed store.
