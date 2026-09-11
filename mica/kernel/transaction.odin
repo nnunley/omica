@@ -489,13 +489,17 @@ optional_tuple_eq :: proc(a: v.Tuple, a_ok: bool, b: v.Tuple, b_ok: bool) -> boo
 transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Error) {
 	kernel := transaction.kernel
 
-	stripes := transaction_write_stripes(transaction)
-	for stripe in stripes {
-		sync.mutex_lock(&kernel.relation_locks[stripe])
+	write_stripes := transaction_write_stripes(transaction)
+	for present, stripe in write_stripes {
+		if present {
+			sync.mutex_lock(&kernel.relation_locks[stripe])
+		}
 	}
 	defer {
-		for stripe in stripes {
-			sync.mutex_unlock(&kernel.relation_locks[stripe])
+		for present, stripe in write_stripes {
+			if present {
+				sync.mutex_unlock(&kernel.relation_locks[stripe])
+			}
 		}
 	}
 
@@ -507,6 +511,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		}
 	}
 
+	transaction_prepare_writes(transaction)
 	candidate := transaction_build_candidate(kernel, transaction, current)
 
 	// Hand the candidate to the group committer. One publication covers every
@@ -530,27 +535,14 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 	return entry.published, .None
 }
 
-// Returns the sorted, de-duplicated lock stripes for the transaction's writes.
+// Returns the lock stripes for the transaction's writes as a stack bitset.
 @(private)
-transaction_write_stripes :: proc(transaction: ^Transaction) -> []int {
-	if len(transaction.writes) == 0 {
-		return nil
-	}
-	stripes := make([dynamic]int, 0, len(transaction.writes), context.temp_allocator)
+transaction_write_stripes :: proc(transaction: ^Transaction) -> [RELATION_LOCK_STRIPES]bool {
+	stripes: [RELATION_LOCK_STRIPES]bool
 	for writes in transaction.writes {
-		append(&stripes, int(writes.relation) % RELATION_LOCK_STRIPES)
+		stripes[int(writes.relation) % RELATION_LOCK_STRIPES] = true
 	}
-	slice.sort(stripes[:])
-	write := 0
-	previous := -1
-	for stripe in stripes {
-		if stripe != previous {
-			stripes[write] = stripe
-			write += 1
-			previous = stripe
-		}
-	}
-	return stripes[:write]
+	return stripes
 }
 
 // Builds an unpublished candidate snapshot from `current`. The caller owns the
@@ -579,26 +571,10 @@ transaction_build_candidate :: proc(
 			continue
 		}
 
-		// A rebased retract only removes tuples the transaction's base
-		// actually held; a concurrent assert of a tuple the base lacked
-		// survives. Asserts always apply.
-		base_block, _ := snapshot_relation_block(transaction.base, writes.relation)
-		entries := make([dynamic]Pending_Write, 0, len(writes.entries), context.temp_allocator)
-		for entry in writes.entries {
-			if entry.kind == .Retract &&
-			   (base_block == nil || !relation_block_contains(base_block, entry.tuple)) {
-				continue
-			}
-			append(&entries, entry)
-		}
-		slice.sort_by(entries[:], proc(a, b: Pending_Write) -> bool {
-			return v.tuple_cmp(a.tuple, b.tuple) == .Less
-		})
-
 		// Copy-on-write against the block in the snapshot we are committing
 		// onto, so a rebase merges with the other transaction's changes.
 		current_block, _ := snapshot_relation_block(current, writes.relation)
-		block := relation_block_apply(kernel, current_block, metadata, entries[:])
+		block := relation_block_apply(kernel, current_block, metadata, writes.entries[:])
 		snapshot_set_block(fork, block)
 	}
 
@@ -644,6 +620,33 @@ transaction_rebase_in_place :: proc(
 	candidate.parent = winner
 	snapshot_compute_derived(candidate)
 	return true
+}
+
+// Filters and sorts staged writes once, before candidate construction. A
+// rebased retract only removes tuples the transaction's base actually held; a
+// concurrent assert of a tuple the base lacked survives. Asserts always apply.
+@(private)
+transaction_prepare_writes :: proc(transaction: ^Transaction) {
+	for &writes in transaction.writes {
+		base_block, _ := snapshot_relation_block(transaction.base, writes.relation)
+		write := 0
+		for entry in writes.entries {
+			if entry.kind == .Retract &&
+			   (base_block == nil || !relation_block_contains(base_block, entry.tuple)) {
+				continue
+			}
+			writes.entries[write] = entry
+			write += 1
+		}
+		if write != len(writes.entries) {
+			resize(&writes.entries, write)
+		}
+		if len(writes.entries) > 1 {
+			slice.sort_by(writes.entries[:], proc(a, b: Pending_Write) -> bool {
+				return v.tuple_cmp(a.tuple, b.tuple) == .Less
+			})
+		}
+	}
 }
 
 @(private)

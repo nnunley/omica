@@ -243,31 +243,42 @@ relation_block_apply :: proc(
 	chunks := base != nil ? base.chunks : []^Relation_Chunk{}
 	count := base != nil ? base.count : 0
 
-	// Locate the span of chunks the entries can affect.
+	// Locate the span of chunks the entries can affect. When the entries fall
+	// in the gap before a chunk or beyond the last key, the neighbouring chunk
+	// is merged as well: that both keeps chunk fill near capacity on appends
+	// and avoids leaving a trail of single-row chunks and an O(n) spine.
 	lo := 0
+	hi := len(chunks) - 1
 	if len(entries) > 0 {
 		first := entries[0].tuple
 		for lo < len(chunks) && v.tuple_cmp(relation_chunk_last(chunks[lo]), first) == .Less {
 			lo += 1
 		}
-	}
-	hi := len(chunks) - 1
-	if len(entries) > 0 {
 		last := entries[len(entries) - 1].tuple
 		for hi >= 0 && v.tuple_cmp(relation_chunk_first(chunks[hi]), last) == .Greater {
 			hi -= 1
 		}
+		if hi < lo {
+			// The entries fall before a chunk or past the last one. Merge the
+			// neighbouring chunk only when it has room: filling the tail keeps
+			// chunk counts linear, while a full tail starts a fresh chunk
+			// without copying it.
+			if hi >= 0 && len(chunks[hi].tuples) < CHUNK_CAPACITY {
+				lo = hi
+			}
+		}
 	}
 	suffix_start := max(hi + 1, lo)
 
-	merged := make([dynamic]v.Tuple, 0, chunk_span_rows(chunks, lo, hi) + len(entries), context.temp_allocator)
-	added, removed := merge_chunks(&merged, chunks, lo, hi, entries)
-	count = count + added - removed
-
-	new_chunks := chunks_from_rows(kernel.arena_pool, merged[:], context.temp_allocator)
-
 	block_arena := arena_pool_take(kernel.arena_pool)
 	block_alloc := frame_arena_allocator(block_arena)
+
+	merged := make([]v.Tuple, chunk_span_rows(chunks, lo, hi) + len(entries), block_alloc)
+	written := 0
+	added, removed := merge_chunks(merged, &written, chunks, lo, hi, entries)
+	count = count + added - removed
+
+	new_chunks := chunks_from_rows(kernel.arena_pool, merged[:written], block_alloc)
 
 	total := lo + len(new_chunks) + (len(chunks) - suffix_start)
 	spine := make([]^Relation_Chunk, total, block_alloc)
@@ -345,7 +356,8 @@ chunk_span_rows :: proc(chunks: []^Relation_Chunk, lo, hi: int) -> int {
 // without materialising the base rows in a scratch array.
 @(private)
 merge_chunks :: proc(
-	merged: ^[dynamic]v.Tuple,
+	merged: []v.Tuple,
+	written: ^int,
 	chunks: []^Relation_Chunk,
 	lo, hi: int,
 	entries: []Pending_Write,
@@ -353,13 +365,17 @@ merge_chunks :: proc(
 	added: int,
 	removed: int,
 ) {
+	put :: proc(merged: []v.Tuple, written: ^int, row: v.Tuple) {
+		merged[written^] = row
+		written^ += 1
+	}
 	entry_index := 0
 	for index in lo ..= hi {
 		for row in chunks[index].tuples {
 			for entry_index < len(entries) &&
 			    v.tuple_cmp(entries[entry_index].tuple, row) == .Less {
 				if entries[entry_index].kind == .Assert {
-					append(merged, entries[entry_index].tuple)
+					put(merged, written, entries[entry_index].tuple)
 					added += 1
 				}
 				entry_index += 1
@@ -367,19 +383,19 @@ merge_chunks :: proc(
 			if entry_index < len(entries) &&
 			   v.tuple_cmp(entries[entry_index].tuple, row) == .Equal {
 				if entries[entry_index].kind == .Assert {
-					append(merged, row)
+					put(merged, written, row)
 				} else {
 					removed += 1
 				}
 				entry_index += 1
 			} else {
-				append(merged, row)
+				put(merged, written, row)
 			}
 		}
 	}
 	for entry_index < len(entries) {
 		if entries[entry_index].kind == .Assert {
-			append(merged, entries[entry_index].tuple)
+			put(merged, written, entries[entry_index].tuple)
 			added += 1
 		}
 		entry_index += 1

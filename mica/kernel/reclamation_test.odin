@@ -155,8 +155,19 @@ test_cow_commit_shares_untouched_chunks :: proc(t: ^testing.T) {
 	block3, found3 := snapshot_relation_block(kernel.current, relation)
 	testing.expect(t, found3)
 	testing.expect_value(t, relation_block_len(block3), 302)
-	testing.expect_value(t, len(block3.chunks), len(block2.chunks) + 1)
-	for index in 0 ..< len(block2.chunks) {
-		testing.expect(t, block3.chunks[index] == block2.chunks[index])
+
+	// The append either filled the last chunk (replacing only it) or started a
+	// new one; either way every earlier chunk is shared.
+	testing.expect(t, block3.chunks[0] == block2.chunks[0])
+	if len(block3.chunks) == len(block2.chunks) {
+		testing.expect(t, block3.chunks[len(block3.chunks) - 1] != block2.chunks[len(block2.chunks) - 1])
+		for index in 0 ..< len(block2.chunks) - 1 {
+			testing.expect(t, block3.chunks[index] == block2.chunks[index])
+		}
+	} else {
+		testing.expect_value(t, len(block3.chunks), len(block2.chunks) + 1)
+		for index in 0 ..< len(block2.chunks) {
+			testing.expect(t, block3.chunks[index] == block2.chunks[index])
+		}
 	}
 }
