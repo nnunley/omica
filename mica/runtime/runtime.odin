@@ -36,33 +36,38 @@ Builtin_Env :: struct {
 	allocator: mem.Allocator,
 }
 
-// Compiles and runs one filein against `kernel`. On success the transaction is
-// committed.
-run_filein :: proc(
+// Compiles and runs a set of fileins as one world against `kernel`. On success
+// the transaction is committed.
+run_files :: proc(
 	kernel: ^k.Kernel,
-	path: string,
+	paths: []string,
 	allocator := context.allocator,
 ) -> Run_Result {
-	data, read_err := os.read_entire_file(path, allocator)
-	if read_err != nil {
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"cannot read %s",
-			path,
-			allocator = allocator,
-		)}
-	}
+	asts := make([dynamic]^c.Program_AST, allocator)
+	defer delete(asts)
 
-	ast, parse_errors := c.parse_program(string(data), allocator)
-	if len(parse_errors) > 0 {
-		first := parse_errors[0]
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"%s:%d:%d: %s",
-			path,
-			first.line,
-			first.column,
-			first.message,
-			allocator = allocator,
-		)}
+	for path in paths {
+		data, read_err := os.read_entire_file(path, allocator)
+		if read_err != nil {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"cannot read %s",
+				path,
+				allocator = allocator,
+			)}
+		}
+		ast, parse_errors := c.parse_program(string(data), allocator)
+		if len(parse_errors) > 0 {
+			first := parse_errors[0]
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"%s:%d:%d: %s",
+				path,
+				first.line,
+				first.column,
+				first.message,
+				allocator = allocator,
+			)}
+		}
+		append(&asts, ast)
 	}
 
 	ctx := c.Compile_Context {
@@ -83,135 +88,36 @@ run_filein :: proc(
 		allocator = allocator,
 	}
 
-	next_relation: u32 = 1
-	next_identity: u64 = 0x1000
-	next_rule: u64 = 1
-
-	// Declarations: identities and relations.
-	for item in ast.items {
-		expression: ^c.Expr
-		#partial switch matched in item {
-		case c.Expr_Item:
-			expression = matched.expr
-		case:
-			continue
+	declarations := Declarations {
+		next_relation = 1,
+		next_identity = 0x1000,
+		next_rule     = 1,
+	}
+	for ast in asts {
+		result := prescan_file(&env, ast, &declarations)
+		if !result.ok {
+			return result
 		}
-
-		if binding, is_binding := expression^.(c.Binding); is_binding {
-			expression = binding.value
-		}
-		call, is_call := expression^.(c.Call)
-		if !is_call {
-			continue
-		}
-		callee, is_name := call.callee^.(c.Name)
-		if !is_name {
-			continue
-		}
-		declared := name_text(callee)
-
-		switch declared {
-		case "make_identity":
-			if len(call.args) < 1 {
-				continue
-			}
-			symbol_name := symbol_text(call.args[0].expr)
-			if symbol_name == "" {
-				continue
-			}
-			if _, exists := ctx.identities[symbol_name]; exists {
-				continue
-			}
-			identity_value, identity_ok := v.value_identity_raw(next_identity)
-			if identity_ok {
-				ctx.identities[symbol_name] = identity_value
-				next_identity += 1
-			}
-
-		case "make_relation", "make_functional_relation":
-			if len(call.args) < 2 {
-				continue
-			}
-			relation_name := symbol_text(call.args[0].expr)
-			arity := int_argument(call.args[1].expr)
-			if relation_name == "" || arity <= 0 {
-				continue
-			}
-			if _, exists := ctx.relations[relation_name]; exists {
-				continue
-			}
-
-			metadata := k.relation_metadata(
-				k.Relation_ID(next_relation),
-				v.symbol_intern(relation_name),
-				u16(arity),
-			)
-			functional_keys: [dynamic]u16
-			if declared == "make_functional_relation" && len(call.args) >= 3 {
-				if list, is_list := call.args[2].expr^.(c.List_Literal); is_list {
-					for element in list.elements {
-						position := int_argument(element)
-						if position >= 0 {
-							append(&functional_keys, u16(position))
-						}
-					}
-				}
-				metadata.conflict = k.conflict_functional(functional_keys[:])
-			}
-
-			created, create_err := k.kernel_create_relation(kernel, metadata)
-			if create_err != k.Kernel_Error.None {
-				return Run_Result{ok = false, message = fmt.aprintf(
-					"cannot create relation %s: %v",
-					relation_name,
-					create_err,
-					allocator = allocator,
-				)}
-			}
-			k.snapshot_release(created)
-			ctx.relations[relation_name] = next_relation
-
-			if metadata.conflict.kind == .Functional {
-				key_positions := make([]u16, len(metadata.conflict.key_positions), allocator)
-				copy(key_positions, metadata.conflict.key_positions)
-				env.fields[lower_first(relation_name, allocator)] = Field_Info {
-					relation      = k.Relation_ID(next_relation),
-					key_positions = key_positions,
-				}
-			}
-			delete(functional_keys)
-			next_relation += 1
+	}
+	for path, index in paths {
+		result := install_rules(&env, kernel, asts[index], &declarations, path)
+		if !result.ok {
+			return result
 		}
 	}
 
-	// Rules.
-	for item in ast.items {
-		rule_item, is_rule := item.(c.Rule_Item)
-		if !is_rule {
-			continue
+	items := make([dynamic]c.Item, allocator)
+	defer delete(items)
+	for ast in asts {
+		for item in ast.items {
+			append(&items, item)
 		}
-		rule, rule_ok := convert_rule(rule_item, &ctx)
-		if !rule_ok {
-			return Run_Result{ok = false, message = "could not lower a rule"}
-		}
-		installed, install_err := k.kernel_install_rule(
-			kernel,
-			v.Identity(next_rule),
-			rule,
-			path,
-		)
-		if install_err != k.Kernel_Error.None {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"rule install failed: %v",
-				install_err,
-				allocator = allocator,
-			)}
-		}
-		k.snapshot_release(installed)
-		next_rule += 1
+	}
+	program_ast := c.Program_AST {
+		items = items[:],
 	}
 
-	compiled := c.compile_program(ast, &ctx, allocator)
+	compiled := c.compile_program(&program_ast, &ctx, allocator)
 	if len(compiled.errors) > 0 {
 		return Run_Result{ok = false, message = compiled.errors[0].message}
 	}
@@ -262,6 +168,172 @@ run_filein :: proc(
 			return Run_Result{ok = false, message = "vm did not run"}
 		}
 	}
+}
+
+// Compiles and runs one filein against `kernel`. On success the transaction is
+// committed.
+run_filein :: proc(
+	kernel: ^k.Kernel,
+	path: string,
+	allocator := context.allocator,
+) -> Run_Result {
+	return run_files(kernel, []string{path}, allocator)
+}
+
+@(private)
+Declarations :: struct {
+	next_relation: u32,
+	next_identity: u64,
+	next_rule:     u64,
+}
+
+// Pre-scans one file's top-level declarations into the shared compile context.
+@(private)
+prescan_file :: proc(
+	env: ^Builtin_Env,
+	ast: ^c.Program_AST,
+	declarations: ^Declarations,
+) -> Run_Result {
+	ctx := env.ctx
+	for item in ast.items {
+		expression: ^c.Expr
+		#partial switch matched in item {
+		case c.Expr_Item:
+			expression = matched.expr
+		case:
+			continue
+		}
+
+		if binding, is_binding := expression^.(c.Binding); is_binding {
+			expression = binding.value
+		}
+		call, is_call := expression^.(c.Call)
+		if !is_call {
+			continue
+		}
+		callee, is_name := call.callee^.(c.Name)
+		if !is_name {
+			continue
+		}
+		declared := name_text(callee)
+
+		switch declared {
+		case "make_identity":
+			if len(call.args) < 1 {
+				continue
+			}
+			symbol_name := symbol_text(call.args[0].expr)
+			if symbol_name == "" {
+				continue
+			}
+			if _, exists := ctx.identities[symbol_name]; exists {
+				continue
+			}
+			identity_value, identity_ok := v.value_identity_raw(declarations.next_identity)
+			if identity_ok {
+				ctx.identities[symbol_name] = identity_value
+				declarations.next_identity += 1
+			}
+
+		case "make_relation", "make_functional_relation":
+			if len(call.args) < 2 {
+				continue
+			}
+			relation_name := symbol_text(call.args[0].expr)
+			arity := int_argument(call.args[1].expr)
+			if relation_name == "" || arity <= 0 {
+				continue
+			}
+			if _, exists := ctx.relations[relation_name]; exists {
+				continue
+			}
+
+			metadata := k.relation_metadata(
+				k.Relation_ID(declarations.next_relation),
+				v.symbol_intern(relation_name),
+				u16(arity),
+			)
+			functional_keys: [dynamic]u16
+			if declared == "make_functional_relation" && len(call.args) >= 3 {
+				if list, is_list := call.args[2].expr^.(c.List_Literal); is_list {
+					for element in list.elements {
+						position := int_argument(element)
+						if position >= 0 {
+							append(&functional_keys, u16(position))
+						}
+					}
+				}
+				metadata.conflict = k.conflict_functional(functional_keys[:])
+			}
+
+			created, create_err := k.kernel_create_relation(env.kernel, metadata)
+			if create_err != k.Kernel_Error.None {
+				delete(functional_keys)
+				return Run_Result{ok = false, message = fmt.aprintf(
+					"cannot create relation %s: %v",
+					relation_name,
+					create_err,
+					allocator = env.allocator,
+				)}
+			}
+			k.snapshot_release(created)
+			ctx.relations[relation_name] = declarations.next_relation
+
+			if metadata.conflict.kind == .Functional {
+				key_positions := make([]u16, len(metadata.conflict.key_positions), env.allocator)
+				copy(key_positions, metadata.conflict.key_positions)
+				env.fields[lower_first(relation_name, env.allocator)] = Field_Info {
+					relation      = k.Relation_ID(declarations.next_relation),
+					key_positions = key_positions,
+				}
+			}
+			delete(functional_keys)
+			declarations.next_relation += 1
+		}
+	}
+	return Run_Result{ok = true, message = "loaded"}
+}
+
+// Installs one file's rules into the kernel.
+@(private)
+install_rules :: proc(
+	env: ^Builtin_Env,
+	kernel: ^k.Kernel,
+	ast: ^c.Program_AST,
+	declarations: ^Declarations,
+	path: string,
+) -> Run_Result {
+	for item in ast.items {
+		rule_item, is_rule := item.(c.Rule_Item)
+		if !is_rule {
+			continue
+		}
+		rule, rule_ok := convert_rule(rule_item, env.ctx)
+		if !rule_ok {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"%s: could not lower a rule",
+				path,
+				allocator = env.allocator,
+			)}
+		}
+		installed, install_err := k.kernel_install_rule(
+			kernel,
+			v.Identity(declarations.next_rule),
+			rule,
+			path,
+		)
+		if install_err != k.Kernel_Error.None {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"%s: rule install failed: %v",
+				path,
+				install_err,
+				allocator = env.allocator,
+			)}
+		}
+		k.snapshot_release(installed)
+		declarations.next_rule += 1
+	}
+	return Run_Result{ok = true, message = "loaded"}
 }
 
 // --- Builtins --------------------------------------------------------------

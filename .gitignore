@@ -36,3 +36,5 @@ desktop.ini
 # Logs and scratch files
 *.log
 *.tmp
+/filein
+/filein.bin

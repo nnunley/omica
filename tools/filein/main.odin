@@ -21,17 +21,13 @@ main :: proc() {
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	failed := false
-	for path in os.args[1:] {
-		result := r.run_filein(&kernel, path)
-		if result.ok {
+	result := r.run_files(&kernel, os.args[1:])
+	if result.ok {
+		for path in os.args[1:] {
 			fmt.printf("loaded %s\n", path)
-		} else {
-			fmt.eprintf("failed %s: %s\n", path, result.message)
-			failed = true
 		}
-	}
-	if failed {
+	} else {
+		fmt.eprintf("failed: %s\n", result.message)
 		os.exit(1)
 	}
 }
