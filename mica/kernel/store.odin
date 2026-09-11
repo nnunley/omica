@@ -242,6 +242,7 @@ relation_block_visit :: proc(
 		return
 	}
 
+	primary_count := bound_count
 	best_index := -1
 	best_count := 0
 	for index, i in block.indexes {
@@ -252,12 +253,29 @@ relation_block_visit :: proc(
 		}
 	}
 
-	if best_count > 0 {
+	// A secondary index wins ties, matching the Rust kernel. Otherwise the
+	// primary store's sorted order serves the leading prefix.
+	use_index := best_count > 0 && best_count >= primary_count
+	if use_index {
 		index := &block.indexes[best_index]
 		lo := index_lower_bound(block, index, bindings, best_count)
 		hi := index_upper_bound(block, index, bindings, best_count)
 		for row_index in lo ..< hi {
 			row := block.tuples[index.rows[row_index]]
+			if v.tuple_matches_bindings(row, bindings) {
+				if !visit(user, row) {
+					return
+				}
+			}
+		}
+		return
+	}
+
+	if primary_count > 0 {
+		lo := primary_lower_bound(block, bindings, primary_count)
+		hi := primary_upper_bound(block, bindings, primary_count)
+		for row_index in lo ..< hi {
+			row := block.tuples[row_index]
 			if v.tuple_matches_bindings(row, bindings) {
 				if !visit(user, row) {
 					return
@@ -274,6 +292,60 @@ relation_block_visit :: proc(
 			}
 		}
 	}
+}
+
+@(private)
+compare_primary_prefix :: proc(
+	tuple: v.Tuple,
+	bindings: []v.Binding,
+	count: int,
+) -> v.Ordering {
+	values := v.tuple_values(tuple)
+	for i in 0 ..< count {
+		order := v.value_cmp(values[i], bindings[i].value)
+		if order != .Equal {
+			return order
+		}
+	}
+	return .Equal
+}
+
+@(private)
+primary_lower_bound :: proc(
+	block: ^Relation_Block,
+	bindings: []v.Binding,
+	count: int,
+) -> int {
+	lo, hi := 0, len(block.tuples)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		order := compare_primary_prefix(block.tuples[mid], bindings, count)
+		if order == .Less {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+@(private)
+primary_upper_bound :: proc(
+	block: ^Relation_Block,
+	bindings: []v.Binding,
+	count: int,
+) -> int {
+	lo, hi := 0, len(block.tuples)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		order := compare_primary_prefix(block.tuples[mid], bindings, count)
+		if order != .Greater {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
 }
 
 @(private)
