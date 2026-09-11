@@ -960,6 +960,20 @@ parse_postfix :: proc(parser: ^Parser) -> ^Expr {
 				receiver = node,
 				name     = parse_qualified_name(parser, name),
 			})
+		case .Colon:
+			next := peek_at(parser, 1)
+			after := peek_at(parser, 2)
+			if next.kind != .Ident || after.kind != .LParen {
+				return node
+			}
+			advance(parser)
+			selector := advance(parser).text
+			args := parse_call_arguments(parser)
+			node = expr_node(parser, Receiver_Call {
+				receiver = node,
+				selector = selector,
+				args     = args,
+			})
 		case .Lt:
 			// `#id<[...]>` and `#id<{...}>` are variants when the `<` is
 			// adjacent to the head. `a < b` stays a comparison.

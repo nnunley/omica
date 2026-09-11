@@ -778,6 +778,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			if !vm_dynamic_dispatch(state, base, instr) {
 				break
 			}
+
+		case .Positional_Dispatch:
+			if !vm_positional_dispatch(state, base, instr) {
+				break
+			}
 		}
 
 		if state.status == .Failed {
@@ -1291,7 +1296,24 @@ vm_dispatch_call :: proc(
 		return false
 	}
 	entry := entries[0]
+	args, args_ok := k.dispatch_method_args(entry.params, roles)
+	if !args_ok {
+		vm_fail(state, "E_DISPATCH", "method parameters cannot be bound")
+		return false
+	}
+	return vm_call_dispatch_entry(state, base, destination, entry, args)
+}
 
+// Resolves the method's function index and calls it with `args`.
+@(private)
+vm_call_dispatch_entry :: proc(
+	state: ^VM,
+	base: int,
+	destination: i32,
+	entry: k.Applicable_Method,
+	args: []v.Value,
+) -> bool {
+	program := state.program
 	program_value, found := k.dispatch_method_program(
 		state.source,
 		k.Relation_ID(program.dispatch_method_program_relation),
@@ -1306,27 +1328,78 @@ vm_dispatch_call :: proc(
 		vm_fail(state, "E_DISPATCH", "method program index is invalid")
 		return false
 	}
+	return vm_call_function(state, base, destination, int(function_index), nil, args)
+}
 
-	args, args_ok := k.dispatch_method_args(entry.params, roles)
-	if !args_ok {
-		vm_fail(state, "E_DISPATCH", "method parameters cannot be bound")
-		return false
-	}
-
+// Calls a program function from a dispatch site, binding `args` to its
+// parameters.
+@(private)
+vm_call_function :: proc(
+	state: ^VM,
+	base: int,
+	destination: i32,
+	function_index: int,
+	captures: []v.Value,
+	args: []v.Value,
+) -> bool {
+	program := state.program
 	callee := program.functions[function_index]
+	capture_count := len(captures)
 	callee_base := len(state.registers)
 	resize(&state.registers, callee_base + callee.register_count)
-	if !vm_bind_params(state, callee, args, callee_base) {
+	for capture, index in captures {
+		state.registers[callee_base + index] = capture
+	}
+	if !vm_bind_params(state, callee, args, callee_base + capture_count) {
 		return false
 	}
 	append(&state.frames, Frame {
-		function      = int(function_index),
+		function      = function_index,
 		ip            = callee.code_offset,
 		register_base = callee_base,
 		caller_base   = base,
 		caller_dst    = destination,
 	})
 	return true
+}
+
+@(private)
+vm_positional_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	program := state.program
+	if state.source == nil {
+		vm_fail(state, "E_NO_SOURCE", "dispatch has no relation source")
+		return false
+	}
+	selector := state.registers[base + int(instr.b)]
+	if _, is_symbol := v.value_as_symbol(selector); !is_symbol {
+		vm_fail(state, "E_TYPE", "receiver dispatch selector is not a symbol")
+		return false
+	}
+	argument_count := int(instr.flags)
+	args := make([]v.Value, argument_count, context.temp_allocator)
+	for index in 0 ..< argument_count {
+		args[index] = state.registers[base + int(instr.c) + index]
+	}
+	relations := k.Dispatch_Relations {
+		method_selector = k.Relation_ID(program.dispatch_method_selector_relation),
+		param           = k.Relation_ID(program.dispatch_param_relation),
+		delegates       = k.Relation_ID(program.dispatch_delegates_relation),
+	}
+	entries := k.applicable_positional_method_entries(
+		state.source,
+		relations,
+		selector,
+		args,
+	)
+	if len(entries) == 0 {
+		vm_fail(state, "E_DISPATCH", "no applicable method")
+		return false
+	}
+	if len(entries) > 1 {
+		vm_fail(state, "E_DISPATCH", "ambiguous method dispatch")
+		return false
+	}
+	return vm_call_dispatch_entry(state, base, instr.a, entries[0], args)
 }
 
 @(private)

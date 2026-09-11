@@ -433,6 +433,9 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 	case Call:
 		return emit_call(emitter, n)
 
+	case Receiver_Call:
+		return emit_receiver_dispatch(emitter, n)
+
 	case List_Literal:
 		return emit_list(emitter, n)
 
@@ -1554,6 +1557,90 @@ emit_splice_call :: proc(
 		allocator = emitter.allocator,
 	))
 	return -1, false
+}
+
+// Lowers `receiver:selector(args)`. Positional arguments dispatch by method
+// parameter position with the receiver first; named arguments dispatch by
+// role.
+@(private)
+emit_receiver_dispatch :: proc(
+	emitter: ^Emitter,
+	call: Receiver_Call,
+) -> (int, bool) {
+	receiver, receiver_ok := emit_expr(emitter, call.receiver)
+	if !receiver_ok {
+		return -1, false
+	}
+	has_roles := false
+	for argument in call.args {
+		if argument.has_role {
+			has_roles = true
+		}
+	}
+
+	if has_roles {
+		roles := make([dynamic]vm.Dispatch_Role, 0, len(call.args) + 1, emitter.allocator)
+		defer delete(roles)
+		append(&roles, vm.Dispatch_Role {
+			role     = v.symbol_intern("receiver"),
+			register = i32(receiver),
+		})
+		for argument in call.args {
+			if !argument.has_role {
+				push_error(emitter, "receiver dispatch cannot mix named and positional arguments")
+				return -1, false
+			}
+			register, register_ok := emit_expr(emitter, argument.expr)
+			if !register_ok {
+				return -1, false
+			}
+			append(&roles, vm.Dispatch_Role {
+				role     = v.symbol_intern(argument.role),
+				register = i32(register),
+			})
+		}
+		spec := vm.builder_add_dispatch_spec(
+			emitter.builder,
+			v.symbol_intern(call.selector),
+			roles[:],
+		)
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Dispatch,
+			0,
+			i32(destination),
+			spec,
+			0,
+		)
+		return destination, true
+	}
+
+	selector := emit_constant(
+		emitter,
+		v.value_symbol(v.symbol_intern(call.selector)),
+	)
+	argument_registers := make([dynamic]int, 0, len(call.args) + 1, emitter.allocator)
+	defer delete(argument_registers)
+	append(&argument_registers, receiver)
+	for argument in call.args {
+		register, register_ok := emit_expr(emitter, argument.expr)
+		if !register_ok {
+			return -1, false
+		}
+		append(&argument_registers, register)
+	}
+	first_argument := marshal_arguments(emitter, argument_registers[:])
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Positional_Dispatch,
+		u8(len(call.args) + 1),
+		i32(destination),
+		i32(selector),
+		i32(first_argument),
+	)
+	return destination, true
 }
 
 @(private)

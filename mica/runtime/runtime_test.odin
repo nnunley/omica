@@ -1264,3 +1264,43 @@ assert Out(greet("z", "bonjour"))
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
+
+@(test)
+test_run_receiver_dispatch :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:player)
+make_identity(:alice)
+make_identity(:coin)
+make_identity(:gem)
+make_relation(:Taken, 2)
+assert Delegates(#alice, #player, 0)
+assert Delegates(#coin, #player, 0)
+assert Delegates(#gem, #player, 0)
+verb take(actor @ #player, item @ #player)
+  assert Taken(actor, item)
+  return :generic
+end
+verb take(actor @ #player, item @ #coin)
+  assert Taken(actor, item)
+  return :specific
+end
+require(#alice:take(#coin) == :specific)
+require(#alice:take(#gem) == :generic)
+let carried = #alice
+require(carried:take(#gem) == :generic)
+assert Taken(#alice, #coin)
+`
+	path, path_ok := write_temp_source(t, "mica_receiver_dispatch_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Taken", 2)
+}

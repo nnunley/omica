@@ -199,6 +199,14 @@ Call :: struct {
 	args:   []Call_Argument,
 }
 
+// `receiver:selector(args)` dispatches with the receiver as the first
+// positional argument.
+Receiver_Call :: struct {
+	receiver: ^Expr,
+	selector: string,
+	args:     []Call_Argument,
+}
+
 Index :: struct {
 	collection: ^Expr,
 	key:        ^Expr,
@@ -380,6 +388,7 @@ Expr :: union {
 	Binary,
 	Assignment,
 	Call,
+	Receiver_Call,
 	Index,
 	Field,
 	If,

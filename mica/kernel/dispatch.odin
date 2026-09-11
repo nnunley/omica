@@ -198,6 +198,83 @@ applicable_method_entries :: proc(
 	return prune_dominated_methods(source, relations.delegates, methods)
 }
 
+// Returns applicable methods for a positional call: arguments are matched to
+// method parameters in position order, starting with the receiver.
+applicable_positional_method_entries :: proc(
+	source: ^Relation_Source,
+	relations: Dispatch_Relations,
+	selector: v.Value,
+	args: []v.Value,
+	allocator := context.temp_allocator,
+) -> [dynamic]Applicable_Method {
+	methods := make([dynamic]Applicable_Method, 0, 4, allocator)
+	selector_rows: [dynamic]v.Tuple
+	defer delete(selector_rows)
+	relation_source_scan_into(
+		source,
+		relations.method_selector,
+		[]v.Binding{{}, v.binding_of(selector)},
+		&selector_rows,
+	)
+	for row in selector_rows {
+		method := v.tuple_values(row)[0]
+		param_rows: [dynamic]v.Tuple
+		relation_source_scan_into(
+			source,
+			relations.param,
+			[]v.Binding{v.binding_of(method), {}, {}, {}},
+			&param_rows,
+		)
+		ordered := make([]v.Tuple, len(param_rows), context.temp_allocator)
+		copy(ordered, param_rows[:])
+		slice.sort_by(ordered, proc(a, b: v.Tuple) -> bool {
+			a_values := v.tuple_values(a)
+			b_values := v.tuple_values(b)
+			a_position, _ := v.value_as_int(a_values[3])
+			b_position, _ := v.value_as_int(b_values[3])
+			return a_position < b_position
+		})
+		if !positional_params_match(
+			source,
+			relations.delegates,
+			args,
+			ordered,
+		) {
+			delete(param_rows)
+			continue
+		}
+		params := make([]v.Tuple, len(ordered), allocator)
+		copy(params, ordered)
+		delete(param_rows)
+		append(&methods, Applicable_Method{method = method, params = params})
+	}
+
+	slice.sort_by(methods[:], proc(a, b: Applicable_Method) -> bool {
+		return v.value_cmp(a.method, b.method) == .Less
+	})
+	prune_duplicate_methods(&methods)
+	return prune_dominated_methods(source, relations.delegates, methods)
+}
+
+@(private)
+positional_params_match :: proc(
+	source: ^Relation_Source,
+	delegates: Relation_ID,
+	args: []v.Value,
+	params: []v.Tuple,
+) -> bool {
+	if len(args) > len(params) {
+		return false
+	}
+	for argument, index in args {
+		restriction := v.tuple_values(params[index])[2]
+		if !matches_restriction(source, delegates, argument, restriction) {
+			return false
+		}
+	}
+	return true
+}
+
 @(private)
 prune_duplicate_methods :: proc(methods: ^[dynamic]Applicable_Method) {
 	write := 0
