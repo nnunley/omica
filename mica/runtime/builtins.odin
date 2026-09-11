@@ -59,6 +59,9 @@ runtime_builtins := [?]Builtin_Spec {
 	{"url_decode_component", 1, builtin_url_decode_component},
 	{"os_getenv", 1, builtin_os_getenv},
 	{"to_literal", 1, builtin_to_literal},
+	{"endpoint", 0, builtin_endpoint},
+	{"actor", 0, builtin_actor},
+	{"principal", 0, builtin_principal},
 }
 
 @(private)
@@ -103,6 +106,30 @@ register_runtime_builtins :: proc(state: ^vm.VM) {
 	for spec in runtime_builtins {
 		vm.vm_register_builtin(state, v.symbol_intern(spec.name), spec.argc, spec.run)
 	}
+}
+
+@(private)
+builtin_endpoint :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 0 {
+		return builtin_error(state, "E_INVARG", "endpoint expects no arguments")
+	}
+	return builtin_env(state).endpoint, true
+}
+
+@(private)
+builtin_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 0 {
+		return builtin_error(state, "E_INVARG", "actor expects no arguments")
+	}
+	return builtin_env(state).actor, true
+}
+
+@(private)
+builtin_principal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 0 {
+		return builtin_error(state, "E_INVARG", "principal expects no arguments")
+	}
+	return builtin_env(state).principal, true
 }
 
 // --- Helpers ---------------------------------------------------------------

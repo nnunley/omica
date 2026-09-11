@@ -34,6 +34,12 @@ Builtin_Env :: struct {
 	ctx:       ^c.Compile_Context,
 	fields:    map[string]Field_Info,
 	allocator: mem.Allocator,
+
+	// Runtime context identities returned by `endpoint()`, `actor()`, and
+	// `principal()`.
+	endpoint:  v.Value,
+	actor:     v.Value,
+	principal: v.Value,
 }
 
 // Compiles and runs a set of fileins as one world against `kernel`. On success
@@ -89,6 +95,15 @@ run_files :: proc(
 		next_relation = 1,
 		next_identity = 0x1000,
 		next_rule     = 1,
+	}
+	endpoint_identity, endpoint_ok := v.value_identity_raw(declarations.next_identity)
+	declarations.next_identity += 1
+	actor_identity, actor_ok := v.value_identity_raw(declarations.next_identity)
+	declarations.next_identity += 1
+	if endpoint_ok && actor_ok {
+		env.endpoint = endpoint_identity
+		env.actor = actor_identity
+		env.principal = actor_identity
 	}
 
 	dispatch_result := install_dispatch_relations(&env)
