@@ -30,6 +30,7 @@ Capability_Scope :: enum {
 	Relations,
 	Selectors,
 	Mailbox,
+	Subscription,
 }
 
 // Optional expiry limits. A zero deadline or epoch limit means no limit. Wall
@@ -48,6 +49,8 @@ Capability_Grant :: struct {
 	// Mailbox handles carry the world mailbox id and which end they are.
 	mailbox:        u64,
 	mailbox_sender: bool,
+	// Subscription handles carry the subscription id.
+	subscription:   u64,
 	revoked:        i32,
 	refs:        i32,
 	limits:      Capability_Limits,
@@ -101,7 +104,7 @@ capability_store_mint :: proc(
 	if scope == .Selectors && len(selectors) == 0 {
 		return v.Value(0), false
 	}
-	if scope == .Mailbox {
+	if scope == .Mailbox || scope == .Subscription {
 		return v.Value(0), false
 	}
 	grant := new(Capability_Grant, store.allocator)
@@ -198,6 +201,23 @@ capability_store_mint_mailbox_pair :: proc(
 	receiver_value, receiver_ok := capability_store_mint_mailbox(store, mailbox, false)
 	sender_value, sender_ok := capability_store_mint_mailbox(store, mailbox, true)
 	return receiver_value, sender_value, receiver_ok && sender_ok
+}
+
+// Mints a subscription handle.
+capability_store_mint_subscription :: proc(
+	store: ^Capability_Store,
+	subscription: u64,
+) -> (
+	v.Value,
+	bool,
+) {
+	grant := new(Capability_Grant, store.allocator)
+	grant.scope = .Subscription
+	grant.subscription = subscription
+	grant.rights = Rights{.Read}
+	grant.allocator = store.allocator
+	grant.children = make([dynamic]^Capability_Grant, store.allocator)
+	return capability_store_register(store, grant)
 }
 
 // Revokes a capability and its whole subtree. Holders observe the revocation
@@ -355,7 +375,7 @@ capability_allows_read :: proc(grant: ^Capability_Grant, relation: Relation_ID) 
 				return true
 			}
 		}
-	case .Selectors, .Mailbox:
+	case .Selectors, .Mailbox, .Subscription:
 	}
 	return false
 }
@@ -373,7 +393,7 @@ capability_allows_write :: proc(grant: ^Capability_Grant, relation: Relation_ID)
 				return true
 			}
 		}
-	case .Selectors, .Mailbox:
+	case .Selectors, .Mailbox, .Subscription:
 	}
 	return false
 }
@@ -391,7 +411,7 @@ capability_allows_invoke :: proc(grant: ^Capability_Grant, selector: v.Symbol) -
 				return true
 			}
 		}
-	case .Relations, .Mailbox:
+	case .Relations, .Mailbox, .Subscription:
 	}
 	return false
 }
@@ -409,6 +429,14 @@ capability_mailbox_target :: proc(
 		return 0, false
 	}
 	return grant.mailbox, true
+}
+
+// Returns the subscription id when the grant is a subscription handle.
+capability_subscription_target :: proc(grant: ^Capability_Grant) -> (u64, bool) {
+	if grant == nil || grant.scope != .Subscription {
+		return 0, false
+	}
+	return grant.subscription, true
 }
 
 // Reports whether the grant allows invoking any method (all-scoped invoke).

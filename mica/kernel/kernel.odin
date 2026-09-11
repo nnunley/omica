@@ -58,6 +58,9 @@ Kernel :: struct {
 
 	// Bearer capabilities minted for this world. Ephemeral; not persisted.
 	capabilities: Capability_Store,
+
+	// Bounded window of committed fact changes for subscriptions.
+	changes: Change_Feed,
 }
 
 // A pool of reset-able virtual arenas shared by transactions, snapshots, and
@@ -167,6 +170,7 @@ kernel_init :: proc(kernel: ^Kernel) {
 	kernel.retired = make([dynamic]^Snapshot)
 	kernel.pending_commits = make([dynamic]^Commit_Entry)
 	capability_store_init(&kernel.capabilities)
+	changes_init(&kernel.changes)
 	kernel.current = snapshot_create(kernel, 0, nil)
 }
 
@@ -183,6 +187,7 @@ kernel_destroy :: proc(kernel: ^Kernel) {
 	delete(kernel.retired)
 	delete(kernel.pending_commits)
 	capability_store_destroy(&kernel.capabilities)
+	changes_destroy(&kernel.changes)
 
 	if kernel.arena_pool != nil {
 		arena_pool_destroy(kernel.arena_pool)
@@ -261,6 +266,7 @@ kernel_try_publish :: proc(
 		.Acquire,
 	)
 	if swapped {
+		changes_note_version(&kernel.changes, next.version)
 		return expected, true
 	}
 	snapshot_release(next)
@@ -347,6 +353,11 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 				snapshot_release(entry.base)
 				entry.base = nil
 				entry.published = entry.candidate
+				changes_record_writes(
+					&kernel.changes,
+					entry.candidate.version,
+					entry.transaction.writes[:],
+				)
 				return
 			}
 			winner := kernel_snapshot(kernel)
@@ -394,13 +405,21 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 		previous, published := kernel_try_publish(kernel, base, merged)
 		if published {
 			kernel_retire(kernel, previous)
+			merged_writes: [dynamic]Relation_Writes
+			defer delete(merged_writes)
 			for entry in batch {
+				append(&merged_writes, ..entry.transaction.writes[:])
 				snapshot_retain(merged)
 				entry.published = merged
 				snapshot_release(entry.candidate)
 				snapshot_release(entry.base)
 				entry.base = nil
 			}
+			changes_record_writes(
+				&kernel.changes,
+				merged.version,
+				merged_writes[:],
+			)
 			snapshot_release(base)
 			return
 		}

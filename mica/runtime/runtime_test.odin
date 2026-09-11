@@ -1796,3 +1796,81 @@ end
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 3)
 }
+
+@(test)
+test_run_subscription_changes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Note, 2)
+let [receiver, sender] = mailbox()
+let sub = subscribe_changes(sender, :facts, some(:Note), [some(1), none], :changes)
+assert Note(1, 10)
+assert Note(1, 11)
+assert Note(2, 12)
+commit()
+let ready = mailbox_recv([receiver])
+let message = ready[0][1][0]
+require(index_or(message, :kind, none) == :changes)
+let assertions = index_or(message, :assertions, [])
+require(len(assertions) == 2)
+require(len(index_or(message, :retractions, [])) == 0)
+cancel_subscription(sub)
+assert Note(1, 13)
+commit()
+let remaining = mailbox_recv([receiver], 0)
+require(len(remaining) == 0)
+`
+	path, path_ok := write_temp_source(t, "mica_subscription_changes_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Note", 4)
+}
+
+@(test)
+test_run_subscription_snapshot_and_close :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Note, 2)
+make_relation(:CloseFailed, 1)
+let [receiver, sender] = mailbox()
+assert Note(5, 50)
+commit()
+let sub = subscribe_changes(sender, :facts, some(:Note), [none, none], :snapshot)
+let ready = mailbox_recv([receiver])
+let message = ready[0][1][0]
+require(index_or(message, :kind, none) == :snapshot)
+require(len(index_or(message, :assertions, [])) == 1)
+
+let [receiver_two, sender_two] = mailbox()
+let sub_two = subscribe_changes(sender_two, :facts, some(:Note), [none, none], :changes)
+mailbox_close(receiver_two)
+assert Note(5, 51)
+commit()
+try
+  mailbox_recv([receiver_two])
+  assert CloseFailed(0)
+catch err
+  assert CloseFailed(1)
+end
+`
+	path, path_ok := write_temp_source(t, "mica_subscription_snapshot_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "CloseFailed", 1)
+}

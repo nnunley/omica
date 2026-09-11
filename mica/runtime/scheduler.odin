@@ -474,6 +474,11 @@ scheduler_mailbox_handle_live :: proc(scheduler: ^Scheduler, value: v.Value) -> 
 	return mailbox_handle_live(scheduler, value, false)
 }
 
+// Reports whether `value` is a live sender handle.
+scheduler_mailbox_sender_handle_live :: proc(scheduler: ^Scheduler, value: v.Value) -> bool {
+	return mailbox_handle_live(scheduler, value, true)
+}
+
 @(private)
 scheduler_park_mailbox_locked :: proc(
 	scheduler: ^Scheduler,

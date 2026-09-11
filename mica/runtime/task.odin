@@ -151,6 +151,9 @@ task_commit :: proc(task: ^Task) -> k.Kernel_Error {
 		return err
 	}
 	k.snapshot_release(committed)
+	if task.env != nil {
+		subscriptions_dispatch(task.env)
+	}
 	return k.Kernel_Error.None
 }
 

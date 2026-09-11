@@ -40,6 +40,8 @@ Builtin_Env :: struct {
 	// When true, tasks mint authority for `actor` at init. The entry task in
 	// `run_files` stays root so declarations and grants can load.
 	enforce_authority: bool,
+	// Change subscriptions registered by this world.
+	subscriptions:     Subscription_Store,
 
 	// Runtime context identities returned by `endpoint()`, `actor()`, and
 	// `principal()`.
@@ -418,6 +420,9 @@ run_files :: proc(
 		fields    = make(map[string]Field_Info, allocator),
 		allocator = allocator,
 	}
+
+	subscriptions_init(&env.subscriptions, allocator)
+	defer subscriptions_destroy(&env.subscriptions)
 
 	declarations := Declarations {
 		next_relation = 1,

@@ -222,3 +222,44 @@ test_capability_store_mailbox_handles :: proc(t: ^testing.T) {
 	testing.expect(t, !capability_live(receiver, 0, time.tick_now()))
 	testing.expect(t, capability_store_revoke(&store, sender_value))
 }
+
+@(private)
+count_change :: proc(user: rawptr, record: ^Change_Record) -> bool {
+	(^int)(user)^ += 1
+	return true
+}
+
+@(test)
+test_change_feed_window_and_resync :: proc(t: ^testing.T) {
+	feed: Change_Feed
+	changes_init(&feed, 2, context.temp_allocator)
+	defer changes_destroy(&feed)
+
+	for version in 1 ..= 3 {
+		writes := make([dynamic]Relation_Writes, context.temp_allocator)
+		entry := Relation_Writes{relation = Relation_ID(70)}
+		entry.entries = make([dynamic]Pending_Write, context.temp_allocator)
+		append(&entry.entries, Pending_Write {
+			tuple = tuple_of(must_int(i64(version))),
+			kind  = .Assert,
+		})
+		append(&writes, entry)
+		changes_record_writes(&feed, u64(version), writes[:])
+	}
+
+	visits := 0
+	latest, ok := changes_visit(&feed, 0, &visits, count_change)
+	testing.expect(t, !ok)
+	testing.expect_value(t, latest, u64(3))
+
+	visits = 0
+	latest, ok = changes_visit(&feed, 1, &visits, count_change)
+	testing.expect(t, ok)
+	testing.expect_value(t, visits, 2)
+	testing.expect_value(t, latest, u64(3))
+
+	visits = 0
+	_, ok = changes_visit(&feed, 3, &visits, count_change)
+	testing.expect(t, ok)
+	testing.expect_value(t, visits, 0)
+}

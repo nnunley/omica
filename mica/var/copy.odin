@@ -82,3 +82,75 @@ tuple_deep_copy :: proc(alloc: mem.Allocator, tuple: Tuple) -> Tuple {
 	}
 	return Tuple(copied)
 }
+
+// Frees a value created by `value_deep_copy`, including heap headers.
+value_deep_free :: proc(alloc: mem.Allocator, value: Value) {
+	if value_is_immediate(value) || value_is_empty_relation(value) {
+		return
+	}
+	#partial switch value_kind(value) {
+	case .String:
+		if header, ok := heap_header(value, .String, Heap_String); ok {
+			delete(header.data, alloc)
+			free(header, alloc)
+		}
+	case .Bytes:
+		if header, ok := heap_header(value, .Bytes, Heap_Bytes); ok {
+			delete(header.data, alloc)
+			free(header, alloc)
+		}
+	case .List:
+		if header, ok := heap_header(value, .List, Heap_List); ok {
+			for item in header.values {
+				value_deep_free(alloc, item)
+			}
+			delete(header.values, alloc)
+			free(header, alloc)
+		}
+	case .Map:
+		if header, ok := heap_header(value, .Map, Heap_Map); ok {
+			for entry in header.entries {
+				value_deep_free(alloc, entry.key)
+				value_deep_free(alloc, entry.value)
+			}
+			delete(header.entries, alloc)
+			free(header, alloc)
+		}
+	case .Range:
+		if header, ok := heap_header(value, .Range, Heap_Range); ok {
+			value_deep_free(alloc, header.start)
+			if header.has_end {
+				value_deep_free(alloc, header.end)
+			}
+			free(header, alloc)
+		}
+	case .Error:
+		if header, ok := heap_header(value, .Error, Heap_Error); ok {
+			if header.has_message {
+				delete(header.message, alloc)
+			}
+			if header.has_value {
+				value_deep_free(alloc, header.value)
+			}
+			free(header, alloc)
+		}
+	case .Frob:
+		if header, ok := heap_header(value, .Frob, Heap_Frob); ok {
+			value_deep_free(alloc, header.value)
+			free(header, alloc)
+		}
+	case .Relation:
+		if header, ok := heap_header(value, .Relation, Relation_Value); ok {
+			for row in header.rows {
+				cells := tuple_values(row)
+				for cell in cells {
+					value_deep_free(alloc, cell)
+				}
+				delete(cells, alloc)
+			}
+			delete(header.rows, alloc)
+			delete(header.heading, alloc)
+			free(header, alloc)
+		}
+	}
+}

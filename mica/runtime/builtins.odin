@@ -81,6 +81,8 @@ runtime_builtins := [?]Builtin_Spec {
 	{"restrict_capability", 2, builtin_restrict_capability},
 	{"revoke_capability", 1, builtin_revoke_capability},
 	{"drop_capability", 1, builtin_drop_capability},
+	{"subscribe_changes", -1, builtin_subscribe_changes},
+	{"cancel_subscription", 1, builtin_cancel_subscription},
 	{"mailbox", 0, builtin_mailbox},
 	{"mailbox_send", 2, builtin_mailbox_send},
 	{"mailbox_close", 1, builtin_mailbox_close},
@@ -612,6 +614,7 @@ builtin_mailbox_close :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 	if !scheduler_mailbox_close(env.scheduler, args[0]) {
 		return builtin_error(state, "E_MAILBOX", "mailbox_close expects a live receiver capability")
 	}
+	_ = subscriptions_cancel_for_mailbox(env, args[0])
 	return v.value_empty_relation(), true
 }
 
@@ -691,8 +694,8 @@ builtin_use_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool
 	if !found {
 		return builtin_error(state, "E_INVARG", "unknown capability")
 	}
-	if grant.scope == .Mailbox {
-		return builtin_error(state, "E_INVARG", "mailbox handles are not authority capabilities")
+	if grant.scope == .Mailbox || grant.scope == .Subscription {
+		return builtin_error(state, "E_INVARG", "handle is not an authority capability")
 	}
 	if !k.capability_live(grant, kernel_version(env), time.tick_now()) {
 		return builtin_error(state, "E_INVARG", "capability is revoked or expired")
@@ -708,8 +711,8 @@ builtin_restrict_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value,
 	if !found {
 		return builtin_error(state, "E_INVARG", "unknown capability")
 	}
-	if parent.scope == .Mailbox {
-		return builtin_error(state, "E_INVARG", "mailbox handles cannot be restricted")
+	if parent.scope == .Mailbox || parent.scope == .Subscription {
+		return builtin_error(state, "E_INVARG", "handles cannot be restricted")
 	}
 	if !k.authority_holds_capability(state.authority, parent) &&
 	   !k.authority_can_grant(state.authority) {
@@ -942,6 +945,125 @@ kernel_version :: proc(env: ^Builtin_Env) -> u64 {
 	snapshot := k.kernel_snapshot(env.kernel)
 	defer k.snapshot_release(snapshot)
 	return snapshot.version
+}
+
+@(private)
+builtin_subscribe_changes :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	if env.scheduler == nil {
+		return builtin_error(state, "E_INVARG", "subscriptions need a running scheduler")
+	}
+	if len(args) < 5 || len(args) > 7 {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			"subscribe_changes expects sender, subject, relation, bindings, initial[, cursor[, queue_budget]]",
+		)
+	}
+	sender := args[0]
+	if !scheduler_mailbox_sender_handle_live(env.scheduler, sender) {
+		return builtin_error(state, "E_INVARG", "subscription sender must be a live mailbox sender")
+	}
+
+	subject_symbol, subject_ok := v.value_as_symbol(args[1])
+	if !subject_ok {
+		return builtin_error(state, "E_TYPE", "subscription subject must be a symbol")
+	}
+	subject, subject_name_ok := v.symbol_name(subject_symbol)
+	if !subject_name_ok || (subject != "facts" && subject != "relation") {
+		return builtin_error(state, "E_INVARG", "unsupported subscription subject")
+	}
+
+	relation_value, has_relation := option_payload(args[2])
+	if !has_relation {
+		return builtin_error(state, "E_INVARG", "subscription needs a relation")
+	}
+	relation_symbol, relation_ok := v.value_as_symbol(relation_value)
+	if !relation_ok {
+		return builtin_error(state, "E_TYPE", "subscription relation must be a symbol")
+	}
+	relation_name, relation_name_ok := v.symbol_name(relation_symbol)
+	if !relation_name_ok {
+		return builtin_error(state, "E_INVARG", "unknown subscription relation")
+	}
+	relation, found := env.ctx.relations[relation_name]
+	if !found {
+		return builtin_error(state, "E_INVARG", "unknown subscription relation")
+	}
+	if !k.authority_can_read(state.authority, k.Relation_ID(relation)) {
+		return builtin_error(state, "E_PERMISSION", "subscription relation read denied")
+	}
+
+	binding_list, bindings_ok := v.value_as_list(args[3])
+	if !bindings_ok {
+		return builtin_error(state, "E_TYPE", "subscription bindings must be a list")
+	}
+	bindings := make([]v.Binding, len(binding_list), context.temp_allocator)
+	for item, index in binding_list {
+		payload, has_payload := option_payload(item)
+		if has_payload {
+			bindings[index] = v.binding_of(payload)
+		} else {
+			bindings[index] = v.Binding{}
+		}
+	}
+
+	initial_symbol, initial_ok := v.value_as_symbol(args[4])
+	if !initial_ok {
+		return builtin_error(state, "E_TYPE", "subscription initial mode must be a symbol")
+	}
+	initial, initial_name_ok := v.symbol_name(initial_symbol)
+	if !initial_name_ok || (initial != "changes" && initial != "snapshot") {
+		return builtin_error(state, "E_INVARG", "unsupported subscription initial mode")
+	}
+
+	cursor := u64(0)
+	has_cursor := false
+	if len(args) >= 6 && !v.value_is_empty_relation(args[5]) {
+		value, is_int := v.value_as_int(args[5])
+		if !is_int || value < 0 {
+			return builtin_error(state, "E_INVARG", "subscription cursor must be non-negative")
+		}
+		cursor = u64(value)
+		has_cursor = true
+	}
+
+	capability, registered := subscriptions_register(
+		env,
+		sender,
+		k.Relation_ID(relation),
+		bindings,
+		initial == "snapshot",
+		cursor,
+		has_cursor,
+	)
+	if !registered {
+		return builtin_error(state, "E_SUBSCRIPTION", "cannot register subscription")
+	}
+	return capability, true
+}
+
+@(private)
+builtin_cancel_subscription :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	if !subscriptions_cancel(env, args[0]) {
+		return builtin_error(state, "E_INVARG", "unknown subscription")
+	}
+	return v.value_bool(true), true
+}
+
+// Unwraps a standard option value: some(x) yields (x, true), none false.
+@(private)
+option_payload :: proc(value: v.Value) -> (v.Value, bool) {
+	relation, is_relation := v.value_as_relation(value)
+	if !is_relation || len(relation.rows) == 0 {
+		return v.Value(0), false
+	}
+	cells := v.tuple_values(relation.rows[0])
+	if len(cells) == 0 {
+		return v.Value(0), false
+	}
+	return cells[0], true
 }
 
 // --- Helpers ---------------------------------------------------------------
