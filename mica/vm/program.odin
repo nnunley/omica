@@ -89,6 +89,12 @@ Op :: enum u8 {
 	// Spawn: a = destination register for the child task id, b = dispatch spec
 	// index, c = delay register (-1 when absent). flags bit 0 marks a delay.
 	Spawn,
+	// Raise: a = error code register, b = message register (-1 when absent),
+	// c = value register (-1 when absent). Aborts the VM with an error value.
+	Raise,
+	// Dynamic_Dispatch: a = dst, b = selector register, c = roles map register.
+	// Resolves a method from a runtime selector symbol and role map.
+	Dynamic_Dispatch,
 }
 
 // A cell in a relation scan pattern.
@@ -611,6 +617,22 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 						return .Bad_Register
 					}
 				}
+			case .Raise:
+				if !valid_register(instr.a, register_count) {
+					return .Bad_Register
+				}
+				if instr.b >= 0 && !valid_register(instr.b, register_count) {
+					return .Bad_Register
+				}
+				if instr.c >= 0 && !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
+			case .Dynamic_Dispatch:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.b, register_count) ||
+				   !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
 			}
 		}
 	}
@@ -725,6 +747,10 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d r%d", instr.a, instr.b)
 			case .Spawn:
 				fmt.sbprintf(&builder, " r%d spec%d", instr.a, instr.b)
+			case .Raise:
+				fmt.sbprintf(&builder, " r%d r%d r%d", instr.a, instr.b, instr.c)
+			case .Dynamic_Dispatch:
+				fmt.sbprintf(&builder, " r%d <- r%d roles@r%d", instr.a, instr.b, instr.c)
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -795,6 +821,10 @@ op_name :: proc(op: Op) -> string {
 		return "sleep"
 	case .Spawn:
 		return "spawn"
+	case .Raise:
+		return "raise"
+	case .Dynamic_Dispatch:
+		return "dynamic_dispatch"
 	}
 	return "?"
 }

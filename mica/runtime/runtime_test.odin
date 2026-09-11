@@ -294,3 +294,76 @@ suspend()
 
 	expect_relation_rows(t, &kernel, "Done", 1)
 }
+
+@(test)
+test_run_raise_reports_error :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `raise E_RANGE, "out of range"
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_raise_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the raise test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expect(t, !result.ok)
+	testing.expectf(
+		t,
+		len(result.message) > 0,
+		"raise should report a message, got %q",
+		result.message,
+	)
+}
+
+@(test)
+test_run_invoke_dynamic_dispatch :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:player)
+make_identity(:alice)
+make_relation(:Taken, 1)
+assert Delegates(#alice, #player, 0)
+verb take(actor @ #player)
+  assert Taken(actor)
+end
+invoke(:take, {:actor -> #alice})
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_invoke_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the invoke test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+
+	expect_relation_rows(t, &kernel, "Taken", 1)
+}

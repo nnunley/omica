@@ -570,3 +570,24 @@ test_emit_spawn_spec :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, spawns, 1)
 }
+
+@(test)
+test_emit_raise :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	program := compile_test_program(t, `raise E_RANGE, "out of range"`, &ctx, allocator)
+
+	raises := 0
+	for instruction in program.code {
+		if instruction.op == .Raise {
+			raises += 1
+		}
+	}
+	testing.expect_value(t, raises, 1)
+}

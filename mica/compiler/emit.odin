@@ -423,8 +423,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return -1, false
 
 	case Raise:
-		push_error(emitter, "raise expressions are not lowered yet")
-		return -1, false
+		return emit_raise(emitter, n)
 
 	case Spawn:
 		return emit_spawn(emitter, n)
@@ -763,6 +762,37 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		return emit_standard_constructor(emitter, text, call)
 	}
 
+	if text == "invoke" {
+		if len(call.args) != 2 {
+			push_error(emitter, "invoke expects a selector and a role map")
+			return -1, false
+		}
+		for argument in call.args {
+			if argument.has_role {
+				push_error(emitter, "invoke does not accept named arguments")
+				return -1, false
+			}
+		}
+		selector, selector_ok := emit_expr(emitter, call.args[0].expr)
+		if !selector_ok {
+			return -1, false
+		}
+		roles, roles_ok := emit_expr(emitter, call.args[1].expr)
+		if !roles_ok {
+			return -1, false
+		}
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Dynamic_Dispatch,
+			0,
+			i32(destination),
+			i32(selector),
+			i32(roles),
+		)
+		return destination, true
+	}
+
 	if text == "commit" {
 		if len(call.args) != 0 {
 			push_error(emitter, "commit expects no arguments")
@@ -1052,6 +1082,47 @@ emit_role_dispatch :: proc(
 		0,
 	)
 	return destination, true
+}
+
+// Lowers `raise code, message, value` to a Raise instruction. The VM aborts
+// the task with the resulting error value.
+@(private)
+emit_raise :: proc(emitter: ^Emitter, raise: Raise) -> (int, bool) {
+	if len(raise.parts) == 0 || len(raise.parts) > 3 {
+		push_error(emitter, "raise expects an error code and optional message and value")
+		return -1, false
+	}
+
+	code, code_ok := emit_expr(emitter, raise.parts[0])
+	if !code_ok {
+		return -1, false
+	}
+	message := i32(-1)
+	if len(raise.parts) > 1 {
+		register, has_value := emit_expr(emitter, raise.parts[1])
+		if !has_value {
+			return -1, false
+		}
+		message = i32(register)
+	}
+	value := i32(-1)
+	if len(raise.parts) > 2 {
+		register, has_value := emit_expr(emitter, raise.parts[2])
+		if !has_value {
+			return -1, false
+		}
+		value = i32(register)
+	}
+
+	vm.builder_emit(
+		emitter.builder,
+		.Raise,
+		0,
+		i32(code),
+		message,
+		value,
+	)
+	return -1, false
 }
 
 // Lowers `spawn :verb(role: value, ...) [after millis]` to a Spawn

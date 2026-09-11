@@ -400,6 +400,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			state.status = .Boundary
 			return .Boundary
 
+		case .Raise:
+			state.error = vm_raised_error(state, base, instr)
+			state.status = .Failed
+			return .Failed
+
 		case .Spawn:
 			delay_millis := i64(0)
 			if instr.flags & 1 != 0 {
@@ -428,6 +433,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Dispatch:
 			if !vm_dispatch(state, base, instr) {
+				return .Failed
+			}
+
+		case .Dynamic_Dispatch:
+			if !vm_dynamic_dispatch(state, base, instr) {
 				return .Failed
 			}
 		}
@@ -838,6 +848,29 @@ vm_apply_write :: proc(
 @(private)
 vm_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	program := state.program
+	spec := program.dispatch_specs[instr.b]
+	selector := v.value_symbol(spec.selector)
+	roles := make([]k.Role_Pair, len(spec.roles), context.temp_allocator)
+	for role, index in spec.roles {
+		roles[index] = k.Role_Pair {
+			role  = v.value_symbol(role.role),
+			value = state.registers[base + int(role.register)],
+		}
+	}
+	return vm_dispatch_call(state, base, instr.a, selector, roles)
+}
+
+// Resolves a method for `selector` with `roles` and calls its function in this
+// program. The destination register receives the method's return value.
+@(private)
+vm_dispatch_call :: proc(
+	state: ^VM,
+	base: int,
+	destination: i32,
+	selector: v.Value,
+	roles: []k.Role_Pair,
+) -> bool {
+	program := state.program
 	if state.source == nil {
 		vm_fail(state, "E_NO_SOURCE", "dispatch has no relation source")
 		return false
@@ -848,16 +881,6 @@ vm_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	   program.dispatch_method_program_relation == 0 {
 		vm_fail(state, "E_DISPATCH", "dispatch relations are not configured")
 		return false
-	}
-
-	spec := program.dispatch_specs[instr.b]
-	selector := v.value_symbol(spec.selector)
-	roles := make([]k.Role_Pair, len(spec.roles), context.temp_allocator)
-	for role, index in spec.roles {
-		roles[index] = k.Role_Pair {
-			role  = v.value_symbol(role.role),
-			value = state.registers[base + int(role.register)],
-		}
 	}
 
 	relations := k.Dispatch_Relations {
@@ -908,9 +931,36 @@ vm_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		ip            = callee.code_offset,
 		register_base = callee_base,
 		caller_base   = base,
-		caller_dst    = instr.a,
+		caller_dst    = destination,
 	})
 	return true
+}
+
+@(private)
+vm_dynamic_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	selector := state.registers[base + int(instr.b)]
+	if _, is_symbol := v.value_as_symbol(selector); !is_symbol {
+		vm_fail(state, "E_TYPE", "invoke selector is not a symbol")
+		return false
+	}
+	entries, is_map := v.value_as_map(state.registers[base + int(instr.c)])
+	if !is_map {
+		vm_fail(state, "E_TYPE", "invoke roles are not a map")
+		return false
+	}
+	roles := make([]k.Role_Pair, len(entries), context.temp_allocator)
+	for entry, index in entries {
+		role, is_symbol := v.value_as_symbol(entry.key)
+		if !is_symbol {
+			vm_fail(state, "E_TYPE", "invoke role name is not a symbol")
+			return false
+		}
+		roles[index] = k.Role_Pair {
+			role  = v.value_symbol(role),
+			value = entry.value,
+		}
+	}
+	return vm_dispatch_call(state, base, instr.a, selector, roles)
 }
 
 @(private)
@@ -1035,6 +1085,46 @@ vm_unary :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		state.registers[base + int(instr.a)] = v.value_bool(!boolean)
 	}
 	return true
+}
+
+// Builds the error value for a Raise instruction, mirroring the Rust VM:
+// raising an existing error merges its message and value.
+@(private)
+vm_raised_error :: proc(state: ^VM, base: int, instr: Instruction) -> v.Value {
+	raised := state.registers[base + int(instr.a)]
+
+	has_message := false
+	message: string
+	if instr.b >= 0 {
+		text, is_string := v.value_as_string(state.registers[base + int(instr.b)])
+		if !is_string {
+			vm_fail(state, "E_TYPE", "raise message is not a string")
+			return state.error
+		}
+		message = text
+		has_message = true
+	}
+	has_value := instr.c >= 0
+	value := v.Value(0)
+	if has_value {
+		value = state.registers[base + int(instr.c)]
+	}
+
+	if code, is_code := v.value_as_error_code(raised); is_code {
+		return v.value_error(state.allocator, code, message, has_message, value, has_value)
+	}
+	if existing, is_error := v.value_as_error(raised); is_error {
+		return v.value_error(
+			state.allocator,
+			existing.code,
+			has_message ? message : existing.message,
+			has_message || existing.has_message,
+			has_value ? value : existing.value,
+			has_value || existing.has_value,
+		)
+	}
+	vm_fail(state, "E_TYPE", "raise expects an error code or error value")
+	return state.error
 }
 
 // Records an error and marks the VM failed. Available to builtins.

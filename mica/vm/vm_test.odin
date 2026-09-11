@@ -687,3 +687,45 @@ test_vm_commit_boundary_resumes :: proc(t: ^testing.T) {
 	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
 	testing.expect_value(t, state.result, must_int(7))
 }
+
+@(test)
+test_vm_raise_aborts_with_error :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	code := i32(builder_add_constant(
+		&builder,
+		v.value_error_code(v.symbol_intern("E_RANGE")),
+	))
+	message := i32(builder_add_constant(
+		&builder,
+		v.value_string(alloc, "out of range"),
+	))
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 3, true)
+	builder_emit(&builder, .Load_Const, 0, 0, code, 0)
+	builder_emit(&builder, .Load_Const, 0, 1, message, 0)
+	builder_emit(&builder, .Raise, 0, 0, 1, -1)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Failed)
+	error, error_ok := v.value_as_error(state.error)
+	testing.expect(t, error_ok)
+	code_name, code_ok := v.symbol_name(error.code)
+	testing.expect(t, code_ok)
+	testing.expect_value(t, code_name, "E_RANGE")
+	testing.expect_value(t, error.message, "out of range")
+}
