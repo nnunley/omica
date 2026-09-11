@@ -244,6 +244,48 @@ test_emit_assert_relation :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_emit_retract_where_with_local :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	metadata := k.relation_metadata(k.Relation_ID(1), v.symbol_intern("Pair"), 2)
+	snapshot, err := k.kernel_create_relation(&kernel, metadata)
+	testing.expect_value(t, err, k.Kernel_Error.None)
+	k.snapshot_release(snapshot)
+
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	ctx.relations["Pair"] = 1
+
+	source := "verb drop(x)\n  retract Pair(x, _)\nend\nassert Pair(1, 2)\nassert Pair(3, 4)\ndrop(1)"
+	program := compile_test_program(t, source, &ctx, allocator)
+	tx := k.kernel_begin(&kernel)
+	source_relation := k.Relation_Source{transaction = &tx, use_stored_derived = true}
+
+	state: vm.VM
+	vm.vm_init(&state, program, allocator)
+	defer vm.vm_destroy(&state)
+	vm.vm_set_workspace(&state, &source_relation, &tx)
+	testing.expect_value(t, vm.vm_run(&state), vm.VM_Status.Halted)
+
+	committed, commit_err := k.transaction_commit(&tx)
+	testing.expect_value(t, commit_err, k.Kernel_Error.None)
+	k.snapshot_release(committed)
+	k.transaction_destroy(&tx)
+
+	rows := make([dynamic]v.Tuple)
+	k.kernel_scan_into(&kernel, k.Relation_ID(1), []v.Binding{{}, {}}, &rows)
+	testing.expect_value(t, len(rows), 1)
+	delete(rows)
+}
+
+@(test)
 test_emit_short_circuit :: proc(t: ^testing.T) {
 	arena := emit_test_arena()
 	defer emit_test_arena_destroy(arena)

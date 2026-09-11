@@ -286,7 +286,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 
 		case .Retract_Where:
-			if !vm_retract_where(state, instr) {
+			if !vm_retract_where(state, base, instr) {
 				return .Failed
 			}
 
@@ -632,7 +632,7 @@ vm_apply_write :: proc(
 }
 
 @(private)
-vm_retract_where :: proc(state: ^VM, instr: Instruction) -> bool {
+vm_retract_where :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	if state.transaction == nil {
 		vm_fail(state, "E_NO_TRANSACTION", "relation write has no transaction")
 		return false
@@ -640,7 +640,7 @@ vm_retract_where :: proc(state: ^VM, instr: Instruction) -> bool {
 	pattern := state.program.patterns[instr.b]
 	rows: [dynamic]v.Tuple
 	defer delete(rows)
-	if !vm_scan_rows(state, 0, pattern, &rows) {
+	if !vm_scan_rows(state, base, pattern, &rows) {
 		return false
 	}
 	for row in rows {

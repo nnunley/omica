@@ -127,7 +127,7 @@ run_files :: proc(
 	tx := k.kernel_begin(kernel)
 	defer k.transaction_destroy(&tx)
 	source := k.Relation_Source {
-		snapshot           = kernel.current,
+		transaction        = &tx,
 		use_stored_derived = true,
 	}
 
@@ -160,7 +160,7 @@ run_files :: proc(
 			k.snapshot_release(committed)
 			k.transaction_destroy(&tx)
 			tx = k.kernel_begin(kernel)
-			source.snapshot = kernel.current
+			source.transaction = &tx
 			state.request = .None
 
 		case .Failed:

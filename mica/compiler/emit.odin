@@ -1243,6 +1243,19 @@ emit_relation_write :: proc(
 		return -1, false
 	}
 
+	if !assert_write {
+		has_wildcard := false
+		for argument in call.args {
+			if _, is_wildcard := argument.expr^.(Wildcard); is_wildcard {
+				has_wildcard = true
+				break
+			}
+		}
+		if has_wildcard {
+			return emit_retract_where(emitter, relation, call)
+		}
+	}
+
 	heading := make([]v.Symbol, len(call.args), emitter.allocator)
 	for index in 0 ..< len(heading) {
 		builder: strings.Builder
@@ -1280,6 +1293,39 @@ emit_relation_write :: proc(
 	op: vm.Op = assert_write ? .Assert : .Retract
 	vm.builder_emit(emitter.builder, op, 0, i32(relation), i32(row_register), 0)
 	return row_register, true
+}
+
+@(private)
+emit_retract_where :: proc(
+	emitter: ^Emitter,
+	relation: u32,
+	call: Call,
+) -> (int, bool) {
+	column_names := make([]v.Symbol, len(call.args), context.temp_allocator)
+	cells := make([]vm.Pattern_Cell, len(call.args), context.temp_allocator)
+	for argument, index in call.args {
+		column_names[index] = v.symbol_intern(generated_column(index, emitter.allocator))
+		if _, is_wildcard := argument.expr^.(Wildcard); is_wildcard {
+			cells[index] = vm.Pattern_Cell{kind = .Wildcard}
+			continue
+		}
+		register, has_value := emit_expr(emitter, argument.expr)
+		if !has_value {
+			return -1, false
+		}
+		cells[index] = vm.Pattern_Cell{kind = .Bind, operand = i32(register)}
+	}
+	pattern := vm.builder_add_pattern(emitter.builder, relation, column_names, cells)
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Retract_Where,
+		0,
+		i32(destination),
+		pattern,
+		0,
+	)
+	return destination, true
 }
 
 // --- Shared helpers --------------------------------------------------------
