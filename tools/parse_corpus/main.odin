@@ -4,8 +4,8 @@
 //
 //	odin run tools/parse_corpus -- [corpus-directory]
 //
-// The default directory is ../mica/apps. The report lists per-file errors with
-// the offending source line and a summary of diagnostic messages, which is the
+// The default directory is apps. The report lists per-file errors with the
+// offending source line and a summary of diagnostic messages, which is the
 // working gap list for the parser.
 package main
 
@@ -30,7 +30,7 @@ Error_Group :: struct {
 }
 
 main :: proc() {
-	corpus := "../mica/apps"
+	corpus := "apps"
 	if len(os.args) > 1 {
 		corpus = os.args[1]
 	}

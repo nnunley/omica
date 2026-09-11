@@ -1,0 +1,243 @@
+// Retrieval-backed inspector panel for the browser MUD view.
+
+make_identity(:ui/retrieval_action)
+make_identity(:retrieval/mud_world)
+
+make_functional_relation(:session/RetrievalPlan, 2, [0], :volatile)
+
+assert Delegates(#ui/retrieval_action, #ui/sync_action, 0)
+"mud_retrieve_related".ui/syncAction = #ui/retrieval_action
+
+grant role #player
+  read:
+    :session/RetrievalPlan
+  write:
+    :session/RetrievalPlan
+end
+
+grant role #player
+  invoke:
+    :ui/retrieval_model
+    :ui/retrieval_index
+    :ui/retrieval_seed_world
+    :ui/retrieval_text
+    :ui/icon_label_node
+    :ui/retrieval_action_node
+    :ui/retrieval_result_row_node
+    :ui/retrieval_panel_node
+    :ui/retrieval_query_selected
+    :retrieval/question_value
+    :retrieval/plan_value
+    :retrieval/context_value
+    :retrieval/answer_value
+    :answer_refresh_status
+    :retrieve_context
+    :answer_question
+    :index_text_unit
+    :ensure_subject_embedding
+    :retrieval/index_entry_status
+    :retrieval/text_unit_status
+end
+
+grant role #player
+  read:
+    :TextUnit
+    :TextUnitText
+    :CanRetrieveSubject
+    :Embedding
+    :EmbeddingOf
+    :EmbeddingVector
+    :EmbeddingModel
+    :EmbeddingSourceText
+    :EmbeddingStatus
+    :VectorIndex
+    :VectorIndexContains
+    :VectorIndexMetric
+    :NearestEmbedding
+    :IndexEntryEmbedding
+    :IndexEntrySourceText
+    :IndexEntryStatus
+    :EmbeddingRefreshNeeded
+    :Question
+    :QuestionText
+    :AskedBy
+    :RetrievalPlan
+    :PlanForQuestion
+    :PlanKind
+    :PlanModel
+    :RetrievedContext
+    :ContextForPlan
+    :ContextSubject
+    :ContextScore
+    :ContextReason
+    :ContextSnapshotVersion
+    :Answer
+    :AnswerForQuestion
+    :AnswerText
+    :AnswerPromptText
+    :AnswerContextText
+    :AnswerStatus
+    :AnswerCitation
+    :AnswerCitationText
+    :AnswerNeedsReview
+    :AnswerRefreshNeeded
+end
+
+grant role #player
+  write:
+    :TextUnit
+    :TextUnitText
+    :Embedding
+    :EmbeddingOf
+    :EmbeddingVector
+    :EmbeddingModel
+    :EmbeddingSourceText
+    :EmbeddingStatus
+    :VectorIndex
+    :VectorIndexContains
+    :VectorIndexMetric
+    :IndexEntryEmbedding
+    :IndexEntrySourceText
+    :IndexEntryStatus
+    :EmbeddingRefreshNeeded
+    :Question
+    :QuestionText
+    :AskedBy
+    :RetrievalPlan
+    :PlanForQuestion
+    :PlanKind
+    :PlanModel
+    :RetrievedContext
+    :ContextForPlan
+    :ContextSubject
+    :ContextScore
+    :ContextReason
+    :ContextSnapshotVersion
+    :Answer
+    :AnswerForQuestion
+    :AnswerText
+    :AnswerPromptText
+    :AnswerContextText
+    :AnswerStatus
+    :AnswerCitation
+    :AnswerCitationText
+    :AnswerNeedsReview
+    :AnswerRefreshNeeded
+end
+
+CanRetrieveSubject(actor, subject) :-
+  CanSee(actor, subject)
+
+verb ui/retrieval_model()
+  return "mud-world"
+end
+
+verb ui/retrieval_index()
+  return #retrieval/mud_world
+end
+
+verb ui/retrieval_text(entity)
+  let text = ui/actor_name(entity)
+  let descriptions = Description(entity, ?description)
+  if descriptions
+    let exactly {:description -> description} = descriptions
+    text = string_concat(text, string_concat(": ", description))
+  end
+  return text
+end
+
+verb ui/retrieval_seed_world(actor @ #player)
+  let index = ui/retrieval_index()
+  let model = ui/retrieval_model()
+  assert VectorIndex(index)
+  index.vectorIndexMetric = "cosine"
+
+  let entities = [#alice, #bob, #coin, #box, #red_button, #first_room, #north_room, #attic]
+  for entity in entities
+    assert TextUnit(entity)
+    entity.textUnitText = ui/retrieval_text(entity)
+    index_text_unit(actor, index, entity, model)
+  end
+  return true
+end
+
+verb ui/retrieval_query_selected(actor @ #player, endpoint, selected)
+  ui/retrieval_seed_world(actor)
+  let retrieval = retrieve_context(actor, ui/retrieval_index(), ui/retrieval_text(selected), 5, ui/retrieval_model())
+  endpoint().session/retrievalPlan = retrieval[:plan]
+  endpoint.session/retrievalPlan = retrieval[:plan]
+  return retrieval[:plan]
+end
+
+verb ui/retrieval_action_node()
+  return dom <form class="mud-action retrieval-action" data-sync-event="submit" data-sync-action="mud_retrieve_related">
+    <button class="mini-button retrieval-button" type="submit">{ui/icon_label_node("search", "Related context")}</button>
+  </form>
+end
+
+verb ui/retrieval_result_row_node(actor @ #player, subject, score, status @ #string)
+  let inspect = ui/entity_action_node(string_concat("related-", to_literal(subject)), subject, string_concat("look ", ui/actor_name(subject)), ui/actor_name(subject), "entity-button related-link")
+  return dom <li data-sync-key={to_literal(subject)} class="retrieval-row">
+    {inspect}
+    <div class="retrieval-meta">
+      <span class={string_concat("retrieval-status retrieval-status-", status)}>{status}</span>
+      <span class="retrieval-score">{to_literal(score)}</span>
+    </div>
+  </li>
+end
+
+verb ui/retrieval_panel_node(actor @ #player, selected)
+  let children = [dom <div class="retrieval-toolbar">{ui/retrieval_action_node()}</div>]
+  let plans = session/RetrievalPlan(endpoint(), ?plan)
+  if not plans
+    children = [@children, dom <p class="muted">Run retrieval to see related rooms, people, and objects.</p>]
+    return dom <section class="panel retrieval-panel">
+      <h3>Related context</h3>
+      {@children}
+    </section>
+  end
+  let exactly {:plan -> plan} = plans
+
+  let items = []
+  for found in ContextForPlan(?context, plan)
+    let context = found[:context]
+    let subject = context.contextSubject
+    if subject != selected && CanSee(actor, subject)
+      let score = context.contextScore
+      let exactly {:status -> status} = IndexEntryStatus(ui/retrieval_index(), subject, ui/retrieval_model(), ?status)
+      if status == none
+        status = "unknown"
+      end
+      items = [@items, ui/retrieval_result_row_node(actor, subject, score, status)]
+    end
+  end
+
+  if items == []
+    children = [@children, dom <p class="muted">No related context found yet.</p>]
+  else
+    children = [@children, dom <ul class="retrieval-results">{@items}</ul>]
+  end
+  return dom <section class="panel retrieval-panel">
+    <h3>Related context</h3>
+    {@children}
+  </section>
+end
+
+verb ui/handle_sync_action(source @ #ui/retrieval_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || event != "submit"
+    return false
+  end
+
+  let current = ui/current_actor()
+  let selections = session/Inspect(endpoint, ?selected)
+  if current == none || not selections
+    return false
+  end
+  let exactly {:selected -> selected} = selections
+  if CanSee(current, selected) == false
+    return false
+  end
+
+  ui/retrieval_query_selected(current, endpoint, selected)
+  return true
+end

@@ -1,0 +1,816 @@
+// Programmer-facing Mica reflection inspector for the server-owned MUD view.
+
+make_functional_relation(:ui/MicaInspect, 2, [0])
+make_functional_relation(:ui/MicaInspectBack, 2, [0])
+make_functional_relation(:ui/MicaInspectLayout, 2, [0])
+make_functional_relation(:ui/MicaMethodMode, 2, [0])
+make_functional_relation(:ui/MicaMethodLimit, 2, [0])
+make_functional_relation(:ui/MicaBrowserQuery, 2, [0])
+make_relation(:ui/MicaPrototype, 2)
+
+make_identity(:ui/mica_inspect_action)
+make_identity(:ui/mica_inspect_close_action)
+make_identity(:ui/mica_inspect_back_action)
+make_identity(:ui/mica_inspect_layout_action)
+make_identity(:ui/mica_method_mode_action)
+make_identity(:ui/mica_method_limit_action)
+make_identity(:ui/mica_browser_search_action)
+
+assert Delegates(#ui/mica_inspect_action, #ui/sync_action, 0)
+assert Delegates(#ui/mica_inspect_close_action, #ui/sync_action, 0)
+assert Delegates(#ui/mica_inspect_back_action, #ui/sync_action, 0)
+assert Delegates(#ui/mica_inspect_layout_action, #ui/sync_action, 0)
+assert Delegates(#ui/mica_method_mode_action, #ui/sync_action, 0)
+assert Delegates(#ui/mica_method_limit_action, #ui/sync_action, 0)
+assert Delegates(#ui/mica_browser_search_action, #ui/sync_action, 0)
+"mud_mica_inspect".ui/syncAction = #ui/mica_inspect_action
+"mud_mica_inspect_close".ui/syncAction = #ui/mica_inspect_close_action
+"mud_mica_inspect_back".ui/syncAction = #ui/mica_inspect_back_action
+"mud_mica_inspect_layout".ui/syncAction = #ui/mica_inspect_layout_action
+"mud_mica_method_mode".ui/syncAction = #ui/mica_method_mode_action
+"mud_mica_method_limit".ui/syncAction = #ui/mica_method_limit_action
+"mud_mica_browser_search".ui/syncAction = #ui/mica_browser_search_action
+
+grant role #player
+  invoke:
+    :ui/can_program
+    :ui/try_mica_inspect_command
+end
+
+grant role #programmer
+  read:
+    :ui/MicaInspect
+    :ui/MicaInspectBack
+    :ui/MicaInspectLayout
+    :ui/MicaMethodMode
+    :ui/MicaMethodLimit
+    :ui/MicaBrowserQuery
+    :ui/MicaPrototype
+    :Relation
+    :RelationName
+    :Arity
+    :ArgumentName
+    :ConflictPolicy
+    :FunctionalKey
+    :Index
+    :IndexPosition
+    :IndexStorageKind
+    :Rule
+    :RuleHead
+    :RuleSource
+    :ActiveRule
+    :SubjectFact
+    :MentionedFact
+    :ExtensionalMentionedFact
+    :MethodSelector
+    :Param
+    :MethodSource
+    :MethodProgram
+    :CanRead
+    :CanWrite
+    :CanInvoke
+    :CanEffect
+    :RoleCanRead
+    :RoleCanWrite
+    :RoleCanInvoke
+    :RoleCanEffect
+  write:
+    :ui/MicaInspect
+    :ui/MicaInspectBack
+    :ui/MicaInspectLayout
+    :ui/MicaMethodMode
+    :ui/MicaMethodLimit
+    :ui/MicaBrowserQuery
+  invoke:
+    :ui/mica_inspect_selected
+    :ui/mica_inspect_expanded
+    :ui/icon_node
+    :ui/icon_label_node
+    :ui/mica_inspect_action_node
+    :ui/mica_inspect_entity_node
+    :ui/mica_method_mode_node
+    :ui/mica_method_limit_node
+    :ui/mica_inspect_layout_node
+    :ui/mica_inspect_close_node
+    :ui/mica_inspect_back_node
+    :ui/mica_inspect_panel_node
+    :ui/mica_section_node
+    :ui/mica_empty_node
+    :ui/mica_can_link
+    :ui/mica_value_node
+    :ui/mica_tuple_node
+    :ui/relation_label
+    :ui/mica_fact_row_node
+    :ui/mica_subject_facts_node
+    :ui/mica_mentioned_facts_node
+    :ui/mica_delegates_header_node
+    :ui/mica_method_source_excerpt
+    :ui/mica_method_source_full
+    :ui/mica_method_row_node
+    :ui/mica_method_catalog_node
+    :ui/mica_browser_panel_node
+    :ui/mica_browser_results_node
+    :ui/mica_browser_relation_row_node
+    :ui/mica_browser_method_row_node
+    :ui/mica_browser_rule_row_node
+    :ui/mica_inspect_set_selected
+end
+
+ui/MicaPrototype(obj, proto) :-
+  Delegates(obj, proto, ?distance)
+
+ui/MicaPrototype(obj, ancestor) :-
+  Delegates(obj, proto, ?distance),
+  ui/MicaPrototype(proto, ancestor)
+
+verb ui/mica_inspect_selected()
+  let selections = ui/MicaInspect(endpoint(), ?selected)
+  if not selections
+    return none
+  end
+  let exactly {:selected -> selected} = selections
+  return selected
+end
+
+verb ui/mica_inspect_expanded()
+  return ui/MicaInspectLayout(endpoint(), "expanded")
+end
+
+verb ui/mica_inspect_action_node(entity, label, class)
+  return dom <form class="mud-action mica-inspect-action" data-sync-event="submit" data-sync-action="mud_mica_inspect">
+    <input type="hidden" name="entity" value={to_literal(entity)} />
+    <button type="submit" class={class} data-entity={to_literal(entity)}>{label}</button>
+  </form>
+end
+
+verb ui/mica_inspect_close_node()
+  return dom <form class="mud-action mica-close-action" data-sync-event="submit" data-sync-action="mud_mica_inspect_close">
+    <button type="submit" class="mini-button mica-close">{ui/icon_label_node("x", "Close")}</button>
+  </form>
+end
+
+verb ui/mica_inspect_back_node(previous)
+  return dom <form class="mud-action mica-back-action" data-sync-event="submit" data-sync-action="mud_mica_inspect_back">
+    <button type="submit" class="mini-button">{ui/icon_label_node("arrow-left", string_concat("Back to ", ui/actor_name(previous)))}</button>
+  </form>
+end
+
+verb ui/mica_inspect_layout_node(mode, label)
+  let icon = "maximize"
+  if mode == "normal"
+    icon = "minimize"
+  end
+
+  return dom <form class="mud-action mica-layout-action" data-sync-event="submit" data-sync-action="mud_mica_inspect_layout">
+    <input type="hidden" name="mode" value={mode} />
+    <button type="submit" class="mini-button mica-layout-toggle">{ui/icon_label_node(icon, label)}</button>
+  </form>
+end
+
+verb ui/mica_method_mode_node(mode, label, selected)
+  let class = "mini-button method-filter"
+  if mode == selected
+    class = "mini-button method-filter active"
+  end
+
+  return dom <form class="mud-action method-filter-action" data-sync-event="submit" data-sync-action="mud_mica_method_mode">
+    <input type="hidden" name="mode" value={mode} />
+    <button type="submit" class={class}>{label}</button>
+  </form>
+end
+
+verb ui/mica_method_limit_node(mode, label)
+  return dom <form class="mud-action method-limit-action" data-sync-event="submit" data-sync-action="mud_mica_method_limit">
+    <input type="hidden" name="mode" value={mode} />
+    <button type="submit" class="mini-button">{label}</button>
+  </form>
+end
+
+verb ui/relation_label(relation)
+  let names = RelationName(relation, ?name)
+  if not names
+    return to_literal(relation)
+  end
+  let exactly {:name -> name} = names
+
+  return to_literal(name)
+end
+
+verb ui/mica_empty_node(text)
+  return dom <p class="muted mica-empty">{text}</p>
+end
+
+verb ui/mica_section_node(title, children)
+  return dom <section class="mica-section">
+    <h3>{title}</h3>
+    <div class="mica-section-body">{@children}</div>
+  </section>
+end
+
+verb ui/mica_can_link(value)
+  if string_starts_with(to_literal(value), "#") == false
+    return false
+  end
+
+  if Name(value, ?name)
+    return true
+  elseif RelationName(value, ?relation_name)
+    return true
+  elseif Delegates(value, ?delegate, ?distance)
+    return true
+  elseif MethodSelector(value, ?selector)
+    return true
+  elseif RuleSource(value, ?rule_source)
+    return true
+  end
+
+  for found in Param(?method_id, ?role, value, ?position)
+    return true
+  end
+
+  return false
+end
+
+verb ui/mica_inspect_entity_node(value, class)
+  let label = to_literal(value)
+  let names = Name(value, ?name)
+  if names
+    let exactly {:name -> name} = names
+    label = name
+  else
+    let relation_names = RelationName(value, ?relation_name)
+    if relation_names
+      let exactly {:relation_name -> relation_name} = relation_names
+      label = to_literal(relation_name)
+    end
+  end
+  return dom <form class="mud-action mica-identity-action" data-sync-event="submit" data-sync-action="mud_mica_inspect">
+    <input type="hidden" name="entity" value={to_literal(value)} />
+    <button type="submit" class={class} data-entity={to_literal(value)}>{label}</button>
+  </form>
+end
+
+verb ui/mica_value_node(value)
+  if ui/mica_can_link(value)
+    return ui/mica_inspect_entity_node(value, "mica-identity-link")
+  end
+
+  return dom <code>{to_literal(value)}</code>
+end
+
+verb ui/mica_tuple_node(tuple)
+  let children = ["["]
+  let first = true
+  for value in tuple
+    if first
+      first = false
+    else
+      children = [@children, ", "]
+    end
+    children = [@children, ui/mica_value_node(value)]
+  end
+  children = [@children, "]"]
+  return dom <div class="mica-tuple">{@children}</div>
+end
+
+verb ui/mica_fact_row_node(relation, position, tuple)
+  let heading = dom <summary class="mica-row-summary">
+    <code class="mica-row-title">{string_concat(ui/relation_label(relation), string_concat(" @ ", to_literal(position)))}</code>
+    <code class="mica-row-preview">{to_literal(tuple)}</code>
+  </summary>
+  let body = dom <div class="mica-row-body">
+    <div class="mica-relation">{ui/mica_inspect_entity_node(relation, "mica-relation-link")}<code>{string_concat(" @ ", to_literal(position))}</code></div>
+    {ui/mica_tuple_node(tuple)}
+  </div>
+  return dom <details class="mica-row">{heading}{body}</details>
+end
+
+verb ui/mica_subject_facts_node(entity)
+  let rows = []
+  let count = 0
+  for found in SubjectFact(entity, ?relation, ?tuple)
+    if count < 12
+      rows = [@rows, ui/mica_fact_row_node(found[:relation], 0, found[:tuple])]
+    end
+    count = count + 1
+  end
+
+  if rows == []
+    rows = [ui/mica_empty_node("No subject-position facts are visible.")]
+  end
+  if count > 12
+    rows = [@rows, ui/mica_empty_node(string_concat("Showing 12 of ", to_literal(count)))]
+  end
+
+  return ui/mica_section_node("Subject facts", rows)
+end
+
+verb ui/mica_mentioned_facts_node(entity)
+  let rows = []
+  let count = 0
+  for found in MentionedFact(entity, ?relation, ?position, ?tuple)
+    if count < 16
+      rows = [@rows, ui/mica_fact_row_node(found[:relation], found[:position], found[:tuple])]
+    end
+    count = count + 1
+  end
+
+  if rows == []
+    rows = [ui/mica_empty_node("No relation mentions are visible.")]
+  end
+  if count > 16
+    rows = [@rows, ui/mica_empty_node(string_concat("Showing 16 of ", to_literal(count)))]
+  end
+
+  return ui/mica_section_node("Relation mentions", rows)
+end
+
+verb ui/mica_delegates_header_node(entity)
+  let chips = []
+  for found in Delegates(entity, ?delegate, ?distance)
+    chips = [@chips, dom <span class="mica-delegate-chip">{ui/mica_value_node(found[:delegate])}{string_concat(" (", string_concat(to_literal(found[:distance]), ")"))}</span>]
+  end
+
+  if chips == []
+    return dom <div class="mica-delegates muted">No direct delegates visible</div>
+  end
+
+  return dom <div class="mica-delegates">
+    <span class="mica-delegates-label">Delegates</span>
+    <div class="mica-delegate-list">{@chips}</div>
+  </div>
+end
+
+verb ui/mica_method_source_excerpt(method_id)
+  let exactly {:source -> source} = MethodSource(method_id, ?source)
+  if source == none
+    return ""
+  end
+  if string_len(source) > 180
+    return string_concat(string_slice(source, 0, 180), " ...")
+  end
+
+  return source
+end
+
+verb ui/mica_method_source_full(method_id)
+  let exactly {:source -> source} = MethodSource(method_id, ?source)
+  if source == none
+    return ""
+  end
+
+  return source
+end
+
+verb ui/mica_method_row_node(method_id, selector, role, restriction, position)
+  let meta = string_concat(to_literal(role), string_concat(" @ ", to_literal(position)))
+  let label = dom <div class="mica-method-label"><code>{to_literal(selector)}</code> via {ui/mica_value_node(restriction)}</div>
+  let method_key = to_literal(method_id)
+  let method_title = string_concat("Method ", to_literal(selector))
+  let summary = dom <summary class="mica-method-head">
+    <span class="mica-method-title">{label}<span class="muted">{meta}</span></span>
+  </summary>
+  return dom <details class="mica-method-row source-host">
+    {summary}
+    <button type="button" class="mini-button source-popout mica-source-open" data-source-key={method_key} data-source-title={method_title}>{ui/icon_label_node("open", "Open source")}</button>
+    <pre class="mica-source">{ui/mica_method_source_excerpt(method_id)}</pre>
+    <pre class="mica-source-full" hidden="hidden" data-source-key={method_key}>{ui/mica_method_source_full(method_id)}</pre>
+  </details>
+end
+
+verb ui/mica_browser_relation_row_node(relation)
+  let exactly {:arity -> arity} = Arity(relation, ?arity)
+  if arity == none
+    arity = "?"
+  end
+  return dom <li class="mica-browser-row">
+    {ui/mica_inspect_entity_node(relation, "mica-relation-link")}
+    <span class="muted">{string_concat("arity ", to_literal(arity))}</span>
+  </li>
+end
+
+verb ui/mica_browser_method_row_node(method_id, selector)
+  let method_key = to_literal(method_id)
+  let method_title = string_concat("Method ", to_literal(selector))
+  return dom <li class="mica-browser-row source-host">
+    {ui/mica_inspect_entity_node(method_id, "mica-relation-link")}
+    <code>{to_literal(selector)}</code>
+    <button type="button" class="mini-button source-popout browser-source-open" data-source-key={method_key} data-source-title={method_title}>{ui/icon_label_node("open", "Open source")}</button>
+    <pre class="mica-source-full" hidden="hidden" data-source-key={method_key}>{ui/mica_method_source_full(method_id)}</pre>
+  </li>
+end
+
+verb ui/mica_browser_rule_row_node(rule, source)
+  let rule_key = to_literal(rule)
+  let title = string_concat("Rule ", to_literal(rule))
+  let preview = source
+  if string_len(preview) > 96
+    preview = string_concat(string_slice(preview, 0, 96), " ...")
+  end
+  return dom <li class="mica-browser-row source-host">
+    {ui/mica_inspect_entity_node(rule, "mica-relation-link")}
+    <code>{preview}</code>
+    <button type="button" class="mini-button source-popout browser-source-open" data-source-key={rule_key} data-source-title={title}>{ui/icon_label_node("open", "Open source")}</button>
+    <pre class="mica-source-full" hidden="hidden" data-source-key={rule_key}>{source}</pre>
+  </li>
+end
+
+verb ui/mica_browser_results_node(query)
+  let trimmed = trim(query)
+  if trimmed == ""
+    return dom <p class="muted mica-empty">Search relation names, method selectors, and rule source.</p>
+  end
+
+  let needle = lower(trimmed)
+  let relation_rows = []
+  let relation_count = 0
+  for found in RelationName(?relation, ?name)
+    if string_contains(lower(to_literal(found[:name])), needle)
+      if relation_count < 8
+        relation_rows = [@relation_rows, ui/mica_browser_relation_row_node(found[:relation])]
+      end
+      relation_count = relation_count + 1
+    end
+  end
+
+  let method_rows = []
+  let method_count = 0
+  for found in MethodSelector(?method_id, ?selector)
+    let selector_text = to_literal(found[:selector])
+    let exactly {:source -> source} = MethodSource(found[:method_id], ?source)
+    let source_matches = false
+    if source != none
+      source_matches = string_contains(lower(source), needle)
+    end
+    if string_contains(lower(selector_text), needle) || source_matches
+      if method_count < 8
+        method_rows = [@method_rows, ui/mica_browser_method_row_node(found[:method_id], found[:selector])]
+      end
+      method_count = method_count + 1
+    end
+  end
+
+  let rule_rows = []
+  let rule_count = 0
+  for found in RuleSource(?rule, ?source)
+    if string_contains(lower(found[:source]), needle) || string_contains(lower(to_literal(found[:rule])), needle)
+      if rule_count < 8
+        rule_rows = [@rule_rows, ui/mica_browser_rule_row_node(found[:rule], found[:source])]
+      end
+      rule_count = rule_count + 1
+    end
+  end
+
+  if relation_rows == []
+    relation_rows = [dom <li class="muted">No relations.</li>]
+  end
+  if method_rows == []
+    method_rows = [dom <li class="muted">No methods.</li>]
+  end
+  if rule_rows == []
+    rule_rows = [dom <li class="muted">No rules.</li>]
+  end
+
+  let relation_label = string_concat("Relations", string_concat(" (", string_concat(to_literal(relation_count), ")")))
+  let method_label = string_concat("Methods", string_concat(" (", string_concat(to_literal(method_count), ")")))
+  let rule_label = string_concat("Rules", string_concat(" (", string_concat(to_literal(rule_count), ")")))
+
+  return dom <div class="mica-browser-results">
+    <section>
+      <h4>{relation_label}</h4>
+      <ul class="mica-browser-list">{@relation_rows}</ul>
+    </section>
+    <section>
+      <h4>{method_label}</h4>
+      <ul class="mica-browser-list">{@method_rows}</ul>
+    </section>
+    <section>
+      <h4>{rule_label}</h4>
+      <ul class="mica-browser-list">{@rule_rows}</ul>
+    </section>
+  </div>
+end
+
+verb ui/mica_browser_panel_node(actor @ #player)
+  if ui/can_program(actor) == false
+    return dom <span></span>
+  end
+
+  let query = ""
+  let queries = ui/MicaBrowserQuery(endpoint(), ?query)
+  if queries
+    let exactly {:query -> configured_query} = queries
+    query = configured_query
+  end
+
+  return dom <details class="mica-browser-panel tool-sheet" aria-label="Mica browser">
+    <summary>{ui/icon_label_node("search", "Mica browser")}</summary>
+    <div class="tool-window mica-browser-window" data-window-key="mica-browser">
+      <div class="window-titlebar" data-window-drag="mica-browser">
+        <strong>Mica browser</strong>
+        <button type="button" class="window-close" data-close-details="mica-browser" aria-label="Close Mica browser">{ui/icon_label_node("x", "Close")}</button>
+      </div>
+      <div class="window-body">
+        <form class="mica-browser-form" data-sync-event="submit" data-sync-action="mud_mica_browser_search" data-sync-reset="false">
+          <input name="query" value={query} autocomplete="off" placeholder="relation, verb, rule" aria-label="Mica browser search" data-sync-event="input" data-sync-action="mud_mica_browser_search" data-sync-debounce="180" />
+          <button type="submit" class="mini-button">{ui/icon_label_node("search", "Search")}</button>
+        </form>
+        {ui/mica_browser_results_node(query)}
+      </div>
+      <div class="window-resize-handle" data-window-resize="mica-browser" aria-hidden="true"></div>
+    </div>
+  </details>
+end
+
+verb ui/mica_method_catalog_node(entity)
+  let rows = []
+  let count = 0
+  let row_limit = 8
+  let limit_mode = "direct"
+  if ui/MicaMethodLimit(endpoint(), "all")
+    limit_mode = "all"
+    row_limit = 9999
+  end
+  let mode = "all"
+  let modes = ui/MicaMethodMode(endpoint(), ?mode)
+  if modes
+    let exactly {:mode -> configured_mode} = modes
+    mode = configured_mode
+  end
+  let controls = dom <div class="method-filters" aria-label="Method catalogue filter">
+    {ui/mica_method_mode_node("all", "All", mode)}
+    {ui/mica_method_mode_node("direct", "Direct", mode)}
+    {ui/mica_method_mode_node("inherited", "Inherited", mode)}
+  </div>
+  if mode != "inherited"
+    for found in Param(?m, ?role, entity, ?position)
+      let method_id = found[:m]
+      let role = found[:role]
+      let position = found[:position]
+      if count < row_limit
+        let exactly {:sel -> selector} = MethodSelector(method_id, ?sel)
+        rows = [@rows, ui/mica_method_row_node(method_id, selector, role, entity, position)]
+      end
+      count = count + 1
+    end
+  end
+  if mode != "direct"
+    for inherited in ui/MicaPrototype(entity, ?prototype)
+      let prototype = inherited[:prototype]
+      for found in Param(?m, ?role, prototype, ?position)
+        let method_id = found[:m]
+        let role = found[:role]
+        let position = found[:position]
+        if count < row_limit
+          let exactly {:sel -> selector} = MethodSelector(method_id, ?sel)
+          rows = [@rows, ui/mica_method_row_node(method_id, selector, role, prototype, position)]
+        end
+        count = count + 1
+      end
+    end
+  end
+
+  if rows == []
+    rows = [ui/mica_empty_node("No method parameter restrictions mention this identity or its delegates.")]
+  end
+  if count > 8
+    let label = string_concat("Show all ", to_literal(count))
+    let mode_value = "all"
+    if limit_mode == "all"
+      label = "Show fewer"
+      mode_value = "compact"
+    else
+      rows = [@rows, ui/mica_empty_node(string_concat("Showing 8 of ", to_literal(count)))]
+    end
+    rows = [@rows, ui/mica_method_limit_node(mode_value, label)]
+  end
+
+  let children = [controls]
+  for row in rows
+    children = [@children, row]
+  end
+  return dom <section class="mica-section mica-method-section">
+    <h3>Method catalogue</h3>
+    <div class="mica-section-body">{@children}</div>
+  </section>
+end
+
+verb ui/mica_inspect_panel_node(actor @ #player)
+  let selected = ui/mica_inspect_selected()
+  if selected == none
+    return dom <section id="mica-inspect" class="panel mica-inspect empty"></section>
+  end
+
+  let title = string_concat(ui/actor_name(selected), string_concat(" ", to_literal(selected)))
+  let layout = ui/mica_inspect_layout_node("expanded", "Expand")
+  if ui/mica_inspect_expanded()
+    layout = ui/mica_inspect_layout_node("normal", "Normal")
+  end
+  let controls = [layout, ui/mica_inspect_close_node()]
+  let previous_values = ui/MicaInspectBack(endpoint(), ?previous)
+  if previous_values
+    let exactly {:previous -> previous} = previous_values
+    controls = [ui/mica_inspect_back_node(previous), layout, ui/mica_inspect_close_node()]
+  end
+  return dom <section id="mica-inspect" class="panel mica-inspect" data-entity={to_literal(selected)}>
+    <div class="mica-inspect-header">
+      <div class="mica-inspect-title">
+        <h2>Mica Inspect</h2>
+        <code>{title}</code>
+        {ui/mica_delegates_header_node(selected)}
+      </div>
+      <div class="mica-inspect-controls">{@controls}</div>
+    </div>
+    <div class="mica-inspect-grid">
+      {ui/mica_subject_facts_node(selected)}
+      {ui/mica_mentioned_facts_node(selected)}
+      {ui/mica_method_catalog_node(selected)}
+    </div>
+  </section>
+end
+
+verb ui/mica_inspect_set_selected(endpoint, selected)
+  let previous_values = ui/MicaInspect(endpoint(), ?previous)
+  if previous_values
+    let exactly {:previous -> previous} = previous_values
+    if previous != selected
+      endpoint().ui/micaInspectBack = previous
+      endpoint.ui/micaInspectBack = previous
+    end
+  end
+  endpoint().ui/micaInspect = selected
+  endpoint.ui/micaInspect = selected
+end
+
+verb ui/try_mica_inspect_command(current @ #player, endpoint, line @ #string)
+  let lowered = lower(line)
+  if string_starts_with(lowered, "mica inspect ") == false || ui/can_program(current) == false
+    return false
+  end
+
+  let selected = command/match_object(current, trim(string_slice(line, 13, string_len(line))))
+  if selected == none
+    return false
+  end
+
+  ui/mica_inspect_set_selected(endpoint, selected)
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/mica_inspect_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || event != "submit"
+    return false
+  end
+
+  let current = ui/current_actor()
+  if current == none || ui/can_program(current) == false || index_or(fields, :entity, none) == none
+    return false
+  end
+
+  let selected_option = ui/entity_from_literal(fields[:entity])
+  if not selected_option
+    return false
+  end
+  let exactly {:value -> selected} = selected_option
+
+  ui/mica_inspect_set_selected(endpoint, selected)
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/mica_inspect_close_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || event != "submit"
+    return false
+  end
+
+  let current = ui/current_actor()
+  if current == none || ui/can_program(current) == false
+    return false
+  end
+
+  retract ui/MicaInspect(endpoint(), _)
+  retract ui/MicaInspect(endpoint, _)
+  retract ui/MicaInspectBack(endpoint(), _)
+  retract ui/MicaInspectBack(endpoint, _)
+  retract ui/MicaInspectLayout(endpoint(), _)
+  retract ui/MicaInspectLayout(endpoint, _)
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/mica_inspect_back_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || event != "submit"
+    return false
+  end
+
+  let current = ui/current_actor()
+  if current == none || ui/can_program(current) == false
+    return false
+  end
+
+  let previous_values = ui/MicaInspectBack(endpoint(), ?previous)
+  if not previous_values
+    return false
+  end
+  let exactly {:previous -> previous} = previous_values
+
+  let selected_values = ui/MicaInspect(endpoint(), ?selected)
+  endpoint().ui/micaInspect = previous
+  endpoint.ui/micaInspect = previous
+  retract ui/MicaInspectBack(endpoint(), _)
+  retract ui/MicaInspectBack(endpoint, _)
+  if selected_values
+    let exactly {:selected -> selected} = selected_values
+    if selected != previous
+      endpoint().ui/micaInspectBack = selected
+      endpoint.ui/micaInspectBack = selected
+    end
+  end
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/mica_inspect_layout_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || event != "submit"
+    return false
+  end
+
+  let current = ui/current_actor()
+  if current == none || ui/can_program(current) == false
+    return false
+  end
+
+  let mode = fields[:mode]
+  if mode != "expanded" && mode != "normal"
+    return false
+  end
+
+  retract ui/MicaInspectLayout(endpoint(), _)
+  retract ui/MicaInspectLayout(endpoint, _)
+  if mode == "expanded"
+    endpoint().ui/micaInspectLayout = mode
+    endpoint.ui/micaInspectLayout = mode
+  end
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/mica_method_mode_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || event != "submit"
+    return false
+  end
+
+  let current = ui/current_actor()
+  if current == none || ui/can_program(current) == false
+    return false
+  end
+
+  let mode = fields[:mode]
+  if mode != "direct" && mode != "inherited" && mode != "all"
+    return false
+  end
+
+  endpoint().ui/micaMethodMode = mode
+  endpoint.ui/micaMethodMode = mode
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/mica_method_limit_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || event != "submit"
+    return false
+  end
+
+  let current = ui/current_actor()
+  if current == none || ui/can_program(current) == false
+    return false
+  end
+
+  let mode = fields[:mode]
+  if mode != "all" && mode != "compact"
+    return false
+  end
+
+  retract ui/MicaMethodLimit(endpoint(), _)
+  retract ui/MicaMethodLimit(endpoint, _)
+  if mode == "all"
+    endpoint().ui/micaMethodLimit = mode
+    endpoint.ui/micaMethodLimit = mode
+  end
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/mica_browser_search_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || (event != "submit" && event != "input")
+    return false
+  end
+
+  let current = ui/current_actor()
+  if current == none || ui/can_program(current) == false
+    return false
+  end
+
+  let query = ui/form_text(fields, :query)
+  retract ui/MicaBrowserQuery(endpoint(), _)
+  retract ui/MicaBrowserQuery(endpoint, _)
+  if query != ""
+    endpoint().ui/micaBrowserQuery = query
+    endpoint.ui/micaBrowserQuery = query
+  end
+  return true
+end

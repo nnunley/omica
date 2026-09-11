@@ -5,13 +5,13 @@ import "core:os"
 import "core:strings"
 import "core:testing"
 
-// Lexes every `.mica` file under the sibling mica corpus when it is present.
-// Set `MICA_CORPUS` to point at a different corpus. The test passes when no
-// corpus is available so the package remains self-contained.
+// Lexes every `.mica` file under the vendored `apps/` corpus. Set
+// `MICA_CORPUS` to point at a different corpus.
 @(test)
 test_lex_corpus :: proc(t: ^testing.T) {
 	corpus := corpus_directory()
 	if corpus == "" {
+		testing.expectf(t, false, "apps corpus directory not found")
 		return
 	}
 
@@ -98,7 +98,7 @@ corpus_directory :: proc() -> string {
 			return configured
 		}
 	}
-	candidates := []string{"../mica/apps", "../../mica/apps", "../../../mica/apps"}
+	candidates := []string{"apps", "../../apps", "../apps", "../../../apps"}
 	for candidate in candidates {
 		if os.is_dir(candidate) {
 			return candidate

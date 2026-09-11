@@ -5,13 +5,13 @@ import "core:os"
 import "core:strings"
 import "core:testing"
 
-// Parses every `.mica` file under the sibling mica corpus when it is present.
-// Set `MICA_CORPUS` to point at a different corpus. The test passes when no
-// corpus is available so the package remains self-contained.
+// Parses every `.mica` file under the vendored `apps/` corpus. Set
+// `MICA_CORPUS` to point at a different corpus.
 @(test)
 test_parse_corpus :: proc(t: ^testing.T) {
 	corpus := corpus_directory()
 	if corpus == "" {
+		testing.expectf(t, false, "apps corpus directory not found")
 		return
 	}
 

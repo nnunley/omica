@@ -1,0 +1,85 @@
+// OpenAI-compatible chat helpers. The daemon routes these host requests through
+// OpenRouter by default using OPENROUTER_API_KEY.
+
+make_identity(:openai/chat)
+
+verb openai/system_message(content @ #string)
+  return {:role -> "system", :content -> content}
+end
+
+verb openai/user_message(content @ #string)
+  return {:role -> "user", :content -> content}
+end
+
+verb openai/assistant_message(content @ #string)
+  return {:role -> "assistant", :content -> content}
+end
+
+verb openai/chat(model @ #string, messages)
+  return openai_chat_completion(model, messages)
+end
+
+verb openai/chat_with_options(model @ #string, messages, options @ #map)
+  return openai_chat_completion_with_options(model, messages, options)
+end
+
+verb openai/assistant_text(response @ #map)
+  let choices = index_or(response, :choices, none)
+  if choices == none || choices == []
+    return none
+  end
+
+  let first = choices[0]
+  if first == none
+    return none
+  end
+
+  let message = index_or(first, :message, none)
+  if message == none
+    return none
+  end
+
+  return index_or(message, :content, none)
+end
+
+verb openai/assistant_text(response)
+  return none
+end
+
+verb openai/assistant_reasoning(response @ #map)
+  let choices = index_or(response, :choices, none)
+  if choices == none || choices == []
+    return none
+  end
+
+  let first = choices[0]
+  if first == none
+    return none
+  end
+
+  let message = index_or(first, :message, none)
+  if message == none
+    return none
+  end
+
+  let reasoning = index_or(message, :reasoning, none)
+  if reasoning != none && reasoning != ""
+    return reasoning
+  end
+
+  reasoning = index_or(message, :reasoning_content, none)
+  if reasoning != none && reasoning != ""
+    return reasoning
+  end
+
+  let reasoning_details = index_or(message, :reasoning_details, none)
+  if reasoning_details != none && reasoning_details != []
+    return to_literal(reasoning_details)
+  end
+
+  return none
+end
+
+verb openai/assistant_reasoning(response)
+  return none
+end

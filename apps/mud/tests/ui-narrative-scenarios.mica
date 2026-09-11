@@ -1,0 +1,183 @@
+// MUD narrative DOM rendering scenarios.
+
+verb test/ui_narrative_renders_recent_event_window()
+  let i = 0
+  while i < 45
+    let text = string_concat("message ", to_literal(i))
+    if i == 0
+      text = "oldest-zero"
+    elseif i == 4
+      text = "oldest-four"
+    elseif i == 5
+      text = "first-kept"
+    elseif i == 44
+      text = "latest-kept"
+    end
+    event/notify(#alice, text)
+    i = i + 1
+  end
+
+  let literal = to_literal(ui/narrative_node(#alice, 100, 40))
+  test/assert_true(string_contains(literal, "45"), "narrative older count")
+  test/assert_true(string_contains(literal, "oldest-zero") == false, "narrative hides oldest zero")
+  test/assert_true(string_contains(literal, "oldest-four") == false, "narrative hides oldest four")
+  test/assert_true(string_contains(literal, "first-kept"), "narrative keeps first visible")
+  test/assert_true(string_contains(literal, "latest-kept"), "narrative keeps latest")
+
+  return true
+end
+
+verb test/ui_narrative_renders_structured_events()
+  event/notify(#alice, "structured notice")
+  let source = test/latest_event_source(#alice)
+  let latest = none
+  let latest_seq = -1
+  for found in event/Delivery(#alice, ?event)
+    let event = found[:event]
+    let seq = event.event/seq
+    if seq > latest_seq
+      latest = event
+      latest_seq = seq
+    end
+  end
+  let literal = to_literal(ui/event_body_node(latest, #alice))
+  test/assert_true(source != none, "notify stores event source")
+  test/assert_equal(event/metadata(source, :label, none), "utility", "notify source label")
+  test/assert_true(string_contains(literal, "event-quote"), "notify DOM quote")
+  test/assert_true(string_contains(literal, "structured notice"), "notify DOM text")
+
+  source = event/scene(#event/take, "transfer", "event-line transfer", "{Actor} {take|takes} {the item}.", {:actor -> #alice, :item -> #coin})
+  literal = to_literal(ui/event_body_for(source, #bob))
+  test/assert_true(string_contains(literal, "actor-entity"), "structured actor entity")
+  test/assert_true(string_contains(literal, "event-entity"), "structured event entity")
+  test/assert_true(string_contains(literal, "coin"), "structured object text")
+  test/assert_true(string_contains(literal, "Alice takes") == false, "structured event avoids flat text")
+
+  source = event/scene_at(event/scene(#event/drop, "transfer", "event-line transfer", "{Actor} {drop|drops} {d} in {l}.", {:actor -> #alice, :dobj -> #coin}), #first_room)
+  literal = to_literal(ui/event_body_for(source, #alice))
+  test/assert_true(string_contains(literal, "actor-entity"), "alias actor entity")
+  test/assert_true(string_contains(literal, "event-entity"), "alias event entity")
+  test/assert_true(string_contains(literal, "coin"), "alias object text")
+  test/assert_true(string_contains(literal, "here"), "alias location text")
+  test/assert_true(string_contains(literal, "You drop") == false, "alias avoids flat text")
+
+  let template = template/from_parts([template/name(:actor, true), " ", template/self_alt("inspect", "inspects"), " ", template/self_alt("yourself", [template/article(:the, :dobj, false)]), "."])
+  source = event/scene_from_template(#event/examine, "examine", "event-line utility", template, {:actor -> #alice, :dobj -> #coin})
+  literal = to_literal(ui/event_body_for(source, #bob))
+  test/assert_true(string_contains(literal, "actor-entity"), "nested DOM actor entity")
+  test/assert_true(string_contains(literal, "entity-button event-entity"), "nested DOM object entity")
+  test/assert_true(string_contains(literal, "coin"), "nested DOM object text")
+  test/assert_true(string_contains(literal, "inspects"), "nested DOM branch text")
+
+  source = event/scene(#event/say, "speech", "event-line speech", "{Actor} {say|says}, \"{message}\"", {:actor -> #alice, :message -> "hello"})
+  literal = to_literal(ui/event_body_for(source, #bob))
+  test/assert_true(string_contains(literal, "event-quote"), "speech DOM quote")
+  test/assert_true(string_contains(literal, "hello"), "speech DOM message")
+
+  source = event/replacing_group(event/scene(#event/look, "look", "event-line utility", "{Actor} {inspect|inspects} {the d}.", {:actor -> #alice, :dobj -> #coin}), :inspect_coin)
+  literal = to_literal(ui/event_body_for(source, #bob))
+  test/assert_true(string_contains(literal, "Alice inspects") == false, "replacement DOM keeps structured nodes")
+  test/assert_true(string_contains(literal, "coin"), "replacement DOM object text")
+
+  source = social_directed_event(#alice, #bob, "to", "wave", "waves")
+  literal = to_literal(ui/event_body_for(source, #bob))
+  test/assert_true(string_contains(literal, "actor-entity"), "social DOM actor entity")
+  test/assert_true(string_contains(literal, "event-entity"), "social DOM target entity")
+  test/assert_true(string_contains(literal, "waves"), "social DOM action text")
+  test/assert_true(string_contains(literal, "to"), "social DOM preposition text")
+  test/assert_true(string_contains(literal, "Alice waves to you") == false, "social DOM avoids flat text")
+
+  endpoint().session/inspect = #bob
+  literal = to_literal(ui/inspector_node(#alice))
+  test/assert_true(string_contains(literal, "wave to Bob"), "player inspector wave action")
+  test/assert_true(string_contains(literal, "bow to Bob"), "player inspector bow action")
+  test/assert_true(string_contains(literal, "smile at Bob"), "player inspector smile action")
+  test/assert_true(string_contains(literal, "bonk Bob"), "player inspector bonk action")
+
+  literal = to_literal(ui/command_chips_node(#alice))
+  test/assert_true(string_contains(literal, "wave to Bob"), "player chips wave action")
+  test/assert_true(string_contains(literal, "bonk Bob"), "player chips bonk action")
+
+  endpoint().session/commandDraft = ""
+  literal = to_literal(ui/command_bar_node(#alice))
+  test/assert_true(string_contains(literal, "data-command-suggestion") == false, "command suggestions stay hidden before typing")
+  literal = to_literal(ui/command_suggestions(#alice, "", true))
+  test/assert_true(string_contains(literal, "north"), "tab can reveal suggestions before typing")
+  literal = to_literal(ui/command_suggestions_node(#alice, "", true, 0))
+  test/assert_true(string_contains(literal, "data-command-suggestion"), "tab reveal renders an empty-field completion")
+  literal = to_literal(ui/command_suggestions_node(#alice, "", true, 1))
+  test/assert_true(string_contains(literal, "data-suggestion-count"), "tab cycling exposes the suggestion count")
+
+  endpoint().session/commandDraft = "n"
+  literal = to_literal(ui/command_suggestions(#alice, "n", false))
+  test/assert_true(string_contains(literal, "north"), "command suggestion data includes matching exit")
+  test/assert_true(string_contains(literal, "go to North Room"), "exit suggestions hint at the destination")
+
+  endpoint().session/commandDraft = "bo"
+  literal = to_literal(ui/command_suggestions(#alice, "bo", false))
+  test/assert_true(string_contains(literal, "bonk"), "command suggestion data includes matching verb")
+  test/assert_true(string_contains(literal, "targeted social action"), "verb suggestions include command summaries")
+
+  endpoint().session/commandDraft = "loo"
+  test/assert_equal(ui/suggestion_suffix("loo", "look"), "k", "command completion suffix only includes missing text")
+  literal = to_literal(ui/command_suggestions_node(#alice, "loo", false, 0))
+  test/assert_true(string_contains(literal, "data-command-suggestion"), "command completion node exposes a completion value")
+  test/assert_true(string_contains(literal, "inspect the room or a visible thing"), "command completion node renders the command hint")
+
+  endpoint().session/commandDraft = "bonk "
+  literal = to_literal(ui/command_suggestions(#alice, "bonk ", false))
+  test/assert_true(string_contains(literal, "bob"), "command suggestion data includes visible targets")
+  test/assert_true(string_contains(literal, "target: Bob"), "target suggestions hint at the visible target")
+  literal = to_literal(ui/command_suggestions(#alice, "get ", false))
+  test/assert_true(string_contains(literal, "get coin"), "object command suggestions preserve the target-selection space")
+
+  literal = to_literal(ui/command_suggestions(#alice, "dance ", false))
+  test/assert_true(string_contains(literal, "dance bob") == false, "command suggestions do not invent targets for intransitive verbs")
+
+  endpoint().session/commandDraft = "wave t"
+  literal = to_literal(ui/command_suggestions(#alice, "wave t", false))
+  test/assert_true(string_contains(literal, "wave to"), "command suggestion data includes matching prepositions")
+
+  endpoint().session/commandDraft = "@d"
+  literal = to_literal(ui/command_suggestions(#alice, "@d", false))
+  test/assert_true(string_contains(literal, "@dig"), "builder command suggestion data includes at-prefixed commands for builders")
+  test/assert_true(string_contains(literal, "connect rooms with a passage"), "builder command suggestions include command summaries")
+  literal = to_literal(ui/command_suggestions(#bob, "@d", false))
+  test/assert_true(string_contains(literal, "@dig") == false, "builder command suggestions hide at-prefixed commands for non-builders")
+
+  endpoint().session/objectBrowserQuery = "wooden"
+  literal = to_literal(ui/object_browser_panel_node(#alice))
+  test/assert_true(string_contains(literal, "Objects"), "builder tool column exposes object browser")
+  test/assert_true(string_contains(literal, "wooden box"), "object browser searches parser aliases")
+  test/assert_true(string_contains(literal, "mud_edit_entity"), "object browser rows expose edit actions")
+
+  endpoint().session/inspect = #alice
+  literal = to_literal(ui/inspector_node(#alice))
+  test/assert_true(string_contains(literal, "bonk Alice") == false, "self inspector omits bonk action")
+
+  endpoint().session/inspect = #coin
+  literal = to_literal(ui/inspector_node(#alice))
+  test/assert_true(string_contains(literal, "mud_edit_entity"), "builder inspector exposes entity edit sheet")
+  test/assert_true(string_contains(literal, "entity-edit-window"), "entity edit sheet renders as a floating window")
+  test/assert_true(string_contains(literal, "brass coin"), "entity edit sheet renders parser aliases")
+  test/assert_true(string_contains(literal, "A tarnished brass coin catches the light."), "entity edit sheet renders description")
+  test/assert_true(string_contains(literal, "Portable"), "entity edit sheet renders mobility control")
+  test/assert_true(string_contains(literal, "Visible here"), "entity edit sheet renders visibility control")
+
+  endpoint().session/inspect = #first_room
+  literal = to_literal(ui/inspector_node(#alice))
+  test/assert_true(string_contains(literal, "entity-edit-window"), "room edit sheet renders as a floating window")
+  test/assert_true(string_contains(literal, "Room tools"), "room edit sheet includes room-specific builder tools")
+  test/assert_true(string_contains(literal, "Build connected room"), "room edit sheet includes connected-room creation")
+  test/assert_true(string_contains(literal, "Edit room") == false, "room inspector does not render a duplicate inline room editor")
+
+  endpoint().session/inspect = #passage<[#first_room, #north_room, "north"]>
+  literal = to_literal(ui/inspector_node(#bob))
+  test/assert_true(string_contains(literal, "state"), "passage inspector shows state label")
+  test/assert_true(string_contains(literal, "Open"), "passage inspector shows capitalized open state")
+  test/assert_true(string_contains(literal, "entity-kind") == false, "non-builder inspector hides kind fact")
+  test/assert_true(string_contains(literal, "entity-id") == false, "non-builder inspector hides identity fact")
+  test/assert_true(string_contains(literal, "entity-ambient") == false, "non-builder inspector hides ambient fact")
+
+  return true
+end

@@ -1,0 +1,1272 @@
+// DOM composition for the server-owned MUD view.
+
+verb ui/icon_node(name)
+  name == "arrow-left" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"></path><path d="M19 12H5"></path></svg>
+  name == "clock" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>
+  name == "code" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6"></path><path d="m8 6-6 6 6 6"></path></svg>
+  name == "eye" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+  name == "hand" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 11V6a2 2 0 0 0-4 0v4"></path><path d="M14 10V4a2 2 0 0 0-4 0v8"></path><path d="M10 12V6a2 2 0 0 0-4 0v8"></path><path d="M6 14v-2a2 2 0 0 0-4 0v3a7 7 0 0 0 7 7h4a7 7 0 0 0 7-7v-4a2 2 0 0 0-4 0"></path></svg>
+  name == "login" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><path d="m10 17 5-5-5-5"></path><path d="M15 12H3"></path></svg>
+  name == "maximize" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"></path><path d="M21 8V5a2 2 0 0 0-2-2h-3"></path><path d="M3 16v3a2 2 0 0 0 2 2h3"></path><path d="M16 21h3a2 2 0 0 0 2-2v-3"></path></svg>
+  name == "minimize" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v3a2 2 0 0 1-2 2H3"></path><path d="M21 8h-3a2 2 0 0 1-2-2V3"></path><path d="M3 16h3a2 2 0 0 1 2 2v3"></path><path d="M16 21v-3a2 2 0 0 1 2-2h3"></path></svg>
+  name == "open" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"></path></svg>
+  name == "package" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21 8-9-5-9 5 9 5 9-5Z"></path><path d="M3 8v8l9 5 9-5V8"></path><path d="M12 13v8"></path></svg>
+  name == "pencil" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>
+  name == "plus" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"></path><path d="M12 5v14"></path></svg>
+  name == "route" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="19" r="3"></circle><circle cx="18" cy="5" r="3"></circle><path d="M12 19h2a4 4 0 0 0 0-8h-4a4 4 0 0 1 0-8h2"></path></svg>
+  name == "save" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"></path><path d="M17 21v-8H7v8"></path><path d="M7 3v5h8"></path></svg>
+  name == "search" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+  name == "send" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"></path><path d="M22 2 11 13"></path></svg>
+  name == "trash" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path><path d="M10 11v5"></path><path d="M14 11v5"></path></svg>
+  name == "wrench" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a4 4 0 0 0 5 5L11 20H6v-5Z"></path><path d="m13 7 4 4"></path></svg>
+  name == "x" && return dom <svg class="mud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+
+  return dom <span class="mud-icon-fallback"></span>
+end
+
+verb ui/icon_label_node(icon, label)
+  return dom <span class="mud-icon-label">{ui/icon_node(icon)}<span>{label}</span></span>
+end
+
+verb ui/command_icon(command)
+  if string_starts_with(command, "look") || string_starts_with(command, "examine")
+    return "eye"
+  elseif string_starts_with(command, "get") || string_starts_with(command, "take") || string_starts_with(command, "push") || string_starts_with(command, "press")
+    return "hand"
+  elseif string_starts_with(command, "drop")
+    return "package"
+  elseif string_starts_with(command, "undig") || string_starts_with(command, "remove")
+    return "trash"
+  elseif command == "north" || command == "south" || command == "east" || command == "west" || command == "up" || command == "down" || command == "in" || command == "out"
+    return "route"
+  end
+
+  return ""
+end
+
+verb ui/command_label_node(command, label)
+  let icon = ui/command_icon(command)
+  if icon == ""
+    return label
+  end
+
+  return ui/icon_label_node(icon, label)
+end
+
+verb ui/command_form_node(id, text, label, class)
+  if id != ""
+    return dom <form id={id} class="mud-action" data-sync-event="submit" data-sync-action="mud_command">
+      <input type="hidden" name="text" value={text} />
+      <button type="submit" class={class} data-command={text}>{ui/command_label_node(text, label)}</button>
+    </form>
+  end
+
+  return dom <form class="mud-action" data-sync-event="submit" data-sync-action="mud_command">
+    <input type="hidden" name="text" value={text} />
+    <button type="submit" class={class} data-command={text}>{ui/command_label_node(text, label)}</button>
+  </form>
+end
+
+verb ui/entity_action_node(id, entity, text, label, class)
+  let entity_label = to_literal(entity)
+  if id != ""
+    return dom <form id={id} class="mud-action entity-action" data-sync-event="submit" data-sync-action="mud_inspect">
+      <input type="hidden" name="entity" value={entity_label} />
+      <button type="submit" class={class} data-entity={entity_label}>{label}</button>
+    </form>
+  end
+
+  return dom <form class="mud-action entity-action" data-sync-event="submit" data-sync-action="mud_inspect">
+    <input type="hidden" name="entity" value={entity_label} />
+    <button type="submit" class={class} data-entity={entity_label}>{label}</button>
+  </form>
+end
+
+verb ui/passage_action_node(id, passage, label, class)
+  return ui/entity_action_node(id, passage, label, label, class)
+end
+
+verb ui/exit_form_node(id, passage, command, label, class)
+  let passage_label = to_literal(passage)
+  return dom <form id={id} class="mud-action exit-action" data-sync-event="submit" data-sync-action="mud_command">
+    <input type="hidden" name="text" value={command} />
+    <button type="submit" class={class} data-command={command} data-hold-entity={passage_label} aria-label={string_concat(label, ". Hold to examine.")}>{ui/icon_label_node("route", label)}</button>
+  </form>
+end
+
+verb ui/auth_required_node()
+  return dom <main id="mud-root" class="mud-login">
+    <section class="login-card">
+      <h1>Mica MUD</h1>
+      <p class="lede">Sign in to enter the world.</p>
+      <a class="login-link" href="/auth/login?return=%2Fmud">{ui/icon_label_node("login", "Open sign-in")}</a>
+    </section>
+  </main>
+end
+
+verb ui/room_panel_node(actor @ #player)
+  let room = actor.locatedIn
+  let title = room.name
+  let description = room.description
+  return dom <section id="room" class="panel room-panel">
+    <h2>{ui/entity_action_node("inspect-current-room", room, string_concat("look ", title), title, "room-title-button")}</h2>
+    <p class="room-description">{description}</p>
+    {ui/snapshot_exits_node(room)}
+    {ui/room_objects_node(actor, room)}
+  </section>
+end
+
+verb ui/area_room_row_node(actor @ #player, current_room @ #room, room @ #room)
+  let name = ui/actor_name(room)
+  let status = "unreached"
+  if room == current_room
+    status = "current"
+  elseif ReachableRoom(current_room.roomInArea, current_room, room)
+    status = "reachable"
+  end
+
+  let exits = []
+  for found in PassageSide(?passage, room, ?destination)
+    let passage = found[:passage]
+    exits = [@exits, dom <span class="area-exit">{passage/label_for(passage, room)}</span>]
+  end
+  if exits == []
+    exits = [dom <span class="muted">no exits</span>]
+  end
+
+  return dom <li class={string_concat("area-room ", status)} data-sync-key={to_literal(room)}>
+    {ui/entity_action_node("", room, string_concat("look ", name), name, "area-room-name entity-button")}
+    <span class="area-room-status">{status}</span>
+    <span class="area-room-exits">{@exits}</span>
+  </li>
+end
+
+verb ui/room_option_nodes(area)
+  let options = []
+  for found in RoomInArea(?room, area)
+    let name = ui/actor_name(found[:room])
+    options = [@options, dom <option value={name}>{name}</option>]
+  end
+
+  return options
+end
+
+verb ui/direction_options_node()
+  return dom <datalist id="mud-direction-options">
+    <option value="north">north</option>
+    <option value="south">south</option>
+    <option value="east">east</option>
+    <option value="west">west</option>
+    <option value="up">up</option>
+    <option value="down">down</option>
+    <option value="in">in</option>
+    <option value="out">out</option>
+  </datalist>
+end
+
+verb ui/area_panel_node(actor @ #player, room @ #room)
+  let area = room.roomInArea
+  if area == none
+    return dom <span></span>
+  end
+
+  let rows = []
+  for found in RoomInArea(?area_room, area)
+    rows = [@rows, ui/area_room_row_node(actor, room, found[:area_room])]
+  end
+
+  return dom <details class="area-panel" aria-label="Area map">
+    <summary>{ui/icon_label_node("route", string_concat("Area: ", ui/actor_name(area)))}</summary>
+    <ul class="area-room-list">{@rows}</ul>
+  </details>
+end
+
+verb ui/build_controls_node(actor @ #player, room @ #room)
+  if ui/can_build(actor) == false
+    return dom <span></span>
+  end
+
+  let area = room.roomInArea
+  let room_options = []
+  if area != none
+    room_options = ui/room_option_nodes(area)
+  end
+
+  return dom <details class="builder-tools tool-sheet" aria-label="Builder tools">
+    <summary>{ui/icon_label_node("wrench", "Build")}</summary>
+    <div class="tool-window builder-window" data-window-key="build-tools">
+      <div class="window-titlebar" data-window-drag="build-tools">
+        <strong>Build</strong>
+        <button type="button" class="window-close" data-close-details="builder-tools" aria-label="Close build tools">{ui/icon_label_node("x", "Close")}</button>
+      </div>
+      <div class="builder-palette window-body">
+        <datalist id="mud-room-options">{@room_options}</datalist>
+        {ui/direction_options_node()}
+        <details class="builder-sheet">
+          <summary>{ui/icon_label_node("plus", "New room")}</summary>
+          <form class="builder-form" data-sync-event="submit" data-sync-action="mud_build_room">
+            <input name="name" autocomplete="off" placeholder="Room name" aria-label="Room name" />
+            <button type="submit">{ui/icon_label_node("plus", "Create")}</button>
+          </form>
+        </details>
+        <details class="builder-sheet">
+          <summary>{ui/icon_label_node("route", "Passage")}</summary>
+          {ui/passage_builder_form_node(actor, room, "Create passage")}
+        </details>
+      </div>
+      <div class="window-resize-handle" data-window-resize="build-tools" aria-hidden="true"></div>
+    </div>
+  </details>
+end
+
+verb ui/passage_builder_form_node(actor @ #player, source @ #room, submit_label @ #string)
+  let source_name = ui/actor_name(source)
+  return dom <form class="builder-form passage-builder-form" data-sync-event="submit" data-sync-action="mud_create_passage">
+    <label><span>From</span><input name="source" list="mud-room-options" value={source_name} autocomplete="off" aria-label="Source room" /></label>
+    <label><span>Direction</span><input name="direction" list="mud-direction-options" autocomplete="off" placeholder="north" aria-label="Passage direction" /></label>
+    <label><span>To</span><input name="target" list="mud-room-options" autocomplete="off" placeholder="Destination room" aria-label="Destination room" /></label>
+    <label><span>Return</span><input name="return_direction" list="mud-direction-options" autocomplete="off" placeholder="auto" aria-label="Return direction" /></label>
+    <label class="checkbox-field"><input type="checkbox" name="one_way" value="true" /> One-way</label>
+    <button type="submit">{ui/icon_label_node("route", submit_label)}</button>
+  </form>
+end
+
+verb ui/passage_editor_node(actor @ #player, passage)
+  if ui/can_build(actor) == false
+    return dom <span></span>
+  end
+
+  let room = ui/passage_room_for(actor, passage)
+  if room == none
+    return dom <span></span>
+  end
+
+  let label = passage/label_for(passage, room)
+  let description = passage/describe_from(passage, room)
+
+  return dom <details class="builder-sheet inspector-builder-sheet">
+    <summary>{ui/icon_label_node("route", "Edit passage")}</summary>
+    <form class="builder-form passage-edit-form" data-sync-event="submit" data-sync-action="mud_describe_passage">
+      <input type="hidden" name="passage" value={to_literal(passage)} />
+      <input type="hidden" name="room" value={to_literal(room)} />
+      <label><span>Direction</span><input name="direction" list="mud-direction-options" value={label} autocomplete="off" aria-label="Passage direction" /></label>
+      <label><span>Description</span><textarea name="description" aria-label="Passage description">{description}</textarea></label>
+      <label class="checkbox-field"><input type="checkbox" name="ambient" value="true" /> Ambient</label>
+      <button type="submit">{ui/icon_label_node("save", "Save passage")}</button>
+    </form>
+  </details>
+end
+
+verb ui/entity_alias_text(entity)
+  return string_join(builder/entity_aliases(entity), ", ")
+end
+
+verb ui/entity_edit_checkbox_node(name @ #string, label @ #string, checked)
+  if checked
+    return dom <label class="checkbox-field"><input type="checkbox" name={name} value="true" checked="checked" /> {label}</label>
+  end
+
+  return dom <label class="checkbox-field"><input type="checkbox" name={name} value="true" /> {label}</label>
+end
+
+verb ui/entity_extra_editor_nodes(actor @ #player, entity)
+  if Delegates(entity, #room, 0) || Delegates(entity, #player, 0)
+    return []
+  end
+
+  let portable = Portable(entity)
+  let visible_here = LocatedIn(entity, actor.locatedIn)
+  let fields = [ui/entity_edit_checkbox_node("portable", "Portable", portable)]
+  fields = [@fields, ui/entity_edit_checkbox_node("visible_here", "Visible here", visible_here)]
+  return fields
+end
+
+verb ui/room_editor_tools_node(actor @ #player, room @ #room)
+  let area = room.roomInArea
+  let room_options = []
+  if area != none
+    room_options = ui/room_option_nodes(area)
+  end
+
+  return dom <section class="room-edit-tools">
+    <h3>Room tools</h3>
+    <datalist id="mud-room-edit-options">{@room_options}</datalist>
+    <details class="builder-sheet">
+      <summary>{ui/icon_label_node("plus", "Connected room")}</summary>
+      <form class="builder-form" data-sync-event="submit" data-sync-action="mud_build_room">
+        <input type="hidden" name="source" value={to_literal(room)} />
+        <label><span>Name</span><input name="name" autocomplete="off" placeholder="New room" aria-label="New room" /></label>
+        <label><span>Direction</span><input name="direction" list="mud-direction-options" autocomplete="off" placeholder="north" aria-label="Passage direction" /></label>
+        <label><span>Return</span><input name="return_direction" list="mud-direction-options" autocomplete="off" placeholder="auto" aria-label="Return direction" /></label>
+        <label class="checkbox-field"><input type="checkbox" name="one_way" value="true" /> One-way</label>
+        <button type="submit">{ui/icon_label_node("plus", "Build connected room")}</button>
+      </form>
+    </details>
+    <details class="builder-sheet">
+      <summary>{ui/icon_label_node("route", "Passage")}</summary>
+      {ui/passage_builder_form_node(actor, room, "Create passage")}
+    </details>
+  </section>
+end
+
+verb ui/entity_editor_node(actor @ #player, entity)
+  if ui/can_build(actor) == false || is_frob(entity) && frob_delegate(entity) == #passage
+    return dom <span></span>
+  end
+
+  let name = ui/actor_name(entity)
+  let aliases = ui/entity_alias_text(entity)
+  let description = ""
+  let descriptions = Description(entity, ?description)
+  if descriptions
+    let exactly {:description -> configured_description} = descriptions
+    description = configured_description
+  end
+  let window_key = string_concat("edit-", to_literal(entity))
+  let title = string_concat("Edit ", name)
+  let extra_fields = ui/entity_extra_editor_nodes(actor, entity)
+  let room_tools = []
+  if Delegates(entity, #room, 0)
+    room_tools = [ui/room_editor_tools_node(actor, entity)]
+  end
+
+  return dom <details class="entity-edit-tools tool-sheet inspector-builder-sheet" aria-label={title}>
+    <summary>{ui/icon_label_node("pencil", "Edit")}</summary>
+    <div class="tool-window entity-edit-window" data-window-key={window_key}>
+      <div class="window-titlebar" data-window-drag={window_key}>
+        <strong>{title}</strong>
+        <button type="button" class="window-close" data-close-details={window_key} aria-label="Close edit sheet">{ui/icon_label_node("x", "Close")}</button>
+      </div>
+      <div class="window-body">
+        <form class="builder-form entity-edit-form" data-sync-event="submit" data-sync-action="mud_edit_entity">
+          <input type="hidden" name="entity" value={to_literal(entity)} />
+          <label><span>Name</span><input name="name" value={name} autocomplete="off" aria-label="Name" /></label>
+          <label><span>Aliases</span><input name="aliases" value={aliases} autocomplete="off" placeholder="comma-separated parser names" aria-label="Aliases" /></label>
+          <label><span>Description</span><textarea name="description" aria-label="Description">{description}</textarea></label>
+          {@extra_fields}
+          <button type="submit">{ui/icon_label_node("save", "Save")}</button>
+        </form>
+        {@room_tools}
+      </div>
+      <div class="window-resize-handle" data-window-resize={window_key} aria-hidden="true"></div>
+    </div>
+  </details>
+end
+
+verb ui/object_browser_description(entity)
+  let descriptions = Description(entity, ?description)
+  if not descriptions
+    return ""
+  end
+  let exactly {:description -> description} = descriptions
+  if string_len(description) > 120
+    return string_concat(string_slice(description, 0, 117), "...")
+  end
+  return description
+end
+
+verb ui/object_browser_matches(actor @ #player, entity, needle @ #string)
+  if entity == none || is_frob(entity) && frob_delegate(entity) == #passage || Delegates(entity, #player, 0)
+    return false
+  end
+
+  if Delegates(entity, #room, 0)
+    let area = builder/current_area(actor)
+    if area == none || RoomInArea(entity, area) == false
+      return false
+    end
+  elseif command/TrustedForName(actor, entity) == false
+    return false
+  end
+
+  if string_contains(lower(ui/actor_name(entity)), needle)
+    return true
+  end
+
+  let descriptions = Description(entity, ?description)
+  if descriptions
+    let exactly {:description -> description} = descriptions
+    if string_contains(lower(description), needle)
+      return true
+    end
+  end
+
+  for found in command/Name(entity, ?parser_name)
+    if string_contains(lower(found[:parser_name]), needle)
+      return true
+    end
+  end
+
+  return false
+end
+
+verb ui/object_browser_row_node(actor @ #player, entity)
+  let name = ui/actor_name(entity)
+  let kind = ui/entity_kind(entity)
+  let description = ui/object_browser_description(entity)
+  let aliases = ui/entity_alias_text(entity)
+  let details = []
+  if aliases != ""
+    details = [dom <span>Aliases: {aliases}</span>]
+  end
+  if Delegates(entity, #room, 0)
+    details = [@details, dom <span>Room</span>]
+  elseif Portable(entity)
+    details = [@details, dom <span>Portable</span>]
+  else
+    details = [@details, dom <span>Fixed</span>]
+  end
+
+  return dom <li class="object-browser-row" data-sync-key={to_literal(entity)}>
+    <div class="object-browser-main">
+      <strong>{name}</strong>
+      <span class="muted">{kind}</span>
+      <p>{description}</p>
+      <div class="object-browser-tags">{@details}</div>
+    </div>
+    <div class="object-browser-actions">
+      {ui/entity_action_node("", entity, string_concat("examine ", name), ui/icon_label_node("eye", "Examine"), "mini-button")}
+      {ui/entity_editor_node(actor, entity)}
+    </div>
+  </li>
+end
+
+verb ui/object_browser_results_node(actor @ #player, query @ #string)
+  let needle = lower(trim(query))
+  if needle == ""
+    return dom <p class="muted mica-empty">Search rooms and things by name, alias, or description.</p>
+  end
+
+  let rows = []
+  let count = 0
+  for found in Name(?entity, ?label)
+    let entity = found[:entity]
+    if count < 16 && ui/object_browser_matches(actor, entity, needle)
+      rows = [@rows, ui/object_browser_row_node(actor, entity)]
+      count = count + 1
+    end
+  end
+
+  if rows == []
+    rows = [dom <li class="muted">No rooms or things matched.</li>]
+  elseif count == 16
+    rows = [@rows, dom <li class="muted">Showing first 16 matches.</li>]
+  end
+
+  return dom <ul class="object-browser-list">{@rows}</ul>
+end
+
+verb ui/object_browser_panel_node(actor @ #player)
+  if ui/can_build(actor) == false
+    return dom <span></span>
+  end
+
+  let query = ""
+  let queries = session/ObjectBrowserQuery(endpoint(), ?query)
+  if queries
+    let exactly {:query -> configured_query} = queries
+    query = configured_query
+  end
+
+  return dom <details class="object-browser-panel tool-sheet" aria-label="Object browser">
+    <summary>{ui/icon_label_node("search", "Objects")}</summary>
+    <div class="tool-window object-browser-window" data-window-key="object-browser">
+      <div class="window-titlebar" data-window-drag="object-browser">
+        <strong>Objects</strong>
+        <button type="button" class="window-close" data-close-details="object-browser" aria-label="Close object browser">{ui/icon_label_node("x", "Close")}</button>
+      </div>
+      <div class="window-body">
+        <form class="mica-browser-form" data-sync-event="submit" data-sync-action="mud_object_browser_search" data-sync-reset="false">
+          <input name="query" value={query} autocomplete="off" placeholder="room, thing, alias, description" aria-label="Object browser search" data-sync-event="input" data-sync-action="mud_object_browser_search" data-sync-debounce="180" />
+          <button type="submit" class="mini-button">{ui/icon_label_node("search", "Search")}</button>
+        </form>
+        {ui/object_browser_results_node(actor, query)}
+      </div>
+      <div class="window-resize-handle" data-window-resize="object-browser" aria-hidden="true"></div>
+    </div>
+  </details>
+end
+
+verb ui/world_tools_node(actor @ #player, room @ #room)
+  return dom <aside id="world-tools" class="panel world-tools">
+    {ui/area_panel_node(actor, room)}
+    {ui/build_controls_node(actor, room)}
+    {ui/object_browser_panel_node(actor)}
+    {ui/mica_browser_panel_node(actor)}
+  </aside>
+end
+
+verb ui/room_object_count(actor @ #player, room @ #room)
+  let count = 0
+  for found in LocatedIn(?item, room)
+    let item = found[:item]
+    if item != actor && PresentActor(room, item) == false
+      count = count + 1
+    end
+  end
+
+  return count
+end
+
+verb ui/room_people_count(actor @ #player, room @ #room)
+  let count = 0
+  for found in PresentActor(room, ?player)
+    if found[:player] != actor
+      count = count + 1
+    end
+  end
+
+  return count
+end
+
+verb ui/room_exit_count(room @ #room)
+  let count = 0
+  for found in PassageSide(?passage, room, ?destination)
+    count = count + 1
+  end
+
+  return count
+end
+
+verb ui/inventory_count(actor @ #player)
+  let count = 0
+  for found in Carrying(actor, ?item)
+    count = count + 1
+  end
+
+  return count
+end
+
+verb ui/summary_metric_node(label, value)
+  return dom <div class="summary-metric">
+    <span class="summary-value">{to_literal(value)}</span>
+    <span class="summary-label">{label}</span>
+  </div>
+end
+
+verb ui/scene_summary_node(actor @ #player, room @ #room)
+  let metrics = []
+  metrics = [@metrics, ui/summary_metric_node("people", ui/room_people_count(actor, room))]
+  metrics = [@metrics, ui/summary_metric_node("things", ui/room_object_count(actor, room))]
+  metrics = [@metrics, ui/summary_metric_node("exits", ui/room_exit_count(room))]
+  metrics = [@metrics, ui/summary_metric_node("carried", ui/inventory_count(actor))]
+  return dom <section id="scene-summary" class="scene-summary" aria-label="Current scene summary">
+    <span class="summary-room">Room: {ui/actor_name(room)}</span>
+    <div class="summary-metrics">{@metrics}</div>
+  </section>
+end
+
+verb ui/presence_card_node(viewer @ #player, actor @ #player)
+  let name = ui/actor_name(actor)
+  let description = actor.description
+  let label = dom <strong class="presence-name">{name}</strong>
+  if actor != viewer
+    label = ui/entity_action_node(string_concat("presence-", to_literal(actor)), actor, string_concat("look ", name), name, "entity-button presence-name")
+  end
+
+  return dom <li data-sync-key={to_literal(actor)} class="presence-card">
+    {label}
+    <p>{description}</p>
+  </li>
+end
+
+verb ui/presence_node(actor @ #player)
+  let room = actor.locatedIn
+  let people = []
+  for found in PresentActor(room, ?player)
+    people = [@people, ui/presence_card_node(actor, found[:player])]
+  end
+
+  return dom <aside id="presence" class="panel presence">
+    <h2>People here</h2>
+    <ul>{@people}</ul>
+  </aside>
+end
+
+verb ui/snapshot_row_node(label, chips)
+  if chips == []
+    return dom <div class="snapshot-row empty">
+      <span class="snapshot-label">{label}</span>
+      <span class="muted">None</span>
+    </div>
+  end
+
+  return dom <div class="snapshot-row">
+    <span class="snapshot-label">{label}</span>
+    <div class="snapshot-rail">{@chips}</div>
+  </div>
+end
+
+verb ui/snapshot_exits_node(room @ #room)
+  let exits = []
+  for found in PassageSide(?passage, room, ?destination)
+    let passage = found[:passage]
+    let label = passage/label_for(passage, room)
+    exits = [@exits, ui/exit_form_node(string_concat("exit-", label), passage, label, label, "chip exit-chip")]
+  end
+
+  return ui/snapshot_row_node("Exits", exits)
+end
+
+verb ui/snapshot_things_node(actor @ #player, room @ #room)
+  let things = []
+  for found in LocatedIn(?item, room)
+    let item = found[:item]
+    if item != actor && PresentActor(room, item) == false
+      let name = ui/actor_name(item)
+      things = [@things, ui/entity_action_node(string_concat("snapshot-inspect-", to_literal(item)), item, string_concat("look ", name), name, "chip entity-chip")]
+      if Portable(item)
+        things = [@things, ui/command_form_node(string_concat("snapshot-get-", to_literal(item)), string_concat("get ", name), string_concat("take ", name), "chip")]
+      end
+    end
+  end
+
+  return ui/snapshot_row_node("Things", things)
+end
+
+verb ui/snapshot_players_node(actor @ #player, room @ #room)
+  let players = []
+  for found in PresentActor(room, ?player)
+    let player = found[:player]
+    if player != actor
+      let name = ui/actor_name(player)
+      players = [@players, ui/entity_action_node(string_concat("snapshot-player-", to_literal(player)), player, string_concat("look ", name), name, "chip player-chip")]
+    end
+  end
+
+  return ui/snapshot_row_node("Players", players)
+end
+
+verb ui/room_snapshot_node(actor @ #player, room @ #room)
+  return dom <nav class="room-snapshot" aria-label="Room snapshot">
+    {ui/snapshot_exits_node(room)}
+    {ui/snapshot_things_node(actor, room)}
+    {ui/snapshot_players_node(actor, room)}
+  </nav>
+end
+
+verb ui/exits_node(room @ #room)
+  return ui/snapshot_exits_node(room)
+end
+
+verb ui/room_objects_node(actor @ #player, room @ #room)
+  let objects = []
+  for found in LocatedIn(?item, room)
+    let item = found[:item]
+    if item != actor && PresentActor(room, item) == false
+      let name = ui/actor_name(item)
+      objects = [@objects, dom <li data-sync-key={to_literal(item)} class="object-row">{ui/entity_action_node(string_concat("inspect-", to_literal(item)), item, string_concat("look ", name), name, "entity-button object-link")}</li>]
+    end
+  end
+
+  if objects == []
+    objects = [dom <li class="muted">Nothing catches your eye.</li>]
+  end
+
+  return dom <section class="objects">
+    <h2>Here</h2>
+    <ul class="object-list">{@objects}</ul>
+  </section>
+end
+
+verb ui/inventory_node(actor @ #player)
+  let items = []
+  for found in Carrying(actor, ?item)
+    let item = found[:item]
+    let name = ui/actor_name(item)
+    items = [@items, dom <li data-sync-key={to_literal(item)}>
+      {ui/entity_action_node(string_concat("inventory-inspect-", to_literal(item)), item, string_concat("look ", name), name, "entity-button inventory-link")}
+      {ui/command_form_node(string_concat("drop-", to_literal(item)), string_concat("drop ", name), "drop", "mini-button")}
+    </li>]
+  end
+
+  if items == []
+    items = [dom <li class="muted">Empty hands.</li>]
+  end
+
+  return dom <aside id="inventory" class="panel inventory">
+    <h2>Inventory</h2>
+    <ul>{@items}</ul>
+  </aside>
+end
+
+verb ui/inspector_action_node(command, label, class)
+  return ui/command_form_node("", command, label, class)
+end
+
+verb ui/entity_initial(name @ #string)
+  if string_len(name) == 0
+    return "?"
+  end
+
+  return string_slice(name, 0, 1)
+end
+
+verb ui/entity_kind(entity)
+  if is_frob(entity) && frob_delegate(entity) == #passage
+    return "passage"
+  elseif Delegates(entity, #player, 0)
+    return "player"
+  elseif Delegates(entity, #room, 0)
+    return "room"
+  elseif Delegates(entity, #container, 0)
+    return "container"
+  elseif Portable(entity)
+    return "portable"
+  end
+
+  return "thing"
+end
+
+verb ui/entity_location_text(actor @ #player, entity)
+  if entity == actor
+    return "you"
+  end
+
+  if is_frob(entity) && frob_delegate(entity) == #passage
+    let room = ui/passage_room_for(actor, entity)
+    if room != none
+      return string_concat("from ", ui/actor_name(room))
+    end
+    return "unplaced"
+  end
+
+  let locations = LocatedIn(entity, ?location)
+  if not locations
+    return "unplaced"
+  end
+  let exactly {:location -> location} = locations
+  if location == actor
+    return "carried by you"
+  elseif Delegates(location, #player, 0)
+    return string_concat("carried by ", ui/actor_name(location))
+  end
+
+  return ui/actor_name(location)
+end
+
+verb ui/entity_fact_node(label, value, class)
+  return dom <div class={string_concat("entity-fact ", class)}>
+    <span class="entity-fact-label">{label}</span>
+    <span class="entity-fact-value">{value}</span>
+  </div>
+end
+
+verb ui/entity_facts_node(actor @ #player, entity)
+  let facts = []
+  let show_builder_details = ui/can_build(actor)
+  if show_builder_details
+    facts = [@facts, ui/entity_fact_node("kind", ui/entity_kind(entity), "entity-kind")]
+    facts = [@facts, ui/entity_fact_node("identity", to_literal(entity), "entity-id")]
+  end
+  facts = [@facts, ui/entity_fact_node("location", ui/entity_location_text(actor, entity), "entity-location")]
+  if is_frob(entity) && frob_delegate(entity) == #passage
+    let room = ui/passage_room_for(actor, entity)
+    if room != none
+      let exactly {:destination -> destination} = PassageSide(entity, room, ?destination)
+      if destination != none
+        facts = [@facts, ui/entity_fact_node("to", ui/actor_name(destination), "entity-destination")]
+      end
+      if show_builder_details
+        let exactly {:ambient -> ambient} = PassageAmbient(entity, room, ?ambient)
+        if ambient != none
+          facts = [@facts, ui/entity_fact_node("ambient", to_literal(ambient), "entity-ambient")]
+        end
+      end
+    end
+    if PassageOpen(entity, true)
+      facts = [@facts, ui/entity_fact_node("state", "Open", "entity-state")]
+    else
+      facts = [@facts, ui/entity_fact_node("state", "Closed", "entity-state")]
+    end
+    return dom <div class="entity-facts">{@facts}</div>
+  end
+  if Portable(entity)
+    facts = [@facts, ui/entity_fact_node("mobility", "portable", "entity-mobility")]
+  else
+    facts = [@facts, ui/entity_fact_node("mobility", "fixed", "entity-mobility")]
+  end
+  if CanSee(actor, entity)
+    facts = [@facts, ui/entity_fact_node("visibility", "visible", "entity-visibility")]
+  end
+
+  return dom <div class="entity-facts">{@facts}</div>
+end
+
+verb ui/inspector_node(actor @ #player)
+  let selections = session/Inspect(endpoint(), ?selected)
+  let pulse_values = session/InspectPulse(endpoint(), ?pulse)
+  let pulse_class = "inspector panel"
+  if pulse_values
+    let exactly {:pulse -> pulse} = pulse_values
+    if pulse == "even"
+      pulse_class = "inspector panel inspect-flash-even"
+    else
+      pulse_class = "inspector panel inspect-flash-odd"
+    end
+  end
+  if not selections
+    return dom <aside id="inspector" class={pulse_class}>
+      <h2>Examine</h2>
+      <p class="muted">Select a room, exit, object, or player to examine.</p>
+    </aside>
+  end
+  let exactly {:selected -> selected} = selections
+  if ui/can_inspect_entity(actor, selected) == false
+    return dom <aside id="inspector" class={pulse_class}>
+      <h2>Examine</h2>
+      <p class="muted">Select a room, exit, object, or player to examine.</p>
+    </aside>
+  end
+
+  let name = ui/actor_name(selected)
+  let description = ui/description_text(actor, selected)
+  let title_meta = []
+  if ui/can_build(actor)
+    title_meta = [dom <span class="inspector-subtitle">{ui/entity_kind(selected)}</span>]
+  end
+  let actions = []
+  if is_frob(selected) && frob_delegate(selected) == #passage
+    actions = [@actions, ui/inspector_action_node(name, "go", "mini-button exit-go-button")]
+    if ui/can_build(actor)
+      actions = [@actions, ui/inspector_action_node(string_concat("undig ", name), "remove", "mini-button danger")]
+    end
+  elseif Delegates(selected, #room, 0) == false
+    actions = [@actions, ui/inspector_action_node(string_concat("look ", name), "look", "mini-button")]
+  end
+  if (not is_frob(selected) || frob_delegate(selected) != #passage) && Portable(selected) && Carrying(actor, selected) == false
+    actions = [@actions, ui/inspector_action_node(string_concat("get ", name), "take", "mini-button")]
+  end
+  if (not is_frob(selected) || frob_delegate(selected) != #passage) && Carrying(actor, selected)
+    actions = [@actions, ui/inspector_action_node(string_concat("drop ", name), "drop", "mini-button")]
+  end
+  if selected == #red_button
+    actions = [@actions, ui/inspector_action_node("push button", "push", "mini-button danger")]
+  end
+  if selected != actor && Delegates(selected, #player, ?player_depth)
+    actions = [@actions, ui/inspector_action_node(string_concat("wave to ", name), "wave", "mini-button")]
+    actions = [@actions, ui/inspector_action_node(string_concat("bow to ", name), "bow", "mini-button")]
+    actions = [@actions, ui/inspector_action_node(string_concat("smile at ", name), "smile", "mini-button")]
+    actions = [@actions, ui/inspector_action_node(string_concat("bonk ", name), "bonk", "mini-button")]
+  end
+  if ui/can_program(actor)
+    actions = [@actions, ui/mica_inspect_action_node(selected, ui/icon_label_node("code", "Mica inspect"), "mini-button mica-button")]
+  end
+  let builder_panels = []
+  if Delegates(selected, #room, 0)
+    builder_panels = [@builder_panels, ui/entity_editor_node(actor, selected)]
+  elseif is_frob(selected) && frob_delegate(selected) == #passage
+    builder_panels = [@builder_panels, ui/passage_editor_node(actor, selected)]
+  else
+    builder_panels = [@builder_panels, ui/entity_editor_node(actor, selected)]
+  end
+
+  return dom <aside id="inspector" class={pulse_class} data-entity={to_literal(selected)}>
+    <h2>Examine</h2>
+    <div class="inspector-title-row">
+      <span class="entity-avatar">{ui/entity_initial(name)}</span>
+      <div>
+        <strong class="inspector-title">{name}</strong>
+        {@title_meta}
+      </div>
+    </div>
+    <p class="inspector-description">{description}</p>
+    {ui/entity_facts_node(actor, selected)}
+    {@builder_panels}
+    {ui/retrieval_panel_node(actor, selected)}
+    <div class="object-actions inspector-actions">{@actions}</div>
+  </aside>
+end
+
+verb ui/command_bar_node(actor @ #player)
+  let draft = ""
+  let drafts = session/CommandDraft(endpoint(), ?draft)
+  if drafts
+    let exactly {:draft -> configured_draft} = drafts
+    draft = configured_draft
+  end
+  let suggest = false
+  let suggest_values = session/CommandSuggest(endpoint(), ?suggest)
+  if suggest_values
+    let exactly {:suggest -> configured_suggest} = suggest_values
+    suggest = configured_suggest
+  end
+  let suggest_index = 0
+  let suggest_indexes = session/CommandSuggestIndex(endpoint(), ?suggest_index)
+  if suggest_indexes
+    let exactly {:suggest_index -> configured_index} = suggest_indexes
+    suggest_index = configured_index
+  end
+  let suggest_value = "false"
+  if suggest
+    suggest_value = "true"
+  end
+  let placeholder = "Try: look, north, get coin, say hello"
+  if suggest
+    placeholder = ""
+  end
+  let composer = dom <form id="mud-command" class="command-form" data-sync-event="submit" data-sync-action="mud_command" data-sync-submit-key="ctrl+enter">
+    <div class="command-input-box">
+      <input id="command-suggest" type="hidden" name="suggest" value={suggest_value} />
+      <input id="command-suggest-index" type="hidden" name="suggest_index" value={to_literal(suggest_index)} />
+      <input id="command" name="text" value={draft} autocomplete="off" placeholder={placeholder} aria-label="Command" aria-controls="command-suggestions" data-sync-event="input" data-sync-action="mud_command" data-sync-debounce="90" />
+      {ui/command_suggestions_node(actor, draft, suggest, suggest_index)}
+    </div>
+    <button id="send-command" type="submit">{ui/icon_label_node("send", "Send")}</button>
+  </form>
+  return dom <section class="command-deck">
+    {ui/command_chips_node(actor)}
+    {composer}
+  </section>
+end
+
+verb ui/suggestion_matches(candidate @ #string, prefix @ #string)
+  if prefix == ""
+    return true
+  end
+  return string_starts_with(lower(candidate), lower(prefix))
+end
+
+verb ui/add_command_suggestion(suggestions @ #list, command @ #string, label @ #string, kind @ #string, hint @ #string)
+  return [@suggestions, {:command -> command, :label -> label, :kind -> kind, :hint -> hint}]
+end
+
+verb ui/suggestion_suffix(draft @ #string, command @ #string)
+  let draft_text = trim(draft)
+  if draft_text == ""
+    return ""
+  end
+  if string_starts_with(lower(command), lower(draft_text))
+    return string_slice(command, string_len(draft_text), string_len(command))
+  end
+  return command
+end
+
+verb ui/command_summary(selector)
+  let exactly {:summary -> summary} = command/Summary(selector, ?summary)
+  if summary == none
+    return "command"
+  end
+  return summary
+end
+
+verb ui/suggestion_count(suggestions @ #list)
+  let count = 0
+  for suggestion in suggestions
+    count = count + 1
+  end
+  return count
+end
+
+verb ui/selected_command_suggestion(suggestions @ #list, index)
+  let count = ui/suggestion_count(suggestions)
+  if count == 0
+    return none
+  end
+  let selected_index = index
+  while selected_index >= count
+    selected_index = selected_index - count
+  end
+  return suggestions[selected_index]
+end
+
+verb ui/merge_command_suggestions(left @ #list, right @ #list)
+  let merged = left
+  for suggestion in right
+    merged = [@merged, suggestion]
+  end
+  return merged
+end
+
+verb ui/suggest_command_aliases(actor @ #player, prefix @ #string)
+  let suggestions = []
+  let count = 0
+  for found in command/VerbAlias(?alias, ?selector)
+    let alias = found[:alias]
+    if count < 8 && ui/suggestion_matches(alias, prefix)
+      if string_starts_with(alias, "@") == false || ui/can_build(actor)
+        suggestions = ui/add_command_suggestion(suggestions, alias, alias, "command", ui/command_summary(found[:selector]))
+        count = count + 1
+      end
+    end
+  end
+  return suggestions
+end
+
+verb ui/suggest_exit_commands(actor @ #player, prefix @ #string)
+  let suggestions = []
+  let room = actor.locatedIn
+  let count = 0
+  for found in PassageSide(?passage, room, ?destination)
+    let passage = found[:passage]
+    let label = passage/label_for(passage, room)
+    if count < 6 && ui/suggestion_matches(label, prefix)
+      let hint = string_concat("go to ", ui/actor_name(found[:destination]))
+      suggestions = ui/add_command_suggestion(suggestions, label, label, "exit", hint)
+      count = count + 1
+    end
+  end
+  return suggestions
+end
+
+verb ui/suggest_visible_targets(actor @ #player, stem @ #string, prefix @ #string)
+  let suggestions = []
+  let count = 0
+  for found in command/Name(?obj, ?name)
+    let obj = found[:obj]
+    let name = found[:name]
+    if count < 8 && command/NameMatchable(actor, obj) && ui/suggestion_matches(name, prefix)
+      let command = string_concat(stem, name)
+      let hint = string_concat("target: ", ui/actor_name(obj))
+      suggestions = ui/add_command_suggestion(suggestions, command, name, "target", hint)
+      count = count + 1
+    end
+  end
+  return suggestions
+end
+
+verb ui/suggest_prepositions(actor @ #player, command_word @ #string, prefix @ #string)
+  let suggestions = []
+  let exactly {:selector -> selector} = command/VerbAlias(command_word, ?selector)
+  if selector == none
+    return suggestions
+  end
+
+  let count = 0
+  for found in command/Pattern(selector, ?dispatch_selector, ?pattern)
+    let parts = command/PatternPart(found[:pattern], 0, ?kind, ?argument)
+    if parts
+      let exactly {:kind -> kind, :argument -> argument} = parts
+      if kind == :prep || kind == :optional_prep
+        for prep in command/Preposition(argument, ?word)
+        let word = prep[:word]
+        if count < 6 && ui/suggestion_matches(word, prefix)
+          suggestions = ui/add_command_suggestion(suggestions, string_concat(string_concat(command_word, " "), word), word, "preposition", "choose a target relation")
+          count = count + 1
+        end
+      end
+      end
+    end
+  end
+  return suggestions
+end
+
+verb ui/selector_accepts_direct_target(selector)
+  for found in command/Pattern(selector, ?dispatch_selector, ?pattern)
+    let first_parts = command/PatternPart(found[:pattern], 0, ?kind, ?argument)
+    if first_parts
+      let exactly {:kind -> kind, :argument -> argument} = first_parts
+      if kind == :object_role
+        return true
+      end
+      if kind == :optional_prep
+        let second_parts = command/PatternPart(found[:pattern], 1, ?second_kind, ?second_argument)
+        if second_parts
+          let exactly {:second_kind -> second_kind, :second_argument -> second_argument} = second_parts
+          if second_kind == :object_role
+          return true
+          end
+        end
+      end
+    end
+  end
+  return false
+end
+
+verb ui/selector_accepts_preposition_target(selector, word @ #string)
+  for found in command/Pattern(selector, ?dispatch_selector, ?pattern)
+    let first_parts = command/PatternPart(found[:pattern], 0, ?kind, ?argument)
+    if first_parts
+      let exactly {:kind -> kind, :argument -> argument} = first_parts
+      if kind == :prep || kind == :optional_prep
+        if command/Preposition(argument, word)
+          let second_parts = command/PatternPart(found[:pattern], 1, ?second_kind, ?second_argument)
+          if second_parts
+            let exactly {:second_kind -> second_kind, :second_argument -> second_argument} = second_parts
+            if second_kind == :object_role
+              return true
+            end
+          end
+        end
+      end
+    end
+  end
+  return false
+end
+
+verb ui/command_suggestions(actor @ #player, draft @ #string, show_empty @ #bool)
+  let raw = trim(draft)
+  let tokens = words(lower(raw))
+  let first = index_or(tokens, 0, none)
+  let second = index_or(tokens, 1, none)
+  let third = index_or(tokens, 2, none)
+  let ends_space = false
+  if draft != ""
+    ends_space = string_slice(draft, string_len(draft) - 1, string_len(draft)) == " "
+  end
+
+  if first == none
+    if show_empty
+      let suggestions = ui/suggest_exit_commands(actor, "")
+      return ui/merge_command_suggestions(suggestions, ui/suggest_command_aliases(actor, ""))
+    end
+    return []
+  end
+
+  if second == none && ends_space == false
+    let suggestions = ui/suggest_exit_commands(actor, first)
+    return ui/merge_command_suggestions(suggestions, ui/suggest_command_aliases(actor, first))
+  end
+
+  if first == "go"
+    let prefix = ""
+    if ends_space == false && second != none
+      prefix = second
+    end
+    return ui/suggest_exit_commands(actor, prefix)
+  end
+
+  let exactly {:selector -> selector} = command/VerbAlias(first, ?selector)
+  if selector == none
+    return []
+  end
+
+  let stem = string_concat(first, " ")
+  if second == none
+    let suggestions = ui/suggest_prepositions(actor, first, "")
+    if ui/selector_accepts_direct_target(selector)
+      return ui/merge_command_suggestions(suggestions, ui/suggest_visible_targets(actor, stem, ""))
+    end
+    return suggestions
+  end
+
+  let matched_prep = none
+  for found in command/Preposition(?prep, second)
+    matched_prep = second
+  end
+  if matched_prep != none && ui/selector_accepts_preposition_target(selector, second)
+    let prefix = ""
+    if ends_space == false && third != none
+      prefix = third
+    end
+    return ui/suggest_visible_targets(actor, string_concat(string_concat(first, " "), string_concat(second, " ")), prefix)
+  end
+
+  let suggestions = ui/suggest_prepositions(actor, first, second)
+  if ui/selector_accepts_direct_target(selector)
+    return ui/merge_command_suggestions(suggestions, ui/suggest_visible_targets(actor, stem, second))
+  end
+  return suggestions
+end
+
+verb ui/command_suggestions_node(actor @ #player, draft @ #string, show_empty @ #bool, index)
+  let suggestions = ui/command_suggestions(actor, draft, show_empty)
+  let count = ui/suggestion_count(suggestions)
+  if count == 0
+    return dom <div id="command-suggestions" class="command-suggestions empty" hidden="hidden"></div>
+  end
+
+  let suggestion = ui/selected_command_suggestion(suggestions, index)
+  let suffix = ui/suggestion_suffix(draft, suggestion[:command])
+  if suffix == "" && trim(draft) == "" && show_empty
+    suffix = suggestion[:command]
+  end
+  if suffix == ""
+    return dom <div id="command-suggestions" class="command-suggestions empty" hidden="hidden"></div>
+  end
+
+  return dom <span id="command-suggestions" class="command-ghost" data-command-suggestion={suggestion[:command]} data-suggestion-count={to_literal(count)} aria-hidden="true">
+    <span class="command-ghost-prefix">{trim(draft)}</span><span class="command-ghost-suffix">{suffix}</span><span class="command-ghost-hint">{string_concat(" - ", suggestion[:hint])}</span>
+  </span>
+end
+
+verb ui/command_chips_node(actor @ #player)
+  let chips = [ui/command_form_node("", "look", "look", "chip")]
+  let selections = session/Inspect(endpoint(), ?selected)
+  if selections
+    let exactly {:selected -> selected} = selections
+    if ui/can_inspect_entity(actor, selected)
+    let name = ui/actor_name(selected)
+    if is_frob(selected) && frob_delegate(selected) == #passage
+      chips = [@chips, ui/command_form_node("", name, string_concat("go ", name), "chip exit-chip")]
+      if ui/can_build(actor)
+        chips = [@chips, ui/command_form_node("", string_concat("undig ", name), string_concat("remove ", name), "chip danger")]
+      end
+      return dom <div class="command-chips" aria-label="Available actions">{@chips}</div>
+    end
+    chips = [@chips, ui/command_form_node("", string_concat("look ", name), string_concat("examine ", name), "chip")]
+    if Portable(selected) && Carrying(actor, selected) == false
+      chips = [@chips, ui/command_form_node("", string_concat("get ", name), string_concat("take ", name), "chip")]
+    end
+    if Carrying(actor, selected)
+      chips = [@chips, ui/command_form_node("", string_concat("drop ", name), string_concat("drop ", name), "chip")]
+    end
+    if selected == #red_button
+      chips = [@chips, ui/command_form_node("", "push button", "push button", "chip danger")]
+    end
+    if selected != actor && Delegates(selected, #player, ?player_depth)
+      chips = [@chips, ui/command_form_node("", string_concat("wave to ", name), string_concat("wave to ", name), "chip")]
+      chips = [@chips, ui/command_form_node("", string_concat("bow to ", name), string_concat("bow to ", name), "chip")]
+      chips = [@chips, ui/command_form_node("", string_concat("smile at ", name), string_concat("smile at ", name), "chip")]
+      chips = [@chips, ui/command_form_node("", string_concat("bonk ", name), string_concat("bonk ", name), "chip")]
+    end
+    return dom <div class="command-chips" aria-label="Available actions">{@chips}</div>
+    end
+  end
+
+  let room = actor.locatedIn
+  for found in PassageSide(?passage, room, ?destination)
+    let passage = found[:passage]
+    let label = passage/label_for(passage, room)
+    chips = [@chips, ui/exit_form_node("", passage, label, label, "chip exit-chip")]
+  end
+
+  for found in LocatedIn(?item, room)
+    let item = found[:item]
+    if item != actor && PresentActor(room, item) == false
+      let name = ui/actor_name(item)
+      chips = [@chips, ui/entity_action_node("", item, string_concat("look ", name), string_concat("examine ", name), "chip entity-chip")]
+      if Portable(item)
+        chips = [@chips, ui/command_form_node("", string_concat("get ", name), string_concat("take ", name), "chip")]
+      end
+      if item == #red_button
+        chips = [@chips, ui/command_form_node("", "push button", "push button", "chip danger")]
+      end
+    end
+  end
+
+  return dom <div class="command-chips" aria-label="Available actions">{@chips}</div>
+end
+
+verb ui/world_view_node(actor @ #player, revision, limit)
+  let room = actor.locatedIn
+  let area_title = ""
+  if room != none && room.roomInArea != none
+    area_title = ui/actor_name(room.roomInArea)
+  end
+  let header = dom <header class="topbar">
+    <h1>{area_title}</h1>
+  </header>
+  let left_column = dom <div class="mud-left-column">{ui/room_panel_node(actor)}{ui/narrative_node(actor, revision, limit)}</div>
+  let right_column = dom <div class="mud-right-column">{ui/world_tools_node(actor, room)}{ui/presence_node(actor)}{ui/inventory_node(actor)}{ui/inspector_node(actor)}</div>
+  let splitter = dom <div class="column-splitter" role="separator" aria-label="Resize tools column" aria-orientation="vertical"></div>
+  let stage = dom <div class="mud-columns">{left_column}{splitter}{right_column}</div>
+  let children = [header, stage]
+  let class = "mud-shell"
+  if ui/can_program(actor)
+    let mica_selected = ui/mica_inspect_selected()
+    if mica_selected != none
+      if ui/mica_inspect_expanded()
+        stage = dom <div class="mud-columns mica-inspect-preview">{ui/narrative_node(actor, revision, 8)}</div>
+        children = [header, stage]
+        class = "mud-shell has-mica-inspect mica-inspect-expanded"
+      end
+      children = [@children, ui/mica_inspect_panel_node(actor)]
+      if class == "mud-shell"
+        class = "mud-shell has-mica-inspect"
+      end
+    end
+  end
+  children = [@children, ui/command_bar_node(actor)]
+  return dom <main id="mud-root" class={class}>{@children}</main>
+end

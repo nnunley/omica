@@ -1,0 +1,62 @@
+// Glob matching unit tests.
+
+verb test/assert_equal(actual, expected, label @ #string)
+  if actual != expected
+    raise E_INVARG, string_concat(label, " failed: got ", to_literal(actual), " expected ", to_literal(expected))
+  end
+  return true
+end
+
+verb test/assert_true(value, label @ #string)
+  if value != true
+    raise E_INVARG, string_concat(label, " failed")
+  end
+  return true
+end
+
+verb test/glob_matching()
+  // Basic literal matching
+  test/assert_true(glob/match("foo.txt", "foo.txt"), "exact match")
+  test/assert_true(glob/match("foo/bar.txt", "foo/bar.txt"), "literal with slash")
+
+  // No match
+  test/assert_true(glob/match("foo.txt", "bar.txt") == false, "no match different names")
+  test/assert_true(glob/match("foo.txt", "foo.txt.bak") == false, "no match longer path")
+  test/assert_true(glob/match("foo.txt", "foo") == false, "no match shorter path")
+
+  // * matches anything except /
+  test/assert_true(glob/match("*.txt", "foo.txt"), "* matches name")
+  test/assert_true(glob/match("*.txt", "bar.txt"), "* matches name 2")
+  test/assert_true(glob/match("*.txt", ".txt"), "* matches zero chars")
+  test/assert_true(glob/match("*.txt", "foo/bar.txt") == false, "* does not cross /")
+  test/assert_true(glob/match("foo*.txt", "foobar.txt"), "* in middle")
+  test/assert_true(glob/match("foo*bar.txt", "foobar.txt"), "* in middle 2")
+  test/assert_true(glob/match("foo*bar.txt", "fooxyzbar.txt"), "* in middle 3")
+
+  // ** matches anything including /
+  test/assert_true(glob/match("**/*.txt", "foo.txt"), "** matches root")
+  test/assert_true(glob/match("**/*.txt", "src/foo.txt"), "** matches one dir")
+  test/assert_true(glob/match("**/*.txt", "src/lib/foo.txt"), "** matches two dirs")
+  test/assert_true(glob/match("**/*.txt", "a/b/c/d/foo.txt"), "** matches many dirs")
+  test/assert_true(glob/match("src/**/*.rs", "src/foo.rs"), "** in middle")
+  test/assert_true(glob/match("src/**/*.rs", "src/lib/foo.rs"), "** in middle 2")
+  test/assert_true(glob/match("src/**/*.rs", "src/lib/mod/inner/foo.rs"), "** in middle 3")
+
+  // ? matches single character
+  test/assert_true(glob/match("?.txt", "a.txt"), "? matches one char")
+  test/assert_true(glob/match("?.txt", "ab.txt") == false, "? does not match two chars")
+  test/assert_true(glob/match("?.txt", ".txt") == false, "? does not match zero chars")
+
+  // Combined patterns
+  test/assert_true(glob/match("src/*/*.rs", "src/lib/foo.rs"), "*/* in path")
+  test/assert_true(glob/match("src/*/*.rs", "src/lib/mod/foo.rs") == false, "*/* does not cross extra dirs")
+  test/assert_true(glob/match("src/**/?*.rs", "src/lib/a.rs"), "** and ? combined")
+  test/assert_true(glob/match("src/**/?*.rs", "src/lib/mod/ab.rs"), "** and ? combined 2")
+
+  // Edge cases
+  test/assert_true(glob/match("", ""), "empty pattern matches empty path")
+  test/assert_true(glob/match("foo", "foo"), "simple literal")
+  test/assert_true(glob/match("foo", "bar") == false, "simple literal no match")
+
+  return true
+end

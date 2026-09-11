@@ -1,0 +1,280 @@
+// Minimal retrieval and answer-trace vocabulary.
+//
+// This file keeps the first cut small while adding:
+// - provider/model-aware embedding facts;
+// - lifecycle state for embeddings and answers;
+// - a computed `NearestEmbedding/6` search relation;
+// - review/correction facts for keeping derived memory inspectable.
+//
+// This first slice is deliberately text-unit-only. Applications may use domain
+// identities as text units for small demos, but larger systems should separate
+// the subject being described from the text unit that describes it.
+
+make_identity(:retrieval/question)
+make_identity(:retrieval/plan)
+make_identity(:retrieval/context)
+make_identity(:retrieval/answer)
+make_identity(:retrieval/embedding)
+
+make_relation(:Document, 1)
+make_functional_relation(:DocumentTitle, 2, [0])
+make_functional_relation(:DocumentSource, 2, [0])
+
+make_relation(:DocumentRevision, 1)
+make_functional_relation(:RevisionOf, 2, [0])
+make_functional_relation(:RevisionContentHash, 2, [0])
+
+make_relation(:TextUnit, 1)
+make_functional_relation(:TextUnitOf, 2, [0])
+make_functional_relation(:TextUnitOrdinal, 2, [0])
+make_functional_relation(:TextUnitText, 2, [0])
+
+// Applications must define who may retrieve each subject before context is
+// recorded. In the MUD this is derived from `CanSee`.
+make_relation(:CanRetrieveSubject, 2)
+
+make_relation(:Embedding, 1)
+make_functional_relation(:EmbeddingOf, 2, [0])
+make_functional_relation(:EmbeddingVector, 2, [0])
+make_functional_relation(:EmbeddingModel, 2, [0])
+make_functional_relation(:EmbeddingSourceText, 2, [0])
+make_functional_relation(:EmbeddingStatus, 2, [0])
+
+make_relation(:VectorIndex, 1)
+make_relation(:VectorIndexContains, 2)
+make_functional_relation(:VectorIndexMetric, 2, [0])
+make_functional_relation(:IndexEntryEmbedding, 4, [0, 1, 2])
+make_functional_relation(:IndexEntrySourceText, 4, [0, 1, 2])
+make_functional_relation(:IndexEntryStatus, 4, [0, 1, 2])
+make_relation(:EmbeddingRefreshNeeded, 3)
+
+// Read-only computed relation implemented by the runtime.
+make_relation(:NearestEmbedding, 6)
+
+make_relation(:Question, 1)
+make_functional_relation(:QuestionText, 2, [0])
+make_functional_relation(:AskedBy, 2, [0])
+
+make_relation(:RetrievalPlan, 1)
+make_functional_relation(:PlanForQuestion, 2, [0])
+make_functional_relation(:PlanKind, 2, [0])
+make_functional_relation(:PlanModel, 2, [0])
+
+make_relation(:RetrievedContext, 1)
+make_functional_relation(:ContextForPlan, 2, [0])
+make_functional_relation(:ContextSubject, 2, [0])
+make_functional_relation(:ContextScore, 2, [0])
+make_functional_relation(:ContextReason, 2, [0])
+make_functional_relation(:ContextSnapshotVersion, 2, [0])
+make_functional_relation(:ContextOrdinal, 2, [0])
+
+make_relation(:Answer, 1)
+make_functional_relation(:AnswerForQuestion, 2, [0])
+make_functional_relation(:AnswerText, 2, [0])
+make_functional_relation(:AnswerPromptText, 2, [0])
+make_functional_relation(:AnswerContextText, 2, [0])
+make_functional_relation(:AnswerStatus, 2, [0])
+make_relation(:AnswerCitation, 2)
+make_functional_relation(:AnswerCitationText, 3, [0, 1])
+make_relation(:AnswerNeedsReview, 1)
+make_relation(:AnswerRefreshNeeded, 1)
+
+make_relation(:NeedsReview, 1)
+make_relation(:ApprovedFact, 1)
+make_relation(:RejectedFact, 1)
+make_relation(:Correction, 1)
+make_functional_relation(:CorrectionOf, 2, [0])
+make_functional_relation(:CorrectionText, 2, [0])
+
+verb retrieval/question_value(actor, question_text @ #string, index, limit, model @ #string)
+  return frob(#retrieval/question, {:actor -> actor, :index -> index, :limit -> limit, :model -> model, :text -> question_text})
+end
+
+verb retrieval/plan_value(question, index, limit, model @ #string)
+  return frob(#retrieval/plan, {:index -> index, :limit -> limit, :model -> model, :question -> question})
+end
+
+verb retrieval/context_value(plan, subject)
+  return frob(#retrieval/context, {:plan -> plan, :subject -> subject})
+end
+
+verb retrieval/answer_value(question, index, limit, model @ #string)
+  return frob(#retrieval/answer, {:index -> index, :limit -> limit, :model -> model, :question -> question})
+end
+
+verb retrieval/index_entry_status(index, subject, model @ #string, text @ #string)
+  let embeddings = IndexEntryEmbedding(index, subject, model, ?embedding)
+  if not embeddings
+    retract IndexEntryStatus(index, subject, model, _)
+    assert IndexEntryStatus(index, subject, model, "missing")
+    assert EmbeddingRefreshNeeded(index, subject, model)
+    return "missing"
+  end
+  let exactly {:embedding -> embedding} = embeddings
+
+  let stored_texts = IndexEntrySourceText(index, subject, model, ?stored_text)
+  if not stored_texts
+    retract IndexEntryStatus(index, subject, model, _)
+    assert IndexEntryStatus(index, subject, model, "stale")
+    assert EmbeddingRefreshNeeded(index, subject, model)
+    retract VectorIndexContains(index, embedding)
+    embedding.embeddingStatus = "stale"
+    return "stale"
+  end
+  let exactly {:stored_text -> stored_text} = stored_texts
+  if stored_text != text
+    retract IndexEntryStatus(index, subject, model, _)
+    assert IndexEntryStatus(index, subject, model, "stale")
+    assert EmbeddingRefreshNeeded(index, subject, model)
+    retract VectorIndexContains(index, embedding)
+    embedding.embeddingStatus = "stale"
+    return "stale"
+  end
+
+  retract IndexEntryStatus(index, subject, model, _)
+  assert IndexEntryStatus(index, subject, model, "ready")
+  retract EmbeddingRefreshNeeded(index, subject, model)
+  embedding.embeddingStatus = "ready"
+  return "ready"
+end
+
+verb retrieval/text_unit_status(index, unit, model @ #string)
+  let texts = TextUnitText(unit, ?text)
+  if not texts
+    retract IndexEntryStatus(index, unit, model, _)
+    assert IndexEntryStatus(index, unit, model, "missing")
+    assert EmbeddingRefreshNeeded(index, unit, model)
+    return "missing"
+  end
+  let exactly {:text -> text} = texts
+
+  return retrieval/index_entry_status(index, unit, model, text)
+end
+
+verb ensure_subject_embedding(actor, index, subject, text @ #string, model @ #string)
+  assert VectorIndex(index)
+  index.vectorIndexMetric = "cosine"
+
+  let status = retrieval/index_entry_status(index, subject, model, text)
+  if status == "ready"
+    let exactly {:embedding -> embedding} = IndexEntryEmbedding(index, subject, model, ?embedding)
+    return embedding
+  end
+
+  let embedding = frob(#retrieval/embedding, {:index -> index, :model -> model, :subject -> subject, :text -> text})
+  let vector = embed_text(model, text)
+
+  retract IndexEntryEmbedding(index, subject, model, _)
+  retract IndexEntrySourceText(index, subject, model, _)
+  retract IndexEntryStatus(index, subject, model, _)
+  retract EmbeddingRefreshNeeded(index, subject, model)
+
+  assert Embedding(embedding)
+  embedding.embeddingOf = subject
+  embedding.embeddingVector = vector
+  embedding.embeddingModel = model
+  embedding.embeddingSourceText = text
+  embedding.embeddingStatus = "ready"
+  assert VectorIndexContains(index, embedding)
+  assert IndexEntryEmbedding(index, subject, model, embedding)
+  assert IndexEntrySourceText(index, subject, model, text)
+  assert IndexEntryStatus(index, subject, model, "ready")
+  return embedding
+end
+
+verb index_text_unit(actor, index, unit, model @ #string)
+  let text = unit.textUnitText
+  return ensure_subject_embedding(actor, index, unit, text, model)
+end
+
+verb retrieve_context(actor, index, question_text @ #string, limit, model @ #string)
+  let question = retrieval/question_value(actor, question_text, index, limit, model)
+  assert Question(question)
+  question.questionText = question_text
+  question.askedBy = actor
+
+  let plan = retrieval/plan_value(question, index, limit, model)
+  assert RetrievalPlan(plan)
+  plan.planForQuestion = question
+  plan.planKind = "nearest_embedding"
+  plan.planModel = model
+
+  let query_embedding = embed_text(model, question_text)
+  let contexts = []
+  for found in NearestEmbedding(index, query_embedding, limit, ?subject, ?score, ?snapshot_version)
+    let subject = found[:subject]
+    if CanRetrieveSubject(actor, subject)
+      let context = retrieval/context_value(plan, subject)
+      assert RetrievedContext(context)
+      context.contextForPlan = plan
+      context.contextSubject = subject
+      context.contextScore = found[:score]
+      context.contextReason = "nearest_embedding"
+      context.contextSnapshotVersion = found[:snapshot_version]
+      contexts = [@contexts, {:context -> context, :score -> found[:score], :subject -> subject, :snapshot_version -> found[:snapshot_version]}]
+    end
+  end
+
+  return {:contexts -> contexts, :plan -> plan, :question -> question}
+end
+
+verb answer_refresh_status(answer)
+  let stale = false
+  for found in AnswerCitation(answer, ?subject)
+    let subject = found[:subject]
+    let current_texts = TextUnitText(subject, ?text)
+    let exactly {:text -> recorded} = AnswerCitationText(answer, subject, ?text)
+    if not current_texts
+      stale = true
+    else
+      let exactly {:text -> current} = current_texts
+      if current != recorded
+        stale = true
+      end
+    end
+  end
+
+  if stale
+    answer.answerStatus = "stale"
+    assert AnswerNeedsReview(answer)
+    assert AnswerRefreshNeeded(answer)
+    return "stale"
+  end
+
+  retract AnswerNeedsReview(answer)
+  retract AnswerRefreshNeeded(answer)
+  answer.answerStatus = "fresh"
+  return "fresh"
+end
+
+verb answer_question(actor, index, question_text @ #string, limit, model @ #string)
+  let retrieval = retrieve_context(actor, index, question_text, limit, model)
+  let question = retrieval[:question]
+  let plan = retrieval[:plan]
+  let contexts = retrieval[:contexts]
+  let answer = retrieval/answer_value(question, index, limit, model)
+  let snippets = []
+  let context_text = ""
+  let summary = string_concat("Relevant context for: ", question_text)
+
+  for context in contexts
+    let subject = context[:subject]
+    let snippet = subject.textUnitText
+    assert AnswerCitation(answer, subject)
+    assert AnswerCitationText(answer, subject, snippet)
+    snippets = [@snippets, snippet]
+    context_text = string_concat(context_text, string_concat("\n- ", snippet))
+    summary = string_concat(summary, string_concat("\n- ", snippet))
+  end
+
+  assert Answer(answer)
+  answer.answerForQuestion = question
+  answer.answerPromptText = question_text
+  answer.answerContextText = context_text
+  answer.answerText = summary
+  answer.answerStatus = "fresh"
+  retract AnswerNeedsReview(answer)
+  retract AnswerRefreshNeeded(answer)
+
+  return {:answer -> answer, :plan -> plan, :question -> question, :snippets -> snippets, :text -> summary}
+end

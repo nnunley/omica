@@ -1,0 +1,910 @@
+// Agent tools: read-only source tools + tool-call execution.
+
+// Streaming flag set by agent/run_loop while the loop is in progress.
+make_functional_relation(:session/IsStreaming, 2, [0], :volatile)
+
+// Loop phase: "thinking" (LLM call in progress), "executing" (tool
+// execution), "idle" (not running). Drives the activity panel.
+make_functional_relation(:session/LoopPhase, 2, [0], :volatile)
+
+// Stage 4: steering and follow-up queues, keyed by endpoint.
+// Steering messages interrupt the loop mid-turn; follow-up messages
+// extend it after it would otherwise stop. Stored as list-valued
+// functional relations.
+make_functional_relation(:session/SteeringQueue, 2, [0], :volatile)
+make_functional_relation(:session/FollowUpQueue, 2, [0], :volatile)
+
+// Tool relations.
+make_identity(:tool)
+make_relation(:Tool, 1)
+make_functional_relation(:ToolName, 2, [0])
+make_functional_relation(:ToolDescription, 2, [0])
+make_functional_relation(:ToolParameters, 2, [0])
+make_relation(:ToolEnabled, 2)
+
+make_identity(:tool_call)
+make_identity(:tool_result)
+make_relation(:ToolCall, 1)
+make_functional_relation(:ToolCallMessage, 2, [0])
+make_functional_relation(:ToolCallId, 2, [0])
+make_functional_relation(:ToolCallName, 2, [0])
+make_functional_relation(:ToolCallArguments, 2, [0])
+make_functional_relation(:ToolCallStatus, 2, [0])
+make_relation(:ToolResult, 1)
+make_functional_relation(:ToolResultCall, 2, [0])
+make_functional_relation(:ToolResultContent, 2, [0])
+make_functional_relation(:ToolResultIsError, 2, [0])
+make_functional_relation(:ToolResultDetails, 2, [0])
+make_relation(:TranscriptToolCall, 7)
+make_relation(:TranscriptToolResult, 6)
+
+// These projections carry only tool state belonging to one agent's
+// transcript. They let that agent's browser observe tool progress without
+// waking views for unrelated agents.
+TranscriptToolCall(agent, message, call, call_id, name, arguments, status) :-
+  TranscriptEntry(agent, transcript, seq, message, role, content),
+  ToolCall(call),
+  ToolCallMessage(call, message),
+  ToolCallId(call, call_id),
+  ToolCallName(call, name),
+  ToolCallArguments(call, arguments),
+  ToolCallStatus(call, status)
+
+TranscriptToolResult(agent, call, result, content, is_error, details) :-
+  TranscriptToolCall(agent, message, call, call_id, name, arguments, status),
+  ToolResult(result),
+  ToolResultCall(result, call),
+  ToolResultContent(result, content),
+  ToolResultIsError(result, is_error),
+  ToolResultDetails(result, details)
+
+// Built-in read-only tools.
+make_identity(:tool/read)
+make_identity(:tool/grep)
+make_identity(:tool/glob)
+make_identity(:tool/ls)
+
+assert Tool(#tool/read)
+assert ToolName(#tool/read, "read")
+assert ToolDescription(#tool/read, "Read the full text of a file at a given path.")
+assert ToolParameters(#tool/read, "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path relative to the workspace root\"}},\"required\":[\"path\"]}")
+
+assert Tool(#tool/grep)
+assert ToolName(#tool/grep, "grep")
+assert ToolDescription(#tool/grep, "Search file contents for a text pattern.")
+assert ToolParameters(#tool/grep, "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"Text pattern to search for\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of results (default 16)\"}},\"required\":[\"pattern\"]}")
+
+assert Tool(#tool/glob)
+assert ToolName(#tool/glob, "glob")
+assert ToolDescription(#tool/glob, "Find files matching a glob pattern. Supports * (any sequence within a path segment), ** (any sequence across path segments), and ? (single character). The pattern is matched against the full relative path. Optional path prefix restricts the search directory.")
+assert ToolParameters(#tool/glob, "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"Glob pattern, e.g. *.rs, src/**/*.rs, README*\"},\"path\":{\"type\":\"string\",\"description\":\"Directory prefix to restrict the search (default: root)\"}},\"required\":[\"pattern\"]}")
+
+assert Tool(#tool/ls)
+assert ToolName(#tool/ls, "ls")
+assert ToolDescription(#tool/ls, "List files and directories under a path.")
+assert ToolParameters(#tool/ls, "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Directory path relative to the workspace root (default empty)\"}},\"required\":[]}")
+
+// Enable the default set for the default workspace.
+assert ToolEnabled(#workspace/default, #tool/read)
+assert ToolEnabled(#workspace/default, #tool/grep)
+assert ToolEnabled(#workspace/default, #tool/glob)
+assert ToolEnabled(#workspace/default, #tool/ls)
+
+// Helpers
+verb tool/source_repository(workspace)
+  let revisions = WorkspaceRevision(workspace, ?revision)
+  if not revisions
+    return none
+  end
+  let exactly {:revision -> revision} = revisions
+  let repositories = source/RevisionOf(revision, ?repository)
+  if not repositories
+    return none
+  end
+  let exactly {:repository -> repository} = repositories
+  return repository
+end
+
+verb tool/source_revision(workspace)
+  let exactly {:revision -> revision} = WorkspaceRevision(workspace, ?revision)
+  return revision
+end
+
+verb tool/workspace_bound(workspace)
+  return tool/source_repository(workspace) != none
+end
+
+verb tool/args_string(arguments, key)
+  let value = index_or(arguments, key, none)
+  if value == none
+    return ""
+  end
+  return trim(value)
+end
+
+verb tool/args_int(arguments, key)
+  let value = index_or(arguments, key, none)
+  if value == none
+    return 0
+  end
+  let parsed = parse_ordinal(value)
+  return match parsed
+  case ok(number)
+    number
+  case err(problem)
+    0
+  end
+end
+
+// Individual tools.
+
+verb tool/read(agent @ #agent, arguments @ #map)
+  let workspace = workspace/active(agent)
+  if workspace == none || tool/workspace_bound(workspace) == false
+    return {:status -> "error", :error -> "workspace not bound to a source repository", :value -> none}
+  end
+  let repository = tool/source_repository(workspace)
+  let revision = tool/source_revision(workspace)
+
+  let path = tool/args_string(arguments, :path)
+  if path == ""
+    return {:status -> "error", :error -> "missing path argument", :value -> none}
+  end
+  if path == "." || path == "./"
+    return {:status -> "error", :error -> "path must be a file path, not a directory", :value -> none}
+  end
+
+  let file_rows = source/FileText(repository, revision, path, ?provider, ?text, ?hash, ?source_version)
+  if not file_rows
+    return {:status -> "error", :error -> string_concat("file not found: ", path), :value -> none}
+  end
+  let exactly {:text -> text, :hash -> hash} = file_rows
+
+  let exactly {:line_count -> line_count} = source/FileLineCount(repository, revision, path, ?line_count, ?line_provider, ?line_version)
+  if line_count == none
+    line_count = 0
+  end
+
+  return {:status -> "complete", :path -> path, :lines -> line_count, :content -> text, :rendered -> string_concat(path, " (", to_literal(line_count), " lines)\n", text)}
+end
+
+verb tool/grep(agent @ #agent, arguments @ #map)
+  let workspace = workspace/active(agent)
+  if workspace == none || tool/workspace_bound(workspace) == false
+    return {:status -> "error", :error -> "workspace not bound to a source repository", :value -> none}
+  end
+  let repository = tool/source_repository(workspace)
+  let revision = tool/source_revision(workspace)
+
+  let pattern = tool/args_string(arguments, :pattern)
+  if pattern == ""
+    return {:status -> "error", :error -> "missing pattern argument", :value -> none}
+  end
+
+  let limit = tool/args_int(arguments, :limit)
+  if limit <= 0
+    limit = 16
+  end
+
+  let matches = []
+  let count = 0
+  for found in source/TextSearch(repository, revision, pattern, limit, "all", ?subject, ?score, ?path, ?start_line, ?end_line, ?kind, ?title, ?snippet, ?provider, ?source_version)
+    matches = [@matches, {:path -> found[:path], :start_line -> found[:start_line], :end_line -> found[:end_line], :snippet -> found[:snippet]}]
+    count = count + 1
+  end
+
+  if count == 0
+    return {:status -> "complete", :pattern -> pattern, :matches -> matches, :rendered -> string_concat("No matches for ", pattern), :value -> matches}
+  end
+
+  let rendered_lines = []
+  for match in matches
+    rendered_lines = [@rendered_lines, string_concat(match[:path], ":", to_literal(match[:start_line]), "\n", match[:snippet])]
+  end
+  return {:status -> "complete", :pattern -> pattern, :matches -> matches, :rendered -> string_join(rendered_lines, "\n\n"), :value -> matches}
+end
+
+// Glob matching: supports * (any sequence except /), ** (any sequence
+// including /), and ? (single character). The pattern is matched against
+// the full relative path. Implemented iteratively with backtracking to
+// avoid exceeding the VM call-depth limit on long paths.
+verb glob/match(pattern @ #string, path @ #string)
+  let p = string_chars(pattern)
+  let s = string_chars(path)
+  let plen = string_len(pattern)
+  let slen = string_len(path)
+  let pi = 0
+  let si = 0
+  let star_pi = 0
+  let star_si = 0
+  let has_star = false
+  let is_globstar = false
+
+  while si < slen
+    let pc = ""
+    if pi < plen
+      pc = p[pi]
+    end
+
+    if pc == "*"
+      // check for ** (matches across path separators)
+      if pi + 1 < plen && p[pi + 1] == "*"
+        is_globstar = true
+        star_pi = pi + 2
+      else
+        is_globstar = false
+        star_pi = pi + 1
+      end
+      star_si = si
+      has_star = true
+      pi = star_pi
+    elseif pc == "?" || (pi < plen && pc == s[si])
+      pi = pi + 1
+      si = si + 1
+    elseif has_star
+      // backtrack: star matches one more character
+      star_si = star_si + 1
+      si = star_si
+      pi = star_pi
+      // single * cannot match past a path separator
+      if !is_globstar && star_si > 0 && s[star_si - 1] == "/"
+        return false
+      end
+    else
+      return false
+    end
+  end
+
+  // skip trailing * and ** in pattern
+  while pi < plen && p[pi] == "*"
+    pi = pi + 1
+  end
+
+  return pi >= plen
+end
+
+verb tool/glob(agent @ #agent, arguments @ #map)
+  let workspace = workspace/active(agent)
+  if workspace == none || tool/workspace_bound(workspace) == false
+    return {:status -> "error", :error -> "workspace not bound to a source repository", :value -> none}
+  end
+
+  let pattern = tool/args_string(arguments, :pattern)
+  if pattern == ""
+    return {:status -> "error", :error -> "missing pattern argument", :value -> none}
+  end
+  let path_prefix = tool/args_string(arguments, :path)
+  if path_prefix == "." || path_prefix == "./"
+    path_prefix = ""
+  end
+
+  let matches = []
+  let count = 0
+  for found in source/IndexedFile(?idx, ?repo, ?filepath, ?filetitle, ?lang, ?model)
+    if glob/match(pattern, found[:filepath])
+      if path_prefix == "" || string_starts_with(found[:filepath], path_prefix)
+        matches = [@matches, {:path -> found[:filepath], :kind -> "file", :name -> found[:filetitle]}]
+        count = count + 1
+        if count >= 100
+          break
+        end
+      end
+    end
+  end
+
+  if count == 0
+    return {:status -> "complete", :pattern -> pattern, :matches -> matches, :rendered -> string_concat("No files matching ", pattern), :value -> matches}
+  end
+
+  let rendered_lines = []
+  for match in matches
+    rendered_lines = [@rendered_lines, string_concat(match[:path], " (", match[:kind], ")")]
+  end
+  return {:status -> "complete", :pattern -> pattern, :matches -> matches, :rendered -> string_join(rendered_lines, "\n"), :value -> matches}
+end
+
+verb tool/ls(agent @ #agent, arguments @ #map)
+  let workspace = workspace/active(agent)
+  if workspace == none || tool/workspace_bound(workspace) == false
+    return {:status -> "error", :error -> "workspace not bound to a source repository", :value -> none}
+  end
+  let repository = tool/source_repository(workspace)
+  let revision = tool/source_revision(workspace)
+
+  let path = tool/args_string(arguments, :path)
+  if path == "." || path == "./"
+    path = ""
+  end
+
+  let entries = []
+  let count = 0
+  for entry in source/RepositoryEntry(repository, revision, path, ?child_path, ?kind, ?entry_name, ?provider)
+    if entry[:entry_name] != "." && entry[:entry_name] != ".."
+      entries = [@entries, {:path -> entry[:child_path], :kind -> entry[:kind], :name -> entry[:entry_name]}]
+      count = count + 1
+    end
+  end
+
+  if count == 0
+    return {:status -> "complete", :path -> path, :entries -> entries, :rendered -> "No entries.", :value -> entries}
+  end
+
+  let rendered_lines = []
+  for entry in entries
+    let prefix = "?"
+    if entry[:kind] == "directory"
+      prefix = "dir"
+    elseif entry[:kind] == "file"
+      prefix = "file"
+    end
+    rendered_lines = [@rendered_lines, string_concat(prefix, "  ", entry[:path])]
+  end
+  return {:status -> "complete", :path -> path, :entries -> entries, :rendered -> string_join(rendered_lines, "\n"), :value -> entries}
+end
+
+verb tool/invoke(agent @ #agent, tool_name @ #string, arguments @ #map)
+  if tool_name == "read"
+    return tool/read(agent, arguments)
+  elseif tool_name == "grep"
+    return tool/grep(agent, arguments)
+  elseif tool_name == "glob"
+    return tool/glob(agent, arguments)
+  elseif tool_name == "ls"
+    return tool/ls(agent, arguments)
+  else
+    return {:status -> "error", :error -> string_concat("unknown tool: ", tool_name), :value -> none}
+  end
+end
+
+// LLM-facing helpers.
+
+verb agent/build_tools(agent @ #agent)
+  let workspace = workspace/active(agent)
+  if workspace == none
+    return []
+  end
+
+  let tools = []
+  for found in ToolEnabled(workspace, ?tool)
+    let tool = found[:tool]
+    let exactly {:name -> name} = ToolName(tool, ?name)
+    let exactly {:description -> description} = ToolDescription(tool, ?description)
+    let exactly {:parameters -> parameters} = ToolParameters(tool, ?parameters)
+    if name != none && description != none && parameters != none
+      let spec = {:type -> "function", :function -> {:name -> name, :description -> description, :parameters -> json_decode(parameters)}}
+      tools = [@tools, spec]
+    end
+  end
+  return tools
+end
+
+verb agent/build_responses_tools(agent @ #agent)
+  let workspace = workspace/active(agent)
+  if workspace == none
+    return []
+  end
+
+  let tools = []
+  for found in ToolEnabled(workspace, ?tool)
+    let tool = found[:tool]
+    let exactly {:name -> name} = ToolName(tool, ?name)
+    let exactly {:description -> description} = ToolDescription(tool, ?description)
+    let exactly {:parameters -> parameters} = ToolParameters(tool, ?parameters)
+    if name != none && description != none && parameters != none
+      let spec = {:type -> "function", :name -> name, :description -> description, :parameters -> json_decode(parameters)}
+      tools = [@tools, spec]
+    end
+  end
+  return tools
+end
+
+verb agent/tool_calls(response @ #map)
+  let calls = index_or(response, :tool_calls, none)
+  if calls == none
+    return []
+  end
+  return calls
+end
+
+verb agent/tool_calls(response)
+  return []
+end
+
+verb agent/record_tool_call(assistant_message, event)
+  let call_id = index_or(event, :call_id, none)
+  let tool_name = index_or(event, :name, none)
+  let arguments = index_or(event, :arguments, none)
+  if call_id == none || tool_name == none || arguments == none
+    return none
+  end
+  let tool_call = frob(#tool_call, {:assistant_message -> assistant_message, :call_id -> call_id})
+  assert ToolCall(tool_call)
+  assert ToolCallMessage(tool_call, assistant_message)
+  assert ToolCallId(tool_call, call_id)
+  assert ToolCallName(tool_call, tool_name)
+  assert ToolCallArguments(tool_call, arguments)
+  tool_call.toolCallStatus = "pending"
+  ui/flush(endpoint())
+  return {:entity -> tool_call, :id -> call_id, :name -> tool_name, :arguments -> arguments}
+end
+
+// Cap on tool-call rounds per user message. Stage 4 replaces this with a
+// needs-follow-up loop driven by session/SteeringQueue and session/FollowUpQueue.
+verb agent/max_tool_rounds(agent @ #agent)
+  let configured = AgentMaxToolRounds(agent, ?rounds)
+  if not configured
+    return 4
+  end
+  let exactly {:rounds -> rounds} = configured
+  return rounds
+end
+
+verb agent/execute_tool_calls(agent @ #agent, assistant_message, calls)
+  let executed = []
+  for call in calls
+    let call_id = index_or(call, :id, none)
+    let tool_name = index_or(call, :name, none)
+    let args_text = index_or(call, :arguments, none)
+    if call_id == none || tool_name == none || args_text == none
+      executed = [@executed, {:tool_call_id -> call_id, :content -> "(malformed tool call)"}]
+    else
+      let args = json_decode(args_text)
+      if args == none
+        args = {}
+      end
+
+      let tool_call = index_or(call, :entity, none)
+      if tool_call == none
+        tool_call = frob(#tool_call, {:assistant_message -> assistant_message, :call_id -> call_id})
+        assert ToolCall(tool_call)
+        assert ToolCallMessage(tool_call, assistant_message)
+        assert ToolCallId(tool_call, call_id)
+        assert ToolCallName(tool_call, tool_name)
+        assert ToolCallArguments(tool_call, args_text)
+        tool_call.toolCallStatus = "pending"
+        ui/flush(endpoint())
+      end
+
+      let result
+      try
+        result = tool/invoke(agent, tool_name, args)
+      catch err
+        result = {:status -> "error", :error -> string_concat("tool execution error: ", to_literal(err)), :rendered -> string_concat("tool execution error: ", to_literal(err))}
+      end
+      tool_call.toolCallStatus = result[:status]
+
+      let content = index_or(result, :rendered, none)
+      if content == none
+        content = index_or(result, :error, none)
+      end
+      if content == none
+        content = ""
+      end
+
+      let tool_result = frob(#tool_result, {:tool_call -> tool_call})
+      assert ToolResult(tool_result)
+      assert ToolResultCall(tool_result, tool_call)
+      assert ToolResultContent(tool_result, content)
+      assert ToolResultIsError(tool_result, result[:status] == "error")
+      assert ToolResultDetails(tool_result, to_literal(result))
+
+      executed = [@executed, {:tool_call_id -> call_id, :content -> content}]
+      ui/flush(endpoint())
+    end
+  end
+  return executed
+end
+
+verb agent/llm_messages_with_tools(transcript)
+  // TODO(Stage 7): assemble per-agent/per-workspace system prompt from
+  // Skill/ContextFile relations instead of using the constant default.
+  let system = agent/system_prompt(#agent/default)
+  let messages = [llm/system_message(system)]
+
+  for message in agent/messages_ordered(transcript)
+    let role = message.messageRole
+    let content = message.messageContent
+    if content == none
+      content = ""
+    end
+    if role == "user"
+      messages = [@messages, llm/user_message(content)]
+    elseif role == "assistant"
+      let calls = []
+      for found in ToolCallMessage(?call, message)
+        let exactly {:id -> call_id} = ToolCallId(found[:call], ?id)
+        let exactly {:name -> call_name} = ToolCallName(found[:call], ?name)
+        let exactly {:args -> call_args} = ToolCallArguments(found[:call], ?args)
+        if call_id != none && call_name != none && call_args != none
+          calls = [@calls, {:id -> call_id, :type -> "function", :function -> {:name -> call_name, :arguments -> call_args}}]
+        end
+      end
+      if calls == []
+        messages = [@messages, llm/assistant_message(content)]
+      else
+        messages = [@messages, {:role -> "assistant", :content -> content, :tool_calls -> calls}]
+      end
+    elseif role == "tool"
+      let parsed = from_literal(content)
+      if let ok(value) = parsed
+        let tool_call_id = index_or(value, :tool_call_id, none)
+        if tool_call_id == none
+          tool_call_id = "unknown"
+        end
+        let tool_content = index_or(value, :content, none)
+        if tool_content == none
+          tool_content = "(missing content)"
+        end
+        messages = [@messages, llm/tool_message(tool_call_id, tool_content)]
+      else
+        messages = [@messages, llm/tool_message("unknown", string_concat("(malformed tool result: ", content, ")"))]
+      end
+    elseif role == "system"
+      messages = [@messages, llm/system_message(content)]
+    end
+  end
+
+  return messages
+end
+
+verb agent/llm_responses_input(transcript)
+  let input = []
+  for message in agent/messages_ordered(transcript)
+    let role = message.messageRole
+    let content = message.messageContent
+    if content == none
+      content = ""
+    end
+    if role == "user" || role == "system"
+      input = [@input, {:role -> role, :content -> content}]
+    elseif role == "assistant"
+      let response_item_rows = MessageResponseItems(message, ?items)
+      if response_item_rows
+        let exactly {:items -> response_items} = response_item_rows
+        for item in response_items
+          input = [@input, item]
+        end
+      else
+        if content != ""
+          input = [@input, {:role -> "assistant", :content -> content}]
+        end
+        for found in ToolCallMessage(?call, message)
+          let exactly {:id -> call_id} = ToolCallId(found[:call], ?id)
+          let exactly {:name -> call_name} = ToolCallName(found[:call], ?name)
+          let exactly {:args -> call_args} = ToolCallArguments(found[:call], ?args)
+          if call_id != none && call_name != none && call_args != none
+            input = [@input, {:type -> "function_call", :call_id -> call_id, :name -> call_name, :arguments -> call_args}]
+          end
+        end
+      end
+    elseif role == "tool"
+      let parsed = from_literal(content)
+      if let ok(value) = parsed
+        let call_id = index_or(value, :tool_call_id, none)
+        let output = index_or(value, :content, none)
+        if call_id != none && output != none
+          input = [@input, {:type -> "function_call_output", :call_id -> call_id, :output -> output}]
+        end
+      end
+    end
+  end
+  return input
+end
+
+verb agent/resolve_api(agent @ #agent)
+  let from_env = os_getenv("MICA_AGENT_API")
+  if let some(api) = from_env
+    return api
+  end
+  let configured_apis = AgentApi(agent, ?api)
+  if configured_apis
+    let exactly {:api -> configured} = configured_apis
+    return configured
+  end
+  return "responses"
+end
+
+verb agent/stream_events(message)
+  if index_or(message, :type, none) == :batch
+    return index_or(message, :events, [])
+  end
+  return [message]
+end
+
+verb agent/chat_with_tools(agent @ #agent, transcript)
+  let model = agent/resolve_model(agent)
+  let api = agent/resolve_api(agent)
+  if api != "responses" && api != "chat_completions"
+    raise E_INVARG, string_concat("unsupported agent API: ", api)
+  end
+  let instructions = agent/system_prompt(agent)
+  let request_input
+  let tools
+  if api == "chat_completions"
+    request_input = agent/llm_messages_with_tools(transcript)
+    tools = agent/build_tools(agent)
+  else
+    request_input = agent/llm_responses_input(transcript)
+    tools = agent/build_responses_tools(agent)
+  end
+
+  let [receiver, sender] = mailbox()
+  let steering_subscription = subscribe_changes(sender, :facts, some(:session/SteeringQueue), [some(endpoint()), none], :changes)
+  let assistant_message = agent/append_message(agent, "assistant", "")
+  assistant_message.messageStatus = "streaming"
+  ui/flush(endpoint())
+
+  if api == "chat_completions"
+    llm/chat_stream(model, request_input, {:stream -> true}, tools, sender)
+  else
+    llm/responses_stream(model, request_input, instructions, {:stream -> true}, tools, sender)
+  end
+
+  let text = ""
+  let pending_text = ""
+  let published_text = false
+  let calls = []
+  let completed_response = none
+  let done = false
+  let failed = false
+  let cancelled = false
+  while done == false
+    let ready = mailbox_recv([receiver])
+    for group in ready
+      for message in group[1]
+        if index_or(message, :kind, none) == :changes && session/steering_count(endpoint()) > 0
+          done = true
+          cancelled = true
+        else
+          for event in agent/stream_events(message)
+            let kind = index_or(event, :type, none)
+            if kind == :text_delta
+              let delta = index_or(event, :delta, "")
+              text = string_concat(text, delta)
+              pending_text = string_concat(pending_text, delta)
+              if published_text == false || string_len(pending_text) >= 96
+                assistant_message.messageContent = text
+                pending_text = ""
+                published_text = true
+                ui/flush(endpoint())
+              end
+            elseif kind == :tool_call_ready
+              let call = agent/record_tool_call(assistant_message, event)
+              if call != none
+                calls = [@calls, call]
+              end
+            elseif kind == :completed
+              completed_response = index_or(event, :response, none)
+              if text == ""
+                text = index_or(event, :text, "")
+              end
+              done = true
+            elseif kind == :incomplete
+              done = true
+              failed = true
+              if text == ""
+                text = "(LLM response was incomplete)"
+              end
+            elseif kind == :error
+              done = true
+              failed = true
+              let message = index_or(event, :message, "unknown LLM stream error")
+              if text == ""
+                text = string_concat("(LLM error: ", string_concat(message, ")"))
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  assistant_message.messageContent = text
+  if completed_response != none
+    let response_id = index_or(completed_response, :id, none)
+    let response_model = index_or(completed_response, :model, none)
+    let response_usage = index_or(completed_response, :usage, none)
+    let response_items = index_or(completed_response, :output, none)
+    if response_id != none
+      assistant_message.messageResponseId = response_id
+    end
+    if response_model != none
+      assistant_message.messageModel = response_model
+    end
+    if response_usage != none
+      assistant_message.messageUsage = response_usage
+    end
+    if response_items != none
+      assistant_message.messageResponseItems = response_items
+    end
+  end
+  if cancelled
+    if text == ""
+      text = "(interrupted)"
+      assistant_message.messageContent = text
+    end
+    for call in calls
+      let tool_call = call[:entity]
+      tool_call.toolCallStatus = "cancelled"
+    end
+    assistant_message.messageStatus = "cancelled"
+  elseif failed
+    for call in calls
+      let tool_call = call[:entity]
+      tool_call.toolCallStatus = "failed"
+    end
+    assistant_message.messageStatus = "failed"
+  else
+    assistant_message.messageStatus = "complete"
+  end
+  cancel_subscription(steering_subscription)
+  ui/flush(endpoint())
+  mailbox_close(receiver)
+  if cancelled
+    return {:message -> assistant_message, :text -> text, :tool_calls -> [], :cancelled -> true}
+  end
+  if failed
+    return none
+  end
+  return {:message -> assistant_message, :text -> text, :tool_calls -> calls}
+end
+
+// Stage 4: steering and follow-up queue helpers.
+// The loop task and the sync event task share these relations. Conflicts
+// are retried by the runtime, so concurrent push/drain is safe.
+verb session/steering_push(endpoint, message @ #string)
+  let current = []
+  let queues = session/SteeringQueue(endpoint, ?queue)
+  if queues
+    let exactly {:queue -> configured_queue} = queues
+    current = configured_queue
+  end
+  endpoint().session/SteeringQueue = [@current, message]
+  endpoint.session/SteeringQueue = [@current, message]
+end
+
+verb session/steering_drain(endpoint)
+  let current = []
+  let queues = session/SteeringQueue(endpoint, ?queue)
+  if queues
+    let exactly {:queue -> configured_queue} = queues
+    current = configured_queue
+  end
+  endpoint().session/SteeringQueue = []
+  endpoint.session/SteeringQueue = []
+  return current
+end
+
+verb session/followup_push(endpoint, message @ #string)
+  let current = []
+  let queues = session/FollowUpQueue(endpoint, ?queue)
+  if queues
+    let exactly {:queue -> configured_queue} = queues
+    current = configured_queue
+  end
+  endpoint().session/FollowUpQueue = [@current, message]
+  endpoint.session/FollowUpQueue = [@current, message]
+end
+
+verb session/followup_drain(endpoint)
+  let current = []
+  let queues = session/FollowUpQueue(endpoint, ?queue)
+  if queues
+    let exactly {:queue -> configured_queue} = queues
+    current = configured_queue
+  end
+  endpoint().session/FollowUpQueue = []
+  endpoint.session/FollowUpQueue = []
+  return current
+end
+
+verb session/steering_count(endpoint)
+  let queues = session/SteeringQueue(endpoint, ?queue)
+  if not queues
+    return 0
+  end
+  let exactly {:queue -> current} = queues
+  return list_count(current)
+end
+
+verb session/followup_count(endpoint)
+  let queues = session/FollowUpQueue(endpoint, ?queue)
+  if not queues
+    return 0
+  end
+  let exactly {:queue -> current} = queues
+  return list_count(current)
+end
+
+// Stage 3+4: the agent loop. Submits to the LLM with the current transcript
+// and tool surface, executes any tool calls, appends results, and recurses
+// until the LLM stops calling tools. Steering messages are drained at the
+// top of each iteration and injected as user messages. Follow-up messages
+// extend the loop when it would otherwise stop.
+verb agent/run_loop(agent @ #agent, transcript)
+  endpoint().session/isStreaming = true
+  endpoint().session/loopPhase = "thinking"
+  ui/flush(endpoint())
+
+  try
+    agent/run_loop_body(agent, transcript)
+  catch err
+    agent/append_message(agent, "assistant", string_concat("(agent error: ", to_literal(err), ")"))
+    ui/flush(endpoint())
+  end
+
+  endpoint().session/isStreaming = false
+  endpoint().session/loopPhase = "idle"
+  ui/flush(endpoint())
+end
+
+verb agent/run_loop_body(agent @ #agent, transcript)
+  let max_rounds = agent/max_tool_rounds(agent)
+  let round = 0
+  while round < max_rounds
+    round = round + 1
+
+    // Drain steering messages at the top of each iteration.
+    // These arrive as user messages while the loop was suspended on the
+    // previous LLM call or tool execution.
+    let steering = session/steering_drain(endpoint())
+    if steering != []
+      for msg in steering
+        agent/append_message(agent, "user", msg)
+      end
+      ui/flush(endpoint())
+    end
+
+    let response
+    try
+      endpoint().session/loopPhase = "thinking"
+      ui/flush(endpoint())
+      response = agent/chat_with_tools(agent, transcript)
+    catch err
+      agent/append_message(agent, "assistant", string_concat("(LLM error: ", to_literal(err), ")"))
+      ui/flush(endpoint())
+      response = none
+    end
+
+    if response == none
+      round = max_rounds
+    elseif index_or(response, :cancelled, false) == true
+      // The next loop iteration drains the committed steering queue and
+      // submits it with the complete transcript state.
+    else
+      let text = index_or(response, :text, none)
+      if text == none
+        text = ""
+      end
+      let calls = agent/tool_calls(response)
+      if calls == []
+        if text == ""
+          text = "(no response)"
+          response[:message].messageContent = text
+          ui/flush(endpoint())
+        end
+
+        // The LLM stopped. Drain follow-up messages and continue if any.
+        let follow_up = session/followup_drain(endpoint())
+        if follow_up != []
+          for msg in follow_up
+            agent/append_message(agent, "user", msg)
+          end
+          ui/flush(endpoint())
+        else
+          round = max_rounds
+        end
+      else
+        let assistant_message = response[:message]
+        endpoint().session/loopPhase = "executing"
+        ui/flush(endpoint())
+        let results = agent/execute_tool_calls(agent, assistant_message, calls)
+        for result in results
+          let tool_content = to_literal({:tool_call_id -> result[:tool_call_id], :content -> result[:content]})
+          agent/append_message(agent, "tool", tool_content)
+        end
+        ui/flush(endpoint())
+      end
+    end
+  end
+end

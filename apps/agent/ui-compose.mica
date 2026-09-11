@@ -1,0 +1,561 @@
+// DOM composition for the server-owned agent view.
+
+verb ui/icon_node(name)
+  name == "clock" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>
+  name == "code" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6"></path><path d="m8 6-6 6 6 6"></path></svg>
+  name == "eye" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+  name == "folder" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></svg>
+  name == "git" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><path d="M13 6h3a2 2 0 0 1 2 2v7"></path><path d="M6 9v6"></path><path d="M6 21v-3a2 2 0 0 1 2-2h3"></path></svg>
+  name == "login" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><path d="m10 17 5-5-5-5"></path><path d="M15 12H3"></path></svg>
+  name == "send" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"></path><path d="M22 2 11 13"></path></svg>
+  name == "search" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+  name == "terminal" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"></path><path d="M12 19h8"></path></svg>
+  name == "x" && return dom <svg class="agent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+
+  return dom <span class="agent-icon-fallback"></span>
+end
+
+verb ui/icon_label_node(icon, label)
+  return dom <span class="agent-icon-label">{ui/icon_node(icon)}<span>{label}</span></span>
+end
+
+verb ui/command_form_node(id, text, label, class)
+  if id != ""
+    return dom <form id={id} class="agent-action" data-sync-event="submit" data-sync-action="agent_command">
+      <input type="hidden" name="text" value={text} />
+      <button type="submit" class={class} data-command={text}>{label}</button>
+    </form>
+  end
+
+  return dom <form class="agent-action" data-sync-event="submit" data-sync-action="agent_command">
+    <input type="hidden" name="text" value={text} />
+    <button type="submit" class={class} data-command={text}>{label}</button>
+  </form>
+end
+
+verb ui/entity_action_node(id, entity, text, label, class)
+  let entity_label = to_literal(entity)
+  if id != ""
+    return dom <form id={id} class="agent-action entity-action" data-sync-event="submit" data-sync-action="agent_inspect">
+      <input type="hidden" name="entity" value={entity_label} />
+      <button type="submit" class={class} data-entity={entity_label}>{label}</button>
+    </form>
+  end
+
+  return dom <form class="agent-action entity-action" data-sync-event="submit" data-sync-action="agent_inspect">
+    <input type="hidden" name="entity" value={entity_label} />
+    <button type="submit" class={class} data-entity={entity_label}>{label}</button>
+  </form>
+end
+
+verb ui/auth_required_node()
+  return dom <main id="agent-root" class="agent-login">
+    <section class="login-card">
+      <h1>Mica Agent</h1>
+      <p class="lede">Sign in to enter the workspace.</p>
+      <a class="login-link" href="/auth/login?return=%2Fagent">{ui/icon_label_node("login", "Open sign-in")}</a>
+    </section>
+  </main>
+end
+
+verb ui/entity_kind(entity)
+  if is_frob(entity)
+    let delegate = frob_delegate(entity)
+    if delegate == #target/file
+      return "file"
+    end
+    if delegate == #target/symbol
+      return "symbol"
+    end
+    if delegate == #target/diff
+      return "diff"
+    end
+    if delegate == #target/task
+      return "task"
+    end
+    return "object"
+  end
+  if Delegates(entity, #workspace, 0)
+    return "workspace"
+  end
+  if Delegates(entity, #agent, 0)
+    return "agent"
+  end
+  return "object"
+end
+
+verb ui/workspace_select_node(workspace)
+  let entity_label = to_literal(workspace)
+  return dom <form class="agent-action entity-action" data-sync-event="submit" data-sync-action="agent_select_workspace">
+    <input type="hidden" name="entity" value={entity_label} />
+    <button type="submit" class="mini-button" data-entity={entity_label}>{ui/icon_label_node("folder", "Select")}</button>
+  </form>
+end
+
+verb ui/workspace_row_node(agent @ #agent, workspace)
+  let name = ui/workspace_name(workspace)
+  let root = ui/workspace_root_text(workspace)
+  let root_text = root
+  if root == ""
+    root_text = "no root bound"
+  end
+  let active = workspace/active(agent)
+  let select_node = ""
+  if active == workspace
+    select_node = dom <span class="mini-button disabled">{ui/icon_label_node("folder", "Active")}</span>
+  else
+    select_node = ui/workspace_select_node(workspace)
+  end
+  return dom <li class="workspace-row" data-sync-key={to_literal(workspace)}>
+    <div class="workspace-main">
+      <strong>{name}</strong>
+      <span class="workspace-root">{root_text}</span>
+    </div>
+    <div class="workspace-actions">
+      {ui/entity_action_node("", workspace, "", ui/icon_label_node("eye", "Inspect"), "mini-button")}
+      {select_node}
+    </div>
+  </li>
+end
+
+verb ui/workspace_panel_node(agent @ #agent)
+  let current = workspace/active(agent)
+  let rows = []
+  let count = 0
+  for found in Workspace(?w)
+    rows = [@rows, ui/workspace_row_node(agent, found[:w])]
+    count = count + 1
+  end
+
+  if rows == []
+    let hint = "No workspaces bound. Set MICA_SOURCE_ROOTS to expose a repository."
+    rows = [dom <li class="muted">{hint}</li>]
+  end
+
+  let current_name = "none"
+  if current != none
+    current_name = ui/workspace_name(current)
+  end
+
+  return dom <section id="workspace" class="panel workspace-panel">
+    <h2>Workspace</h2>
+    <p class="workspace-current">Current: <strong>{current_name}</strong></p>
+    <ul class="workspace-list">{@rows}</ul>
+  </section>
+end
+
+verb ui/object_browser_description(entity)
+  let description = entity.description
+  if description == none
+    return ""
+  end
+  if string_len(description) > 120
+    return string_concat(string_slice(description, 0, 117), "...")
+  end
+  return description
+end
+
+verb ui/object_browser_matches(actor @ #agent, entity, needle @ #string)
+  if entity == none
+    return false
+  end
+
+  let name = ui/workspace_name(entity)
+  if string_contains(lower(name), needle)
+    return true
+  end
+
+  if is_frob(entity)
+    return false
+  end
+
+  let description = entity.description
+  if description != none && string_contains(lower(description), needle)
+    return true
+  end
+
+  return false
+end
+
+verb ui/object_browser_row_node(actor @ #agent, entity)
+  let name = ui/workspace_name(entity)
+  let description = ui/object_browser_description(entity)
+  let icon = "eye"
+  if is_frob(entity) && frob_delegate(entity) == #target/file
+    icon = "code"
+  end
+  return dom <li class="object-browser-row" data-sync-key={to_literal(entity)}>
+    <div class="object-browser-main">
+      <strong>{name}</strong>
+      <p>{description}</p>
+    </div>
+    <div class="object-browser-actions">
+      {ui/entity_action_node("", entity, "", ui/icon_label_node(icon, "Inspect"), "mini-button")}
+    </div>
+  </li>
+end
+
+verb ui/object_browser_results_node(actor @ #agent, query @ #string)
+  let needle = lower(trim(query))
+  if needle == ""
+    return dom <p class="muted mica-empty">Search workspaces, files, and symbols by name or path.</p>
+  end
+
+  let rows = []
+  let count = 0
+  for found in Workspace(?entity)
+    let entity = found[:entity]
+    if count < 16 && ui/object_browser_matches(actor, entity, needle)
+      rows = [@rows, ui/object_browser_row_node(actor, entity)]
+      count = count + 1
+    end
+  end
+
+  let workspace = workspace/active(actor)
+  if workspace != none
+    let repository = tool/source_repository(workspace)
+    let revision = tool/source_revision(workspace)
+    if repository != none && revision != none
+      for entry in source/RepositoryEntry(repository, revision, "", ?child_path, ?kind, ?entry_name, ?provider)
+        if count < 16 && entry[:kind] == "directory"
+          let dir_path = entry[:child_path]
+          if string_contains(lower(dir_path), needle)
+            let dir_entity = frob(#target/file, dir_path)
+            rows = [@rows, ui/object_browser_row_node(actor, dir_entity)]
+            count = count + 1
+          end
+        end
+      end
+    end
+  end
+
+  for found in source/IndexedFile(?idx, ?repo, ?filepath, ?filetitle, ?lang, ?model)
+    if count < 16 && string_contains(lower(found[:filepath]), needle)
+      let file_entity = frob(#target/file, found[:filepath])
+      rows = [@rows, ui/object_browser_row_node(actor, file_entity)]
+      count = count + 1
+    end
+  end
+
+  if rows == []
+    rows = [dom <li class="muted">No workspaces, directories, or files matched.</li>]
+  elseif count == 16
+    rows = [@rows, dom <li class="muted">Showing first 16 matches.</li>]
+  end
+
+  return dom <ul class="object-browser-list">{@rows}</ul>
+end
+
+verb ui/object_browser_panel_node(actor @ #agent)
+  let query = ""
+  let queries = session/ObjectBrowserQuery(endpoint(), ?query)
+  if queries
+    let exactly {:query -> configured_query} = queries
+    query = configured_query
+  end
+
+  return dom <details class="object-browser-panel tool-sheet" aria-label="Object browser">
+    <summary>{ui/icon_label_node("search", "Objects")}</summary>
+    <div class="tool-window object-browser-window" data-window-key="object-browser">
+      <div class="window-titlebar" data-window-drag="object-browser">
+        <strong>Objects</strong>
+        <button type="button" class="window-close" data-close-details="object-browser" aria-label="Close object browser">{ui/icon_label_node("x", "Close")}</button>
+      </div>
+      <div class="window-body">
+        <form class="agent-browser-form" data-sync-event="submit" data-sync-action="agent_object_browser_search" data-sync-reset="false">
+          <input name="query" value={query} autocomplete="off" placeholder="workspace, file, symbol" aria-label="Object browser search" data-sync-event="input" data-sync-action="agent_object_browser_search" data-sync-debounce="180" />
+          <button type="submit" class="mini-button">{ui/icon_label_node("search", "Search")}</button>
+        </form>
+        {ui/object_browser_results_node(actor, query)}
+      </div>
+      <div class="window-resize-handle" data-window-resize="object-browser" aria-hidden="true"></div>
+    </div>
+  </details>
+end
+
+verb ui/world_tools_node(agent @ #agent)
+  return dom <aside id="world-tools" class="panel world-tools">
+    {ui/tool_activity_node(agent)}
+    {ui/workspace_panel_node(agent)}
+    {ui/object_browser_panel_node(agent)}
+  </aside>
+end
+
+verb ui/tool_activity_node(agent @ #agent)
+  let streaming = false
+  let streaming_rows = session/IsStreaming(endpoint(), ?value)
+  if streaming_rows
+    let exactly {:value -> configured_streaming} = streaming_rows
+    streaming = configured_streaming
+  end
+  let phase = "idle"
+  let phases = session/LoopPhase(endpoint(), ?phase)
+  if phases
+    let exactly {:phase -> configured_phase} = phases
+    phase = configured_phase
+  end
+
+  // Build a status banner showing what the agent is currently doing.
+  let banner = dom <div class="activity-status idle">Idle</div>
+  if streaming == true
+    if phase == "thinking"
+      banner = dom <div class="activity-status thinking">
+        {ui/icon_label_node("search", "Thinking...")}
+      </div>
+    elseif phase == "executing"
+      banner = dom <div class="activity-status executing">
+        {ui/icon_label_node("terminal", "Executing tools...")}
+      </div>
+    end
+  end
+
+  // Gather recent tool calls from this agent's transcript projection.
+  let items = []
+  let count = 0
+  for found in TranscriptToolCall(agent, ?message, ?call, ?call_id, ?name, ?arguments, ?status)
+    let result_preview = ""
+    for result in TranscriptToolResult(agent, found[:call], ?result, ?content, ?is_error, ?details)
+      result_preview = result[:content]
+    end
+    items = [@items, {:call -> found[:call], :status -> found[:status], :name -> found[:name], :id -> found[:call_id], :args -> found[:arguments], :result -> result_preview}]
+    count = count + 1
+  end
+
+  let class = "tool-activity panel"
+  if streaming == true
+    class = "tool-activity panel active"
+  end
+
+  if count == 0
+    return dom <section class={class} aria-label="Activity">
+      <h2>{ui/icon_label_node("terminal", "Activity")}</h2>
+      {banner}
+    </section>
+  end
+
+  // Show last 8 items.
+  let start = 0
+  if count > 8
+    start = count - 8
+  end
+  let nodes = []
+  let idx = 0
+  for item in items
+    if idx >= start
+      nodes = [@nodes, ui/tool_activity_item_node(item)]
+    end
+    idx = idx + 1
+  end
+
+  return dom <section class={class} aria-label="Activity">
+    <h2>{ui/icon_label_node("terminal", "Activity")}</h2>
+    {banner}
+    <ul class="tool-activity-list">{@nodes}</ul>
+  </section>
+end
+
+verb ui/truncate(text, max_len)
+  let len = string_len(text)
+  if len <= max_len
+    return text
+  end
+  return string_concat(string_slice(text, 0, max_len), "...")
+end
+
+verb ui/tool_activity_item_node(item)
+  let status = item[:status]
+  let glyph = ui/tool_status_glyph(status)
+  let name = item[:name]
+  let args_summary = ui/truncate(item[:args], 80)
+  let summary = string_concat("[", glyph, "] ", name, "(", args_summary, ")")
+  let class = string_concat("tool-activity-item status-", status)
+  let result = item[:result]
+
+  // Collapsed by default; expand to see the full result.
+  return dom <li class={class} data-sync-key={to_literal(item[:call])}>
+    <details>
+      <summary class="tool-activity-summary">{summary}</summary>
+      <div class="tool-activity-detail">
+        <div class="tool-activity-args">{item[:args]}</div>
+        if result != ""
+          <pre class="tool-activity-result">{result}</pre>
+        end
+      </div>
+    </details>
+  </li>
+end
+
+verb ui/entity_fact_node(label, value, class)
+  return dom <div class={string_concat("entity-fact ", class)}>
+    <span class="entity-fact-label">{label}</span>
+    <span class="entity-fact-value">{value}</span>
+  </div>
+end
+
+verb ui/entity_facts_node(agent @ #agent, entity)
+  let facts = []
+  let kind = ui/entity_kind(entity)
+  facts = [@facts, ui/entity_fact_node("kind", kind, "entity-kind")]
+  facts = [@facts, ui/entity_fact_node("identity", to_literal(entity), "entity-id")]
+
+  if is_frob(entity) && frob_delegate(entity) == #target/file
+    let path = frob_value(entity)
+    facts = [@facts, ui/entity_fact_node("path", path, "entity-path")]
+  end
+
+  if Delegates(entity, #workspace, 0)
+    let root = ui/workspace_root_text(entity)
+    facts = [@facts, ui/entity_fact_node("root", root, "entity-root")]
+    let revisions = WorkspaceRevision(entity, ?revision)
+    if revisions
+      let exactly {:revision -> revision} = revisions
+      facts = [@facts, ui/entity_fact_node("revision", revision, "entity-revision")]
+    end
+  end
+
+  return dom <div class="entity-facts">{@facts}</div>
+end
+
+verb ui/inspector_node(agent @ #agent)
+  let selected = none
+  let selections = session/Inspect(endpoint(), ?selected)
+  if selections
+    let exactly {:selected -> configured_selected} = selections
+    selected = configured_selected
+  end
+  let pulse = none
+  let pulses = session/InspectPulse(endpoint(), ?pulse)
+  if pulses
+    let exactly {:pulse -> configured_pulse} = pulses
+    pulse = configured_pulse
+  end
+  let pulse_class = "inspector panel"
+  if pulse != none
+    if pulse == "even"
+      pulse_class = "inspector panel inspect-flash-even"
+    else
+      pulse_class = "inspector panel inspect-flash-odd"
+    end
+  end
+  if selected == none || ui/can_inspect_entity(agent, selected) == false
+    return dom <aside id="inspector" class={pulse_class}>
+      <h2>Inspect</h2>
+      <p class="muted">Select a workspace, file, symbol, diff, or task to inspect.</p>
+    </aside>
+  end
+
+  let name = ui/workspace_name(selected)
+  let description = ""
+  let descriptions = Description(selected, ?description)
+  if descriptions
+    let exactly {:description -> configured_description} = descriptions
+    description = configured_description
+  end
+
+  return dom <aside id="inspector" class={pulse_class} data-entity={to_literal(selected)}>
+    <h2>Inspect</h2>
+    <div class="inspector-title-row">
+      <span class="entity-avatar">{ui/entity_initial(name)}</span>
+      <div>
+        <strong class="inspector-title">{name}</strong>
+      </div>
+    </div>
+    <p class="inspector-description">{description}</p>
+    {ui/entity_facts_node(agent, selected)}
+  </aside>
+end
+
+verb ui/entity_initial(name @ #string)
+  if string_len(name) == 0
+    return "?"
+  end
+  return string_slice(name, 0, 1)
+end
+
+verb ui/inspector_action_node(command, label, class)
+  return ui/command_form_node("", command, label, class)
+end
+
+verb ui/command_bar_node(agent @ #agent)
+  let draft = ""
+  let drafts = session/CommandDraft(endpoint(), ?draft)
+  if drafts
+    let exactly {:draft -> configured_draft} = drafts
+    draft = configured_draft
+  end
+  let streaming = false
+  let streaming_rows = session/IsStreaming(endpoint(), ?value)
+  if streaming_rows
+    let exactly {:value -> configured_streaming} = streaming_rows
+    streaming = configured_streaming
+  end
+  let indicator = dom <span class="command-streaming-indicator"></span>
+  if streaming == true
+    indicator = dom <span class="command-streaming-indicator active" aria-label="Agent is working">…</span>
+  end
+
+  let steering_count = 0
+  let followup_count = 0
+  if streaming == true
+    steering_count = session/steering_count(endpoint())
+    followup_count = session/followup_count(endpoint())
+  end
+
+  let queue_badge = dom <span class="command-queue-badge"></span>
+  if steering_count > 0
+    queue_badge = dom <span class="command-queue-badge steering" title={string_concat(to_literal(steering_count), " steering message(s) queued")}>{ui/icon_label_node("terminal", string_concat("Interrupt (", to_literal(steering_count), ")"))}</span>
+  end
+  if followup_count > 0
+    queue_badge = dom <span class="command-queue-badge followup" title={string_concat(to_literal(followup_count), " follow-up message(s) queued")}>{ui/icon_label_node("clock", string_concat("Queued (", to_literal(followup_count), ")"))}</span>
+  end
+
+  let placeholder = "Ask the agent, run a command, or open a file..."
+  if streaming == true
+    placeholder = "Send to interrupt, or Shift+Enter to queue for after..."
+  end
+  let composer = dom <form id="agent-command" class="command-form" data-sync-event="submit" data-sync-action="agent_command" data-sync-submit-key="ctrl+enter">
+    <div class="command-input-box">
+      <input id="command" name="text" value={draft} autocomplete="off" placeholder={placeholder} aria-label="Command" />
+      <input type="hidden" name="mode" value="" />
+      {indicator}
+    </div>
+    <button id="send-command" type="submit">{ui/icon_label_node("send", "Send")}</button>
+  </form>
+  return dom <section class="command-deck">
+    {ui/command_chips_node(agent)}
+    {queue_badge}
+    {composer}
+  </section>
+end
+
+verb ui/command_chips_node(agent @ #agent)
+  let chips = [ui/command_form_node("", "help", "help", "chip")]
+  let selections = session/Inspect(endpoint(), ?selected)
+  if selections
+    let exactly {:selected -> selected} = selections
+    if ui/can_inspect_entity(agent, selected)
+    let name = ui/workspace_name(selected)
+    chips = [@chips, ui/command_form_node("", string_concat("inspect ", name), string_concat("inspect ", name), "chip")]
+    end
+  end
+  return dom <div class="command-chips" aria-label="Available actions">{@chips}</div>
+end
+
+verb ui/world_view_node(agent @ #agent, revision, limit)
+  let workspace = workspace/active(agent)
+  let header_title = "Mica Agent"
+  if workspace != none
+    header_title = ui/workspace_name(workspace)
+  end
+  let header = dom <header class="topbar">
+    <h1>{header_title}</h1>
+  </header>
+  let left_column = dom <div class="agent-left-column">{ui/transcript_node(agent, revision, limit)}</div>
+  let right_column = dom <div class="agent-right-column">{ui/world_tools_node(agent)}{ui/inspector_node(agent)}</div>
+  let splitter = dom <div class="column-splitter" role="separator" aria-label="Resize tools column" aria-orientation="vertical"></div>
+  let stage = dom <div class="agent-columns">{left_column}{splitter}{right_column}</div>
+  let children = [header, stage]
+  let class = "agent-shell"
+  children = [@children, ui/command_bar_node(agent)]
+  return dom <main id="agent-root" class={class}>{@children}</main>
+end

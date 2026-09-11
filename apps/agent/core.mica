@@ -1,0 +1,328 @@
+// Domain core for the agent workspace app.
+//
+// The agent app is a relation-first LLM coding agent shell. Workspaces bind to
+// on-disk repositories, agents carry transcript state, and inspector targets
+// point at file/symbol/diff/task objects. This file defines the durable
+// identities and relations; session state lives in ui-session.mica.
+
+make_identity(:workspace)
+make_identity(:agent)
+make_identity(:operator)
+make_identity(:transcript)
+make_identity(:message)
+make_identity(:event/message)
+make_identity(:InspectorTarget)
+make_identity(:event/user_message)
+make_identity(:event/assistant_message)
+make_identity(:event/tool_message)
+make_identity(:event/system_message)
+
+make_identity(:target/file)
+make_identity(:target/symbol)
+make_identity(:target/diff)
+make_identity(:target/task)
+
+make_identity(:agent/default)
+
+make_relation(:Delegates, 3)
+
+make_functional_relation(:Name, 2, [0])
+make_functional_relation(:Description, 2, [0])
+make_relation(:ProperNoun, 1)
+
+make_relation(:Workspace, 1)
+make_functional_relation(:WorkspaceRoot, 2, [0])
+make_functional_relation(:WorkspaceProvider, 2, [0])
+make_functional_relation(:WorkspaceRevision, 2, [0])
+
+make_relation(:Agent, 1)
+make_functional_relation(:AgentWorkspace, 2, [0])
+make_functional_relation(:AgentModel, 2, [0])
+make_functional_relation(:AgentApi, 2, [0])
+make_functional_relation(:AgentMaxToolRounds, 2, [0])
+
+make_relation(:Transcript, 1)
+make_functional_relation(:TranscriptAgent, 2, [0])
+make_functional_relation(:TranscriptWorkspace, 2, [0])
+make_functional_relation(:TranscriptCreatedAt, 2, [0])
+
+make_relation(:Message, 1)
+make_functional_relation(:MessageTranscript, 2, [0])
+make_functional_relation(:MessageSeq, 2, [0])
+make_functional_relation(:MessageRole, 2, [0])
+make_functional_relation(:MessageContent, 2, [0])
+make_functional_relation(:MessageStatus, 2, [0])
+make_functional_relation(:MessageResponseId, 2, [0])
+make_functional_relation(:MessageModel, 2, [0])
+make_functional_relation(:MessageUsage, 2, [0])
+make_functional_relation(:MessageResponseItems, 2, [0])
+make_functional_relation(:MessageCreatedAt, 2, [0])
+make_functional_relation(:MessageSource, 2, [0])
+make_relation(:TranscriptEntry, 6)
+
+make_relation(:InspectorTarget, 1)
+make_functional_relation(:InspectorKind, 2, [0])
+make_functional_relation(:InspectorLabel, 2, [0])
+make_functional_relation(:InspectorLocation, 2, [0])
+
+make_relation(:Builder, 1)
+
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+make_relation(:CanInvoke, 2)
+make_relation(:CanEffect, 1)
+make_relation(:RoleCanRead, 2)
+make_relation(:RoleCanWrite, 2)
+make_relation(:RoleCanInvoke, 2)
+make_relation(:RoleCanEffect, 1)
+
+assert Delegates(#event/user_message, #event/message, 0)
+assert Delegates(#event/assistant_message, #event/message, 0)
+assert Delegates(#event/tool_message, #event/message, 0)
+assert Delegates(#event/system_message, #event/message, 0)
+assert Delegates(#target/file, #InspectorTarget, 0)
+assert Delegates(#target/symbol, #InspectorTarget, 0)
+assert Delegates(#target/diff, #InspectorTarget, 0)
+assert Delegates(#target/task, #InspectorTarget, 0)
+
+assert Agent(#agent/default)
+assert Description(#agent/default, "default")
+assert AgentModel(#agent/default, "deepseek/deepseek-v4-pro")
+assert AgentApi(#agent/default, "responses")
+assert AgentMaxToolRounds(#agent/default, 4)
+assert Delegates(#agent/default, #agent, 0)
+assert Delegates(#agent/default, #operator, 0)
+assert Delegates(#operator, #agent, 0)
+
+verb workspace/active(agent @ #agent)
+  let workspaces = AgentWorkspace(agent, ?workspace)
+  if workspaces
+    let exactly {:workspace -> workspace} = workspaces
+    return workspace
+  end
+
+  for found in Workspace(?w)
+    return found[:w]
+  end
+
+  return none
+end
+
+verb workspace/name(workspace)
+  let names = Name(workspace, ?name)
+  if not names
+    return to_literal(workspace)
+  end
+  let exactly {:name -> name} = names
+  return name
+end
+
+verb agent/name(agent @ #agent)
+  let descriptions = Description(agent, ?description)
+  if not descriptions
+    return to_literal(agent)
+  end
+  let exactly {:description -> description} = descriptions
+  return description
+end
+
+verb message/role_label(role @ #string)
+  if role == "user"
+    return "You"
+  elseif role == "assistant"
+    return "Agent"
+  elseif role == "tool"
+    return "Tool"
+  elseif role == "system"
+    return "System"
+  end
+  return role
+end
+
+verb message/class(role @ #string)
+  if role == "user"
+    return "message-line user"
+  elseif role == "assistant"
+    return "message-line assistant"
+  elseif role == "tool"
+    return "message-line tool"
+  elseif role == "system"
+    return "message-line system"
+  end
+  return "message-line"
+end
+
+verb agent/ensure_transcript(agent @ #agent, workspace)
+  let transcripts = TranscriptAgent(?transcript, agent)
+  if transcripts
+    let exactly {:transcript -> existing} = transcripts
+    return existing
+  end
+
+  let transcript = frob(#transcript, [agent, workspace])
+  assert Transcript(transcript)
+  assert TranscriptAgent(transcript, agent)
+  assert TranscriptWorkspace(transcript, workspace)
+  return transcript
+end
+
+verb agent/transcript(agent @ #agent)
+  let transcripts = TranscriptAgent(?transcript, agent)
+  if not transcripts
+    return none
+  end
+  let exactly {:transcript -> transcript} = transcripts
+  return some(transcript)
+end
+
+verb agent/append_message(agent @ #agent, role @ #string, content @ #string)
+  let workspace = workspace/active(agent)
+  if workspace == none
+    return false
+  end
+
+  let transcript = agent/ensure_transcript(agent, workspace)
+  let seq = 0
+  for found in MessageTranscript(?m, transcript)
+    let existing = found[:m].messageSeq
+    if existing >= seq
+      seq = existing + 1
+    end
+  end
+
+  let delegate = message/role_delegate(role)
+  let message = frob(delegate, [transcript, seq])
+  assert Message(message)
+  assert MessageTranscript(message, transcript)
+  assert MessageSeq(message, seq)
+  assert MessageRole(message, role)
+  assert MessageContent(message, content)
+  return message
+end
+
+verb message/role_delegate(role @ #string)
+  if role == "user"
+    return #event/user_message
+  elseif role == "assistant"
+    return #event/assistant_message
+  elseif role == "tool"
+    return #event/tool_message
+  elseif role == "system"
+    return #event/system_message
+  end
+  return #message
+end
+
+verb agent/messages(transcript)
+  let messages = []
+  for found in MessageTranscript(?m, transcript)
+    messages = [@messages, found[:m]]
+  end
+  return messages
+end
+
+verb agent/messages_ordered(transcript)
+  let unsorted = agent/messages(transcript)
+  let total = 0
+  for m in unsorted
+    total = total + 1
+  end
+
+  let ordered = []
+  let next_seq = 0
+  while list_size_lt(ordered, total)
+    let found_at = none
+    for message in unsorted
+      let seq = message.messageSeq
+      if seq == next_seq
+        found_at = message
+      end
+    end
+    if found_at != none
+      ordered = [@ordered, found_at]
+      next_seq = next_seq + 1
+    else
+      next_seq = next_seq + 1
+    end
+  end
+  return ordered
+end
+
+// The browser transcript is a per-agent projection of durable message state.
+// It gives a view one relation to observe rather than every stored message
+// relation in every agent's transcript.
+TranscriptEntry(agent, transcript, seq, message, role, content) :-
+  TranscriptAgent(transcript, agent),
+  MessageTranscript(message, transcript),
+  MessageSeq(message, seq),
+  MessageRole(message, role),
+  MessageContent(message, content)
+
+verb list_size_lt(items, target)
+  let count = 0
+  for m in items
+    count = count + 1
+  end
+  return count < target
+end
+
+verb list_count(items)
+  let count = 0
+  for m in items
+    count = count + 1
+  end
+  return count
+end
+
+verb agent/resolve_model(agent @ #agent)
+  let env_model = os_getenv("MICA_AGENT_MODEL")
+  if let some(model) = env_model
+    return model
+  end
+
+  let configured_models = AgentModel(agent, ?model)
+  if configured_models
+    let exactly {:model -> configured} = configured_models
+    return configured
+  end
+
+  let default_models = AgentModel(#agent/default, ?model)
+  if default_models
+    let exactly {:model -> default} = default_models
+    return default
+  end
+
+  return "deepseek/deepseek-v4-pro"
+end
+
+verb agent/system_prompt(agent @ #agent)
+  return "You are a helpful coding assistant working in a Mica workspace. Be concise and accurate.\n\nUse markdown for all responses: headings for sections, fenced code blocks with language tags for code, bullet and numbered lists for steps, bold/italic for emphasis, and inline `code` spans for identifiers.\n\nReference files using @path syntax (e.g. @./src/main.rs or @./README.md). These become clickable links in the UI."
+end
+
+verb transcript/empty_prompt(transcript)
+  let count = 0
+  for found in MessageTranscript(?m, transcript)
+    count = count + 1
+  end
+  if count == 0
+    return "No messages yet. Ask the agent to do something."
+  end
+  return ""
+end
+
+verb target/kind_label(kind @ #string)
+  if kind == "file"
+    return "File"
+  elseif kind == "symbol"
+    return "Symbol"
+  elseif kind == "diff"
+    return "Diff"
+  elseif kind == "task"
+    return "Task"
+  end
+  return kind
+end
+
+verb target/empty()
+  return dom <span></span>
+end

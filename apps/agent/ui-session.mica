@@ -1,0 +1,543 @@
+// Server-owned UI session state and sync action selectors for the agent app.
+
+make_relation(:ui/View, 1)
+make_functional_relation(:ui/SyncAction, 2, [0])
+make_functional_relation(:session/Actor, 2, [0], :volatile)
+make_functional_relation(:session/Inspect, 2, [0], :volatile)
+make_functional_relation(:session/InspectPulse, 2, [0], :volatile)
+make_functional_relation(:session/TranscriptLimit, 2, [0], :volatile)
+make_functional_relation(:session/CommandDraft, 2, [0], :volatile)
+make_functional_relation(:session/ObjectBrowserQuery, 2, [0], :volatile)
+
+make_identity(:ui/sync_action)
+make_identity(:ui/inspect_action)
+make_identity(:ui/command_action)
+make_identity(:ui/load_older_messages_action)
+make_identity(:ui/object_browser_search_action)
+make_identity(:ui/select_workspace_action)
+
+assert ui/View(31)
+assert Delegates(#ui/inspect_action, #ui/sync_action, 0)
+assert Delegates(#ui/command_action, #ui/sync_action, 0)
+assert Delegates(#ui/load_older_messages_action, #ui/sync_action, 0)
+assert Delegates(#ui/object_browser_search_action, #ui/sync_action, 0)
+assert Delegates(#ui/select_workspace_action, #ui/sync_action, 0)
+"agent_inspect".ui/syncAction = #ui/inspect_action
+"agent_command".ui/syncAction = #ui/command_action
+"agent_load_older_messages".ui/syncAction = #ui/load_older_messages_action
+"agent_object_browser_search".ui/syncAction = #ui/object_browser_search_action
+"agent_select_workspace".ui/syncAction = #ui/select_workspace_action
+
+grant #web
+  read:
+    :ui/View
+    :ui/SyncAction
+    :session/Actor
+    :session/Inspect
+    :session/InspectPulse
+    :session/TranscriptLimit
+    :session/CommandDraft
+    :session/ObjectBrowserQuery
+    :session/IsStreaming
+    :session/LoopPhase
+    :session/SteeringQueue
+    :session/FollowUpQueue
+    :Delegates
+    :Name
+    :Description
+    :Agent
+    :AgentWorkspace
+    :AgentModel
+    :AgentApi
+    :Workspace
+    :WorkspaceRoot
+    :WorkspaceProvider
+    :WorkspaceRevision
+    :Transcript
+    :TranscriptAgent
+    :TranscriptWorkspace
+    :Message
+    :MessageTranscript
+    :MessageSeq
+    :MessageRole
+    :MessageContent
+    :MessageStatus
+    :MessageResponseId
+    :MessageModel
+    :MessageUsage
+    :MessageResponseItems
+    :TranscriptEntry
+    :TranscriptToolCall
+    :TranscriptToolResult
+    :InspectorTarget
+    :InspectorKind
+    :InspectorLabel
+    :InspectorLocation
+  write:
+    :session/Actor
+    :session/Inspect
+    :session/InspectPulse
+    :session/TranscriptLimit
+    :session/CommandDraft
+    :session/ObjectBrowserQuery
+    :session/IsStreaming
+    :session/LoopPhase
+    :session/SteeringQueue
+    :session/FollowUpQueue
+    :Transcript
+    :TranscriptAgent
+    :TranscriptWorkspace
+    :Message
+    :MessageTranscript
+    :MessageSeq
+    :MessageRole
+    :MessageContent
+    :MessageStatus
+    :MessageResponseId
+    :MessageModel
+    :MessageUsage
+    :MessageResponseItems
+  invoke:
+    :sync_event
+    :sync_view_dependencies
+    :sync_view_tree
+    :ui/auth_required_node
+    :ui/fact_dependency
+    :ui/view_dependency
+    :ui/transcript_cutoff
+    :ui/current_agent
+    :ui/entity_from_literal
+    :agent/name
+    :workspace/name
+    :string_concat
+    :lower
+    :trim
+end
+
+CanRead(#web, relation) :-
+  RoleCanRead(#operator, relation)
+
+CanWrite(#web, relation) :-
+  RoleCanWrite(#operator, relation)
+
+CanInvoke(#web, selector) :-
+  RoleCanInvoke(#operator, selector)
+
+CanEffect(#web) :-
+  RoleCanEffect(#operator)
+
+grant role #operator
+  read:
+    :session/Actor
+    :session/Inspect
+    :session/InspectPulse
+    :session/TranscriptLimit
+    :session/CommandDraft
+    :session/ObjectBrowserQuery
+    :session/IsStreaming
+    :session/LoopPhase
+    :session/SteeringQueue
+    :session/FollowUpQueue
+    :ui/View
+    :ui/SyncAction
+    :Delegates
+    :Name
+    :Agent
+    :AgentWorkspace
+    :AgentModel
+    :AgentApi
+    :AgentMaxToolRounds
+    :Workspace
+    :WorkspaceRoot
+    :WorkspaceProvider
+    :WorkspaceRevision
+    :Transcript
+    :TranscriptAgent
+    :TranscriptWorkspace
+    :Message
+    :MessageTranscript
+    :MessageSeq
+    :MessageRole
+    :MessageContent
+    :MessageStatus
+    :MessageResponseId
+    :MessageModel
+    :MessageUsage
+    :MessageResponseItems
+    :TranscriptEntry
+    :Tool
+    :ToolName
+    :ToolDescription
+    :ToolParameters
+    :ToolEnabled
+    :ToolCall
+    :ToolCallMessage
+    :ToolCallId
+    :ToolCallName
+    :ToolCallArguments
+    :ToolCallStatus
+    :ToolResult
+    :ToolResultCall
+    :ToolResultContent
+    :ToolResultIsError
+    :ToolResultDetails
+    :TranscriptToolCall
+    :TranscriptToolResult
+    :source/Repository
+    :source/RepositoryName
+    :source/RepositoryRoot
+    :source/RepositoryProvider
+    :source/Revision
+    :source/RevisionOf
+    :source/RevisionKind
+    :source/RevisionLabel
+    :source/SourceFile
+    :source/FileRevision
+    :source/FilePath
+    :source/FileText
+    :source/FileLines
+    :source/FileLineCount
+    :source/RepositoryEntry
+    :source/TextSearch
+    :source/IndexedFile
+    :InspectorTarget
+    :InspectorKind
+    :InspectorLabel
+    :InspectorLocation
+    :Description
+    :Builder
+    :HttpRequest
+    :RequestMethod
+    :RequestPath
+    :RequestVersion
+    :RequestPrincipal
+    :RequestActor
+    :RequestHeader
+    :RequestBody
+  write:
+    :session/Inspect
+    :session/InspectPulse
+    :session/TranscriptLimit
+    :session/CommandDraft
+    :session/ObjectBrowserQuery
+    :session/IsStreaming
+    :session/LoopPhase
+    :session/SteeringQueue
+    :session/FollowUpQueue
+    :AgentWorkspace
+    :Transcript
+    :TranscriptAgent
+    :TranscriptWorkspace
+    :Message
+    :MessageTranscript
+    :MessageSeq
+    :MessageRole
+    :MessageContent
+    :MessageStatus
+    :MessageResponseId
+    :MessageModel
+    :MessageUsage
+    :MessageResponseItems
+    :ToolCall
+    :ToolCallMessage
+    :ToolCallId
+    :ToolCallName
+    :ToolCallArguments
+    :ToolCallStatus
+    :ToolResult
+    :ToolResultCall
+    :ToolResultContent
+    :ToolResultIsError
+    :ToolResultDetails
+  invoke:
+    :sync_event
+    :sync_snapshot
+    :sync_snapshot_payload
+    :sync_snapshot_tree
+    :sync_snapshot_signature
+    :sync_mount_node
+    :sync_view_dependencies
+    :sync_view_tree
+    :ui/fact_dependency
+    :ui/view_dependency
+    :ui/transcript_cutoff
+    :ui/flush
+    :ui/current_agent
+    :ui/entity_from_literal
+    :ui/can_inspect_entity
+    :ui/agent_name
+    :ui/workspace_name
+    :ui/workspace_root_text
+    :ui/target_kind_label
+    :ui/auth_required_node
+    :ui/icon_node
+    :ui/icon_label_node
+    :ui/command_form_node
+    :ui/entity_action_node
+    :ui/world_view_node
+    :ui/world_tools_node
+    :ui/tool_activity_node
+    :ui/tool_activity_item_node
+    :ui/truncate
+    :ui/workspace_panel_node
+    :ui/workspace_row_node
+    :ui/workspace_select_node
+    :ui/object_browser_panel_node
+    :ui/object_browser_results_node
+    :ui/object_browser_row_node
+    :ui/object_browser_matches
+    :ui/object_browser_description
+    :ui/entity_kind
+    :ui/inspector_node
+    :ui/entity_fact_node
+    :ui/entity_facts_node
+    :ui/entity_initial
+    :ui/inspector_action_node
+    :ui/transcript_node
+    :ui/latest_message_node
+    :ui/message_role_label
+    :ui/message_class
+    :ui/message_role_icon
+    :ui/message_body_node
+    :ui/message_node
+    :ui/tool_status_glyph
+    :ui/tool_call_node
+    :ui/tool_message_body_node
+    :ui/assistant_body_with_tool_calls
+    :ui/render_content
+    :ui/command_bar_node
+    :ui/command_chips_node
+    :ui/sync_action_source
+    :ui/form_text
+    :ui/form_raw_text
+    :ui/form_index
+    :ui/handle_sync_action
+    :agent/name
+    :workspace/name
+    :workspace/active
+    :agent/transcript
+    :agent/ensure_transcript
+    :agent/append_message
+    :agent/messages
+    :agent/messages_ordered
+    :agent/resolve_model
+    :agent/resolve_api
+    :agent/system_prompt
+    :agent/max_tool_rounds
+    :agent/llm_messages_with_tools
+    :agent/llm_responses_input
+    :agent/build_tools
+    :agent/build_responses_tools
+    :agent/stream_events
+    :agent/tool_calls
+    :agent/record_tool_call
+    :agent/execute_tool_calls
+    :agent/chat_with_tools
+    :agent/run_loop
+    :agent/run_loop_body
+    :session/steering_push
+    :session/steering_drain
+    :session/steering_count
+    :session/followup_push
+    :session/followup_drain
+    :session/followup_count
+    :tool/read
+    :tool/grep
+    :tool/glob
+    :tool/ls
+    :tool/invoke
+    :glob/match
+    :tool/source_repository
+    :tool/source_revision
+    :tool/workspace_bound
+    :tool/args_string
+    :tool/args_int
+    :parse_ordinal
+    :string_contains
+    :string_starts_with
+    :message/role_label
+    :message/class
+    :message/role_delegate
+    :list_size_lt
+    :list_count
+    :transcript/empty_prompt
+    :target/kind_label
+    :target/empty
+    :http_request
+    :http/document
+    :http_response
+    :http_html
+    :http/base_style
+    :http/bootstrap_script
+    :dom_text
+    :dom_element
+    :dom_raw
+    :to_literal
+    :to_xml
+    :from_literal
+    :json_decode
+    :string_concat
+    :string_join
+    :string_len
+    :string_slice
+    :lower
+    :trim
+    :os_getenv
+    :llm/chat_stream
+    :llm/responses_stream
+    :llm/ensure_stream
+    :llm/system_message
+    :llm/user_message
+    :llm/assistant_message
+    :llm/tool_message
+    :frob
+    :frob_delegate
+    :frob_value
+    :is_frob
+    :actor
+end
+
+verb ui/current_agent()
+  if let some(current) = actor()
+    if Delegates(current, #agent, 0)
+      return current
+    end
+  end
+  return #agent/default
+end
+
+verb ui/agent_name(agent @ #agent)
+  return agent/name(agent)
+end
+
+verb ui/workspace_name(entity)
+  if is_frob(entity)
+    let delegate = frob_delegate(entity)
+    if delegate == #target/file
+      return frob_value(entity)
+    end
+    return to_literal(entity)
+  end
+  return workspace/name(entity)
+end
+
+verb ui/workspace_root_text(workspace)
+  let root = workspace.workspaceRoot
+  if root == none
+    return ""
+  end
+  return root
+end
+
+verb ui/target_kind_label(kind @ #string)
+  return target/kind_label(kind)
+end
+
+verb ui/entity_from_literal(text)
+  if text == none
+    return none
+  end
+  return match from_literal(text)
+  case ok(value)
+    some(value)
+  case err(problem)
+    none
+  end
+end
+
+verb ui/can_inspect_entity(agent @ #agent, entity)
+  if entity == none
+    return false
+  end
+  return true
+end
+
+verb ui/transcript_cutoff()
+  let current = ui/current_agent()
+  let revision = 1
+  for found in TranscriptEntry(current, ?transcript, ?seq, ?message, ?role, ?content)
+    let seq = found[:seq]
+    if seq > revision || seq == revision
+      revision = seq + 1
+    end
+  end
+  return revision
+end
+
+verb ui/view_dependency(relation, bindings)
+  return {:subject -> :relation, :relation -> relation, :bindings -> bindings}
+end
+
+verb ui/fact_dependency(relation, bindings)
+  return {:subject -> :facts, :relation -> relation, :bindings -> bindings}
+end
+
+// Commit partial tool-loop progress so relation subscriptions can push it while
+// the sync_event task remains active.
+verb ui/flush(endpoint)
+  commit()
+  return none
+end
+
+verb sync_view_dependencies(view)
+  let endpoint = endpoint()
+  let current = ui/current_agent()
+  let current_binding = none
+  if current != none
+    current_binding = some(current)
+  end
+  let dependencies = []
+  dependencies = [@dependencies, ui/fact_dependency(:ui/View, [some(view)])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/Actor, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/Inspect, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/InspectPulse, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/TranscriptLimit, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/CommandDraft, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/ObjectBrowserQuery, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/IsStreaming, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/LoopPhase, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/SteeringQueue, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:session/FollowUpQueue, [some(endpoint), none])]
+  dependencies = [@dependencies, ui/fact_dependency(:Delegates, [none, none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:Name, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:Description, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:Agent, [none])]
+  dependencies = [@dependencies, ui/fact_dependency(:AgentWorkspace, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:AgentModel, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:Workspace, [none])]
+  dependencies = [@dependencies, ui/fact_dependency(:WorkspaceRoot, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:WorkspaceProvider, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:WorkspaceRevision, [none, none])]
+  dependencies = [@dependencies, ui/view_dependency(:TranscriptEntry, [current_binding, none, none, none, none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:Tool, [none])]
+  dependencies = [@dependencies, ui/fact_dependency(:ToolName, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:ToolDescription, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:ToolParameters, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:ToolEnabled, [none, none])]
+  dependencies = [@dependencies, ui/view_dependency(:TranscriptToolCall, [current_binding, none, none, none, none, none, none])]
+  dependencies = [@dependencies, ui/view_dependency(:TranscriptToolResult, [current_binding, none, none, none, none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:source/Repository, [none])]
+  dependencies = [@dependencies, ui/fact_dependency(:source/RepositoryName, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:source/RepositoryRoot, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:source/RepositoryProvider, [none, none, none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:source/Revision, [none])]
+  dependencies = [@dependencies, ui/fact_dependency(:source/RevisionOf, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:source/RevisionKind, [none, none])]
+  dependencies = [@dependencies, ui/fact_dependency(:source/RevisionLabel, [none, none])]
+  return dependencies
+end
+
+verb sync_view_tree(view)
+  let current = ui/current_agent()
+  if ui/View(view) == false || current == none
+    return ui/auth_required_node()
+  end
+  let limit = 40
+  let limits = session/TranscriptLimit(endpoint(), ?limit)
+  if limits
+    let exactly {:limit -> configured_limit} = limits
+    limit = configured_limit
+  end
+  let revision = ui/transcript_cutoff()
+  return ui/world_view_node(current, revision, limit)
+end

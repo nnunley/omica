@@ -1,0 +1,95 @@
+// String utility surface for example fileins.
+//
+// The runtime provides only low-level primitives:
+//
+//   string_len(text)
+//   string_chars(text)
+//   string_slice(text, start, end)
+//   string_from_chars(chars)
+//   string_concat(parts...)
+//   string_join(parts, separator)
+//   sort(list)
+//   words(text)
+//   string_equal_fold(left, right)
+//   string_starts_with(text, prefix)
+//   string_contains(text, subject)
+//   edit_distance(left, right)
+//   parse_ordinal(text)
+//   lower(text)
+//
+// The higher-level operations below are ordinary Mica verbs. Calls such as
+// split("a b") dispatch against the #string primitive prototype.
+
+verb trim(text @ #string: string) -> string
+  let chars: list = string_chars(text)
+  let start: int = 0
+  let end_index: int = string_len(text)
+
+  while start < end_index && chars[start] == " "
+    start = start + 1
+  end
+
+  while end_index > start && chars[end_index - 1] == " "
+    end_index = end_index - 1
+  end
+
+  let trimmed: string = string_slice(text, start, end_index)
+  return trimmed
+end
+
+verb split(text @ #string: string) -> list
+  let words: list = []
+  let current = []
+
+  for ch in string_chars(trim(text))
+    if ch == " "
+      if current != []
+        words = [@words, string_from_chars(current)]
+        current = []
+      end
+    else
+      current = [@current, ch]
+    end
+  end
+
+  if current != []
+    words = [@words, string_from_chars(current)]
+  end
+
+  return words
+end
+
+verb join(parts @ #list: list, separator @ #string: string) -> string
+  let out = []
+  let first = true
+
+  for part: string in parts
+    if first
+      first = false
+    else
+      for ch in string_chars(separator)
+        out = [@out, ch]
+      end
+    end
+
+    for ch in string_chars(part)
+      out = [@out, ch]
+    end
+  end
+
+  let joined: string = string_from_chars(out)
+  return joined
+end
+
+verb starts_with(text @ #string: string, prefix @ #string: string) -> bool
+  string_len(prefix) <= string_len(text) || return false
+  return string_slice(text, 0, string_len(prefix)) == prefix
+end
+
+verb strip_prefix(text @ #string: string, prefix @ #string: string)
+  if starts_with(text, prefix)
+    return string_slice(text, string_len(prefix), string_len(text))
+  end
+
+  return none
+end

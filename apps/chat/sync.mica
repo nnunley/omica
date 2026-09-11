@@ -1,0 +1,122 @@
+// Chat domain state and server-side DOM sync view.
+
+make_relation(:ChatRoom, 1)
+make_relation(:ChatMessage, 2)
+make_relation(:MessageSeq, 2)
+make_relation(:MessageAuthor, 2)
+make_relation(:MessageText, 2)
+make_relation(:ChatView, 2)
+make_relation(:ChatRenderedMessage, 5)
+
+make_identity(:msg_1)
+make_identity(:chat_message)
+
+grant #web
+  read:
+    :ChatRoom
+    :ChatMessage
+    :MessageSeq
+    :MessageAuthor
+    :MessageText
+    :ChatView
+    :ChatRenderedMessage
+  write:
+    :ChatMessage
+    :MessageSeq
+    :MessageAuthor
+    :MessageText
+  invoke:
+    :sync_view_dependencies
+    :sync_view_tree
+    :chat_message_node
+    :chat_composer_node
+    :chat_room_revision
+    :chat_post
+    :sync_event
+end
+
+assert ChatRoom(1)
+assert ChatView(11, 1)
+assert ChatMessage(1, #msg_1)
+assert MessageSeq(#msg_1, 1)
+assert MessageAuthor(#msg_1, "alice")
+assert MessageText(#msg_1, "hello")
+
+ChatRenderedMessage(room, message, seq, author, text) :-
+  ChatMessage(room, message),
+  MessageSeq(message, seq),
+  MessageAuthor(message, author),
+  MessageText(message, text)
+
+verb chat_room_revision(room: int) -> int
+  let revision: int = 0
+  for found in ChatMessage(room, ?message)
+    let exactly {:seq -> seq} = MessageSeq(found[:message], ?seq)
+    if seq > revision
+      revision = seq
+    end
+  end
+
+  return revision
+end
+
+// Seeded message keys are identities while posted message keys are frobs, so this boundary remains
+// dynamic.
+verb chat_message_node(message) -> map
+  let exactly {:author -> author} = MessageAuthor(message, ?author)
+  let exactly {:text -> text} = MessageText(message, ?text)
+  let node: map = dom <li data-sync-key={to_literal(message)}>
+    <span class="author">{author}</span>: {text}
+  </li>
+  return node
+end
+
+verb chat_composer_node() -> map
+  let composer: map = from_xml("<form id='chat-composer' data-sync-event='submit' data-sync-action='chat_post'><input id='actor' name='actor' autocomplete='name' value='browser' aria-label='Actor'/><input id='message' name='text' autocomplete='off' placeholder='Message' aria-label='Message'/><button id='send' type='submit'>Send</button></form>")
+  return composer
+end
+
+verb chat_post(endpoint: identity, room: int, actor: string, text: string) -> bool
+  if string_len(text) == 0
+    return false
+  end
+
+  let seq: int = chat_room_revision(room) + 1
+  let message = #chat_message<[room, seq]>
+
+  assert ChatMessage(room, message)
+  assert MessageSeq(message, seq)
+  assert MessageAuthor(message, actor)
+  assert MessageText(message, text)
+
+  return true
+end
+
+verb sync_event(endpoint: identity, session: int, view: int, event: string, target: string, action: string, fields: map) -> bool
+  if event == "submit" && target == "chat-composer" && action == "chat_post"
+    let exactly {:room -> room} = ChatView(view, ?room)
+    let posted: bool = chat_post(endpoint, room, fields[:actor], fields[:text])
+    return posted
+  end
+
+  return false
+end
+
+verb sync_view_dependencies(view: int) -> list
+  let exactly {:room -> room} = ChatView(view, ?room)
+  return [{:subject -> :relation, :relation -> :ChatRenderedMessage, :bindings -> [some(room), none, none, none, none]}]
+end
+
+verb sync_view_tree(view: int) -> map
+  let exactly {:room -> room} = ChatView(view, ?room)
+  let messages = []
+  for found in ChatMessage(room, ?message)
+    messages = [@messages, chat_message_node(found[:message])]
+  end
+
+  let tree: map = dom <main id="chat-root">
+    <ul id="messages">{@messages}</ul>
+    {chat_composer_node()}
+  </main>
+  return tree
+end

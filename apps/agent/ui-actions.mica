@@ -1,0 +1,210 @@
+// Browser-originated UI action routing for the server-owned agent view.
+
+verb ui/sync_action_source(action)
+  let delegates = ui/SyncAction(action, ?delegate)
+  if not delegates
+    return none
+  end
+  let exactly {:delegate -> found_delegate} = delegates
+  return some(frob(found_delegate, action))
+end
+
+verb ui/form_text(fields, key)
+  let value = index_or(fields, key, none)
+  if value == none
+    return ""
+  end
+  return trim(value)
+end
+
+verb ui/form_raw_text(fields, key)
+  let value = index_or(fields, key, none)
+  if value == none
+    return ""
+  end
+  return value
+end
+
+verb ui/form_index(fields, key)
+  return match parse_ordinal(ui/form_text(fields, key))
+  case ok(value) if value >= 0
+    value
+  case ok(ignored)
+    0
+  case err(problem)
+    0
+  end
+end
+
+verb ui/handle_sync_action(source @ #ui/sync_action<_>, endpoint, session, view, event, target, fields)
+  return false
+end
+
+verb ui/handle_sync_action(source @ #ui/load_older_messages_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false
+    return false
+  end
+
+  let current_limit = 40
+  let limits = session/TranscriptLimit(endpoint, ?limit)
+  if limits
+    let exactly {:limit -> configured_limit} = limits
+    current_limit = configured_limit
+  end
+  let new_limit = current_limit + 40
+  endpoint.session/transcriptLimit = new_limit
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/inspect_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || event != "submit"
+    return false
+  end
+
+  let current = ui/current_agent()
+  if current == none
+    return false
+  end
+
+  let selected_option = ui/entity_from_literal(fields[:entity])
+  if not selected_option
+    return false
+  end
+  let exactly {:value -> selected} = selected_option
+  if ui/can_inspect_entity(current, selected) == false
+    return false
+  end
+
+  endpoint().session/inspect = selected
+  endpoint.session/inspect = selected
+  let pulse = "odd"
+  let pulses = session/InspectPulse(endpoint, ?pulse)
+  if pulses
+    let exactly {:pulse -> configured_pulse} = pulses
+    pulse = configured_pulse
+  end
+  if pulse == "odd"
+    pulse = "even"
+  else
+    pulse = "odd"
+  end
+  endpoint().session/inspectPulse = pulse
+  endpoint.session/inspectPulse = pulse
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/select_workspace_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || event != "submit"
+    return false
+  end
+
+  let current = ui/current_agent()
+  if current == none
+    return false
+  end
+
+  let workspace_option = ui/entity_from_literal(fields[:entity])
+  if not workspace_option
+    return false
+  end
+  let exactly {:value -> workspace} = workspace_option
+  if Delegates(workspace, #workspace, 0) == false
+    return false
+  end
+
+  current.agentWorkspace = workspace
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/command_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || (event != "submit" && event != "input")
+    return false
+  end
+
+  let current = ui/current_agent()
+  if current == none
+    return false
+  end
+
+  let line = ui/form_raw_text(fields, :text)
+  endpoint().session/commandDraft = line
+  endpoint.session/commandDraft = line
+  if event == "input"
+    return true
+  end
+
+  if trim(line) == ""
+    return false
+  end
+
+  // When the agent is streaming, route the message to the steering or
+  // follow-up queue instead of starting a new loop. The mode field is
+  // set by the client: default (empty/absent) = steer, "follow_up" = queue.
+  let streaming = false
+  let streaming_rows = session/IsStreaming(endpoint, ?value)
+  if streaming_rows
+    let exactly {:value -> configured_streaming} = streaming_rows
+    streaming = configured_streaming
+  end
+  if streaming == true
+    let mode = ui/form_text(fields, :mode)
+    if mode == "follow_up"
+      session/followup_push(endpoint, line)
+    else
+      session/steering_push(endpoint, line)
+    end
+    endpoint().session/commandDraft = ""
+    endpoint.session/commandDraft = ""
+    return true
+  end
+
+  agent/append_message(current, "user", line)
+
+  let selected_option = ui/entity_from_literal(index_or(fields, :entity, none))
+  if selected_option
+    let exactly {:value -> selected} = selected_option
+    if ui/can_inspect_entity(current, selected)
+      endpoint().session/inspect = selected
+      endpoint.session/inspect = selected
+    end
+  end
+  endpoint().session/commandDraft = ""
+  endpoint.session/commandDraft = ""
+
+  let transcript_option = agent/transcript(current)
+  if transcript_option
+    let exactly {:value -> transcript} = transcript_option
+    agent/run_loop(current, transcript)
+  end
+
+  return true
+end
+
+verb ui/handle_sync_action(source @ #ui/object_browser_search_action<_>, endpoint, session, view, event, target, fields)
+  if ui/View(view) == false || (event != "submit" && event != "input")
+    return false
+  end
+
+  let current = ui/current_agent()
+  if current == none
+    return false
+  end
+
+  let query = ui/form_text(fields, :query)
+  retract session/ObjectBrowserQuery(endpoint(), _)
+  retract session/ObjectBrowserQuery(endpoint, _)
+  if query != ""
+    endpoint().session/objectBrowserQuery = query
+    endpoint.session/objectBrowserQuery = query
+  end
+  return true
+end
+
+verb sync_event(endpoint, session, view, event, target, action, fields)
+  let source_option = ui/sync_action_source(action)
+  if not source_option
+    return false
+  end
+  let exactly {:value -> source} = source_option
+  return ui/handle_sync_action(source, endpoint, session, view, event, target, fields)
+end

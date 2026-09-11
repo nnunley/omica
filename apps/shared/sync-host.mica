@@ -1,0 +1,49 @@
+// Shared host policy and HTTP helpers for sync apps.
+
+make_identity(:web)
+
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+make_relation(:CanInvoke, 2)
+make_relation(:CanEffect, 1)
+make_relation(:HttpRequest, 1, :volatile)
+make_relation(:RequestMethod, 2, :volatile)
+make_relation(:RequestPath, 2, :volatile)
+make_relation(:RequestVersion, 2, :volatile)
+make_relation(:RequestPrincipal, 2, :volatile)
+make_relation(:RequestActor, 2, :volatile)
+make_relation(:RequestHeader, 3, :volatile)
+make_relation(:RequestBody, 2, :volatile)
+
+grant #web
+  read:
+    :HttpRequest
+    :RequestMethod
+    :RequestPath
+    :RequestVersion
+    :RequestPrincipal
+    :RequestActor
+    :RequestHeader
+    :RequestBody
+  invoke:
+    :http_response
+    :http_html
+    :http_text
+  effect
+end
+
+verb http_response(status, content_type, body)
+  return {:status -> status, :headers -> [["content-type", content_type], ["cache-control", "no-store"]], :body -> body}
+end
+
+verb http_html(status, body)
+  return http_response(status, "text/html; charset=utf-8", body)
+end
+
+verb http_text(status, body)
+  return http_response(status, "text/plain; charset=utf-8", body)
+end
+
+verb http_json(status, body)
+  return http_response(status, "application/json; charset=utf-8", body)
+end

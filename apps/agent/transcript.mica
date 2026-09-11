@@ -1,0 +1,240 @@
+// Transcript composition for the server-owned agent view.
+//
+// Messages are durable relation facts. This file renders them into DOM nodes
+// the same way ui-narrative.mica renders MUD events: a bounded recent window
+// with an opt-in "load older" sync event. Per-role body rendering dispatches
+// on the message's event delegate (#event/user_message, #event/assistant_message,
+// #event/tool_message, #event/system_message) so tool messages and tool-call
+// attachments get structured DOM instead of raw text dumps.
+
+verb ui/message_role_label(role @ #string)
+  return message/role_label(role)
+end
+
+verb ui/message_class(role @ #string)
+  return message/class(role)
+end
+
+verb ui/message_role_icon(role @ #string)
+  if role == "user"
+    return dom <span class="message-glyph user-glyph" aria-hidden="true">></span>
+  end
+  if role == "assistant"
+    return dom <span class="message-glyph assistant-glyph" aria-hidden="true">*</span>
+  end
+  if role == "tool"
+    return dom <span class="message-glyph tool-glyph" aria-hidden="true">+</span>
+  end
+  return dom <span class="message-glyph system-glyph" aria-hidden="true">!</span>
+end
+
+verb ui/tool_status_glyph(status @ #string)
+  if status == "complete"
+    return "OK"
+  elseif status == "error"
+    return "ERR"
+  elseif status == "executing"
+    return "..."
+  elseif status == "pending"
+    return "..."
+  end
+  return "?"
+end
+
+verb ui/tool_call_node(call)
+  let name = "unknown"
+  let arguments = ""
+  let status = ""
+  if call.toolCallName != none
+    name = call.toolCallName
+  end
+  if call.toolCallArguments != none
+    arguments = call.toolCallArguments
+  end
+  if call.toolCallStatus != none
+    status = call.toolCallStatus
+  end
+  let glyph = ui/tool_status_glyph(status)
+  let label = string_concat("[", glyph, "] ", name)
+  if status != ""
+    label = string_concat(label, " (", status, ")")
+  end
+  return dom <details class="tool-call-block" data-sync-key={to_literal(call)}>
+    <summary>{label}</summary>
+    <pre class="tool-call-arguments">{arguments}</pre>
+  </details>
+end
+
+verb ui/tool_message_body_node(message)
+  let content = message.messageContent
+  let parsed = from_literal(content)
+  let tool_call_id = "unknown"
+  let result_content = content
+  if let ok(value) = parsed
+    let maybe_id = index_or(value, :tool_call_id, none)
+    if maybe_id != none
+      tool_call_id = maybe_id
+    end
+    let maybe_content = index_or(value, :content, none)
+    if maybe_content != none
+      result_content = maybe_content
+    end
+  end
+  let header = string_concat("<- result (", tool_call_id, ")")
+  return dom <details class="tool-result-block" open>
+    <summary>{header}</summary>
+    <pre class="tool-result-content">{result_content}</pre>
+  </details>
+end
+
+verb ui/render_content(content @ #string)
+  return dom <div class="message-content" data-raw-content={content}></div>
+end
+
+verb ui/assistant_body_with_tool_calls(content, tool_calls)
+  let blocks = []
+  if content != ""
+    blocks = [@blocks, ui/render_content(content)]
+  end
+  for call in tool_calls
+    blocks = [@blocks, ui/tool_call_node(call)]
+  end
+  return dom <div class="assistant-with-tools">{@blocks}</div>
+end
+
+verb ui/message_body_node(message)
+  let delegate = frob_delegate(message)
+  if delegate == #event/tool_message
+    return ui/tool_message_body_node(message)
+  end
+
+  let content = message.messageContent
+  if content == none
+    content = ""
+  end
+
+  let tool_calls = []
+  for found in ToolCallMessage(?call, message)
+    tool_calls = [@tool_calls, found[:call]]
+  end
+  if tool_calls != []
+    return ui/assistant_body_with_tool_calls(content, tool_calls)
+  end
+
+  return ui/render_content(content)
+end
+
+verb ui/message_node(message)
+  let role = message.messageRole
+  let seq = message.messageSeq
+  let label = ui/message_role_label(role)
+  return dom <li data-sync-key={to_literal(message)} class={ui/message_class(role)}>
+    <div class="message-line-main">
+      <span class="message-role">{ui/message_role_icon(role)}<span>{label}</span></span>
+      {ui/message_body_node(message)}
+    </div>
+    <span class="message-seq" aria-hidden="true">{to_literal(seq)}</span>
+  </li>
+end
+
+verb ui/transcript_node(agent @ #agent, revision, limit)
+  let transcript_option = agent/transcript(agent)
+  let transcript = none
+  let messages = []
+  let count = 0
+
+  if transcript_option
+    let exactly {:value -> selected_transcript} = transcript_option
+    transcript = selected_transcript
+    for message in agent/messages_ordered(transcript)
+      count = count + 1
+    end
+  end
+
+  if count == 0
+    let prompt = transcript/empty_prompt(transcript)
+    messages = [dom <li class="muted">{prompt}</li>]
+  else
+    let first_rendered = 0
+    if count > limit
+      first_rendered = count - limit
+    end
+
+    let rendered = 0
+    let index = 0
+    for message in agent/messages_ordered(transcript)
+      if index >= first_rendered
+        messages = [@messages, ui/message_node(message)]
+        rendered = rendered + 1
+      end
+      index = index + 1
+    end
+
+    let streaming = false
+    let streaming_rows = session/IsStreaming(endpoint(), ?value)
+    if streaming_rows
+      let exactly {:value -> configured_streaming} = streaming_rows
+      streaming = configured_streaming
+    end
+    if streaming == true
+      messages = [@messages, dom <li class="message-line assistant typing-indicator"><div class="message-line-main"><span class="message-role"><span class="message-glyph assistant-glyph">*</span><span>Agent</span></span><span class="typing-dots"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span></div></li>]
+    end
+  end
+
+  let heading = dom <div class="transcript-heading">
+    <h2>Transcript</h2>
+  </div>
+
+  let children = []
+  if count > limit
+    children = [dom <form class="transcript-older-form" data-sync-event="submit" data-sync-action="agent_load_older_messages">
+      <button class="mini-button">{ui/icon_label_node("clock", string_concat("Load older (", to_literal(count - limit), " more)"))}</button>
+    </form>]
+  end
+
+  if count > limit
+    children = [@children, dom <ul class="message-list" data-sync-on-viewport-top="agent_load_older_messages" data-sync-viewport-threshold="24">{@messages}</ul>]
+  else
+    children = [@children, dom <ul class="message-list">{@messages}</ul>]
+  end
+
+  return dom <section id="transcript" class="panel transcript" aria-live="polite" data-sync-follow="bottom" data-sync-stable-top="true">
+    {heading}
+    {@children}
+  </section>
+end
+
+verb ui/latest_message_node(agent @ #agent, revision)
+  let transcript_option = agent/transcript(agent)
+  if not transcript_option
+    return dom <section id="latest-message" class="latest-message empty">
+      <span class="muted">No transcript yet.</span>
+    </section>
+  end
+  let exactly {:value -> transcript} = transcript_option
+
+  let latest = none
+  let latest_seq = -1
+  for message in agent/messages(transcript)
+    let seq = message.messageSeq
+    if seq < revision && seq > latest_seq
+      latest = message
+      latest_seq = seq
+    end
+  end
+
+  if latest == none
+    return dom <section id="latest-message" class="latest-message empty">
+      <span class="muted">No messages yet.</span>
+    </section>
+  end
+
+  let role = latest.messageRole
+  return dom <section id="latest-message" class={string_concat("latest-message ", role)}>
+    <div class="latest-heading">
+      <strong>Latest</strong>
+      <span class="message-role">{ui/message_role_label(role)}</span>
+    </div>
+    <div class="latest-body">{ui/message_body_node(latest)}</div>
+  </section>
+end
