@@ -65,17 +65,46 @@ new_arena :: proc(pool: ^Arena_Pool) -> ^virtual.Arena {
 	return arena
 }
 
+// Deep-copies `rows` into one contiguous cell block plus one tuple pointer
+// array. A single allocation for all cells avoids a per-tuple allocation, and
+// with it the arena mutex and page-commit work that dominates chunk building.
+deep_copy_rows :: proc(alloc: mem.Allocator, rows: []v.Tuple) -> []v.Tuple {
+	if len(rows) == 0 {
+		return make([]v.Tuple, 0, alloc)
+	}
+	arity := v.tuple_arity(rows[0])
+	for row in rows {
+		if v.tuple_arity(row) != arity {
+			// Defensive: uniform arity is expected, but do not corrupt data if
+			// it is ever violated.
+			owned := make([]v.Tuple, len(rows), alloc)
+			for fallback, index in rows {
+				owned[index] = v.tuple_deep_copy(alloc, fallback)
+			}
+			return owned
+		}
+	}
+
+	cells := make([]v.Value, len(rows) * arity, alloc)
+	owned := make([]v.Tuple, len(rows), alloc)
+	for row, index in rows {
+		source := v.tuple_values(row)
+		start := index * arity
+		for value, cell in source {
+			cells[start + cell] = v.value_deep_copy(alloc, value)
+		}
+		owned[index] = v.Tuple(cells[start:start + arity])
+	}
+	return owned
+}
+
 // Creates a chunk owning deep copies of `rows`. With a pool, the chunk arena
 // is pooled and recycled; without one it is owned and destroyed on release.
-@(private)
 relation_chunk_create :: proc(pool: ^Arena_Pool, rows: []v.Tuple) -> ^Relation_Chunk {
 	arena := new_arena(pool)
 	alloc := virtual.arena_allocator(arena)
 
-	owned := make([]v.Tuple, len(rows), alloc)
-	for row, index in rows {
-		owned[index] = v.tuple_deep_copy(alloc, row)
-	}
+	owned := deep_copy_rows(alloc, rows)
 
 	chunk := new(Relation_Chunk, alloc)
 	chunk.tuples = owned
@@ -93,7 +122,6 @@ relation_chunk_retain :: proc(chunk: ^Relation_Chunk) {
 	sync.atomic_add_explicit(&chunk.refs, 1, .Relaxed)
 }
 
-@(private)
 relation_chunk_release :: proc(chunk: ^Relation_Chunk) {
 	if chunk == nil {
 		return
@@ -234,17 +262,8 @@ relation_block_apply :: proc(
 	}
 	suffix_start := max(hi + 1, lo)
 
-	base_rows := make([dynamic]v.Tuple, 0, context.temp_allocator)
-	if lo <= hi {
-		for index in lo ..= hi {
-			for row in chunks[index].tuples {
-				append(&base_rows, row)
-			}
-		}
-	}
-
-	merged := make([dynamic]v.Tuple, 0, len(base_rows) + len(entries), context.temp_allocator)
-	added, removed := merge_entries(&merged, base_rows[:], entries)
+	merged := make([dynamic]v.Tuple, 0, chunk_span_rows(chunks, lo, hi) + len(entries), context.temp_allocator)
+	added, removed := merge_chunks(&merged, chunks, lo, hi, entries)
 	count = count + added - removed
 
 	new_chunks := chunks_from_rows(kernel.arena_pool, merged[:], context.temp_allocator)
@@ -316,50 +335,56 @@ chunks_from_rows :: proc(
 }
 
 @(private)
-merge_entries :: proc(
+chunk_span_rows :: proc(chunks: []^Relation_Chunk, lo, hi: int) -> int {
+	total := 0
+	for index in lo ..= hi {
+		total += len(chunks[index].tuples)
+	}
+	return total
+}
+
+// Merges the rows of chunks `[lo, hi]` with the sorted `entries` directly,
+// without materialising the base rows in a scratch array.
+@(private)
+merge_chunks :: proc(
 	merged: ^[dynamic]v.Tuple,
-	base_rows: []v.Tuple,
+	chunks: []^Relation_Chunk,
+	lo, hi: int,
 	entries: []Pending_Write,
 ) -> (
 	added: int,
 	removed: int,
 ) {
-	base_index := 0
 	entry_index := 0
-	for base_index < len(base_rows) || entry_index < len(entries) {
-		if entry_index >= len(entries) {
-			append(merged, base_rows[base_index])
-			base_index += 1
-			continue
-		}
-		if base_index >= len(base_rows) {
-			if entries[entry_index].kind == .Assert {
-				append(merged, entries[entry_index].tuple)
-				added += 1
+	for index in lo ..= hi {
+		for row in chunks[index].tuples {
+			for entry_index < len(entries) &&
+			    v.tuple_cmp(entries[entry_index].tuple, row) == .Less {
+				if entries[entry_index].kind == .Assert {
+					append(merged, entries[entry_index].tuple)
+					added += 1
+				}
+				entry_index += 1
 			}
-			entry_index += 1
-			continue
-		}
-
-		switch v.tuple_cmp(base_rows[base_index], entries[entry_index].tuple) {
-		case .Less:
-			append(merged, base_rows[base_index])
-			base_index += 1
-		case .Greater:
-			if entries[entry_index].kind == .Assert {
-				append(merged, entries[entry_index].tuple)
-				added += 1
-			}
-			entry_index += 1
-		case .Equal:
-			if entries[entry_index].kind == .Assert {
-				append(merged, base_rows[base_index])
+			if entry_index < len(entries) &&
+			   v.tuple_cmp(entries[entry_index].tuple, row) == .Equal {
+				if entries[entry_index].kind == .Assert {
+					append(merged, row)
+				} else {
+					removed += 1
+				}
+				entry_index += 1
 			} else {
-				removed += 1
+				append(merged, row)
 			}
-			base_index += 1
-			entry_index += 1
 		}
+	}
+	for entry_index < len(entries) {
+		if entries[entry_index].kind == .Assert {
+			append(merged, entries[entry_index].tuple)
+			added += 1
+		}
+		entry_index += 1
 	}
 	return added, removed
 }
@@ -652,10 +677,11 @@ build_block_indexes :: proc(block: ^Relation_Block, alloc: mem.Allocator) {
 			index_count += 1
 		}
 	}
-	block.indexes = make([]Secondary_Index, index_count, alloc)
 	if index_count == 0 {
+		block.indexes = nil
 		return
 	}
+	block.indexes = make([]Secondary_Index, index_count, alloc)
 
 	// Indexed relations keep a flat row view so index comparisons are O(1)
 	// instead of walking the chunk spine.

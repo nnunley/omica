@@ -51,9 +51,11 @@ snapshot_create :: proc(kernel: ^Kernel, version: u64, parent: ^Snapshot) -> ^Sn
 	snapshot.arena = arena
 	snapshot.pool = kernel.arena_pool
 	snapshot.allocator = virtual.arena_allocator(arena)
-	snapshot.catalog = make([]Relation_Metadata, 0, snapshot.allocator)
-	snapshot.blocks = make([]^Relation_Block, 0, snapshot.allocator)
-	snapshot.rules = make([]Rule_Definition, 0, snapshot.allocator)
+	// Callers that fork or add entries assign these arrays; leaving them nil
+	// avoids four allocator round-trips per snapshot.
+	snapshot.catalog = nil
+	snapshot.blocks = nil
+	snapshot.rules = nil
 	snapshot.derived = nil
 	return snapshot
 }

@@ -49,6 +49,11 @@ Store_State :: struct {
 	primary_block: ^k.Relation_Block,
 	index_block:   ^k.Relation_Block,
 
+	copy_rows:  []v.Tuple,
+	copy_arena: virtual.Arena,
+	copy_alloc: mem.Allocator,
+	copy_pool:  k.Arena_Pool,
+
 	unbound: []v.Binding,
 	prefix:  []v.Binding,
 	index:   []v.Binding,
@@ -94,6 +99,21 @@ setup_store_state :: proc(state: ^Store_State) {
 				},
 			)
 		}
+	}
+
+	if err := virtual.arena_init_growing(&state.copy_arena); err != nil {
+		panic("failed to initialize copy benchmark arena")
+	}
+	state.copy_alloc = virtual.arena_allocator(&state.copy_arena)
+	k.arena_pool_init(&state.copy_pool)
+	state.copy_rows = make([]v.Tuple, 128, state.alloc)
+	for index in 0 ..< 128 {
+		group_id, _ := v.identity_new(u64(index))
+		item_id, _ := v.identity_new(u64(index * 2))
+		state.copy_rows[index] = v.tuple_new(
+			state.alloc,
+			[]v.Value{v.value_identity(group_id), v.value_identity(item_id), kind},
+		)
 	}
 
 	state.primary_block = k.relation_block_build_pooled(
@@ -175,6 +195,45 @@ bench_scan_index :: proc(user: rawptr, chunk: int, _: int) {
 		k.relation_block_visit(state.index_block, state.index, scan_visit, &state.sink)
 	}
 	state.sink.value = mm.black_box(state.sink.value)
+}
+
+@(private)
+bench_deep_copy_contiguous :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Store_State)(user)
+	virtual.arena_free_all(&state.copy_arena)
+	total := u64(0)
+	for _ in 0 ..< chunk {
+		copied := k.deep_copy_rows(state.copy_alloc, state.copy_rows)
+		total += u64(len(copied))
+	}
+	state.sink.value = mm.black_box(total)
+}
+
+@(private)
+bench_deep_copy_per_tuple :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Store_State)(user)
+	virtual.arena_free_all(&state.copy_arena)
+	total := u64(0)
+	for _ in 0 ..< chunk {
+		owned := make([]v.Tuple, len(state.copy_rows), state.copy_alloc)
+		for row, index in state.copy_rows {
+			owned[index] = v.tuple_deep_copy(state.copy_alloc, row)
+		}
+		total += u64(len(owned))
+	}
+	state.sink.value = mm.black_box(total)
+}
+
+@(private)
+bench_chunk_create :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Store_State)(user)
+	total := u64(0)
+	for _ in 0 ..< chunk {
+		created := k.relation_chunk_create(&state.copy_pool, state.copy_rows)
+		total += u64(len(created.tuples))
+		k.relation_chunk_release(created)
+	}
+	state.sink.value = mm.black_box(total)
 }
 
 @(private)
@@ -781,6 +840,9 @@ register_kernel_benches :: proc(runner: ^mm.Runner) {
 	mm.bench(store_group, "scan_prefix_16k", store_state, bench_scan_prefix)
 	mm.bench(store_group, "scan_prefix_checksum_16k", store_state, bench_scan_prefix_checksum)
 	mm.bench(store_group, "scan_index_16k", store_state, bench_scan_index)
+	mm.bench_capped(store_group, "deep_copy_128_contiguous", store_state, bench_deep_copy_contiguous, 512)
+	mm.bench_capped(store_group, "deep_copy_128_per_tuple", store_state, bench_deep_copy_per_tuple, 512)
+	mm.bench_capped(store_group, "chunk_create_128", store_state, bench_chunk_create, 512)
 	mm.bench_capped(store_group, "apply_delta_16k", store_state, bench_store_apply_delta, 8)
 	mm.bench_capped(store_group, "rebuild_16k", store_state, bench_store_rebuild, 8)
 
