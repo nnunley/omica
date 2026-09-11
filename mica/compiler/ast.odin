@@ -224,9 +224,11 @@ While :: struct {
 	body:      []^Expr,
 }
 
-// `for name[, value] in iterable`.
+// `for name[, value] in iterable`. `kinds` is parallel to `names`; empty
+// strings mean no annotation.
 For :: struct {
 	names:    []string,
+	kinds:    []string,
 	iterable: ^Expr,
 	body:     []^Expr,
 }
@@ -363,6 +365,27 @@ Expr :: union {
 	Fn,
 }
 
+// Authority sections inside a `grant` block.
+Grant_Section_Kind :: enum {
+	Read,
+	Write,
+	Invoke,
+	Effect,
+}
+
+Grant_Section :: struct {
+	kind:    Grant_Section_Kind,
+	entries: []^Expr,
+}
+
+// `grant #principal` or `grant role #principal` with read, write, invoke, and
+// effect sections.
+Grant_Item :: struct {
+	principal: ^Expr,
+	is_role:   bool,
+	sections:  []Grant_Section,
+}
+
 Expr_Item :: struct {
 	expr: ^Expr,
 }
@@ -383,6 +406,7 @@ Item :: union {
 	Expr_Item,
 	Verb_Item,
 	Rule_Item,
+	Grant_Item,
 }
 
 Program_AST :: struct {

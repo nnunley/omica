@@ -192,6 +192,12 @@ parse_item :: proc(parser: ^Parser) -> Item {
 	case .Verb, .Method:
 		return parse_verb(parser)
 	case:
+		if is_contextual_keyword(parser, "grant") &&
+		   (peek_at(parser, 1).kind == .Hash ||
+			   (peek_at(parser, 1).kind == .Ident && peek_at(parser, 1).text == "role")) {
+			return parse_grant(parser)
+		}
+
 		head := parse_expression(parser)
 		if at(parser, .Colon_Dash) {
 			advance(parser)
@@ -202,10 +208,91 @@ parse_item :: proc(parser: ^Parser) -> Item {
 	}
 }
 
+// --- Grant blocks ----------------------------------------------------------
+
+@(private)
+at_grant_section :: proc(parser: ^Parser) -> bool {
+	if !at(parser, .Ident) {
+		return false
+	}
+	switch peek(parser).text {
+	case "read", "write", "invoke":
+		return peek_at(parser, 1).kind == .Colon
+	case "effect":
+		return true
+	}
+	return false
+}
+
+@(private)
+parse_grant :: proc(parser: ^Parser) -> Item {
+	advance(parser) // grant
+	is_role := false
+	if is_contextual_keyword(parser, "role") {
+		advance(parser)
+		is_role = true
+	}
+	principal := parse_unary(parser)
+	skip_separators(parser)
+
+	sections: [dynamic]Grant_Section
+	for !at(parser, .Eof) && !at(parser, .End) {
+		if !at_grant_section(parser) {
+			error_here(parser, "expected a grant section")
+			for !at(parser, .Eof) && !at_separator(parser) && !at(parser, .End) {
+				advance(parser)
+			}
+			skip_separators(parser)
+			continue
+		}
+
+		kind: Grant_Section_Kind
+		switch peek(parser).text {
+		case "read":
+			kind = .Read
+		case "write":
+			kind = .Write
+		case "invoke":
+			kind = .Invoke
+		case:
+			kind = .Effect
+		}
+		advance(parser)
+		if kind != .Effect {
+			expect(parser, .Colon, "expected ':' after the section name")
+		}
+
+		entries: [dynamic]^Expr
+		skip_separators(parser)
+		for !at(parser, .Eof) && !at(parser, .End) && !at_grant_section(parser) {
+			append(&entries, parse_expression(parser))
+			if !at_separator(parser) && !at(parser, .End) && !at_grant_section(parser) {
+				error_here(parser, "expected newline after a grant entry")
+				for !at(parser, .Eof) && !at_separator(parser) {
+					advance(parser)
+				}
+			}
+			skip_separators(parser)
+		}
+		append(&sections, Grant_Section {
+			kind    = kind,
+			entries = to_slice(parser, entries),
+		})
+	}
+
+	expect(parser, .End, "expected 'end' to close grant")
+	return Grant_Item {
+		principal = principal,
+		is_role   = is_role,
+		sections  = to_slice(parser, sections),
+	}
+}
+
 @(private)
 parse_verb :: proc(parser: ^Parser) -> Item {
 	advance(parser)
 	name_token := expect(parser, .Ident, "expected verb name")
+	verb_name := parse_qualified_name(parser, name_token)
 	expect(parser, .LParen, "expected '(' after verb name")
 	params := parse_params(parser)
 	expect(parser, .RParen, "expected ')' after verb parameters")
@@ -218,7 +305,7 @@ parse_verb :: proc(parser: ^Parser) -> Item {
 	body := parse_block_until(parser, []Token_Kind{.End})
 	expect(parser, .End, "expected 'end' to close verb")
 	return Verb_Item {
-		name        = name_token.text,
+		name        = verb_name,
 		params      = params,
 		result_type = result_type,
 		body        = body,
@@ -259,7 +346,6 @@ parse_rule_body :: proc(parser: ^Parser) -> []^Expr {
 	skip_newlines(parser)
 	for !at_separator(parser) && !at(parser, .Eof) {
 		append(&items, parse_expression(parser))
-		skip_newlines(parser)
 		if at(parser, .Comma) {
 			advance(parser)
 			skip_newlines(parser)
@@ -593,10 +679,20 @@ parse_while :: proc(parser: ^Parser) -> ^Expr {
 parse_for :: proc(parser: ^Parser) -> ^Expr {
 	advance(parser)
 	names: [dynamic]string
-	append(&names, expect(parser, .Ident, "expected loop name").text)
-	if at(parser, .Comma) {
-		advance(parser)
-		append(&names, expect(parser, .Ident, "expected second loop name").text)
+	kinds: [dynamic]string
+	for {
+		append(&names, expect(parser, .Ident, "expected loop name").text)
+		kind := ""
+		if at(parser, .Colon) {
+			advance(parser)
+			kind = parse_type_text(parser)
+		}
+		append(&kinds, kind)
+		if at(parser, .Comma) {
+			advance(parser)
+			continue
+		}
+		break
 	}
 	expect(parser, .In, "expected 'in' in for loop")
 	iterable := parse_expression(parser)
@@ -605,6 +701,7 @@ parse_for :: proc(parser: ^Parser) -> ^Expr {
 	expect(parser, .End, "expected 'end' to close for")
 	return expr_node(parser, For {
 		names    = to_slice(parser, names),
+		kinds    = to_slice(parser, kinds),
 		iterable = iterable,
 		body     = body,
 	})

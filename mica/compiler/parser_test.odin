@@ -385,3 +385,54 @@ test_parse_generic_kind_annotations :: proc(t: ^testing.T) {
 	testing.expect_value(t, item.params[0].kind, "option<string>")
 	testing.expect_value(t, item.result_type, "option<string>")
 }
+
+@(test)
+test_parse_qualified_verb_name :: proc(t: ^testing.T) {
+	source := "verb ui/icon_node(name)\n  return name\nend"
+	program := parse_ok(t, source)
+	item, item_ok := program.items[0].(Verb_Item)
+	testing.expect(t, item_ok)
+	testing.expect_value(t, item.name, "ui/icon_node")
+}
+
+@(test)
+test_parse_typed_for :: proc(t: ^testing.T) {
+	source := "for part: string in parts\n  emit(part)\nend"
+	program := parse_ok(t, source)
+	expr := first_item_expr(t, program)
+	iteration, iteration_ok := expr^.(For)
+	testing.expect(t, iteration_ok)
+	testing.expect_value(t, iteration.names[0], "part")
+	testing.expect_value(t, iteration.kinds[0], "string")
+}
+
+@(test)
+test_parse_grant_block :: proc(t: ^testing.T) {
+	source := "grant role #builder\n  read:\n    :inspection\n  write:\n    :editing\n  invoke:\n    :maintenance\n  effect\nend"
+	program := parse_ok(t, source)
+	item, item_ok := program.items[0].(Grant_Item)
+	testing.expect(t, item_ok)
+	testing.expect(t, item.is_role)
+	testing.expect_value(t, len(item.sections), 4)
+	testing.expect_value(t, item.sections[0].kind, Grant_Section_Kind.Read)
+	testing.expect_value(t, len(item.sections[0].entries), 1)
+	_, entry_is_symbol := item.sections[0].entries[0]^.(Symbol_Literal)
+	testing.expect(t, entry_is_symbol)
+	testing.expect_value(t, item.sections[3].kind, Grant_Section_Kind.Effect)
+	testing.expect_value(t, len(item.sections[3].entries), 0)
+}
+
+@(test)
+test_parse_multiline_rule :: proc(t: ^testing.T) {
+	source := "DependsOn(component, dependency) :-\n  DirectDependency(component, intermediate),\n  DependsOn(intermediate, dependency)\n\nAffected(component) :-\n  Unavailable(component)\n"
+	program := parse_ok(t, source)
+	testing.expect_value(t, len(program.items), 2)
+
+	first, first_ok := program.items[0].(Rule_Item)
+	testing.expect(t, first_ok)
+	testing.expect_value(t, len(first.body), 2)
+
+	second, second_ok := program.items[1].(Rule_Item)
+	testing.expect(t, second_ok)
+	testing.expect_value(t, len(second.body), 1)
+}
