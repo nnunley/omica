@@ -1,0 +1,38 @@
+# Odin build output
+*.bin
+*.test.bin
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.lib
+*.obj
+
+# Odin caches
+.odin/
+odin-cache/
+ODIN_CACHE_DIR/
+
+# Benchmark output
+benchmark_results_*.json
+baseline*.tsv
+*.bench.tsv
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and scratch files
+*.log
+*.tmp
