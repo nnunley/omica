@@ -6,11 +6,20 @@
 package kernel
 
 import "core:mem/virtual"
+import "core:sync"
 import v "../var"
 
 // Published world state.
+//
+// `current` is published atomically. Readers load and retain the snapshot with
+// no lock; this is safe because every snapshot retains its parent, so a
+// snapshot loaded just before a concurrent publish stays alive through its
+// descendant chain. Writers serialise validate-fork-publish on `commit_lock`,
+// matching Rust mica's commit mutex. Loads are lock-free, so a long commit
+// never blocks transaction begins or scans.
 Kernel :: struct {
-	current: ^Snapshot,
+	current:     ^Snapshot,
+	commit_lock: sync.Mutex,
 }
 
 // Creates a kernel with an empty snapshot.
@@ -18,16 +27,20 @@ kernel_init :: proc(kernel: ^Kernel) {
 	kernel.current = snapshot_create(0, nil)
 }
 
-// Releases the published snapshot and all retained history.
+// Releases the published snapshot and all retained history. The caller must
+// guarantee no other thread uses the kernel.
 kernel_destroy :: proc(kernel: ^Kernel) {
-	snapshot_release(kernel.current)
-	kernel.current = nil
+	current := sync.atomic_load(&kernel.current)
+	sync.atomic_store(&kernel.current, nil)
+	snapshot_release(current)
 }
 
-// Returns a retained reference to the current snapshot.
+// Returns a retained reference to the current snapshot. The caller must
+// release it.
 kernel_snapshot :: proc(kernel: ^Kernel) -> ^Snapshot {
-	snapshot_retain(kernel.current)
-	return kernel.current
+	current := sync.atomic_load(&kernel.current)
+	snapshot_retain(current)
+	return current
 }
 
 // Begins a transaction over the current snapshot.
@@ -37,8 +50,11 @@ kernel_begin :: proc(kernel: ^Kernel) -> Transaction {
 
 // Returns the next unused relation id.
 kernel_next_relation_id :: proc(kernel: ^Kernel) -> Relation_ID {
+	current := kernel_snapshot(kernel)
+	defer snapshot_release(current)
+
 	next := u32(1)
-	for metadata in kernel.current.catalog {
+	for metadata in current.catalog {
 		if u32(metadata.id) >= next {
 			next = u32(metadata.id) + 1
 		}
@@ -46,11 +62,12 @@ kernel_next_relation_id :: proc(kernel: ^Kernel) -> Relation_ID {
 	return Relation_ID(next)
 }
 
+// Publishes `next` while the caller holds the exclusive kernel lock.
 @(private)
-kernel_publish :: proc(kernel: ^Kernel, next: ^Snapshot) {
+kernel_publish_locked :: proc(kernel: ^Kernel, next: ^Snapshot) {
 	snapshot_retain(next)
-	previous := kernel.current
-	kernel.current = next
+	previous := sync.atomic_load(&kernel.current)
+	sync.atomic_store(&kernel.current, next)
 	snapshot_release(previous)
 }
 
@@ -63,7 +80,10 @@ kernel_create_relation :: proc(
 	^Snapshot,
 	Kernel_Error,
 ) {
-	current := kernel.current
+	sync.mutex_lock(&kernel.commit_lock)
+	defer sync.mutex_unlock(&kernel.commit_lock)
+
+	current := sync.atomic_load(&kernel.current)
 	if _, exists := snapshot_relation_metadata_named(current, metadata.name); exists {
 		return nil, .Duplicate_Relation_Name
 	}
@@ -77,7 +97,7 @@ kernel_create_relation :: proc(
 	next := snapshot_fork(current)
 	snapshot_add_relation(next, metadata_clone(next.allocator, metadata))
 	snapshot_compute_derived(next)
-	kernel_publish(kernel, next)
+	kernel_publish_locked(kernel, next)
 	return next, .None
 }
 
@@ -92,7 +112,10 @@ kernel_install_rule :: proc(
 	^Snapshot,
 	Kernel_Error,
 ) {
-	current := kernel.current
+	sync.mutex_lock(&kernel.commit_lock)
+	defer sync.mutex_unlock(&kernel.commit_lock)
+
+	current := sync.atomic_load(&kernel.current)
 	if err := rule_validate_arity(rule, current); err != .None {
 		return nil, err
 	}
@@ -121,7 +144,7 @@ kernel_install_rule :: proc(
 	}
 
 	snapshot_compute_derived(next)
-	kernel_publish(kernel, next)
+	kernel_publish_locked(kernel, next)
 	return next, .None
 }
 
@@ -134,7 +157,10 @@ kernel_disable_rule :: proc(
 	^Snapshot,
 	Kernel_Error,
 ) {
-	current := kernel.current
+	sync.mutex_lock(&kernel.commit_lock)
+	defer sync.mutex_unlock(&kernel.commit_lock)
+
+	current := sync.atomic_load(&kernel.current)
 	found := false
 	for definition in current.rules {
 		if definition.id == rule_id {
@@ -153,7 +179,7 @@ kernel_disable_rule :: proc(
 		}
 	}
 	snapshot_compute_derived(next)
-	kernel_publish(kernel, next)
+	kernel_publish_locked(kernel, next)
 	return next, .None
 }
 
@@ -166,7 +192,10 @@ kernel_visit :: proc(
 	visit: proc(user: rawptr, row: v.Tuple) -> bool,
 	user: rawptr,
 ) -> bool {
-	source := Relation_Source{snapshot = kernel.current, use_stored_derived = true}
+	current := kernel_snapshot(kernel)
+	defer snapshot_release(current)
+
+	source := Relation_Source{snapshot = current, use_stored_derived = true}
 	return relation_source_visit(&source, relation, bindings, visit, user)
 }
 
@@ -178,8 +207,11 @@ kernel_scan_into :: proc(
 	bindings: []v.Binding,
 	out: ^[dynamic]v.Tuple,
 ) {
+	current := kernel_snapshot(kernel)
+	defer snapshot_release(current)
+
 	relation_source_scan_into(
-		&Relation_Source{snapshot = kernel.current, use_stored_derived = true},
+		&Relation_Source{snapshot = current, use_stored_derived = true},
 		relation,
 		bindings,
 		out,
@@ -188,5 +220,7 @@ kernel_scan_into :: proc(
 
 // Reports whether a relation tuple is visible in the current snapshot.
 kernel_contains :: proc(kernel: ^Kernel, relation: Relation_ID, tuple: v.Tuple) -> bool {
-	return snapshot_contains(kernel.current, relation, tuple)
+	current := kernel_snapshot(kernel)
+	defer snapshot_release(current)
+	return snapshot_contains(current, relation, tuple)
 }

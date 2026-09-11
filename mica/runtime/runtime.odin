@@ -447,7 +447,9 @@ builtin_set_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		key_values,
 	)
 
-	metadata, metadata_found := k.snapshot_relation_metadata(env.kernel.current, info.relation)
+	current := k.kernel_snapshot(env.kernel)
+	defer k.snapshot_release(current)
+	metadata, metadata_found := k.snapshot_relation_metadata(current, info.relation)
 	if !metadata_found || metadata.arity != 2 {
 		vm.vm_set_error(state, "E_FIELD", "only binary functional relations are supported")
 		return v.Value(0), false

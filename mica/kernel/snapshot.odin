@@ -7,9 +7,11 @@
 // reference-counted; the last release destroys the arenas.
 package kernel
 
+import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
+import "core:sync"
 import v "../var"
 
 // A derived relation's rows, computed from rules at snapshot creation.
@@ -22,7 +24,7 @@ Derived_Relation :: struct {
 Snapshot :: struct {
 	version:   u64,
 	parent:    ^Snapshot,
-	refs:      int,
+	refs:      i32,
 	arena:     ^virtual.Arena,
 	allocator: mem.Allocator,
 	catalog:   []Relation_Metadata,
@@ -33,7 +35,7 @@ Snapshot :: struct {
 
 // Creates an empty snapshot at `version` with an optional retained parent.
 snapshot_create :: proc(version: u64, parent: ^Snapshot) -> ^Snapshot {
-	arena := new(virtual.Arena)
+	arena := new(virtual.Arena, runtime.default_allocator())
 	if err := virtual.arena_init_growing(arena); err != nil {
 		panic("failed to initialize snapshot arena")
 	}
@@ -46,7 +48,7 @@ snapshot_create_with_arena :: proc(
 	parent: ^Snapshot,
 	arena: ^virtual.Arena,
 ) -> ^Snapshot {
-	snapshot := new(Snapshot)
+	snapshot := new(Snapshot, runtime.default_allocator())
 	snapshot.version = version
 	snapshot.refs = 1
 	snapshot.arena = arena
@@ -63,24 +65,31 @@ snapshot_create_with_arena :: proc(
 	return snapshot
 }
 
-// Increments the reference count of a snapshot.
+// Increments the reference count of a snapshot. Thread-safe. A relaxed
+// increment is sufficient: the reference itself is acquired with acquire
+// semantics elsewhere.
 snapshot_retain :: proc(snapshot: ^Snapshot) {
 	if snapshot == nil {
 		return
 	}
-	snapshot.refs += 1
+	sync.atomic_add_explicit(&snapshot.refs, 1, .Relaxed)
 }
 
 // Decrements the reference count of a snapshot, destroying it and its arenas
-// when the last reference is released.
+// when the last reference is released. Thread-safe: a snapshot can only reach
+// zero once every holder has released it.
 snapshot_release :: proc(snapshot: ^Snapshot) {
 	if snapshot == nil {
 		return
 	}
-	snapshot.refs -= 1
-	if snapshot.refs > 0 {
+	// Only the releaser that observed the last reference may free. The other
+	// releasers must not touch the snapshot after their decrement.
+	if sync.atomic_sub_explicit(&snapshot.refs, 1, .Release) != 1 {
 		return
 	}
+	// Acquire pairs with the release decrements so the freeing thread sees all
+	// writes made while other holders still had references.
+	sync.atomic_thread_fence(.Acquire)
 
 	parent := snapshot.parent
 	arena := snapshot.arena
@@ -88,9 +97,9 @@ snapshot_release :: proc(snapshot: ^Snapshot) {
 	snapshot.arena = nil
 	if arena != nil {
 		virtual.arena_destroy(arena)
-		free(arena)
+		free(arena, runtime.default_allocator())
 	}
-	free(snapshot)
+	free(snapshot, runtime.default_allocator())
 	snapshot_release(parent)
 }
 
@@ -371,13 +380,13 @@ snapshot_compute_derived :: proc(snapshot: ^Snapshot) {
 		return
 	}
 
-	arena := new(virtual.Arena)
+	arena := new(virtual.Arena, runtime.default_allocator())
 	if err := virtual.arena_init_growing(arena); err != nil {
 		panic("failed to initialize rule evaluation arena")
 	}
 	defer {
 		virtual.arena_destroy(arena)
-		free(arena)
+		free(arena, runtime.default_allocator())
 	}
 	alloc := virtual.arena_allocator(arena)
 

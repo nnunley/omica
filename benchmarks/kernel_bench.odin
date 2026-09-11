@@ -724,7 +724,9 @@ create_relation_with :: proc(
 bench_snapshot_fork :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Txn_State)(user)
 	for _ in 0 ..< chunk {
-		fork := k.snapshot_fork(state.kernel.current)
+		current := k.kernel_snapshot(&state.kernel)
+		fork := k.snapshot_fork(current)
+		k.snapshot_release(current)
 		k.snapshot_release(fork)
 	}
 }
@@ -758,4 +760,6 @@ register_kernel_benches :: proc(runner: ^mm.Runner) {
 	dispatch_state := dispatch_state_init()
 	dispatch_group := mm.group(runner, "kernel/dispatch")
 	mm.bench(dispatch_group, "applicable_10_methods", dispatch_state, bench_dispatch)
+
+	register_kernel_concurrent_benches(runner)
 }

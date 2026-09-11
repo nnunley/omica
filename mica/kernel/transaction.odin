@@ -8,9 +8,11 @@
 // the relation conflict policy.
 package kernel
 
+import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
+import "core:sync"
 import v "../var"
 
 // The kind of a staged write.
@@ -45,12 +47,11 @@ Transaction :: struct {
 
 // Creates a transaction over the kernel's current snapshot.
 transaction_begin :: proc(kernel: ^Kernel) -> Transaction {
-	arena := new(virtual.Arena)
+	arena := new(virtual.Arena, runtime.default_allocator())
 	if err := virtual.arena_init_growing(arena); err != nil {
 		panic("failed to initialize transaction arena")
 	}
-	base := kernel.current
-	snapshot_retain(base)
+	base := kernel_snapshot(kernel)
 	return Transaction {
 		kernel = kernel,
 		base = base,
@@ -70,7 +71,7 @@ transaction_destroy :: proc(transaction: ^Transaction) {
 
 	if transaction.arena != nil {
 		virtual.arena_destroy(transaction.arena)
-		free(transaction.arena)
+		free(transaction.arena, runtime.default_allocator())
 		transaction.arena = nil
 	}
 	snapshot_release(transaction.base)
@@ -484,7 +485,11 @@ optional_tuple_eq :: proc(a: v.Tuple, a_ok: bool, b: v.Tuple, b_ok: bool) -> boo
 // snapshot is caller-owned. The transaction must be destroyed by the caller;
 // its arena ownership transfers to the returned snapshot.
 transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Error) {
-	current := transaction.kernel.current
+	kernel := transaction.kernel
+	sync.mutex_lock(&kernel.commit_lock)
+	defer sync.mutex_unlock(&kernel.commit_lock)
+
+	current := sync.atomic_load(&kernel.current)
 	if current.version != transaction.base.version {
 		if err := transaction_validate_conflicts(transaction, current); err != .None {
 			return nil, err
@@ -535,7 +540,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 	}
 
 	snapshot_compute_derived(fork)
-	kernel_publish(transaction.kernel, fork)
+	kernel_publish_locked(kernel, fork)
 	return fork, .None
 }
 
