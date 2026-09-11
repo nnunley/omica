@@ -55,6 +55,9 @@ Kernel :: struct {
 	// block payloads. Arenas are reset on release and reused, so the hot path
 	// performs no arena creation at all.
 	arena_pool: ^Arena_Pool,
+
+	// Bearer capabilities minted for this world. Ephemeral; not persisted.
+	capabilities: Capability_Store,
 }
 
 // A pool of reset-able virtual arenas shared by transactions, snapshots, and
@@ -163,6 +166,7 @@ kernel_init :: proc(kernel: ^Kernel) {
 	arena_pool_init(kernel.arena_pool)
 	kernel.retired = make([dynamic]^Snapshot)
 	kernel.pending_commits = make([dynamic]^Commit_Entry)
+	capability_store_init(&kernel.capabilities)
 	kernel.current = snapshot_create(kernel, 0, nil)
 }
 
@@ -178,6 +182,7 @@ kernel_destroy :: proc(kernel: ^Kernel) {
 	}
 	delete(kernel.retired)
 	delete(kernel.pending_commits)
+	capability_store_destroy(&kernel.capabilities)
 
 	if kernel.arena_pool != nil {
 		arena_pool_destroy(kernel.arena_pool)

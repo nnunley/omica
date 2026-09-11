@@ -10,13 +10,18 @@ import "core:mem"
 import v "../var"
 
 Authority :: struct {
-	root:      bool,
-	read:      map[Relation_ID]bool,
-	write:     map[Relation_ID]bool,
-	methods:   map[v.Value]bool,
-	builtins:  map[v.Symbol]bool,
-	effect:    bool,
-	allocator: mem.Allocator,
+	root:       bool,
+	read:       map[Relation_ID]bool,
+	write:      map[Relation_ID]bool,
+	methods:    map[v.Value]bool,
+	builtins:   map[v.Symbol]bool,
+	selectors:  map[v.Symbol]bool,
+	read_all:   bool,
+	write_all:  bool,
+	invoke_all: bool,
+	effect:     bool,
+	can_grant:  bool,
+	allocator:  mem.Allocator,
 }
 
 // A root authority passes every check. It is the default for loaders and for
@@ -34,6 +39,7 @@ authority_empty :: proc(allocator := context.allocator) -> Authority {
 		write     = make(map[Relation_ID]bool, allocator),
 		methods   = make(map[v.Value]bool, allocator),
 		builtins  = make(map[v.Symbol]bool, allocator),
+		selectors = make(map[v.Symbol]bool, allocator),
 		allocator = allocator,
 	}
 }
@@ -46,34 +52,45 @@ authority_destroy :: proc(authority: ^Authority) {
 	delete(authority.write)
 	delete(authority.methods)
 	delete(authority.builtins)
+	delete(authority.selectors)
 }
 
 authority_can_read :: proc(authority: ^Authority, relation: Relation_ID) -> bool {
 	if authority == nil || authority.root {
 		return true
 	}
-	return bool(authority.read[relation])
+	return authority.read_all || bool(authority.read[relation])
 }
 
 authority_can_write :: proc(authority: ^Authority, relation: Relation_ID) -> bool {
 	if authority == nil || authority.root {
 		return true
 	}
-	return bool(authority.write[relation])
+	return authority.write_all || bool(authority.write[relation])
 }
 
 authority_can_invoke_method :: proc(authority: ^Authority, method: v.Value) -> bool {
 	if authority == nil || authority.root {
 		return true
 	}
-	return bool(authority.methods[method])
+	return authority.invoke_all || bool(authority.methods[method])
 }
 
 authority_can_invoke_builtin :: proc(authority: ^Authority, name: v.Symbol) -> bool {
 	if authority == nil || authority.root {
 		return true
 	}
-	return bool(authority.builtins[name])
+	return authority.invoke_all ||
+		bool(authority.builtins[name]) ||
+		bool(authority.selectors[name])
+}
+
+// Reports whether the authority may invoke a method selected by `selector`.
+authority_can_invoke_selector :: proc(authority: ^Authority, selector: v.Symbol) -> bool {
+	if authority == nil || authority.root {
+		return true
+	}
+	return authority.invoke_all || bool(authority.selectors[selector])
 }
 
 authority_can_effect :: proc(authority: ^Authority) -> bool {
@@ -81,6 +98,49 @@ authority_can_effect :: proc(authority: ^Authority) -> bool {
 		return true
 	}
 	return authority.effect
+}
+
+// Reports whether the authority may mint capabilities.
+authority_can_grant :: proc(authority: ^Authority) -> bool {
+	if authority == nil || authority.root {
+		return true
+	}
+	return authority.can_grant
+}
+
+// Merges a capability grant into the authority.
+authority_adopt_grant :: proc(authority: ^Authority, grant: Capability_Grant) {
+	if authority == nil || authority.root {
+		return
+	}
+	switch grant.scope {
+	case .All:
+		if grant.read {
+			authority.read_all = true
+		}
+		if grant.write {
+			authority.write_all = true
+		}
+		if grant.invoke {
+			authority.invoke_all = true
+		}
+		if grant.effect {
+			authority.effect = true
+		}
+		if grant.grant {
+			authority.can_grant = true
+		}
+	case .Relation:
+		if grant.read {
+			authority.read[grant.relation] = true
+		}
+		if grant.write {
+			authority.write[grant.relation] = true
+		}
+	case .Method, .Builtin:
+		authority.selectors[grant.selector] = true
+		authority.builtins[grant.selector] = true
+	}
 }
 
 // Mints the authority for `actor` from the policy relations in `source`.
@@ -238,6 +298,7 @@ authority_mint_invokes :: proc(
 		// A granted selector names a method and, when the name is also a
 		// builtin, allows that builtin.
 		authority.builtins[selector] = true
+		authority.selectors[selector] = true
 		method_rows: [dynamic]v.Tuple
 		defer delete(method_rows)
 		relation_source_scan_into(

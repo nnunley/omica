@@ -12,6 +12,7 @@ import "core:strconv"
 import "core:strings"
 import "core:unicode/utf8"
 import c "../compiler"
+import k "../kernel"
 import vm "../vm"
 import v "../var"
 
@@ -74,6 +75,8 @@ runtime_builtins := [?]Builtin_Spec {
 	{"dom_snapshot_payload", 3, builtin_dom_snapshot_payload},
 	{"embed_text", 2, builtin_embed_text},
 	{"from_literal", 1, builtin_from_literal},
+	{"mint_capability", -1, builtin_mint_capability},
+	{"use_capability", 1, builtin_use_capability},
 	{"mailbox", 0, builtin_mailbox},
 	{"mailbox_send", 2, builtin_mailbox_send},
 	{"mailbox_close", 1, builtin_mailbox_close},
@@ -616,6 +619,96 @@ builtin_mailbox_recv :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 @(private)
 builtin_external_request :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	return builtin_error(state, "E_VM_FAULT", "external_request must be lowered to a VM op")
+}
+
+@(private)
+builtin_mint_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	if !k.authority_can_grant(state.authority) {
+		return builtin_error(state, "E_PERMISSION", "capability minting denied")
+	}
+	if len(args) < 1 || len(args) > 2 {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			"mint_capability expects an operation and optional target",
+		)
+	}
+	operation, operation_ok := v.value_as_symbol(args[0])
+	if !operation_ok {
+		return builtin_error(state, "E_TYPE", "capability operation must be a symbol")
+	}
+	operation_name, operation_name_ok := v.symbol_name(operation)
+	if !operation_name_ok {
+		return builtin_error(state, "E_TYPE", "capability operation is unknown")
+	}
+
+	grant: k.Capability_Grant
+	switch operation_name {
+	case "read", "write":
+		if len(args) != 2 {
+			return builtin_error(
+				state,
+				"E_INVARG",
+				"read and write capabilities need a relation name",
+			)
+		}
+		relation_name, relation_ok := v.value_as_symbol(args[1])
+		if !relation_ok {
+			return builtin_error(state, "E_TYPE", "capability target must be a symbol")
+		}
+		relation_text, relation_text_ok := v.symbol_name(relation_name)
+		if !relation_text_ok {
+			return builtin_error(state, "E_TYPE", "capability target is unknown")
+		}
+		relation, found := env.ctx.relations[relation_text]
+		if !found {
+			return builtin_error(state, "E_INVARG", "capability target is not a relation")
+		}
+		grant = k.capability_grant_relation(
+			k.Relation_ID(relation),
+			operation_name == "read",
+		)
+
+	case "invoke":
+		if len(args) != 2 {
+			return builtin_error(state, "E_INVARG", "invoke capability needs a selector")
+		}
+		selector, selector_ok := v.value_as_symbol(args[1])
+		if !selector_ok {
+			return builtin_error(state, "E_TYPE", "capability target must be a symbol")
+		}
+		grant = k.capability_grant_invoke(selector)
+
+	case "effect":
+		grant = k.capability_grant_effect()
+
+	case "grant":
+		grant = k.capability_grant_grant()
+
+	case "all":
+		grant = k.capability_grant_all()
+
+	case:
+		return builtin_error(state, "E_INVARG", "unknown capability operation")
+	}
+
+	value, minted := k.capability_store_mint(&env.kernel.capabilities, grant)
+	if !minted {
+		return builtin_error(state, "E_CAPABILITY", "capability id space exhausted")
+	}
+	return value, true
+}
+
+@(private)
+builtin_use_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	grant, found := k.capability_store_lookup(&env.kernel.capabilities, args[0])
+	if !found {
+		return builtin_error(state, "E_INVARG", "unknown capability")
+	}
+	k.authority_adopt_grant(state.authority, grant)
+	return v.value_bool(true), true
 }
 
 // --- Helpers ---------------------------------------------------------------

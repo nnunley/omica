@@ -96,3 +96,44 @@ test_authority_empty_denies_and_root_allows :: proc(t: ^testing.T) {
 	testing.expect(t, authority_can_write(&root, Relation_ID(70)))
 	testing.expect(t, authority_can_effect(&root))
 }
+
+@(test)
+test_capability_store_and_adoption :: proc(t: ^testing.T) {
+	store: Capability_Store
+	capability_store_init(&store, context.temp_allocator)
+	defer capability_store_destroy(&store)
+
+	value, minted := capability_store_mint(&store, capability_grant_effect())
+	testing.expect(t, minted)
+	grant, found := capability_store_lookup(&store, value)
+	testing.expect(t, found)
+	testing.expect(t, grant.effect)
+
+	_, missing := capability_store_lookup(&store, must_identity(9))
+	testing.expect(t, !missing)
+
+	secret := Relation_ID(70)
+	leak := Relation_ID(71)
+	authority := authority_empty(context.temp_allocator)
+	defer authority_destroy(&authority)
+
+	read_cap, read_minted := capability_store_mint(
+		&store,
+		capability_grant_relation(secret, true),
+	)
+	testing.expect(t, read_minted)
+	read_grant, read_found := capability_store_lookup(&store, read_cap)
+	testing.expect(t, read_found)
+	authority_adopt_grant(&authority, read_grant)
+
+	testing.expect(t, authority_can_read(&authority, secret))
+	testing.expect(t, !authority_can_read(&authority, leak))
+	testing.expect(t, !authority_can_grant(&authority))
+
+	grant_cap, grant_minted := capability_store_mint(&store, capability_grant_grant())
+	testing.expect(t, grant_minted)
+	grant_value, grant_found := capability_store_lookup(&store, grant_cap)
+	testing.expect(t, grant_found)
+	authority_adopt_grant(&authority, grant_value)
+	testing.expect(t, authority_can_grant(&authority))
+}

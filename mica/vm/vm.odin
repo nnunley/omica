@@ -1306,10 +1306,12 @@ vm_dispatch_call :: proc(
 		vm_fail(state, "E_DISPATCH", "no applicable method")
 		return false
 	}
+	selector_symbol, _ := v.value_as_symbol(selector)
 	entries: [dynamic]k.Applicable_Method
 	defer delete(entries)
 	for entry in all_entries {
-		if k.authority_can_invoke_method(state.authority, entry.method) {
+		if k.authority_can_invoke_method(state.authority, entry.method) ||
+		   k.authority_can_invoke_selector(state.authority, selector_symbol) {
 			append(&entries, entry)
 		}
 	}
@@ -1421,10 +1423,12 @@ vm_positional_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> boo
 		vm_fail(state, "E_DISPATCH", "no applicable method")
 		return false
 	}
+	selector_symbol, _ := v.value_as_symbol(selector)
 	entries: [dynamic]k.Applicable_Method
 	defer delete(entries)
 	for entry in all_entries {
-		if k.authority_can_invoke_method(state.authority, entry.method) {
+		if k.authority_can_invoke_method(state.authority, entry.method) ||
+		   k.authority_can_invoke_selector(state.authority, selector_symbol) {
 			append(&entries, entry)
 		}
 	}
@@ -1713,6 +1717,10 @@ vm_builtin_allowed :: proc(state: ^VM, name: v.Symbol) -> bool {
 	}
 	if text == "emit" {
 		return k.authority_can_effect(state.authority)
+	}
+	// Capability bootstrap: adopting and minting check their own authority.
+	if text == "use_capability" || text == "mint_capability" {
+		return true
 	}
 	return k.authority_can_invoke_builtin(state.authority, name)
 }
