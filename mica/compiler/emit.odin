@@ -128,8 +128,7 @@ compile_program :: proc(
 		if !is_verb {
 			continue
 		}
-		index := emitter.functions[verb.name]
-		vm.builder_begin_function(
+		index := vm.builder_begin_function(
 			&builder,
 			v.symbol_intern(verb.name),
 			len(verb.params),
