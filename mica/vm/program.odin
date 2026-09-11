@@ -65,14 +65,21 @@ Op :: enum u8 {
 	Builtin_Call,
 	// Commit: requests a transaction commit from the host.
 	Commit,
+	// Is_Truthy: a = dst (bool), b = source.
+	Is_Truthy,
+	// Scan_One: a = dst (bool), b = pattern index. Fails unless exactly one
+	// row matches, then writes output cells.
+	Scan_One,
 }
 
 // A cell in a relation scan pattern.
 Pattern_Cell_Kind :: enum u8 {
 	// A constant constant-pool value.
 	Const,
-	// A register bound to the matched cell value.
+	// A register holding a join input value.
 	Bind,
+	// A register that receives the matched cell value.
+	Output,
 	// Any value.
 	Wildcard,
 }
@@ -430,7 +437,7 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				   !valid_register(instr.b, register_count) {
 					return .Bad_Register
 				}
-			case .Scan_Collect, .Scan_Exists, .Scan_First:
+			case .Scan_Collect, .Scan_Exists, .Scan_First, .Scan_One:
 				if !valid_register(instr.a, register_count) {
 					return .Bad_Register
 				}
@@ -478,6 +485,11 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 					return .Bad_Register
 				}
 			case .Commit:
+			case .Is_Truthy:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.b, register_count) {
+					return .Bad_Register
+				}
 			}
 		}
 	}
@@ -578,6 +590,10 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d %s args@r%d", instr.a, builtin_name, instr.c)
 			case .Commit:
 				fmt.sbprintf(&builder, "")
+			case .Is_Truthy:
+				fmt.sbprintf(&builder, " r%d r%d", instr.a, instr.b)
+			case .Scan_One:
+				fmt.sbprintf(&builder, " r%d pat%d", instr.a, instr.b)
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -632,6 +648,10 @@ op_name :: proc(op: Op) -> string {
 		return "builtin_call"
 	case .Commit:
 		return "commit"
+	case .Is_Truthy:
+		return "is_truthy"
+	case .Scan_One:
+		return "scan_one"
 	}
 	return "?"
 }

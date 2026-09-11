@@ -416,7 +416,7 @@ test_vm_scan_first_binds_register :: proc(t: ^testing.T) {
 		&builder,
 		u32(relation),
 		[]v.Symbol{owner, item},
-		[]Pattern_Cell{{kind = .Bind, operand = 0}, {kind = .Const, operand = lamp_constant}},
+		[]Pattern_Cell{{kind = .Output, operand = 0}, {kind = .Const, operand = lamp_constant}},
 	)
 
 	builder_begin_function(&builder, v.symbol_intern("main"), 0, 3, true)

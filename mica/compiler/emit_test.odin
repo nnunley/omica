@@ -242,3 +242,48 @@ test_emit_assert_relation :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(rows), 1)
 	delete(rows)
 }
+
+@(test)
+test_emit_short_circuit :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	// `&&` gives false for a falsy left side and the right value otherwise.
+	source := "let a = 1 < 0 && 5\nlet b = 0 < 1 && 5\nb"
+	program := compile_test_program(t, source, &ctx, allocator)
+	state := run_test_program(t, program, allocator)
+	defer vm.vm_destroy(&state)
+	expect_int_result(t, &state, 5)
+
+	// `||` gives the right value for a falsy left side and true otherwise.
+	source_or := "let a = 1 < 0 || 7\na"
+	program_or := compile_test_program(t, source_or, &ctx, allocator)
+	state_or := run_test_program(t, program_or, allocator)
+	defer vm.vm_destroy(&state_or)
+	expect_int_result(t, &state_or, 7)
+}
+
+@(test)
+test_emit_map_pattern_over_variable :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	source := "let delegates = {:delegate -> #1}\nlet exactly {delegate} = delegates\ndelegate"
+	program := compile_test_program(t, source, &ctx, allocator)
+	state := run_test_program(t, program, allocator)
+	defer vm.vm_destroy(&state)
+
+	identity, identity_ok := v.value_as_identity(state.result)
+	testing.expect(t, identity_ok)
+	testing.expect_value(t, v.identity_raw(identity), u64(1))
+}

@@ -55,6 +55,8 @@ VM :: struct {
 	transaction: ^k.Transaction,
 	builtins:    [dynamic]VM_Builtin,
 	request:     VM_Request,
+	// Free slot for host data, for example a builtin environment.
+	user:        rawptr,
 }
 
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
@@ -307,6 +309,15 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			state.request = .Commit
 			state.status = .Boundary
 			return .Boundary
+
+		case .Is_Truthy:
+			truthy := vm_value_is_truthy(state.registers[base + int(instr.b)])
+			state.registers[base + int(instr.a)] = v.value_bool(truthy)
+
+		case .Scan_One:
+			if !vm_scan_one(state, base, instr) {
+				return .Failed
+			}
 		}
 	}
 }
@@ -364,12 +375,30 @@ vm_index :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		}
 
 	case .Relation:
+		relation, _ := v.value_as_relation(collection)
+
+		if row_index, is_int := v.value_as_int(key); is_int {
+			if row_index < 0 || int(row_index) >= len(relation.rows) {
+				vm_fail(state, "E_INDEX", "relation row index out of range")
+				return false
+			}
+			row := relation.rows[row_index]
+			entries := make([]v.Map_Entry, len(relation.heading), context.temp_allocator)
+			for column, index in relation.heading {
+				entries[index] = v.Map_Entry {
+					key   = v.value_symbol(column),
+					value = v.tuple_values(row)[index],
+				}
+			}
+			state.registers[base + int(instr.a)] = v.value_map(state.allocator, entries)
+			return true
+		}
+
 		symbol, is_symbol := v.value_as_symbol(key)
 		if !is_symbol {
 			vm_fail(state, "E_TYPE", "relation column key is not a symbol")
 			return false
 		}
-		relation, _ := v.value_as_relation(collection)
 		position := -1
 		for column, index in relation.heading {
 			if column == symbol {
@@ -430,13 +459,18 @@ vm_builtin_call :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 @(private)
 vm_pattern_bindings :: proc(
 	state: ^VM,
+	base: int,
 	pattern: Scan_Pattern,
 	alloc: mem.Allocator,
 ) -> []v.Binding {
 	bindings := make([]v.Binding, len(pattern.cells), alloc)
 	for cell, index in pattern.cells {
-		if cell.kind == .Const {
+		switch cell.kind {
+		case .Const:
 			bindings[index] = v.binding_of(state.program.constants[cell.operand])
+		case .Bind:
+			bindings[index] = v.binding_of(state.registers[base + int(cell.operand)])
+		case .Output, .Wildcard:
 		}
 	}
 	return bindings
@@ -445,6 +479,7 @@ vm_pattern_bindings :: proc(
 @(private)
 vm_scan_rows :: proc(
 	state: ^VM,
+	base: int,
 	pattern: Scan_Pattern,
 	out: ^[dynamic]v.Tuple,
 ) -> bool {
@@ -452,7 +487,7 @@ vm_scan_rows :: proc(
 		vm_fail(state, "E_NO_SOURCE", "relation scan has no source")
 		return false
 	}
-	bindings := vm_pattern_bindings(state, pattern, context.temp_allocator)
+	bindings := vm_pattern_bindings(state, base, pattern, context.temp_allocator)
 	k.relation_source_scan_into(state.source, k.Relation_ID(pattern.relation), bindings, out)
 	return true
 }
@@ -462,7 +497,7 @@ vm_scan_collect :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	pattern := state.program.patterns[instr.b]
 	rows: [dynamic]v.Tuple
 	defer delete(rows)
-	if !vm_scan_rows(state, pattern, &rows) {
+	if !vm_scan_rows(state, base, pattern, &rows) {
 		return false
 	}
 	result, err := v.value_relation(state.allocator, pattern.column_names, rows[:])
@@ -486,7 +521,7 @@ First_Binding_Context :: struct {
 first_binding_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
 	ctx := (^First_Binding_Context)(user)
 	for cell, index in ctx.pattern.cells {
-		if cell.kind == .Bind {
+		if cell.kind == .Output {
 			ctx.vm.registers[ctx.base + int(cell.operand)] = v.tuple_values(row)[index]
 		}
 	}
@@ -501,7 +536,7 @@ vm_scan_first :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		return false
 	}
 	pattern := state.program.patterns[instr.b]
-	bindings := vm_pattern_bindings(state, pattern, context.temp_allocator)
+	bindings := vm_pattern_bindings(state, base, pattern, context.temp_allocator)
 	ctx := First_Binding_Context {
 		vm      = state,
 		base    = base,
@@ -517,10 +552,46 @@ vm_scan_exists :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	pattern := state.program.patterns[instr.b]
 	rows: [dynamic]v.Tuple
 	defer delete(rows)
-	if !vm_scan_rows(state, pattern, &rows) {
+	if !vm_scan_rows(state, base, pattern, &rows) {
 		return false
 	}
 	state.registers[base + int(instr.a)] = v.value_bool(len(rows) > 0)
+	return true
+}
+
+@(private)
+vm_scan_one :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	pattern := state.program.patterns[instr.b]
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	if !vm_scan_rows(state, base, pattern, &rows) {
+		return false
+	}
+	if len(rows) != 1 {
+		vm_fail(state, "E_ONE", "exactly one row is required")
+		return false
+	}
+	for cell, index in pattern.cells {
+		if cell.kind == .Output {
+			state.registers[base + int(cell.operand)] = v.tuple_values(rows[0])[index]
+		}
+	}
+	state.registers[base + int(instr.a)] = v.value_bool(true)
+	return true
+}
+
+// Truthiness used by `if`, `&&`, and `||`: false and the empty option and
+// relation values are falsy; everything else is truthy.
+vm_value_is_truthy :: proc(value: v.Value) -> bool {
+	if boolean, ok := v.value_as_bool(value); ok {
+		return boolean
+	}
+	if v.value_is_empty_relation(value) {
+		return false
+	}
+	if relation, ok := v.value_as_relation(value); ok {
+		return len(relation.rows) > 0
+	}
 	return true
 }
 
@@ -565,7 +636,7 @@ vm_retract_where :: proc(state: ^VM, instr: Instruction) -> bool {
 	pattern := state.program.patterns[instr.b]
 	rows: [dynamic]v.Tuple
 	defer delete(rows)
-	if !vm_scan_rows(state, pattern, &rows) {
+	if !vm_scan_rows(state, 0, pattern, &rows) {
 		return false
 	}
 	for row in rows {

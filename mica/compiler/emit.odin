@@ -356,6 +356,12 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 	case Index:
 		return emit_index(emitter, n)
 
+	case Field:
+		return emit_field_read(emitter, n)
+
+	case Require:
+		return emit_require(emitter, n)
+
 	case If:
 		return emit_if(emitter, n)
 
@@ -449,9 +455,13 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 		}
 	}
 
+	if map_pattern, is_map_pattern := binding.pattern^.(Map_Pattern); is_map_pattern {
+		return emit_map_pattern_binding(emitter, binding, map_pattern)
+	}
+
 	pattern, is_binding_pattern := binding.pattern^.(Binding_Pattern)
 	if !is_binding_pattern {
-		push_error(emitter, "destructuring bindings are not lowered yet")
+		push_error(emitter, "this binding pattern is not lowered yet")
 		return -1, false
 	}
 
@@ -464,9 +474,35 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 
 @(private)
 emit_assignment :: proc(emitter: ^Emitter, assignment: Assignment) -> (int, bool) {
+	if field, is_field := assignment.target^.(Field); is_field {
+		receiver, receiver_ok := emit_expr(emitter, field.receiver)
+		if !receiver_ok {
+			return -1, false
+		}
+		_ = emit_constant(
+			emitter,
+			v.value_symbol(v.symbol_intern(field.name)),
+		)
+		value, value_ok := emit_expr(emitter, assignment.value)
+		if !value_ok {
+			return -1, false
+		}
+		destination := alloc_register(emitter)
+		builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__set_field"))
+		vm.builder_emit(
+			emitter.builder,
+			.Builtin_Call,
+			0,
+			i32(destination),
+			builtin,
+			i32(receiver),
+		)
+		return value, true
+	}
+
 	target, is_name := assignment.target^.(Name)
 	if !is_name {
-		push_error(emitter, "assignment target must be a name")
+		push_error(emitter, "assignment target must be a name or field")
 		return -1, false
 	}
 	text := join_name(target, emitter.allocator)
@@ -506,8 +542,7 @@ emit_unary :: proc(emitter: ^Emitter, unary: Unary) -> (int, bool) {
 @(private)
 emit_binary :: proc(emitter: ^Emitter, binary: Binary) -> (int, bool) {
 	if binary.op == .And || binary.op == .Or {
-		push_error(emitter, "&& and || are not lowered yet")
-		return -1, false
+		return emit_short_circuit(emitter, binary)
 	}
 
 	left, has_left := emit_expr(emitter, binary.left)
@@ -579,6 +614,13 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		if _, is_splice := argument.expr^.(Splice); is_splice {
 			push_error(emitter, "argument splices are not lowered yet")
 			return -1, false
+		}
+	}
+
+	// A relation query.
+	if emitter.ctx != nil {
+		if relation, found := emitter.ctx.relations[text]; found {
+			return emit_relation_query(emitter, relation, call)
 		}
 	}
 
@@ -1022,4 +1064,255 @@ unquote_string :: proc(text: string, allocator: mem.Allocator) -> string {
 		index += 1
 	}
 	return strings.to_string(builder)
+}
+
+// --- Short circuit and relation queries ------------------------------------
+
+@(private)
+emit_short_circuit :: proc(emitter: ^Emitter, binary: Binary) -> (int, bool) {
+	left, left_ok := emit_expr(emitter, binary.left)
+	if !left_ok {
+		return -1, false
+	}
+	result := alloc_register(emitter)
+	truth := alloc_register(emitter)
+	vm.builder_emit(emitter.builder, .Is_Truthy, 0, i32(truth), i32(left), 0)
+	branch := emit_instruction(emitter, .Branch, 0, truth, 0, 0)
+
+	if binary.op == .And {
+		// Falsy: the result is false.
+		false_register := emit_constant(emitter, v.value_bool(false))
+		vm.builder_emit(emitter.builder, .Move, 0, i32(result), i32(false_register), 0)
+		end_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+		patch_jump(emitter, branch, current_offset(emitter))
+
+		right, right_ok := emit_expr(emitter, binary.right)
+		if !right_ok {
+			return -1, false
+		}
+		vm.builder_emit(emitter.builder, .Move, 0, i32(result), i32(right), 0)
+		patch_jump(emitter, end_jump, current_offset(emitter))
+		return result, true
+	}
+
+	// Or: truthy gives true, otherwise the right operand.
+	right, right_ok := emit_expr(emitter, binary.right)
+	if !right_ok {
+		return -1, false
+	}
+	vm.builder_emit(emitter.builder, .Move, 0, i32(result), i32(right), 0)
+	end_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+	patch_jump(emitter, branch, current_offset(emitter))
+
+	true_register := emit_constant(emitter, v.value_bool(true))
+	vm.builder_emit(emitter.builder, .Move, 0, i32(result), i32(true_register), 0)
+	patch_jump(emitter, end_jump, current_offset(emitter))
+	return result, true
+}
+
+@(private)
+relation_call :: proc(emitter: ^Emitter, call: Call) -> (u32, Name, bool) {
+	callee, is_name := call.callee^.(Name)
+	if !is_name || emitter.ctx == nil {
+		return 0, {}, false
+	}
+	text := join_name(callee, emitter.allocator)
+	relation, found := emitter.ctx.relations[text]
+	return relation, callee, found
+}
+
+@(private)
+relation_cells :: proc(
+	emitter: ^Emitter,
+	call: Call,
+	allocator: mem.Allocator,
+) -> (
+	[]vm.Pattern_Cell,
+	[]v.Symbol,
+	bool,
+) {
+	cells := make([]vm.Pattern_Cell, len(call.args), allocator)
+	names := make([]v.Symbol, len(call.args), allocator)
+	for argument, index in call.args {
+		#partial switch term in argument.expr^ {
+		case Query_Variable:
+			register := alloc_register(emitter)
+			cells[index] = vm.Pattern_Cell{kind = .Output, operand = i32(register)}
+			names[index] = v.symbol_intern(term.name)
+		case Wildcard:
+			cells[index] = vm.Pattern_Cell{kind = .Wildcard}
+			names[index] = v.symbol_intern(generated_column(index, allocator))
+		case:
+			register, has_value := emit_expr(emitter, argument.expr)
+			if !has_value {
+				return nil, nil, false
+			}
+			cells[index] = vm.Pattern_Cell{kind = .Bind, operand = i32(register)}
+			names[index] = v.symbol_intern(generated_column(index, allocator))
+		}
+	}
+	return cells, names, true
+}
+
+@(private)
+generated_column :: proc(index: int, allocator: mem.Allocator) -> string {
+	builder: strings.Builder
+	strings.builder_init(&builder, allocator)
+	fmt.sbprintf(&builder, "column%d", index)
+	return strings.to_string(builder)
+}
+
+@(private)
+emit_relation_query :: proc(emitter: ^Emitter, relation: u32, call: Call) -> (int, bool) {
+	cells, names, cells_ok := relation_cells(emitter, call, context.temp_allocator)
+	if !cells_ok {
+		return -1, false
+	}
+	pattern := vm.builder_add_pattern(emitter.builder, relation, names, cells)
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Scan_Collect,
+		0,
+		i32(destination),
+		pattern,
+		0,
+	)
+	return destination, true
+}
+
+@(private)
+emit_map_pattern_binding :: proc(
+	emitter: ^Emitter,
+	binding: Binding,
+	pattern: Map_Pattern,
+) -> (int, bool) {
+	// A relation call binds columns directly by name.
+	if call, is_call := binding.value^.(Call); is_call {
+		if relation, _, found := relation_call(emitter, call); found {
+			cells, names, cells_ok := relation_cells(emitter, call, context.temp_allocator)
+			if !cells_ok {
+				return -1, false
+			}
+			builder_pattern := vm.builder_add_pattern(emitter.builder, relation, names, cells)
+			result := alloc_register(emitter)
+			op: vm.Op = binding.is_exactly ? .Scan_One : .Scan_First
+			vm.builder_emit(emitter.builder, op, 0, i32(result), builder_pattern, 0)
+			for entry in pattern.entries {
+				key_name := pattern_key_name(entry, emitter.allocator)
+				cell_register := relation_cell_register(cells, names, key_name)
+				binding_pattern, is_binding := entry.pattern^.(Binding_Pattern)
+				if !is_binding {
+					push_error(emitter, "map pattern values must be names")
+					return -1, false
+				}
+				if cell_register < 0 {
+					push_error(emitter, "map pattern column is not in the query")
+					return -1, false
+				}
+				declare_local(emitter, binding_pattern.name, cell_register, binding.is_const)
+			}
+			return result, true
+		}
+	}
+
+	// Otherwise read columns from the value with symbol indexing.
+	value_register, has_value := emit_expr(emitter, binding.value)
+	if !has_value {
+		return -1, false
+	}
+	result := alloc_register(emitter)
+	for entry in pattern.entries {
+		key_name := pattern_key_name(entry, emitter.allocator)
+		symbol_register := emit_constant(
+			emitter,
+			v.value_symbol(v.symbol_intern(key_name)),
+		)
+		column := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Index,
+			0,
+			i32(column),
+			i32(value_register),
+			i32(symbol_register),
+		)
+		binding_pattern, is_binding := entry.pattern^.(Binding_Pattern)
+		if !is_binding {
+			push_error(emitter, "map pattern values must be names")
+			return -1, false
+		}
+		declare_local(emitter, binding_pattern.name, column, binding.is_const)
+		vm.builder_emit(emitter.builder, .Move, 0, i32(result), i32(column), 0)
+	}
+	return result, true
+}
+
+@(private)
+pattern_key_name :: proc(entry: Map_Pattern_Entry, allocator: mem.Allocator) -> string {
+	symbol, is_symbol := entry.key^.(Symbol_Literal)
+	if !is_symbol {
+		return ""
+	}
+	if strings.has_prefix(symbol.name, "\"") {
+		return unquote_string(symbol.name, allocator)
+	}
+	return symbol.name
+}
+
+@(private)
+relation_cell_register :: proc(
+	cells: []vm.Pattern_Cell,
+	names: []v.Symbol,
+	name: string,
+) -> int {
+	for cell, index in cells {
+		if cell.kind != .Output {
+			continue
+		}
+		column_name, ok := v.symbol_name(names[index])
+		if ok && column_name == name {
+			return int(cell.operand)
+		}
+	}
+	return -1
+}
+
+@(private)
+emit_field_read :: proc(emitter: ^Emitter, field: Field) -> (int, bool) {
+	receiver, receiver_ok := emit_expr(emitter, field.receiver)
+	if !receiver_ok {
+		return -1, false
+	}
+	symbol_register := emit_constant(emitter, v.value_symbol(v.symbol_intern(field.name)))
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__get_field"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		0,
+		i32(destination),
+		builtin,
+		i32(receiver),
+	)
+	return destination, true
+}
+
+@(private)
+emit_require :: proc(emitter: ^Emitter, require: Require) -> (int, bool) {
+	condition, condition_ok := emit_expr(emitter, require.condition)
+	if !condition_ok {
+		return -1, false
+	}
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("require"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		0,
+		i32(destination),
+		builtin,
+		i32(condition),
+	)
+	return destination, true
 }
