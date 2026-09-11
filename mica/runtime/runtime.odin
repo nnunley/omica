@@ -160,7 +160,6 @@ run_filein :: proc(
 			}
 
 			created, create_err := k.kernel_create_relation(kernel, metadata)
-			delete(functional_keys)
 			if create_err != k.Kernel_Error.None {
 				return Run_Result{ok = false, message = fmt.aprintf(
 					"cannot create relation %s: %v",
@@ -180,6 +179,7 @@ run_filein :: proc(
 					key_positions = key_positions,
 				}
 			}
+			delete(functional_keys)
 			next_relation += 1
 		}
 	}
