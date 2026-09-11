@@ -6,6 +6,7 @@
 // temporaries are reclaimed when a block scope ends.
 package compiler
 
+import "core:encoding/base64"
 import "core:fmt"
 import "core:mem"
 import "core:strconv"
@@ -531,8 +532,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return -1, false
 
 	case Bytes_Literal:
-		push_error(emitter, "byte literals are not lowered yet")
-		return -1, false
+		return emit_bytes_literal(emitter, n)
 
 	case:
 		push_error(emitter, "this expression is not lowered yet")
@@ -1340,6 +1340,27 @@ emit_role_dispatch :: proc(
 		0,
 	)
 	return destination, true
+}
+
+// Lowers a base64url byte literal such as `b"3q2-7w=="`.
+@(private)
+emit_bytes_literal :: proc(emitter: ^Emitter, bytes: Bytes_Literal) -> (int, bool) {
+	text := bytes.text
+	if len(text) < 3 || text[0] != 'b' || text[1] != '"' || text[len(text) - 1] != '"' {
+		push_error(emitter, "malformed byte literal")
+		return -1, false
+	}
+	decoded, decode_err := base64.decode(
+		text[2 : len(text) - 1],
+		base64.DEC_URL_TABLE,
+		nil,
+		emitter.allocator,
+	)
+	if decode_err != nil {
+		push_error(emitter, "byte literal is not valid base64url")
+		return -1, false
+	}
+	return emit_constant(emitter, v.value_bytes(emitter.allocator, decoded)), true
 }
 
 // Reserves a function slot for a fn literal and emits a Make_Function. The

@@ -946,3 +946,26 @@ assert Result(7, [{:f -> add}][0][:f](5))
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Result", 7)
 }
+
+@(test)
+test_run_byte_literals :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Payload, 1)
+require(b"3q2-7w==" == b"3q2-7w==")
+require(b"" == b"")
+assert Payload(b"3q2-7w==")
+`
+	path, path_ok := write_temp_source(t, "mica_bytes_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Payload", 1)
+}
