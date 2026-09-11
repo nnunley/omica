@@ -103,13 +103,71 @@ Range_Literal :: struct {
 	has_end: bool,
 }
 
-// `let name = value` or `const name = value`, with an optional kind.
+// Pattern nodes for bindings, `if let`, and `match`.
+Binding_Pattern :: struct {
+	name: string,
+}
+
+Wildcard_Pattern :: struct {
+}
+
+// A constant pattern, such as a case label.
+Literal_Pattern :: struct {
+	value: ^Expr,
+}
+
+// `@rest`.
+Rest_Pattern :: struct {
+	name: string,
+}
+
+// `?name` with an optional default, as in list destructuring.
+Optional_Pattern :: struct {
+	name:        string,
+	default:     ^Expr,
+	has_default: bool,
+}
+
+List_Pattern :: struct {
+	elements: []^Pattern,
+}
+
+Map_Pattern_Entry :: struct {
+	key:       ^Expr,
+	pattern:   ^Pattern,
+	shorthand: bool,
+}
+
+Map_Pattern :: struct {
+	entries: []Map_Pattern_Entry,
+}
+
+// `some(x)`, `ok(x)`, `err(x)`, or any constructor-like pattern.
+Call_Pattern :: struct {
+	name: string,
+	args: []^Pattern,
+}
+
+Pattern :: union {
+	Binding_Pattern,
+	Wildcard_Pattern,
+	Literal_Pattern,
+	Rest_Pattern,
+	Optional_Pattern,
+	List_Pattern,
+	Map_Pattern,
+	Call_Pattern,
+}
+
+// `let <pattern> = value` or `const <pattern> = value`. `is_exactly` marks
+// the `let exactly <pattern> = ...` form, which requires one row.
 Binding :: struct {
-	is_const: bool,
-	name:     string,
-	kind:     string,
-	has_kind: bool,
-	value:    ^Expr,
+	is_const:   bool,
+	is_exactly: bool,
+	pattern:    ^Pattern,
+	kind:       string,
+	has_kind:   bool,
+	value:      ^Expr,
 }
 
 Unary :: struct {
@@ -213,6 +271,49 @@ Param :: struct {
 	has_kind:       bool,
 }
 
+// A cell in a structural variant value. `name` is set for named fields.
+Structural_Cell :: struct {
+	name:  ^Expr,
+	value: ^Expr,
+}
+
+// `#id<[cells]>` or `#id<{field -> value}>`.
+Structural_Literal :: struct {
+	head:  ^Expr,
+	cells: []Structural_Cell,
+	named: bool,
+}
+
+// A DOM attribute. Attributes without a value are boolean presence.
+Dom_Attribute :: struct {
+	name:      string,
+	value:     ^Expr,
+	has_value: bool,
+}
+
+// Literal text inside DOM markup.
+Dom_Text :: struct {
+	text: string,
+}
+
+// `dom <tag ...>children</tag>`.
+Dom_Element :: struct {
+	tag:          string,
+	attributes:   []Dom_Attribute,
+	children:     []^Expr,
+	self_closing: bool,
+}
+
+Match_Case :: struct {
+	pattern: ^Pattern,
+	body:    []^Expr,
+}
+
+Match :: struct {
+	value: ^Expr,
+	cases: []Match_Case,
+}
+
 Fn :: struct {
 	params:              []Param,
 	body:                []^Expr,
@@ -255,6 +356,10 @@ Expr :: union {
 	Retract,
 	Require,
 	Raise,
+	Match,
+	Structural_Literal,
+	Dom_Text,
+	Dom_Element,
 	Fn,
 }
 

@@ -95,6 +95,7 @@ Token_Kind :: enum {
 Token :: struct {
 	kind:   Token_Kind,
 	text:   string,
+	offset: int,
 	line:   int,
 	column: int,
 }
@@ -124,9 +125,15 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 		tokens: ^[dynamic]Token,
 		kind: Token_Kind,
 		text: string,
-		line, column: int,
+		offset, line, column: int,
 	) {
-		append(tokens, Token{kind = kind, text = text, line = line, column = column})
+		append(tokens, Token {
+			kind   = kind,
+			text   = text,
+			offset = offset,
+			line   = line,
+			column = column,
+		})
 	}
 
 	advance :: proc(
@@ -169,7 +176,7 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 					advance(source, &pos, &line, &column, 1)
 				}
 			}
-			append_token(&tokens, .Newline, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Newline, source[start:pos], start, start_line, start_column)
 			continue
 
 		case ch == '/' && pos + 1 < len(source) && source[pos + 1] == '/':
@@ -199,10 +206,10 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 					line    = start_line,
 					column  = start_column,
 				})
-				append_token(&tokens, .Error, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Error, source[start:pos], start, start_line, start_column)
 				continue
 			}
-			append_token(&tokens, .String, source[start:pos], start_line, start_column)
+			append_token(&tokens, .String, source[start:pos], start, start_line, start_column)
 			continue
 
 		case ch == 'b' && pos + 1 < len(source) && source[pos + 1] == '"':
@@ -222,10 +229,10 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 					line    = start_line,
 					column  = start_column,
 				})
-				append_token(&tokens, .Error, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Error, source[start:pos], start, start_line, start_column)
 				continue
 			}
-			append_token(&tokens, .Bytes, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Bytes, source[start:pos], start, start_line, start_column)
 			continue
 
 		case ch >= '0' && ch <= '9':
@@ -257,7 +264,7 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 				}
 			}
 			kind := is_float ? Token_Kind.Float : Token_Kind.Int
-			append_token(&tokens, kind, source[start:pos], start_line, start_column)
+			append_token(&tokens, kind, source[start:pos], start, start_line, start_column)
 			continue
 
 		case is_ident_start(ch):
@@ -266,11 +273,11 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 			}
 			text := source[start:pos]
 			if kind, is_keyword := keyword_kind(text); is_keyword {
-				append_token(&tokens, kind, text, start_line, start_column)
+				append_token(&tokens, kind, text, start, start_line, start_column)
 			} else if is_error_code(text) {
-				append_token(&tokens, .Error_Code, text, start_line, start_column)
+				append_token(&tokens, .Error_Code, text, start, start_line, start_column)
 			} else {
-				append_token(&tokens, .Ident, text, start_line, start_column)
+				append_token(&tokens, .Ident, text, start, start_line, start_column)
 			}
 			continue
 
@@ -280,9 +287,9 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 				for pos < len(source) && is_ident_continue(source[pos]) {
 					advance(source, &pos, &line, &column, 1)
 				}
-				append_token(&tokens, .Ident, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Ident, source[start:pos], start, start_line, start_column)
 			} else {
-				append_token(&tokens, .Underscore, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Underscore, source[start:pos], start, start_line, start_column)
 			}
 			continue
 		}
@@ -291,95 +298,95 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 		switch ch {
 		case '(':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .LParen, source[start:pos], start_line, start_column)
+			append_token(&tokens, .LParen, source[start:pos], start, start_line, start_column)
 		case ')':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .RParen, source[start:pos], start_line, start_column)
+			append_token(&tokens, .RParen, source[start:pos], start, start_line, start_column)
 		case '[':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .LBracket, source[start:pos], start_line, start_column)
+			append_token(&tokens, .LBracket, source[start:pos], start, start_line, start_column)
 		case ']':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .RBracket, source[start:pos], start_line, start_column)
+			append_token(&tokens, .RBracket, source[start:pos], start, start_line, start_column)
 		case '{':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .LBrace, source[start:pos], start_line, start_column)
+			append_token(&tokens, .LBrace, source[start:pos], start, start_line, start_column)
 		case '}':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .RBrace, source[start:pos], start_line, start_column)
+			append_token(&tokens, .RBrace, source[start:pos], start, start_line, start_column)
 		case ',':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .Comma, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Comma, source[start:pos], start, start_line, start_column)
 		case ';':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .Semi, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Semi, source[start:pos], start, start_line, start_column)
 		case '#':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .Hash, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Hash, source[start:pos], start, start_line, start_column)
 		case '@':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .At, source[start:pos], start_line, start_column)
+			append_token(&tokens, .At, source[start:pos], start, start_line, start_column)
 		case '?':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .Question, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Question, source[start:pos], start, start_line, start_column)
 		case '.':
 			if pos + 1 < len(source) && source[pos + 1] == '.' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .DotDot, source[start:pos], start_line, start_column)
+				append_token(&tokens, .DotDot, source[start:pos], start, start_line, start_column)
 			} else {
 				advance(source, &pos, &line, &column, 1)
-				append_token(&tokens, .Dot, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Dot, source[start:pos], start, start_line, start_column)
 			}
 		case ':':
 			if pos + 1 < len(source) && source[pos + 1] == '-' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .Colon_Dash, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Colon_Dash, source[start:pos], start, start_line, start_column)
 			} else {
 				advance(source, &pos, &line, &column, 1)
-				append_token(&tokens, .Colon, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Colon, source[start:pos], start, start_line, start_column)
 			}
 		case '=':
 			if pos + 1 < len(source) && source[pos + 1] == '=' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .Eq_Eq, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Eq_Eq, source[start:pos], start, start_line, start_column)
 			} else if pos + 1 < len(source) && source[pos + 1] == '>' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .Fat_Arrow, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Fat_Arrow, source[start:pos], start, start_line, start_column)
 			} else {
 				advance(source, &pos, &line, &column, 1)
-				append_token(&tokens, .Eq, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Eq, source[start:pos], start, start_line, start_column)
 			}
 		case '!':
 			if pos + 1 < len(source) && source[pos + 1] == '=' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .Bang_Eq, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Bang_Eq, source[start:pos], start, start_line, start_column)
 			} else {
 				advance(source, &pos, &line, &column, 1)
-				append_token(&tokens, .Bang, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Bang, source[start:pos], start, start_line, start_column)
 			}
 		case '<':
 			if pos + 1 < len(source) && source[pos + 1] == '=' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .Lt_Eq, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Lt_Eq, source[start:pos], start, start_line, start_column)
 			} else {
 				advance(source, &pos, &line, &column, 1)
-				append_token(&tokens, .Lt, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Lt, source[start:pos], start, start_line, start_column)
 			}
 		case '>':
 			if pos + 1 < len(source) && source[pos + 1] == '=' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .Gt_Eq, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Gt_Eq, source[start:pos], start, start_line, start_column)
 			} else {
 				advance(source, &pos, &line, &column, 1)
-				append_token(&tokens, .Gt, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Gt, source[start:pos], start, start_line, start_column)
 			}
 		case '&':
 			if pos + 1 < len(source) && source[pos + 1] == '&' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .Amp_Amp, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Amp_Amp, source[start:pos], start, start_line, start_column)
 			} else {
 				advance(source, &pos, &line, &column, 1)
-				append_token(&tokens, .Error, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Error, source[start:pos], start, start_line, start_column)
 				append(&errors, Lex_Error {
 					message = "unexpected '&'",
 					line    = start_line,
@@ -389,31 +396,31 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 		case '|':
 			if pos + 1 < len(source) && source[pos + 1] == '|' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .Pipe_Pipe, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Pipe_Pipe, source[start:pos], start, start_line, start_column)
 			} else {
 				advance(source, &pos, &line, &column, 1)
-				append_token(&tokens, .Pipe, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Pipe, source[start:pos], start, start_line, start_column)
 			}
 		case '-':
 			if pos + 1 < len(source) && source[pos + 1] == '>' {
 				advance(source, &pos, &line, &column, 2)
-				append_token(&tokens, .Arrow, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Arrow, source[start:pos], start, start_line, start_column)
 			} else {
 				advance(source, &pos, &line, &column, 1)
-				append_token(&tokens, .Minus, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Minus, source[start:pos], start, start_line, start_column)
 			}
 		case '+':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .Plus, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Plus, source[start:pos], start, start_line, start_column)
 		case '*':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .Star, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Star, source[start:pos], start, start_line, start_column)
 		case '/':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .Slash, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Slash, source[start:pos], start, start_line, start_column)
 		case '%':
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .Percent, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Percent, source[start:pos], start, start_line, start_column)
 		case:
 			// UTF-8 membership operator.
 			if pos + 2 < len(source) &&
@@ -421,7 +428,7 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 			   source[pos + 1] == 0x88 &&
 			   source[pos + 2] == 0x88 {
 				advance(source, &pos, &line, &column, 3)
-				append_token(&tokens, .Membership, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Membership, source[start:pos], start, start_line, start_column)
 				continue
 			}
 			// Non-ASCII text can appear inside DOM markup. The lexer keeps
@@ -433,11 +440,11 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 					length = len(source) - pos
 				}
 				advance(source, &pos, &line, &column, length)
-				append_token(&tokens, .Error, source[start:pos], start_line, start_column)
+				append_token(&tokens, .Error, source[start:pos], start, start_line, start_column)
 				continue
 			}
 			advance(source, &pos, &line, &column, 1)
-			append_token(&tokens, .Error, source[start:pos], start_line, start_column)
+			append_token(&tokens, .Error, source[start:pos], start, start_line, start_column)
 			append(&errors, Lex_Error {
 				message = "unexpected character",
 				line    = start_line,
@@ -446,7 +453,7 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 		}
 	}
 
-	append(&tokens, Token{kind = .Eof, text = "", line = line, column = column})
+	append(&tokens, Token{kind = .Eof, text = "", offset = pos, line = line, column = column})
 	return Lex_Result{tokens = tokens[:], errors = errors[:]}
 }
 
