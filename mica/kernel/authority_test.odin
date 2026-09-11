@@ -1,6 +1,7 @@
 package kernel
 
 import "core:testing"
+import "core:time"
 import v "../var"
 
 @(test)
@@ -98,42 +99,99 @@ test_authority_empty_denies_and_root_allows :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_capability_store_and_adoption :: proc(t: ^testing.T) {
+test_capability_store_revoke_and_expiry :: proc(t: ^testing.T) {
 	store: Capability_Store
 	capability_store_init(&store, context.temp_allocator)
 	defer capability_store_destroy(&store)
 
-	value, minted := capability_store_mint(&store, capability_grant_effect())
+	secret := Relation_ID(70)
+	leak := Relation_ID(71)
+	now := time.tick_now()
+
+	value, minted := capability_store_mint(
+		&store,
+		{.Read},
+		.Relations,
+		[]Relation_ID{secret},
+		nil,
+	)
 	testing.expect(t, minted)
 	grant, found := capability_store_lookup(&store, value)
 	testing.expect(t, found)
-	testing.expect(t, grant.effect)
+	testing.expect(t, capability_live(grant, 0, now))
+	testing.expect(t, capability_allows_read(grant, secret))
+	testing.expect(t, !capability_allows_read(grant, leak))
 
-	_, missing := capability_store_lookup(&store, must_identity(9))
-	testing.expect(t, !missing)
+	restricted_value, restricted_ok := capability_store_restrict(&store, value, {.Read})
+	testing.expect(t, restricted_ok)
+	restricted, restricted_found := capability_store_lookup(&store, restricted_value)
+	testing.expect(t, restricted_found)
+	testing.expect(t, capability_allows_read(restricted, secret))
+	_, no_rights := capability_store_restrict(&store, value, {.Write})
+	testing.expect(t, !no_rights)
+
+	testing.expect(t, capability_store_revoke(&store, value))
+	testing.expect(t, !capability_live(restricted, 0, time.tick_now()))
+	testing.expect(t, !capability_store_revoke(&store, value))
+
+	epoch_value, epoch_minted := capability_store_mint(
+		&store,
+		{.Read},
+		.Relations,
+		[]Relation_ID{secret},
+		nil,
+		Capability_Limits{epoch_limit = 10},
+	)
+	testing.expect(t, epoch_minted)
+	epoch_grant, _ := capability_store_lookup(&store, epoch_value)
+	testing.expect(t, capability_live(epoch_grant, 9, now))
+	testing.expect(t, !capability_live(epoch_grant, 10, now))
+
+	expired_value, expired_minted := capability_store_mint(
+		&store,
+		{.Read},
+		.Relations,
+		[]Relation_ID{secret},
+		nil,
+		Capability_Limits{deadline = time.tick_add(now, -time.Second)},
+	)
+	testing.expect(t, expired_minted)
+	expired_grant, _ := capability_store_lookup(&store, expired_value)
+	testing.expect(t, !capability_live(expired_grant, 0, now))
+}
+
+@(test)
+test_authority_adopts_revocable_capability :: proc(t: ^testing.T) {
+	store: Capability_Store
+	capability_store_init(&store, context.temp_allocator)
+	defer capability_store_destroy(&store)
 
 	secret := Relation_ID(70)
 	leak := Relation_ID(71)
+	value, minted := capability_store_mint(
+		&store,
+		{.Read},
+		.Relations,
+		[]Relation_ID{secret},
+		nil,
+	)
+	testing.expect(t, minted)
+	grant, found := capability_store_lookup(&store, value)
+	testing.expect(t, found)
+
 	authority := authority_empty(context.temp_allocator)
 	defer authority_destroy(&authority)
-
-	read_cap, read_minted := capability_store_mint(
-		&store,
-		capability_grant_relation(secret, true),
-	)
-	testing.expect(t, read_minted)
-	read_grant, read_found := capability_store_lookup(&store, read_cap)
-	testing.expect(t, read_found)
-	authority_adopt_grant(&authority, read_grant)
-
+	authority_set_clock(&authority, 0, time.tick_now())
+	authority_adopt_capability(&authority, grant)
+	testing.expect(t, authority_holds_capability(&authority, grant))
 	testing.expect(t, authority_can_read(&authority, secret))
 	testing.expect(t, !authority_can_read(&authority, leak))
-	testing.expect(t, !authority_can_grant(&authority))
 
-	grant_cap, grant_minted := capability_store_mint(&store, capability_grant_grant())
-	testing.expect(t, grant_minted)
-	grant_value, grant_found := capability_store_lookup(&store, grant_cap)
-	testing.expect(t, grant_found)
-	authority_adopt_grant(&authority, grant_value)
-	testing.expect(t, authority_can_grant(&authority))
+	testing.expect(t, authority_drop_capability(&authority, grant))
+	testing.expect(t, !authority_can_read(&authority, secret))
+
+	authority_adopt_capability(&authority, grant)
+	testing.expect(t, authority_can_read(&authority, secret))
+	testing.expect(t, capability_store_revoke(&store, value))
+	testing.expect(t, !authority_can_read(&authority, secret))
 }

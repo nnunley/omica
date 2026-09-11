@@ -10,6 +10,7 @@ import "core:os"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 import "core:unicode/utf8"
 import c "../compiler"
 import k "../kernel"
@@ -77,6 +78,9 @@ runtime_builtins := [?]Builtin_Spec {
 	{"from_literal", 1, builtin_from_literal},
 	{"mint_capability", -1, builtin_mint_capability},
 	{"use_capability", 1, builtin_use_capability},
+	{"restrict_capability", 2, builtin_restrict_capability},
+	{"revoke_capability", 1, builtin_revoke_capability},
+	{"drop_capability", 1, builtin_drop_capability},
 	{"mailbox", 0, builtin_mailbox},
 	{"mailbox_send", 2, builtin_mailbox_send},
 	{"mailbox_close", 1, builtin_mailbox_close},
@@ -627,75 +631,55 @@ builtin_mint_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, boo
 	if !k.authority_can_grant(state.authority) {
 		return builtin_error(state, "E_PERMISSION", "capability minting denied")
 	}
-	if len(args) < 1 || len(args) > 2 {
+	if len(args) < 1 || len(args) > 3 {
 		return builtin_error(
 			state,
 			"E_INVARG",
-			"mint_capability expects an operation and optional target",
+			"mint_capability expects rights, optional targets, and optional limits",
 		)
 	}
-	operation, operation_ok := v.value_as_symbol(args[0])
-	if !operation_ok {
-		return builtin_error(state, "E_TYPE", "capability operation must be a symbol")
+	rights, rights_ok := capability_rights_argument(state, args[0])
+	if !rights_ok {
+		return v.Value(0), false
 	}
-	operation_name, operation_name_ok := v.symbol_name(operation)
-	if !operation_name_ok {
-		return builtin_error(state, "E_TYPE", "capability operation is unknown")
-	}
-
-	grant: k.Capability_Grant
-	switch operation_name {
-	case "read", "write":
-		if len(args) != 2 {
-			return builtin_error(
-				state,
-				"E_INVARG",
-				"read and write capabilities need a relation name",
-			)
-		}
-		relation_name, relation_ok := v.value_as_symbol(args[1])
-		if !relation_ok {
-			return builtin_error(state, "E_TYPE", "capability target must be a symbol")
-		}
-		relation_text, relation_text_ok := v.symbol_name(relation_name)
-		if !relation_text_ok {
-			return builtin_error(state, "E_TYPE", "capability target is unknown")
-		}
-		relation, found := env.ctx.relations[relation_text]
-		if !found {
-			return builtin_error(state, "E_INVARG", "capability target is not a relation")
-		}
-		grant = k.capability_grant_relation(
-			k.Relation_ID(relation),
-			operation_name == "read",
+	scope := k.Capability_Scope.All
+	relations: []k.Relation_ID
+	selectors: []v.Symbol
+	if len(args) >= 2 {
+		parsed_scope, parsed_relations, parsed_selectors, targets_ok := capability_target_argument(
+			state,
+			env,
+			args[1],
+			rights,
 		)
-
-	case "invoke":
-		if len(args) != 2 {
-			return builtin_error(state, "E_INVARG", "invoke capability needs a selector")
+		if !targets_ok {
+			return v.Value(0), false
 		}
-		selector, selector_ok := v.value_as_symbol(args[1])
-		if !selector_ok {
-			return builtin_error(state, "E_TYPE", "capability target must be a symbol")
-		}
-		grant = k.capability_grant_invoke(selector)
-
-	case "effect":
-		grant = k.capability_grant_effect()
-
-	case "grant":
-		grant = k.capability_grant_grant()
-
-	case "all":
-		grant = k.capability_grant_all()
-
-	case:
-		return builtin_error(state, "E_INVARG", "unknown capability operation")
+		scope = parsed_scope
+		relations = parsed_relations
+		selectors = parsed_selectors
+	} else if !capability_rights_allow_all(rights) {
+		// Absolute scopes (effect/grant) are fine without targets; read,
+		// write, and invoke without targets mean "all".
 	}
-
-	value, minted := k.capability_store_mint(&env.kernel.capabilities, grant)
+	limits := k.Capability_Limits{}
+	if len(args) == 3 {
+		parsed_limits, limits_ok := capability_limits_argument(state, env, args[2])
+		if !limits_ok {
+			return v.Value(0), false
+		}
+		limits = parsed_limits
+	}
+	value, minted := k.capability_store_mint(
+		&env.kernel.capabilities,
+		rights,
+		scope,
+		relations,
+		selectors,
+		limits,
+	)
 	if !minted {
-		return builtin_error(state, "E_CAPABILITY", "capability id space exhausted")
+		return builtin_error(state, "E_CAPABILITY", "cannot create capability")
 	}
 	return value, true
 }
@@ -707,8 +691,251 @@ builtin_use_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool
 	if !found {
 		return builtin_error(state, "E_INVARG", "unknown capability")
 	}
-	k.authority_adopt_grant(state.authority, grant)
+	if !k.capability_live(grant, kernel_version(env), time.tick_now()) {
+		return builtin_error(state, "E_INVARG", "capability is revoked or expired")
+	}
+	k.authority_adopt_capability(state.authority, grant)
 	return v.value_bool(true), true
+}
+
+@(private)
+builtin_restrict_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	parent, found := k.capability_store_lookup(&env.kernel.capabilities, args[0])
+	if !found {
+		return builtin_error(state, "E_INVARG", "unknown capability")
+	}
+	if !k.authority_holds_capability(state.authority, parent) &&
+	   !k.authority_can_grant(state.authority) {
+		return builtin_error(state, "E_PERMISSION", "capability restriction denied")
+	}
+	rights, rights_ok := capability_rights_argument(state, args[1])
+	if !rights_ok {
+		return v.Value(0), false
+	}
+	value, restricted := k.capability_store_restrict(
+		&env.kernel.capabilities,
+		args[0],
+		rights,
+	)
+	if !restricted {
+		return builtin_error(state, "E_INVARG", "cannot restrict capability")
+	}
+	return value, true
+}
+
+@(private)
+builtin_revoke_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	grant, found := k.capability_store_lookup(&env.kernel.capabilities, args[0])
+	if !found {
+		return builtin_error(state, "E_INVARG", "unknown capability")
+	}
+	if !k.authority_holds_capability(state.authority, grant) &&
+	   !k.authority_can_grant(state.authority) {
+		return builtin_error(state, "E_PERMISSION", "capability revocation denied")
+	}
+	if !k.capability_store_revoke(&env.kernel.capabilities, args[0]) {
+		return builtin_error(state, "E_INVARG", "capability is already revoked")
+	}
+	return v.value_bool(true), true
+}
+
+@(private)
+builtin_drop_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	grant, found := k.capability_store_lookup(&env.kernel.capabilities, args[0])
+	if !found {
+		return builtin_error(state, "E_INVARG", "unknown capability")
+	}
+	return v.value_bool(k.authority_drop_capability(state.authority, grant)), true
+}
+
+// Parses a rights argument: a symbol or a list of symbols.
+@(private)
+capability_rights_argument :: proc(state: ^vm.VM, value: v.Value) -> (k.Rights, bool) {
+	rights: k.Rights
+	if list, is_list := v.value_as_list(value); is_list {
+		for item in list {
+			item_right, item_ok := capability_right(state, item)
+			if !item_ok {
+				return {}, false
+			}
+			rights += item_right
+		}
+	} else {
+		right, right_ok := capability_right(state, value)
+		if !right_ok {
+			return {}, false
+		}
+		rights = right
+	}
+	if card(rights) == 0 {
+		vm.vm_set_error(state, "E_INVARG", "capability needs at least one right")
+		return {}, false
+	}
+	return rights, true
+}
+
+@(private)
+capability_right :: proc(state: ^vm.VM, value: v.Value) -> (k.Rights, bool) {
+	symbol, is_symbol := v.value_as_symbol(value)
+	if !is_symbol {
+		vm.vm_set_error(state, "E_TYPE", "capability rights must be symbols")
+		return {}, false
+	}
+	name, name_ok := v.symbol_name(symbol)
+	if !name_ok {
+		vm.vm_set_error(state, "E_TYPE", "capability right is unknown")
+		return {}, false
+	}
+	switch name {
+	case "read":
+		return {.Read}, true
+	case "write":
+		return {.Write}, true
+	case "invoke":
+		return {.Invoke}, true
+	case "effect":
+		return {.Effect}, true
+	case "grant":
+		return {.Grant}, true
+	case "all":
+		return {.Read, .Write, .Invoke, .Effect, .Grant}, true
+	}
+	vm.vm_set_error(state, "E_INVARG", "unknown capability right")
+	return {}, false
+}
+
+@(private)
+capability_rights_allow_all :: proc(rights: k.Rights) -> bool {
+	return card(rights) > 0
+}
+
+// Parses a target argument. Read/write rights take relation names; invoke
+// takes selectors; effect/grant take no targets.
+@(private)
+capability_target_argument :: proc(
+	state: ^vm.VM,
+	env: ^Builtin_Env,
+	value: v.Value,
+	rights: k.Rights,
+) -> (
+	scope: k.Capability_Scope,
+	relations: []k.Relation_ID,
+	selectors: []v.Symbol,
+	ok: bool,
+) {
+	targets: [dynamic]v.Symbol
+	defer delete(targets)
+	if list, is_list := v.value_as_list(value); is_list {
+		for item in list {
+			symbol, is_symbol := v.value_as_symbol(item)
+			if !is_symbol {
+				vm.vm_set_error(state, "E_TYPE", "capability targets must be symbols")
+				return .All, nil, nil, false
+			}
+			append(&targets, symbol)
+		}
+	} else if symbol, is_symbol := v.value_as_symbol(value); is_symbol {
+		append(&targets, symbol)
+	} else if v.value_is_empty_relation(value) {
+		return .All, nil, nil, true
+	} else {
+		vm.vm_set_error(state, "E_TYPE", "capability targets must be symbols")
+		return .All, nil, nil, false
+	}
+	if len(targets) == 0 {
+		return .All, nil, nil, true
+	}
+
+	has_relation_rights := .Read in rights || .Write in rights
+	has_selector_rights := .Invoke in rights
+	if has_relation_rights && has_selector_rights {
+		vm.vm_set_error(
+			state,
+			"E_INVARG",
+			"cannot combine read/write and invoke rights on named targets",
+		)
+		return .All, nil, nil, false
+	}
+	if has_relation_rights {
+		relation_targets := make([]k.Relation_ID, len(targets), context.temp_allocator)
+		for target, index in targets {
+			name, name_ok := v.symbol_name(target)
+			if !name_ok {
+				vm.vm_set_error(state, "E_TYPE", "capability target is unknown")
+				return .All, nil, nil, false
+			}
+			relation, found := env.ctx.relations[name]
+			if !found {
+				vm.vm_set_error(state, "E_INVARG", "capability target is not a relation")
+				return .All, nil, nil, false
+			}
+			relation_targets[index] = k.Relation_ID(relation)
+		}
+		return .Relations, relation_targets, nil, true
+	}
+	if has_selector_rights {
+		selector_targets := make([]v.Symbol, len(targets), context.temp_allocator)
+		copy(selector_targets, targets[:])
+		return .Selectors, nil, selector_targets, true
+	}
+	vm.vm_set_error(state, "E_INVARG", "effect and grant capabilities take no targets")
+	return .All, nil, nil, false
+}
+
+// Parses a limits map: `:ttl_millis`, `:epochs`, or `:epoch_limit`.
+@(private)
+capability_limits_argument :: proc(
+	state: ^vm.VM,
+	env: ^Builtin_Env,
+	value: v.Value,
+) -> (
+	limits: k.Capability_Limits,
+	ok: bool,
+) {
+	entries, is_map := v.value_as_map(value)
+	if !is_map {
+		vm.vm_set_error(state, "E_TYPE", "capability limits must be a map")
+		return {}, false
+	}
+	version := kernel_version(env)
+	for entry in entries {
+		key, key_ok := v.value_as_symbol(entry.key)
+		if !key_ok {
+			vm.vm_set_error(state, "E_TYPE", "capability limit keys must be symbols")
+			return {}, false
+		}
+		name, name_ok := v.symbol_name(key)
+		if !name_ok {
+			continue
+		}
+		number, number_ok := v.value_as_int(entry.value)
+		if !number_ok || number < 0 {
+			vm.vm_set_error(state, "E_INVARG", "capability limits must be non-negative integers")
+			return {}, false
+		}
+		switch name {
+		case "ttl_millis":
+			limits.deadline = time.tick_add(
+				time.tick_now(),
+				time.Duration(number) * time.Millisecond,
+			)
+		case "epochs":
+			limits.epoch_limit = version + u64(number)
+		case "epoch_limit":
+			limits.epoch_limit = u64(number)
+		}
+	}
+	return limits, true
+}
+
+@(private)
+kernel_version :: proc(env: ^Builtin_Env) -> u64 {
+	snapshot := k.kernel_snapshot(env.kernel)
+	defer k.snapshot_release(snapshot)
+	return snapshot.version
 }
 
 // --- Helpers ---------------------------------------------------------------

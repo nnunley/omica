@@ -7,6 +7,7 @@
 package kernel
 
 import "core:mem"
+import "core:time"
 import v "../var"
 
 Authority :: struct {
@@ -21,7 +22,12 @@ Authority :: struct {
 	invoke_all: bool,
 	effect:     bool,
 	can_grant:  bool,
-	allocator:  mem.Allocator,
+	// Adopted capability grants, in adoption order.
+	capabilities: [dynamic]^Capability_Grant,
+	// Clock used for capability expiry.
+	epoch:        u64,
+	now:          time.Tick,
+	allocator:    mem.Allocator,
 }
 
 // A root authority passes every check. It is the default for loaders and for
@@ -40,6 +46,7 @@ authority_empty :: proc(allocator := context.allocator) -> Authority {
 		methods   = make(map[v.Value]bool, allocator),
 		builtins  = make(map[v.Symbol]bool, allocator),
 		selectors = make(map[v.Symbol]bool, allocator),
+		capabilities = make([dynamic]^Capability_Grant, allocator),
 		allocator = allocator,
 	}
 }
@@ -53,27 +60,70 @@ authority_destroy :: proc(authority: ^Authority) {
 	delete(authority.methods)
 	delete(authority.builtins)
 	delete(authority.selectors)
+	for grant in authority.capabilities {
+		capability_release(grant)
+	}
+	delete(authority.capabilities)
 }
 
 authority_can_read :: proc(authority: ^Authority, relation: Relation_ID) -> bool {
 	if authority == nil || authority.root {
 		return true
 	}
-	return authority.read_all || bool(authority.read[relation])
+	return authority.read_all ||
+		bool(authority.read[relation]) ||
+		authority_caps_allow_read(authority, relation)
+}
+
+@(private)
+authority_caps_allow_read :: proc(authority: ^Authority, relation: Relation_ID) -> bool {
+	for grant in authority.capabilities {
+		if capability_live(grant, authority.epoch, authority.now) &&
+		   capability_allows_read(grant, relation) {
+			return true
+		}
+	}
+	return false
 }
 
 authority_can_write :: proc(authority: ^Authority, relation: Relation_ID) -> bool {
 	if authority == nil || authority.root {
 		return true
 	}
-	return authority.write_all || bool(authority.write[relation])
+	return authority.write_all ||
+		bool(authority.write[relation]) ||
+		authority_caps_allow_write(authority, relation)
+}
+
+@(private)
+authority_caps_allow_write :: proc(authority: ^Authority, relation: Relation_ID) -> bool {
+	for grant in authority.capabilities {
+		if capability_live(grant, authority.epoch, authority.now) &&
+		   capability_allows_write(grant, relation) {
+			return true
+		}
+	}
+	return false
 }
 
 authority_can_invoke_method :: proc(authority: ^Authority, method: v.Value) -> bool {
 	if authority == nil || authority.root {
 		return true
 	}
-	return authority.invoke_all || bool(authority.methods[method])
+	return authority.invoke_all ||
+		bool(authority.methods[method]) ||
+		authority_caps_allow_invoke_any(authority)
+}
+
+@(private)
+authority_caps_allow_invoke_any :: proc(authority: ^Authority) -> bool {
+	for grant in authority.capabilities {
+		if capability_live(grant, authority.epoch, authority.now) &&
+		   capability_allows_invoke_any(grant) {
+			return true
+		}
+	}
+	return false
 }
 
 authority_can_invoke_builtin :: proc(authority: ^Authority, name: v.Symbol) -> bool {
@@ -82,7 +132,19 @@ authority_can_invoke_builtin :: proc(authority: ^Authority, name: v.Symbol) -> b
 	}
 	return authority.invoke_all ||
 		bool(authority.builtins[name]) ||
-		bool(authority.selectors[name])
+		bool(authority.selectors[name]) ||
+		authority_caps_allow_invoke(authority, name)
+}
+
+@(private)
+authority_caps_allow_invoke :: proc(authority: ^Authority, selector: v.Symbol) -> bool {
+	for grant in authority.capabilities {
+		if capability_live(grant, authority.epoch, authority.now) &&
+		   capability_allows_invoke(grant, selector) {
+			return true
+		}
+	}
+	return false
 }
 
 // Reports whether the authority may invoke a method selected by `selector`.
@@ -90,14 +152,27 @@ authority_can_invoke_selector :: proc(authority: ^Authority, selector: v.Symbol)
 	if authority == nil || authority.root {
 		return true
 	}
-	return authority.invoke_all || bool(authority.selectors[selector])
+	return authority.invoke_all ||
+		bool(authority.selectors[selector]) ||
+		authority_caps_allow_invoke(authority, selector)
 }
 
 authority_can_effect :: proc(authority: ^Authority) -> bool {
 	if authority == nil || authority.root {
 		return true
 	}
-	return authority.effect
+	return authority.effect || authority_caps_allow_effect(authority)
+}
+
+@(private)
+authority_caps_allow_effect :: proc(authority: ^Authority) -> bool {
+	for grant in authority.capabilities {
+		if capability_live(grant, authority.epoch, authority.now) &&
+		   capability_allows_effect(grant) {
+			return true
+		}
+	}
+	return false
 }
 
 // Reports whether the authority may mint capabilities.
@@ -105,43 +180,68 @@ authority_can_grant :: proc(authority: ^Authority) -> bool {
 	if authority == nil || authority.root {
 		return true
 	}
-	return authority.can_grant
+	return authority.can_grant || authority_caps_allow_grant(authority)
 }
 
-// Merges a capability grant into the authority.
-authority_adopt_grant :: proc(authority: ^Authority, grant: Capability_Grant) {
+@(private)
+authority_caps_allow_grant :: proc(authority: ^Authority) -> bool {
+	for grant in authority.capabilities {
+		if capability_live(grant, authority.epoch, authority.now) &&
+		   capability_allows_grant(grant) {
+			return true
+		}
+	}
+	return false
+}
+
+// Adopts a capability, retaining a reference to its grant.
+authority_adopt_capability :: proc(authority: ^Authority, grant: ^Capability_Grant) {
+	if authority == nil || authority.root || grant == nil {
+		return
+	}
+	capability_retain(grant)
+	append(&authority.capabilities, grant)
+}
+
+// Releases an adopted capability without revoking it.
+authority_drop_capability :: proc(authority: ^Authority, grant: ^Capability_Grant) -> bool {
+	if authority == nil || authority.root || grant == nil {
+		return false
+	}
+	for existing, index in authority.capabilities {
+		if existing == grant {
+			last := len(authority.capabilities) - 1
+			authority.capabilities[index] = authority.capabilities[last]
+			resize(&authority.capabilities, last)
+			capability_release(grant)
+			return true
+		}
+	}
+	return false
+}
+
+// Reports whether the authority has adopted this grant.
+authority_holds_capability :: proc(authority: ^Authority, grant: ^Capability_Grant) -> bool {
+	if authority == nil || authority.root || grant == nil {
+		return false
+	}
+	for existing in authority.capabilities {
+		if existing == grant {
+			return true
+		}
+	}
+	return false
+}
+
+// Sets the clock used for capability expiry checks.
+authority_set_clock :: proc(authority: ^Authority, epoch: u64, now: time.Tick) {
 	if authority == nil || authority.root {
 		return
 	}
-	switch grant.scope {
-	case .All:
-		if grant.read {
-			authority.read_all = true
-		}
-		if grant.write {
-			authority.write_all = true
-		}
-		if grant.invoke {
-			authority.invoke_all = true
-		}
-		if grant.effect {
-			authority.effect = true
-		}
-		if grant.grant {
-			authority.can_grant = true
-		}
-	case .Relation:
-		if grant.read {
-			authority.read[grant.relation] = true
-		}
-		if grant.write {
-			authority.write[grant.relation] = true
-		}
-	case .Method, .Builtin:
-		authority.selectors[grant.selector] = true
-		authority.builtins[grant.selector] = true
-	}
+	authority.epoch = epoch
+	authority.now = now
 }
+
 
 // Mints the authority for `actor` from the policy relations in `source`.
 authority_from_actor :: proc(

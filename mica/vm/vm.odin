@@ -9,6 +9,7 @@ package vm
 import "core:mem"
 import "core:strings"
 import "core:sync"
+import "core:time"
 import k "../kernel"
 import v "../var"
 
@@ -218,6 +219,13 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 	}
 	if state.status != .Ready {
 		return state.status
+	}
+	if state.authority != nil {
+		epoch: u64 = 0
+		if state.transaction != nil {
+			epoch = state.transaction.base.version
+		}
+		k.authority_set_clock(state.authority, epoch, time.tick_now())
 	}
 
 	program := state.program
@@ -1718,8 +1726,12 @@ vm_builtin_allowed :: proc(state: ^VM, name: v.Symbol) -> bool {
 	if text == "emit" {
 		return k.authority_can_effect(state.authority)
 	}
-	// Capability bootstrap: adopting and minting check their own authority.
-	if text == "use_capability" || text == "mint_capability" {
+	// Capability bootstrap: the capability builtins check their own authority.
+	if text == "use_capability" ||
+	   text == "mint_capability" ||
+	   text == "restrict_capability" ||
+	   text == "revoke_capability" ||
+	   text == "drop_capability" {
 		return true
 	}
 	return k.authority_can_invoke_builtin(state.authority, name)

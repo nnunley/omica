@@ -1653,3 +1653,104 @@ suspend()
 	expect_relation_rows(t, &kernel, "AllowedRead", 0)
 	expect_relation_rows(t, &kernel, "AllowedMint", 0)
 }
+
+@(test)
+test_run_capability_multi_revoke_and_expiry :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:A, 1)
+make_relation(:B, 1)
+make_relation(:Rw, 2)
+make_relation(:Vault, 1)
+make_relation(:Ephemeral, 1)
+make_relation(:Denied, 1)
+make_relation(:Expired, 1)
+make_relation(:Allowed, 1)
+make_relation(:ChildBoom, 1)
+assert A(1)
+assert B(2)
+assert Ephemeral(3)
+let read_two = mint_capability(:read, [:A, :B])
+let rw = mint_capability([:read, :write], :Rw)
+let vault = mint_capability([:read, :write], :Vault)
+let short = mint_capability(:read, :Ephemeral, {:ttl_millis -> 100})
+let write_denied = mint_capability(:write, :Denied)
+let write_expired = mint_capability(:write, :Expired)
+let write_allowed = mint_capability(:write, :Allowed)
+let write_boom = mint_capability(:write, :ChildBoom)
+let call_cap = mint_capability(:invoke, [:mailbox_send])
+verb work(read_two, rw, vault, short, write_denied, write_expired, write_allowed, write_boom, call_cap, sender_cap)
+  use_capability(call_cap)
+  use_capability(write_boom)
+  mailbox_send(sender_cap, :start)
+  try
+    use_capability(read_two)
+    use_capability(rw)
+    use_capability(vault)
+    use_capability(short)
+    use_capability(write_denied)
+    use_capability(write_expired)
+    use_capability(write_allowed)
+    let a_rows = A(1)
+    let b_rows = B(2)
+    assert Rw(1, 2)
+    let rw_rows = Rw(1, 2)
+    assert Vault(read_two)
+    let vault_rows = Vault(read_two)
+    let restricted = restrict_capability(read_two, [:read])
+    use_capability(restricted)
+    revoke_capability(read_two)
+    try
+      let rows = B(2)
+      assert Allowed(1)
+    catch err
+      assert Denied(1)
+    end
+    try
+      use_capability(read_two)
+    catch err
+      assert Denied(2)
+    end
+    suspend(150)
+    try
+      let rows = Ephemeral(3)
+      assert Allowed(2)
+    catch err
+      assert Expired(1)
+    end
+  catch err
+    assert ChildBoom(err.code)
+  end
+  mailbox_send(sender_cap, :done)
+end
+let [receiver, sender] = mailbox()
+let child_id = spawn :work(read_two: read_two, rw: rw, vault: vault, short: short, write_denied: write_denied, write_expired: write_expired, write_allowed: write_allowed, write_boom: write_boom, call_cap: call_cap, sender_cap: sender)
+require(child_id != 0)
+let started = mailbox_recv([receiver], 2000)
+require(len(started) == 1)
+require(len(mailbox_recv([receiver], 2000)) == 1)
+`
+	path, path_ok := write_temp_source(t, "mica_capability_full_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{actor = "alice"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "ChildBoom", 0)
+	expect_relation_rows(t, &kernel, "Denied", 2)
+	expect_relation_rows(t, &kernel, "Expired", 1)
+	expect_relation_rows(t, &kernel, "Allowed", 0)
+	expect_relation_rows(t, &kernel, "Vault", 1)
+	expect_relation_rows(t, &kernel, "Rw", 1)
+}

@@ -391,6 +391,11 @@ test_value_is_persistable :: proc(t: ^testing.T) {
 	testing.expect(t, !value_is_persistable(capability))
 	testing.expect(t, !value_is_persistable(function))
 
+	// Capabilities are storable in a live world even though they cannot be
+	// persisted.
+	testing.expect(t, value_is_storable(capability))
+	testing.expect(t, !value_is_storable(function))
+
 	good_list := value_list(alloc, []Value{must_int(1), value_string(alloc, "text")})
 	bad_list := value_list(alloc, []Value{capability})
 	testing.expect(t, value_is_persistable(good_list))

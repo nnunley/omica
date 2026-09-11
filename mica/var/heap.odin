@@ -366,12 +366,26 @@ value_error_code_symbol :: proc(v: Value) -> (Symbol, bool) {
 	return Symbol(0), false
 }
 
-// Reports whether a value can be persisted in a relation tuple. Capabilities
-// and function designations never persist; heap values are checked
-// recursively.
+// Reports whether a value can be persisted in a durable relation store.
+// Capabilities and function designations never persist; heap values are
+// checked recursively.
 value_is_persistable :: proc(v: Value) -> bool {
+	return value_ephemeral_ok(v, false)
+}
+
+// Reports whether a value can live in an in-memory relation tuple. This is
+// weaker than persistence: capabilities are ephemeral handles that may be
+// stored in a live world but have no codec.
+value_is_storable :: proc(v: Value) -> bool {
+	return value_ephemeral_ok(v, true)
+}
+
+@(private)
+value_ephemeral_ok :: proc(v: Value, allow_capabilities: bool) -> bool {
 	#partial switch value_kind(v) {
-	case .Capability, .Function:
+	case .Capability:
+		return allow_capabilities
+	case .Function:
 		return false
 	case .List:
 		values, ok := value_as_list(v)

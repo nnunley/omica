@@ -829,15 +829,17 @@ test_transaction_error_matrix :: proc(t: ^testing.T) {
 		Kernel_Error.Arity_Mismatch,
 	)
 
+	// Capabilities are storable in live tuples, but function values are not.
 	capability := v.value_capability(v.Capability_ID(1))
 	testing.expect_value(
 		t,
 		transaction_assert(&tx, relation, tuple_of(must_identity(1), capability)),
-		Kernel_Error.Non_Persistent_Value,
+		Kernel_Error.None,
 	)
+	function := v.value_function(v.Function_ID(1))
 	testing.expect_value(
 		t,
-		transaction_retract(&tx, relation, tuple_of(must_identity(1), capability)),
+		transaction_assert(&tx, relation, tuple_of(must_identity(1), function)),
 		Kernel_Error.Non_Persistent_Value,
 	)
 }

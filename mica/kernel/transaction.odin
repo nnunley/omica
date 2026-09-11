@@ -171,7 +171,7 @@ transaction_assert :: proc(
 		return .Arity_Mismatch
 	}
 	for cell in v.tuple_values(tuple) {
-		if !v.value_is_persistable(cell) {
+		if !v.value_is_storable(cell) {
 			return .Non_Persistent_Value
 		}
 	}
@@ -213,7 +213,7 @@ transaction_retract :: proc(
 		return .Arity_Mismatch
 	}
 	for cell in v.tuple_values(tuple) {
-		if !v.value_is_persistable(cell) {
+		if !v.value_is_storable(cell) {
 			return .Non_Persistent_Value
 		}
 	}
