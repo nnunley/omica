@@ -7,6 +7,7 @@ package web
 import "core:net"
 import "core:strings"
 import "core:time"
+import dom "../../mica/dom"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
 import v "../../mica/var"
@@ -93,15 +94,21 @@ sync_render_view :: proc(
 	roles := []k.Role_Pair {
 		{role = v.value_symbol(v.symbol_intern("view")), value = view_value},
 	}
-	outcome := r.world_call(host.world, "sync_snapshot_payload", roles)
+	outcome := r.world_call(host.world, "sync_view_tree", roles)
 	if outcome.kind != .Complete {
 		return false
 	}
-	payload, is_string := v.value_as_string(outcome.value)
-	if !is_string {
+	node, node_error := dom.dom_node_from_value(outcome.value, context.temp_allocator)
+	if node_error != "" {
 		return false
 	}
 	revision := u64(1)
+	payload := dom.dom_snapshot_payload_json(
+		view_id,
+		revision,
+		node,
+		context.temp_allocator,
+	)
 	payload_bytes := transmute([]u8)payload
 	envelope := Sync_Envelope {
 		kind             = .View_Snapshot,

@@ -75,8 +75,8 @@ test_sync_query_u64 :: proc(t: ^testing.T) {
 @(test)
 test_sync_input_and_stream :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	source := `verb sync_snapshot_payload(view)
-  return "{\"view\":1,\"revision\":1,\"root\":\"<div></div>\"}"
+	source := `verb sync_view_tree(view)
+  return dom <div id="mount"><span>hello</span></div>
 end
 `
 	path, path_ok := write_document_source(t, "mica_sync_fixture.mica", source)
@@ -164,6 +164,9 @@ end
 	testing.expectf(t, strings.contains(text, "\"kind\":\"ViewSnapshot\""), "event: %q", text)
 	testing.expectf(t, strings.contains(text, "\"session\":\"7\""), "event: %q", text)
 	testing.expectf(t, strings.contains(text, "\"view\":\"1\""), "event: %q", text)
+	// The payload is DOM node JSON, not an XML string.
+	testing.expectf(t, strings.contains(text, `\"root\":{\"attrs\"`), "event: %q", text)
+	testing.expectf(t, strings.contains(text, `\"tag\":\"span\"`), "event: %q", text)
 
 	net.close(input_client)
 	net.close(sse_client)

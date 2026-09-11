@@ -14,6 +14,7 @@ import "core:time"
 import "core:unicode/utf8"
 import c "../compiler"
 import k "../kernel"
+import dom "../dom"
 import vm "../vm"
 import v "../var"
 
@@ -498,22 +499,24 @@ builtin_sync_signature :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool
 builtin_dom_snapshot_payload :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	view, view_ok := v.value_as_int(args[0])
 	revision, revision_ok := v.value_as_int(args[1])
-	if !view_ok || !revision_ok {
+	if !view_ok || !revision_ok || view < 0 || revision < 0 {
 		return builtin_error(
 			state,
 			"E_INVARG",
-			"dom_snapshot_payload expects view, revision, and a root node",
+			"dom_snapshot_payload expects non-negative view and revision",
 		)
 	}
-	builder: strings.Builder
-	strings.builder_init(&builder, state.allocator)
-	fmt.sbprintf(&builder, "{\"view\":%d,\"revision\":%d,\"root\":\"", view, revision)
-	if !write_xml_node(&builder, args[2]) {
-		strings.builder_destroy(&builder)
-		return builtin_error(state, "E_TYPE", "dom_snapshot_payload root is not a DOM node")
+	node, node_error := dom.dom_node_from_value(args[2], state.allocator)
+	if node_error != "" {
+		return builtin_error(state, "E_TYPE", node_error)
 	}
-	strings.write_string(&builder, "\"}")
-	return v.value_string(state.allocator, strings.to_string(builder)), true
+	payload := dom.dom_snapshot_payload_json(
+		u64(view),
+		u64(revision),
+		node,
+		state.allocator,
+	)
+	return v.value_string(state.allocator, payload), true
 }
 
 // A deterministic stand-in for a host embedding provider: hashes the text into
