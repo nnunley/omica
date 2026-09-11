@@ -7,6 +7,7 @@
 package vm
 
 import "core:mem"
+import k "../kernel"
 import v "../var"
 
 VM_Status :: enum {
@@ -24,13 +25,15 @@ Frame :: struct {
 }
 
 VM :: struct {
-	program:   ^Program,
-	allocator: mem.Allocator,
-	registers: [dynamic]v.Value,
-	frames:    [dynamic]Frame,
-	result:    v.Value,
-	error:     v.Value,
-	status:    VM_Status,
+	program:     ^Program,
+	allocator:   mem.Allocator,
+	registers:   [dynamic]v.Value,
+	frames:      [dynamic]Frame,
+	result:      v.Value,
+	error:       v.Value,
+	status:      VM_Status,
+	source:      ^k.Relation_Source,
+	transaction: ^k.Transaction,
 }
 
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
@@ -46,6 +49,17 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 vm_destroy :: proc(state: ^VM) {
 	delete(state.registers)
 	delete(state.frames)
+}
+
+// Sets the relation read source and write transaction for relation
+// instructions. Either may be nil when the program does not use them.
+vm_set_workspace :: proc(
+	state: ^VM,
+	source: ^k.Relation_Source,
+	transaction: ^k.Transaction,
+) {
+	state.source = source
+	state.transaction = transaction
 }
 
 // Runs the program from its entry function until it returns. Read
@@ -202,8 +216,218 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				return .Failed
 			}
 			state.registers[base + int(instr.a)] = length_value
+
+		case .Scan_Collect:
+			if !vm_scan_collect(state, base, instr) {
+				return .Failed
+			}
+
+		case .Scan_Exists:
+			if !vm_scan_exists(state, base, instr) {
+				return .Failed
+			}
+
+		case .Scan_First:
+			if !vm_scan_first(state, base, instr) {
+				return .Failed
+			}
+
+		case .Assert:
+			if !vm_apply_write(state, base, instr, true) {
+				return .Failed
+			}
+
+		case .Retract:
+			if !vm_apply_write(state, base, instr, false) {
+				return .Failed
+			}
+
+		case .Retract_Where:
+			if !vm_retract_where(state, instr) {
+				return .Failed
+			}
 		}
 	}
+}
+
+@(private)
+vm_pattern_bindings :: proc(
+	state: ^VM,
+	pattern: Scan_Pattern,
+	alloc: mem.Allocator,
+) -> []v.Binding {
+	bindings := make([]v.Binding, len(pattern.cells), alloc)
+	for cell, index in pattern.cells {
+		if cell.kind == .Const {
+			bindings[index] = v.binding_of(state.program.constants[cell.operand])
+		}
+	}
+	return bindings
+}
+
+@(private)
+vm_scan_rows :: proc(
+	state: ^VM,
+	pattern: Scan_Pattern,
+	out: ^[dynamic]v.Tuple,
+) -> bool {
+	if state.source == nil {
+		vm_fail(state, "E_NO_SOURCE", "relation scan has no source")
+		return false
+	}
+	bindings := vm_pattern_bindings(state, pattern, context.temp_allocator)
+	k.relation_source_scan_into(state.source, k.Relation_ID(pattern.relation), bindings, out)
+	return true
+}
+
+@(private)
+vm_scan_collect :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	pattern := state.program.patterns[instr.b]
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	if !vm_scan_rows(state, pattern, &rows) {
+		return false
+	}
+	result, err := v.value_relation(state.allocator, pattern.column_names, rows[:])
+	if err != .None {
+		vm_fail(state, "E_RELATION", "scan result columns are invalid")
+		return false
+	}
+	state.registers[base + int(instr.a)] = result
+	return true
+}
+
+@(private)
+First_Binding_Context :: struct {
+	vm:      ^VM,
+	base:    int,
+	pattern: ^Scan_Pattern,
+	found:   bool,
+}
+
+@(private)
+first_binding_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
+	ctx := (^First_Binding_Context)(user)
+	for cell, index in ctx.pattern.cells {
+		if cell.kind == .Bind {
+			ctx.vm.registers[ctx.base + int(cell.operand)] = v.tuple_values(row)[index]
+		}
+	}
+	ctx.found = true
+	return false
+}
+
+@(private)
+vm_scan_first :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	if state.source == nil {
+		vm_fail(state, "E_NO_SOURCE", "relation scan has no source")
+		return false
+	}
+	pattern := state.program.patterns[instr.b]
+	bindings := vm_pattern_bindings(state, pattern, context.temp_allocator)
+	ctx := First_Binding_Context {
+		vm      = state,
+		base    = base,
+		pattern = &pattern,
+	}
+	k.relation_source_visit(state.source, k.Relation_ID(pattern.relation), bindings, first_binding_visit, &ctx)
+	state.registers[base + int(instr.a)] = v.value_bool(ctx.found)
+	return true
+}
+
+@(private)
+vm_scan_exists :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	pattern := state.program.patterns[instr.b]
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	if !vm_scan_rows(state, pattern, &rows) {
+		return false
+	}
+	state.registers[base + int(instr.a)] = v.value_bool(len(rows) > 0)
+	return true
+}
+
+@(private)
+vm_apply_write :: proc(
+	state: ^VM,
+	base: int,
+	instr: Instruction,
+	assert_write: bool,
+) -> bool {
+	if state.transaction == nil {
+		vm_fail(state, "E_NO_TRANSACTION", "relation write has no transaction")
+		return false
+	}
+	value := state.registers[base + int(instr.b)]
+	relation, ok := v.value_as_relation(value)
+	if !ok || len(relation.rows) != 1 {
+		vm_fail(state, "E_TYPE", "relation write expects a single-row relation value")
+		return false
+	}
+	tuple := relation.rows[0]
+	relation_id := k.Relation_ID(u32(instr.a))
+	err: k.Kernel_Error
+	if assert_write {
+		err = k.transaction_assert(state.transaction, relation_id, tuple)
+	} else {
+		err = k.transaction_retract(state.transaction, relation_id, tuple)
+	}
+	if err != .None {
+		vm_fail(state, kernel_error_code(err), "relation write failed")
+		return false
+	}
+	return true
+}
+
+@(private)
+vm_retract_where :: proc(state: ^VM, instr: Instruction) -> bool {
+	if state.transaction == nil {
+		vm_fail(state, "E_NO_TRANSACTION", "relation write has no transaction")
+		return false
+	}
+	pattern := state.program.patterns[instr.b]
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	if !vm_scan_rows(state, pattern, &rows) {
+		return false
+	}
+	for row in rows {
+		err := k.transaction_retract(
+			state.transaction,
+			k.Relation_ID(pattern.relation),
+			row,
+		)
+		if err != .None {
+			vm_fail(state, kernel_error_code(err), "relation retract failed")
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+kernel_error_code :: proc(err: k.Kernel_Error) -> string {
+	switch err {
+	case .Unknown_Relation:
+		return "E_UNKNOWN_RELATION"
+	case .Arity_Mismatch:
+		return "E_ARITY"
+	case .Non_Persistent_Value:
+		return "E_NOT_PERSISTENT"
+	case .Functional_Key_Violation:
+		return "E_FUNCTIONAL_KEY"
+	case .Read_Only:
+		return "E_READ_ONLY"
+	case .Conflict:
+		return "E_CONFLICT"
+	case .Duplicate_Relation_Name, .Invalid_Metadata:
+		return "E_METADATA"
+	case .No_Such_Rule, .Unstratified_Negation, .Unsafe_Negation, .Unsafe_Guard, .Unbound_Head_Variable:
+		return "E_RULE"
+	case .None:
+		return "E_NONE"
+	}
+	return "E_KERNEL"
 }
 
 @(private)

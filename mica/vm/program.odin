@@ -40,6 +40,45 @@ Op :: enum u8 {
 	Build_Range,
 	// Len: a = dst, b = collection register.
 	Len,
+	// Scan_Collect: a = dst, b = pattern index. Binds nothing; the result is
+	// a relation value with one row per match.
+	Scan_Collect,
+	// Scan_Exists: a = dst (bool), b = pattern index.
+	Scan_Exists,
+	// Scan_First: a = dst (bool), b = pattern index. Writes bind cells from
+	// the first match; returns false when there is no match.
+	Scan_First,
+	// Assert: a = relation id, b = register holding a single-row relation
+	// value.
+	Assert,
+	// Retract: a = relation id, b = register holding a single-row relation
+	// value.
+	Retract,
+	// Retract_Where: b = pattern index. Retracts every matching row.
+	Retract_Where,
+}
+
+// A cell in a relation scan pattern.
+Pattern_Cell_Kind :: enum u8 {
+	// A constant constant-pool value.
+	Const,
+	// A register bound to the matched cell value.
+	Bind,
+	// Any value.
+	Wildcard,
+}
+
+Pattern_Cell :: struct {
+	kind:    Pattern_Cell_Kind,
+	operand: i32,
+}
+
+// A relation scan pattern. Column names head the relation value produced by
+// Scan_Collect.
+Scan_Pattern :: struct {
+	relation:     u32,
+	column_names: []v.Symbol,
+	cells:        []Pattern_Cell,
 }
 
 Bin_Op :: enum u8 {
@@ -81,6 +120,7 @@ Program :: struct {
 	code:      []Instruction,
 	constants: []v.Value,
 	functions: []Function,
+	patterns:  []Scan_Pattern,
 	entry:     int,
 }
 
@@ -100,6 +140,7 @@ Builder :: struct {
 	code:          [dynamic]Instruction,
 	constants:     [dynamic]v.Value,
 	functions:     [dynamic]Function,
+	patterns:      [dynamic]Scan_Pattern,
 	entry:         int,
 	open_function: int,
 	open_offset:   int,
@@ -109,6 +150,7 @@ builder_init :: proc(builder: ^Builder) {
 	builder.code = make([dynamic]Instruction)
 	builder.constants = make([dynamic]v.Value)
 	builder.functions = make([dynamic]Function)
+	builder.patterns = make([dynamic]Scan_Pattern)
 	builder.entry = -1
 	builder.open_function = -1
 }
@@ -117,6 +159,30 @@ builder_destroy :: proc(builder: ^Builder) {
 	delete(builder.code)
 	delete(builder.constants)
 	delete(builder.functions)
+	for pattern in builder.patterns {
+		delete(pattern.column_names)
+		delete(pattern.cells)
+	}
+	delete(builder.patterns)
+}
+
+// Adds a scan pattern, copying its slices. Returns the pattern index.
+builder_add_pattern :: proc(
+	builder: ^Builder,
+	relation: u32,
+	column_names: []v.Symbol,
+	cells: []Pattern_Cell,
+) -> i32 {
+	names := make([]v.Symbol, len(column_names))
+	copy(names, column_names)
+	pattern_cells := make([]Pattern_Cell, len(cells))
+	copy(pattern_cells, cells)
+	append(&builder.patterns, Scan_Pattern {
+		relation     = relation,
+		column_names = names,
+		cells        = pattern_cells,
+	})
+	return i32(len(builder.patterns) - 1)
 }
 
 builder_add_constant :: proc(builder: ^Builder, value: v.Value) -> int {
@@ -169,6 +235,18 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 	copy(program.constants, builder.constants[:])
 	program.functions = make([]Function, len(builder.functions), alloc)
 	copy(program.functions, builder.functions[:])
+	program.patterns = make([]Scan_Pattern, len(builder.patterns), alloc)
+	for pattern, i in builder.patterns {
+		names := make([]v.Symbol, len(pattern.column_names), alloc)
+		copy(names, pattern.column_names)
+		cells := make([]Pattern_Cell, len(pattern.cells), alloc)
+		copy(cells, pattern.cells)
+		program.patterns[i] = Scan_Pattern {
+			relation     = pattern.relation,
+			column_names = names,
+			cells        = cells,
+		}
+	}
 	program.entry = builder.entry
 	return program
 }
@@ -177,6 +255,11 @@ program_destroy :: proc(program: ^Program, alloc: mem.Allocator) {
 	free(raw_data(program.code), alloc)
 	free(raw_data(program.constants), alloc)
 	free(raw_data(program.functions), alloc)
+	for pattern in program.patterns {
+		free(raw_data(pattern.column_names), alloc)
+		free(raw_data(pattern.cells), alloc)
+	}
+	free(raw_data(program.patterns), alloc)
 	free(program, alloc)
 }
 
@@ -295,6 +378,24 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				   !valid_register(instr.b, register_count) {
 					return .Bad_Register
 				}
+			case .Scan_Collect, .Scan_Exists, .Scan_First:
+				if !valid_register(instr.a, register_count) {
+					return .Bad_Register
+				}
+				if instr.b < 0 || int(instr.b) >= len(program.patterns) {
+					return .Bad_Function
+				}
+			case .Retract_Where:
+				if instr.b < 0 || int(instr.b) >= len(program.patterns) {
+					return .Bad_Function
+				}
+			case .Assert, .Retract:
+				if instr.a < 0 {
+					return .Bad_Function
+				}
+				if !valid_register(instr.b, register_count) {
+					return .Bad_Register
+				}
 			}
 		}
 	}
@@ -378,6 +479,14 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d r%d..r%d", instr.a, instr.b, instr.c)
 			case .Len:
 				fmt.sbprintf(&builder, " r%d r%d", instr.a, instr.b)
+			case .Scan_Collect, .Scan_Exists, .Scan_First:
+				fmt.sbprintf(&builder, " r%d pat%d", instr.a, instr.b)
+			case .Assert:
+				fmt.sbprintf(&builder, " rel%d r%d", instr.a, instr.b)
+			case .Retract:
+				fmt.sbprintf(&builder, " rel%d r%d", instr.a, instr.b)
+			case .Retract_Where:
+				fmt.sbprintf(&builder, " pat%d", instr.b)
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -412,6 +521,18 @@ op_name :: proc(op: Op) -> string {
 		return "build_range"
 	case .Len:
 		return "len"
+	case .Scan_Collect:
+		return "scan_collect"
+	case .Scan_Exists:
+		return "scan_exists"
+	case .Scan_First:
+		return "scan_first"
+	case .Assert:
+		return "assert"
+	case .Retract:
+		return "retract"
+	case .Retract_Where:
+		return "retract_where"
 	}
 	return "?"
 }

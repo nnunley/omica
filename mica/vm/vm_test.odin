@@ -4,6 +4,7 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:testing"
+import k "../kernel"
 import v "../var"
 
 @(private)
@@ -312,4 +313,269 @@ test_program_disassembly :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(text, "load_const"))
 	testing.expect(t, strings.contains(text, "r0 c0"))
 	testing.expect(t, strings.contains(text, "return"))
+}
+
+@(private)
+must_identity :: proc(raw: u64) -> v.Value {
+	value, ok := v.value_identity_raw(raw)
+	assert(ok)
+	return value
+}
+
+@(private)
+relation_setup :: proc() -> (k.Kernel, k.Relation_ID) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	metadata := k.relation_metadata(k.Relation_ID(1), v.symbol_intern("HeldBy"), 2)
+	snapshot, err := k.kernel_create_relation(&kernel, metadata)
+	assert(err == .None)
+	k.snapshot_release(snapshot)
+	return kernel, k.Relation_ID(1)
+}
+
+@(private)
+relation_seed :: proc(kernel: ^k.Kernel, relation: k.Relation_ID, facts: [][2]v.Value) {
+	tx := k.kernel_begin(kernel)
+	for fact in facts {
+		row := v.tuple_new(context.temp_allocator, []v.Value{fact[0], fact[1]})
+		assert(k.transaction_assert(&tx, relation, row) == .None)
+	}
+	snapshot, err := k.transaction_commit(&tx)
+	assert(err == .None)
+	k.snapshot_release(snapshot)
+	k.transaction_destroy(&tx)
+}
+
+@(test)
+test_vm_scan_collect_and_len :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	kernel, relation := relation_setup()
+	defer k.kernel_destroy(&kernel)
+	relation_seed(&kernel, relation, [][2]v.Value {
+		{must_identity(1), must_identity(2)},
+		{must_identity(3), must_identity(4)},
+	})
+	source := k.Relation_Source{snapshot = kernel.current, use_stored_derived = true}
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	owner := v.symbol_intern("owner")
+	item := v.symbol_intern("item")
+	pattern := builder_add_pattern(
+		&builder,
+		u32(relation),
+		[]v.Symbol{owner, item},
+		[]Pattern_Cell{{kind = .Wildcard}, {kind = .Wildcard}},
+	)
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder, .Scan_Collect, 0, 0, pattern, 0)
+	builder_emit(&builder, .Len, 0, 1, 0, 0)
+	builder_emit(&builder, .Return, 0, 1, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	vm_set_workspace(&state, &source, nil)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect_value(t, state.result, must_int(2))
+}
+
+@(test)
+test_vm_scan_first_binds_register :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	kernel, relation := relation_setup()
+	defer k.kernel_destroy(&kernel)
+	relation_seed(&kernel, relation, [][2]v.Value {
+		{must_identity(1), must_identity(2)},
+	})
+	source := k.Relation_Source{snapshot = kernel.current, use_stored_derived = true}
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	lamp := must_identity(2)
+	lamp_constant := i32(builder_add_constant(&builder, lamp))
+	owner := v.symbol_intern("owner")
+	item := v.symbol_intern("item")
+	pattern := builder_add_pattern(
+		&builder,
+		u32(relation),
+		[]v.Symbol{owner, item},
+		[]Pattern_Cell{{kind = .Bind, operand = 0}, {kind = .Const, operand = lamp_constant}},
+	)
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 3, true)
+	builder_emit(&builder, .Scan_First, 0, 1, pattern, 0)
+	builder_emit(&builder, .Branch, 0, 1, 1, 0)
+	builder_emit(&builder, .Return, 0, 1, 0, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	vm_set_workspace(&state, &source, nil)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect_value(t, state.result, must_identity(1))
+}
+
+@(test)
+test_vm_assert_and_retract :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	kernel, relation := relation_setup()
+	defer k.kernel_destroy(&kernel)
+
+	owner := v.symbol_intern("owner")
+	item := v.symbol_intern("item")
+
+	row_values := []v.Value{must_identity(1), must_identity(2)}
+	row := v.tuple_new(alloc, row_values)
+	relation_value, relation_err := v.value_relation(
+		alloc,
+		[]v.Symbol{owner, item},
+		[]v.Tuple{row},
+	)
+	testing.expect_value(t, relation_err, v.Relation_Value_Error.None)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	row_constant := i32(builder_add_constant(&builder, relation_value))
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder, .Load_Const, 0, 0, row_constant, 0)
+	builder_emit(&builder, .Assert, 0, i32(relation), 0, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	source := k.Relation_Source{snapshot = kernel.current, use_stored_derived = true}
+	tx := k.kernel_begin(&kernel)
+	defer k.transaction_destroy(&tx)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	vm_set_workspace(&state, &source, &tx)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	snapshot, commit_err := k.transaction_commit(&tx)
+	testing.expect_value(t, commit_err, k.Kernel_Error.None)
+	k.snapshot_release(snapshot)
+
+	rows := make([dynamic]v.Tuple)
+	k.kernel_scan_into(&kernel, relation, []v.Binding{{}, {}}, &rows)
+	testing.expect_value(t, len(rows), 1)
+	delete(rows)
+
+	// Retract the same row through a second program.
+	builder2: Builder
+	builder_init(&builder2)
+	defer builder_destroy(&builder2)
+	row_constant2 := i32(builder_add_constant(&builder2, relation_value))
+	builder_begin_function(&builder2, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder2, .Load_Const, 0, 0, row_constant2, 0)
+	builder_emit(&builder2, .Retract, 0, i32(relation), 0, 0)
+	builder_emit(&builder2, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder2)
+	program2 := builder_build(&builder2, alloc)
+	testing.expect_value(t, program_validate(program2), Program_Error.None)
+
+	source2 := k.Relation_Source{snapshot = kernel.current, use_stored_derived = true}
+	tx2 := k.kernel_begin(&kernel)
+	defer k.transaction_destroy(&tx2)
+	state2: VM
+	vm_init(&state2, program2, alloc)
+	defer vm_destroy(&state2)
+	vm_set_workspace(&state2, &source2, &tx2)
+	testing.expect_value(t, vm_run(&state2), VM_Status.Halted)
+	snapshot2, commit_err2 := k.transaction_commit(&tx2)
+	testing.expect_value(t, commit_err2, k.Kernel_Error.None)
+	k.snapshot_release(snapshot2)
+
+	rows2 := make([dynamic]v.Tuple)
+	k.kernel_scan_into(&kernel, relation, []v.Binding{{}, {}}, &rows2)
+	testing.expect_value(t, len(rows2), 0)
+	delete(rows2)
+}
+
+@(test)
+test_vm_retract_where :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	kernel, relation := relation_setup()
+	defer k.kernel_destroy(&kernel)
+	relation_seed(&kernel, relation, [][2]v.Value {
+		{must_identity(1), must_identity(2)},
+		{must_identity(1), must_identity(3)},
+		{must_identity(4), must_identity(5)},
+	})
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	alice := must_identity(1)
+	alice_constant := i32(builder_add_constant(&builder, alice))
+	owner := v.symbol_intern("owner")
+	item := v.symbol_intern("item")
+	pattern := builder_add_pattern(
+		&builder,
+		u32(relation),
+		[]v.Symbol{owner, item},
+		[]Pattern_Cell{{kind = .Const, operand = alice_constant}, {kind = .Wildcard}},
+	)
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 1, true)
+	builder_emit(&builder, .Retract_Where, 0, 0, pattern, 0)
+	builder_emit(&builder, .Load_Const, 0, 0, alice_constant, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	source := k.Relation_Source{snapshot = kernel.current, use_stored_derived = true}
+	tx := k.kernel_begin(&kernel)
+	defer k.transaction_destroy(&tx)
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	vm_set_workspace(&state, &source, &tx)
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+
+	snapshot, commit_err := k.transaction_commit(&tx)
+	testing.expect_value(t, commit_err, k.Kernel_Error.None)
+	k.snapshot_release(snapshot)
+
+	rows := make([dynamic]v.Tuple)
+	k.kernel_scan_into(&kernel, relation, []v.Binding{{}, {}}, &rows)
+	testing.expect_value(t, len(rows), 1)
+	delete(rows)
 }
