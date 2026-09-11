@@ -1114,7 +1114,12 @@ parse_call_arguments :: proc(parser: ^Parser) -> []Call_Argument {
 			argument.has_role = true
 			advance(parser)
 		}
-		argument.expr = parse_expression(parser)
+		if at(parser, .At) {
+			advance(parser)
+			argument.expr = expr_node(parser, Splice{value = parse_unary(parser)})
+		} else {
+			argument.expr = parse_expression(parser)
+		}
 		append(&args, argument)
 		skip_newlines(parser)
 		if at(parser, .Comma) {

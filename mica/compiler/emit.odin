@@ -903,6 +903,36 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		if !target_ok {
 			return -1, false
 		}
+		computed_splice := false
+		for argument in call.args {
+			if _, is_splice := argument.expr^.(Splice); is_splice {
+				computed_splice = true
+			}
+		}
+		if computed_splice {
+			elements := make([]^Expr, len(call.args), emitter.allocator)
+			defer delete(elements)
+			for argument, index in call.args {
+				elements[index] = argument.expr
+			}
+			args_register, args_ok := emit_list(
+				emitter,
+				List_Literal{elements = elements},
+			)
+			if !args_ok {
+				return -1, false
+			}
+			destination := alloc_register(emitter)
+			vm.builder_emit(
+				emitter.builder,
+				.Call_Value_Splice,
+				0,
+				i32(destination),
+				i32(target),
+				i32(args_register),
+			)
+			return destination, true
+		}
 		argument_registers := make([dynamic]int, 0, len(call.args), emitter.allocator)
 		defer delete(argument_registers)
 		for argument in call.args {
@@ -926,6 +956,7 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 	}
 	text := join_name(callee, emitter.allocator)
 
+	has_splice := false
 	for argument in call.args {
 		if argument.has_role {
 			push_error(emitter, fmt.aprintf(
@@ -936,9 +967,11 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 			return -1, false
 		}
 		if _, is_splice := argument.expr^.(Splice); is_splice {
-			push_error(emitter, "argument splices are not lowered yet")
-			return -1, false
+			has_splice = true
 		}
+	}
+	if has_splice {
+		return emit_splice_call(emitter, call, text)
 	}
 
 	if text == "some" || text == "ok" || text == "err" {
@@ -1301,6 +1334,77 @@ emit_frob :: proc(emitter: ^Emitter, frob: Structural_Literal) -> (int, bool) {
 		i32(first_argument),
 	)
 	return destination, true
+}
+
+// Lowers a call whose arguments include a splice (`foo(a, @rest)`). The
+// argument expressions build one list, and the callee receives it whole.
+@(private)
+emit_splice_call :: proc(
+	emitter: ^Emitter,
+	call: Call,
+	text: string,
+) -> (int, bool) {
+	elements := make([]^Expr, len(call.args), emitter.allocator)
+	defer delete(elements, emitter.allocator)
+	for argument, index in call.args {
+		elements[index] = argument.expr
+	}
+	args_register, args_ok := emit_list(
+		emitter,
+		List_Literal{elements = elements},
+	)
+	if !args_ok {
+		return -1, false
+	}
+	if emitter.ctx != nil {
+		if _, is_relation := emitter.ctx.relations[text]; is_relation {
+			push_error(emitter, "relation queries do not support argument splices")
+			return -1, false
+		}
+	}
+	if function_index, found := emitter.functions[text]; found {
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Call_Splice,
+			0,
+			i32(destination),
+			i32(function_index),
+			i32(args_register),
+		)
+		return destination, true
+	}
+	if emitter.ctx != nil && emitter.ctx.builtins[text] {
+		destination := alloc_register(emitter)
+		builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern(text))
+		vm.builder_emit(
+			emitter.builder,
+			.Builtin_Call_Splice,
+			0,
+			i32(destination),
+			builtin,
+			i32(args_register),
+		)
+		return destination, true
+	}
+	if local_register, _, found := resolve_local(emitter, text); found {
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Call_Value_Splice,
+			0,
+			i32(destination),
+			i32(local_register),
+			i32(args_register),
+		)
+		return destination, true
+	}
+	push_error(emitter, fmt.aprintf(
+		"unknown callable: %s",
+		text,
+		allocator = emitter.allocator,
+	))
+	return -1, false
 }
 
 @(private)

@@ -969,3 +969,36 @@ assert Payload(b"3q2-7w==")
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Payload", 1)
 }
+
+@(test)
+test_run_argument_splices :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Result, 1)
+verb sum3(a, b, c)
+  return a + b + c
+end
+let xs = [1, 2, 3]
+require(sum3(@xs) == 6)
+require(sum3(1, @[2, 3]) == 6)
+let f = fn(a, b) => a * b
+let pair = [6, 7]
+require(f(@pair) == 42)
+require(string_concat(@["a", "b", "c"]) == "abc")
+let pick = [f]
+require(pick[0](@pair) == 42)
+assert Result(sum3(@xs))
+`
+	path, path_ok := write_temp_source(t, "mica_splice_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Result", 1)
+}

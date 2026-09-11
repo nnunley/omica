@@ -112,6 +112,13 @@ Op :: enum u8 {
 	// Call_Value: a = dst, b = function value register, c = first argument
 	// register. flags holds the argument count.
 	Call_Value,
+	// Call_Splice: a = dst, b = function index, c = argument list register.
+	Call_Splice,
+	// Builtin_Call_Splice: a = dst, b = builtin index, c = argument list.
+	Builtin_Call_Splice,
+	// Call_Value_Splice: a = dst, b = function value register, c = argument
+	// list register.
+	Call_Value_Splice,
 }
 
 // A cell in a relation scan pattern.
@@ -699,6 +706,28 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if instr.flags > 0 && !valid_register(instr.c, register_count) {
 					return .Bad_Register
 				}
+			case .Call_Splice:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
+				if instr.b < 0 || int(instr.b) >= len(program.functions) {
+					return .Bad_Function
+				}
+			case .Builtin_Call_Splice:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
+				if instr.b < 0 || int(instr.b) >= len(program.builtins) {
+					return .Bad_Function
+				}
+			case .Call_Value_Splice:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.b, register_count) ||
+				   !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
 			}
 		}
 	}
@@ -829,6 +858,12 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d fn%d", instr.a, instr.b)
 			case .Call_Value:
 				fmt.sbprintf(&builder, " r%d r%d args@r%d", instr.a, instr.b, instr.c)
+			case .Call_Splice:
+				fmt.sbprintf(&builder, " r%d fn%d args@r%d", instr.a, instr.b, instr.c)
+			case .Builtin_Call_Splice:
+				fmt.sbprintf(&builder, " r%d builtin%d args@r%d", instr.a, instr.b, instr.c)
+			case .Call_Value_Splice:
+				fmt.sbprintf(&builder, " r%d r%d args@r%d", instr.a, instr.b, instr.c)
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -915,6 +950,12 @@ op_name :: proc(op: Op) -> string {
 		return "make_function"
 	case .Call_Value:
 		return "call_value"
+	case .Call_Splice:
+		return "call_splice"
+	case .Builtin_Call_Splice:
+		return "builtin_call_splice"
+	case .Call_Value_Splice:
+		return "call_value_splice"
 	}
 	return "?"
 }
