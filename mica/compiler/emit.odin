@@ -603,23 +603,13 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 			push_error(emitter, "list binding needs a value")
 			return -1, false
 		}
-		for element, index in list_pattern.elements {
-			binding_pattern, is_binding := element^.(Binding_Pattern)
-			if !is_binding {
-				push_error(emitter, "list pattern elements must be names")
-				return -1, false
-			}
-			index_register := emit_constant(emitter, int_value(i64(index)))
-			column := alloc_register(emitter)
-			vm.builder_emit(
-				emitter.builder,
-				.Index,
-				0,
-				i32(column),
-				i32(value_register),
-				i32(index_register),
-			)
-			declare_local(emitter, binding_pattern.name, column, binding.is_const)
+		if !emit_list_scatter_binding(
+			emitter,
+			value_register,
+			list_pattern,
+			binding.is_const,
+		) {
+			return -1, false
 		}
 		return value_register, true
 	}
@@ -638,6 +628,135 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 	}
 	declare_local(emitter, pattern.name, value_register, binding.is_const)
 	return value_register, true
+}
+
+// Binds a scatter list pattern such as `[a, ?b = default, @rest]`. Required
+// elements index the list; optional elements fall back to their default (or
+// none); a rest element receives the remaining items.
+@(private)
+emit_list_scatter_binding :: proc(
+	emitter: ^Emitter,
+	value_register: int,
+	pattern: List_Pattern,
+	is_const: bool,
+) -> bool {
+	length_option := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Len,
+		0,
+		i32(length_option),
+		i32(value_register),
+		0,
+	)
+	length_register := length_option
+	position := 0
+	for element in pattern.elements {
+		#partial switch node in element^ {
+		case Binding_Pattern:
+			index_register := emit_constant(emitter, int_value(i64(position)))
+			column := alloc_register(emitter)
+			vm.builder_emit(
+				emitter.builder,
+				.Index,
+				0,
+				i32(column),
+				i32(value_register),
+				i32(index_register),
+			)
+			declare_local(emitter, node.name, column, is_const)
+			position += 1
+
+		case Optional_Pattern:
+			destination := alloc_register(emitter)
+			position_register := emit_constant(emitter, int_value(i64(position)))
+			present := alloc_register(emitter)
+			vm.builder_emit(
+				emitter.builder,
+				.Binary,
+				u8(vm.Bin_Op.Gt),
+				i32(present),
+				i32(length_register),
+				i32(position_register),
+			)
+			present_branch := emit_instruction(emitter, .Branch, 0, present, 0, 0)
+			missing_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+			patch_jump(emitter, present_branch, current_offset(emitter))
+
+			index_register := emit_constant(emitter, int_value(i64(position)))
+			item := alloc_register(emitter)
+			vm.builder_emit(
+				emitter.builder,
+				.Index,
+				0,
+				i32(item),
+				i32(value_register),
+				i32(index_register),
+			)
+			vm.builder_emit(
+				emitter.builder,
+				.Move,
+				0,
+				i32(destination),
+				i32(item),
+				0,
+			)
+			end_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+			patch_jump(emitter, missing_jump, current_offset(emitter))
+
+			default_register := 0
+			if node.has_default {
+				default, default_ok := emit_expr(emitter, node.default)
+				if !default_ok {
+					return false
+				}
+				default_register = default
+			} else {
+				default_register = emit_constant(
+					emitter,
+					v.value_empty_relation(),
+				)
+			}
+			vm.builder_emit(
+				emitter.builder,
+				.Move,
+				0,
+				i32(destination),
+				i32(default_register),
+				0,
+			)
+			patch_jump(emitter, end_jump, current_offset(emitter))
+			declare_local(emitter, node.name, destination, is_const)
+			position += 1
+
+		case Rest_Pattern:
+			start_register := emit_constant(emitter, int_value(i64(position)))
+			end_register := emit_constant(emitter, int_value(-1))
+			first := marshal_arguments(
+				emitter,
+				[]int{value_register, start_register, end_register},
+			)
+			destination := alloc_register(emitter)
+			builtin := vm.builder_add_builtin(
+				emitter.builder,
+				v.symbol_intern("__list_slice"),
+			)
+			vm.builder_emit(
+				emitter.builder,
+				.Builtin_Call,
+				3,
+				i32(destination),
+				builtin,
+				i32(first),
+			)
+			declare_local(emitter, node.name, destination, is_const)
+
+		case:
+			push_error(emitter, "unsupported list binding element")
+			return false
+		}
+	}
+	return true
 }
 
 // Binds `some(x)`, `ok(x)`, or `err(x)` patterns from the value's `value`

@@ -1039,3 +1039,32 @@ assert Out(classify([1, 2]))
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
+
+@(test)
+test_run_scatter_bindings :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Out, 1)
+let [a, b] = [1, 2]
+let [first, @rest] = [10, 20, 30]
+let [x, ?y = 9, @tail] = [4]
+let [p, ?q, @remaining] = [4, 5, 6, 7]
+require(a + b == 3)
+require(first + len(rest) == 12)
+require(x + y + len(tail) == 13)
+require(p + q + len(remaining) == 11)
+assert Out(a)
+`
+	path, path_ok := write_temp_source(t, "mica_scatter_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
