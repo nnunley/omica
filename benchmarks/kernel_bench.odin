@@ -16,12 +16,15 @@ Sink :: struct {
 @(private)
 scan_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
 	sink := (^Sink)(user)
-	cell, _ := v.value_as_int(v.tuple_values(row)[0])
-	sink.value = sink.value + u64(cell)
+	sink.value = sink.value + 1
 	return true
 }
 
 // --- Store benchmarks ------------------------------------------------------
+//
+// The corpus matches the Rust relation_index_benches shape: 128 groups by 128
+// items of identity values, with a symbol kind column. Prefix scans select one
+// group and visit 128 rows.
 
 Store_State :: struct {
 	arena:         virtual.Arena,
@@ -29,15 +32,69 @@ Store_State :: struct {
 	alloc:         mem.Allocator,
 	scratch_alloc: mem.Allocator,
 
-	metadata: k.Relation_Metadata,
-	rows_1k:  []v.Tuple,
-	block:    ^k.Relation_Block,
+	primary_metadata: k.Relation_Metadata,
+	index_metadata:   k.Relation_Metadata,
+	rows:             []v.Tuple,
+
+	primary_block: ^k.Relation_Block,
+	index_block:   ^k.Relation_Block,
 
 	unbound: []v.Binding,
 	prefix:  []v.Binding,
 	index:   []v.Binding,
 
 	sink: Sink,
+}
+
+@(private)
+setup_store_state :: proc(state: ^Store_State) {
+	GROUPS :: 128
+	ITEMS_PER_GROUP :: 128
+
+	state.primary_metadata = k.relation_metadata(
+		k.Relation_ID(1),
+		v.symbol_intern("Store"),
+		3,
+	)
+	state.index_metadata = k.relation_metadata(
+		k.Relation_ID(1),
+		v.symbol_intern("Store"),
+		3,
+	)
+	index_positions := make([]u16, 1, state.alloc)
+	index_positions[0] = 0
+	index_specs := make([]k.Index_Spec, 1, state.alloc)
+	index_specs[0] = k.index_spec(index_positions)
+	state.index_metadata.indexes = index_specs
+
+	kind := v.value_symbol(v.symbol_intern("bench_kind"))
+	state.rows = make([]v.Tuple, GROUPS * ITEMS_PER_GROUP, state.alloc)
+	for group in 0 ..< GROUPS {
+		group_id, _ := v.identity_new(u64(group))
+		for item in 0 ..< ITEMS_PER_GROUP {
+			item_id, _ := v.identity_new(u64(item))
+			state.rows[group * ITEMS_PER_GROUP + item] = v.tuple_new(
+				state.alloc,
+				[]v.Value {
+					v.value_identity(group_id),
+					v.value_identity(item_id),
+					kind,
+				},
+			)
+		}
+	}
+
+	state.primary_block = k.relation_block_build(state.alloc, state.primary_metadata, state.rows)
+	state.index_block = k.relation_block_build(state.alloc, state.index_metadata, state.rows)
+
+	state.unbound = make([]v.Binding, 3, state.alloc)
+
+	state.prefix = make([]v.Binding, 3, state.alloc)
+	group_id, _ := v.identity_new(42)
+	state.prefix[0] = v.binding_of(v.value_identity(group_id))
+
+	state.index = make([]v.Binding, 3, state.alloc)
+	state.index[0] = v.binding_of(v.value_identity(group_id))
 }
 
 @(private)
@@ -51,34 +108,7 @@ store_state_init :: proc() -> ^Store_State {
 	}
 	state.alloc = virtual.arena_allocator(&state.arena)
 	state.scratch_alloc = virtual.arena_allocator(&state.scratch)
-
-	state.metadata = k.relation_metadata(k.Relation_ID(1), v.symbol_intern("Store"), 3)
-	positions := make([]u16, 1, state.alloc)
-	positions[0] = 1
-	specs := make([]k.Index_Spec, 1, state.alloc)
-	specs[0] = k.index_spec(positions)
-	state.metadata.indexes = specs
-
-	row_count := 10_000
-	rows := make([]v.Tuple, row_count, state.alloc)
-	for i in 0 ..< row_count {
-		first, _ := v.value_int(i64(i % 100))
-		second, _ := v.value_int(i64((i / 100) % 100))
-		third, _ := v.value_int(i64(i))
-		rows[i] = v.tuple_new(state.alloc, []v.Value{first, second, third})
-	}
-	state.rows_1k = rows[:1000]
-	state.block = k.relation_block_build(state.alloc, state.metadata, rows)
-
-	state.unbound = make([]v.Binding, 3, state.alloc)
-
-	state.prefix = make([]v.Binding, 3, state.alloc)
-	prefix, _ := v.value_int(1)
-	state.prefix[0] = v.binding_of(prefix)
-
-	state.index = make([]v.Binding, 3, state.alloc)
-	indexed, _ := v.value_int(2)
-	state.index[1] = v.binding_of(indexed)
+	setup_store_state(state)
 	return state
 }
 
@@ -86,7 +116,7 @@ store_state_init :: proc() -> ^Store_State {
 bench_scan_full :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Store_State)(user)
 	for _ in 0 ..< chunk {
-		k.relation_block_visit(state.block, state.unbound, scan_visit, &state.sink)
+		k.relation_block_visit(state.primary_block, state.unbound, scan_visit, &state.sink)
 	}
 	state.sink.value = mm.black_box(state.sink.value)
 }
@@ -95,7 +125,7 @@ bench_scan_full :: proc(user: rawptr, chunk: int, _: int) {
 bench_scan_prefix :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Store_State)(user)
 	for _ in 0 ..< chunk {
-		k.relation_block_visit(state.block, state.prefix, scan_visit, &state.sink)
+		k.relation_block_visit(state.primary_block, state.prefix, scan_visit, &state.sink)
 	}
 	state.sink.value = mm.black_box(state.sink.value)
 }
@@ -104,18 +134,18 @@ bench_scan_prefix :: proc(user: rawptr, chunk: int, _: int) {
 bench_scan_index :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Store_State)(user)
 	for _ in 0 ..< chunk {
-		k.relation_block_visit(state.block, state.index, scan_visit, &state.sink)
+		k.relation_block_visit(state.index_block, state.index, scan_visit, &state.sink)
 	}
 	state.sink.value = mm.black_box(state.sink.value)
 }
 
 @(private)
-bench_store_build_1k :: proc(user: rawptr, chunk: int, _: int) {
+bench_store_rebuild :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Store_State)(user)
 	virtual.arena_free_all(&state.scratch)
 	accumulator := u64(0)
 	for _ in 0 ..< chunk {
-		block := k.relation_block_build(state.scratch_alloc, state.metadata, state.rows_1k)
+		block := k.relation_block_build(state.scratch_alloc, state.index_metadata, state.rows)
 		accumulator += u64(uintptr(block))
 	}
 	state.sink.value = mm.black_box(accumulator)
@@ -266,7 +296,7 @@ rule_state_init :: proc() -> ^Rule_State {
 	k.snapshot_release(recursive_snapshot)
 
 	tx := k.kernel_begin(&state.kernel)
-	chain_length := 50
+	chain_length := 48
 	for i in 0 ..< chain_length {
 		first_id, _ := v.identity_new(u64(i + 1))
 		second_id, _ := v.identity_new(u64(i + 2))
@@ -296,6 +326,141 @@ bench_rules_eval :: proc(user: rawptr, chunk: int, _: int) {
 		derived, err := k.rules_evaluate(state.scratch_alloc, state.rules, state.snapshot)
 		if err == .None {
 			accumulator += u64(len(derived.relations))
+		}
+	}
+	state.sink.value = mm.black_box(accumulator)
+}
+
+// --- Visible-items rule benchmark ------------------------------------------
+//
+// Mirrors the Rust visible_items seed_world and rule: 96 rooms, 64 items per
+// room, 24 actors that can see 8 rooms each, and every 17th item hidden from
+// one actor.
+
+@(private)
+bench_identity :: proc(raw: u64) -> v.Identity {
+	identity, _ := v.identity_new(raw)
+	return identity
+}
+
+Visible_State :: struct {
+	arena:         virtual.Arena,
+	scratch:       virtual.Arena,
+	alloc:         mem.Allocator,
+	scratch_alloc: mem.Allocator,
+
+	kernel:   k.Kernel,
+	snapshot: ^k.Snapshot,
+	rules:    []k.Rule_Definition,
+
+	sink: Sink,
+}
+
+@(private)
+visible_state_init :: proc() -> ^Visible_State {
+	ROOMS :: 96
+	ITEMS_PER_ROOM :: 64
+	ACTORS :: 24
+	ROOMS_PER_ACTOR :: 8
+	HIDDEN_EVERY :: 17
+
+	state := new(Visible_State)
+	if err := virtual.arena_init_growing(&state.arena); err != nil {
+		panic("failed to initialize visible benchmark arena")
+	}
+	if err := virtual.arena_init_growing(&state.scratch); err != nil {
+		panic("failed to initialize visible scratch arena")
+	}
+	state.alloc = virtual.arena_allocator(&state.arena)
+	state.scratch_alloc = virtual.arena_allocator(&state.scratch)
+	k.kernel_init(&state.kernel)
+
+	located_in := create_relation(&state.kernel, 10, "LocatedIn", 2)
+	can_see_room := create_relation(&state.kernel, 11, "CanSeeRoom", 2)
+	portable := create_relation(&state.kernel, 12, "Portable", 1)
+	hidden_from := create_relation(&state.kernel, 13, "HiddenFrom", 2)
+	visible := create_relation(&state.kernel, 14, "Visible", 2)
+
+	actor := v.symbol_intern("actor")
+	item := v.symbol_intern("item")
+	room := v.symbol_intern("room")
+
+	rule := k.rule_new(
+		visible,
+		[]k.Term{k.term_var(actor), k.term_var(item)},
+		[]k.Rule_Body_Item {
+			k.body_atom(k.atom_positive(located_in, []k.Term{k.term_var(item), k.term_var(room)})),
+			k.body_atom(
+				k.atom_positive(can_see_room, []k.Term{k.term_var(actor), k.term_var(room)}),
+			),
+			k.body_atom(k.atom_positive(portable, []k.Term{k.term_var(item)})),
+			k.body_atom(
+				k.atom_negated(hidden_from, []k.Term{k.term_var(item), k.term_var(actor)}),
+			),
+		},
+	)
+	snapshot, err := k.kernel_install_rule(&state.kernel, v.Identity(20), rule, "visible")
+	assert(err == .None)
+	k.snapshot_release(snapshot)
+
+	tx := k.kernel_begin(&state.kernel)
+	for room_index in 0 ..< ROOMS {
+		for item_index in 0 ..< ITEMS_PER_ROOM {
+			item_id := bench_identity(u64(room_index * ITEMS_PER_ROOM + item_index))
+			room_id := bench_identity(u64(100_000 + room_index))
+
+			located := v.tuple_new(state.alloc, []v.Value {
+				v.value_identity(item_id),
+				v.value_identity(room_id),
+			})
+			assert(k.transaction_assert(&tx, located_in, located) == .None)
+
+			portable_row := v.tuple_new(state.alloc, []v.Value{v.value_identity(item_id)})
+			assert(k.transaction_assert(&tx, portable, portable_row) == .None)
+
+			if item_index % HIDDEN_EVERY == 0 {
+				hidden_actor := bench_identity(u64(200_000 + room_index % ACTORS))
+				hidden := v.tuple_new(state.alloc, []v.Value {
+					v.value_identity(item_id),
+					v.value_identity(hidden_actor),
+				})
+				assert(k.transaction_assert(&tx, hidden_from, hidden) == .None)
+			}
+		}
+	}
+	for actor_index in 0 ..< ACTORS {
+		for offset in 0 ..< ROOMS_PER_ACTOR {
+			room_index := (actor_index * ROOMS_PER_ACTOR + offset) % ROOMS
+			actor_id := bench_identity(u64(200_000 + actor_index))
+			room_id := bench_identity(u64(100_000 + room_index))
+			sees := v.tuple_new(state.alloc, []v.Value {
+				v.value_identity(actor_id),
+				v.value_identity(room_id),
+			})
+			assert(k.transaction_assert(&tx, can_see_room, sees) == .None)
+		}
+	}
+	committed, commit_err := k.transaction_commit(&tx)
+	assert(commit_err == .None)
+	k.snapshot_release(committed)
+	k.transaction_destroy(&tx)
+
+	state.snapshot = k.kernel_snapshot(&state.kernel)
+	state.rules = state.snapshot.rules
+	return state
+}
+
+@(private)
+bench_visible_items :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Visible_State)(user)
+	accumulator := u64(0)
+	for _ in 0 ..< chunk {
+		virtual.arena_free_all(&state.scratch)
+		derived, err := k.rules_evaluate(state.scratch_alloc, state.rules, state.snapshot)
+		if err == .None {
+			for relation in derived.relations {
+				accumulator += u64(len(k.rules_derived_rows(&derived, relation)))
+			}
 		}
 	}
 	state.sink.value = mm.black_box(accumulator)
@@ -540,10 +705,10 @@ bench_snapshot_fork :: proc(user: rawptr, chunk: int, _: int) {
 register_kernel_benches :: proc(runner: ^mm.Runner) {
 	store_state := store_state_init()
 	store_group := mm.group(runner, "kernel/store")
-	mm.bench(store_group, "scan_full_10k", store_state, bench_scan_full)
-	mm.bench(store_group, "scan_prefix_10k", store_state, bench_scan_prefix)
-	mm.bench(store_group, "scan_index_10k", store_state, bench_scan_index)
-	mm.bench_capped(store_group, "build_1k", store_state, bench_store_build_1k, 64)
+	mm.bench(store_group, "scan_full_16k", store_state, bench_scan_full)
+	mm.bench(store_group, "scan_prefix_16k", store_state, bench_scan_prefix)
+	mm.bench(store_group, "scan_index_16k", store_state, bench_scan_index)
+	mm.bench_capped(store_group, "rebuild_16k", store_state, bench_store_rebuild, 8)
 
 	txn_state := txn_state_init()
 	txn_group := mm.group(runner, "kernel/txn")
@@ -552,8 +717,10 @@ register_kernel_benches :: proc(runner: ^mm.Runner) {
 	mm.bench(txn_group, "snapshot_fork_release", txn_state, bench_snapshot_fork)
 
 	rule_state := rule_state_init()
+	visible_state := visible_state_init()
 	rules_group := mm.group(runner, "kernel/rules")
-	mm.bench(rules_group, "transitive_chain_50", rule_state, bench_rules_eval)
+	mm.bench(rules_group, "transitive_chain_48", rule_state, bench_rules_eval)
+	mm.bench(rules_group, "visible_items_rule", visible_state, bench_visible_items)
 
 	closure_state := closure_state_init()
 	closure_group := mm.group(runner, "kernel/closure")
