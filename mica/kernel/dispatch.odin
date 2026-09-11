@@ -51,6 +51,38 @@ frob_only_marker :: proc() -> v.Value {
 	return v.value_symbol(v.symbol_intern("dispatch/frob_only"))
 }
 
+PARAM_REQUIRED_MODE :: 0
+PARAM_OPTIONAL_MODE :: 1
+PARAM_REST_MODE :: 2
+
+@(private)
+rest_marker :: proc() -> v.Value {
+	return v.value_symbol(v.symbol_intern("dispatch/rest"))
+}
+
+// The parameter mode is packed into the high byte of the position cell so the
+// method relation keeps its four-column shape.
+@(private)
+param_mode :: proc(param: v.Tuple) -> int {
+	values := v.tuple_values(param)
+	position, is_int := v.value_as_int(values[3])
+	if !is_int || position < 0 {
+		return PARAM_REQUIRED_MODE
+	}
+	return int(position >> 8)
+}
+
+// The restriction meaning "a rest parameter": it absorbs trailing arguments
+// and never requires a role of its own.
+rest_dispatch_restriction :: proc() -> v.Value {
+	return rest_marker()
+}
+
+@(private)
+is_rest_restriction :: proc(restriction: v.Value) -> bool {
+	return v.value_eq(restriction, rest_marker())
+}
+
 // Creates the metadata for the dispatch relations, in id order.
 dispatch_relation_metadata :: proc(allocator := context.allocator) -> []Relation_Metadata {
 	metadata := make([]Relation_Metadata, 4, allocator)
@@ -263,10 +295,29 @@ positional_params_match :: proc(
 	args: []v.Value,
 	params: []v.Tuple,
 ) -> bool {
-	if len(args) > len(params) {
+	fixed := len(params)
+	has_rest := false
+	if len(params) > 0 && param_mode(params[len(params) - 1]) == PARAM_REST_MODE {
+		has_rest = true
+		fixed -= 1
+	}
+	required := fixed
+	for index in 0 ..< fixed {
+		if param_mode(params[index]) == PARAM_OPTIONAL_MODE {
+			required = index
+			break
+		}
+	}
+	if len(args) < required {
+		return false
+	}
+	if !has_rest && len(args) > fixed {
 		return false
 	}
 	for argument, index in args {
+		if index >= fixed {
+			break
+		}
 		restriction := v.tuple_values(params[index])[2]
 		if !matches_restriction(source, delegates, argument, restriction) {
 			return false
@@ -370,6 +421,9 @@ params_match :: proc(
 	params: []v.Tuple,
 ) -> bool {
 	for param in params {
+		if param_mode(param) == PARAM_REST_MODE {
+			continue
+		}
 		values := v.tuple_values(param)
 		value, found := role_value(roles, values[1])
 		if !found {
@@ -505,16 +559,19 @@ dispatch_method_args :: proc(
 	slice.sort_by(ordered, proc(a, b: v.Tuple) -> bool {
 		return param_position(a) < param_position(b)
 	})
-	args := make([]v.Value, len(ordered), allocator)
-	for param, index in ordered {
+	arguments := make([dynamic]v.Value, 0, len(ordered), allocator)
+	for param in ordered {
+		if param_mode(param) == PARAM_REST_MODE {
+			continue
+		}
 		role := v.tuple_values(param)[1]
 		value, found := role_value(roles, role)
 		if !found {
 			return nil, false
 		}
-		args[index] = value
+		append(&arguments, value)
 	}
-	return args, true
+	return arguments[:], true
 }
 
 @(private)
@@ -527,5 +584,5 @@ param_position :: proc(param: v.Tuple) -> i64 {
 	if !ok {
 		return i64(0x7fff_ffff_ffff_ffff)
 	}
-	return position
+	return position & 0xff
 }

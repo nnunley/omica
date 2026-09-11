@@ -1304,3 +1304,138 @@ assert Taken(#alice, #coin)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Taken", 2)
 }
+
+@(test)
+test_run_return_in_finally :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Ran, 1)
+verb override()
+  try
+    return 1
+  finally
+    return 2
+  end
+end
+verb override_error()
+  try
+    raise E_RANGE, "bad"
+  finally
+    return 3
+  end
+end
+verb nested()
+  try
+    try
+      return 4
+    finally
+      assert Ran(1)
+      return 5
+    end
+  finally
+    assert Ran(2)
+  end
+end
+require(override() == 2)
+require(override_error() == 3)
+require(nested() == 5)
+`
+	path, path_ok := write_temp_source(t, "mica_finally_return2_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Ran", 2)
+}
+
+@(test)
+test_run_constant_defaults :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Out, 1)
+verb conf(a, ?tags = [], ?opts = {:mode -> :fast}, ?pair = some(1), ?flag = -2, ?raw = b"AAEC", ?missing = none)
+  return [a, tags, opts, pair, flag, raw, missing]
+end
+require(conf(1) == [1, [], {:mode -> :fast}, some(1), -2, b"AAEC", none])
+require(conf(1, [2], {:mode -> :slow}, some(9), 5, b"", none) == [1, [2], {:mode -> :slow}, some(9), 5, b"", none])
+fn f(?x = [1, 2], ?list = {:a -> [3]}) => [x, list]
+require(f() == [[1, 2], {:a -> [3]}])
+assert Out(conf(1))
+`
+	path, path_ok := write_temp_source(t, "mica_const_defaults_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
+
+@(test)
+test_run_cross_task_closure :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Out, 2)
+verb run_it(f, tag)
+  let value = f()
+  assert Out(tag, value)
+end
+let base = 10
+let closure = fn(?step = 1) => base + step
+spawn :run_it(f: closure, tag: 1)
+suspend()
+`
+	path, path_ok := write_temp_source(t, "mica_cross_task_closure_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
+
+@(test)
+test_run_dispatch_optional_rest_params :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_identity(:bob)
+make_relation(:Out, 1)
+assert Delegates(#bob, #alice, 0)
+verb act(receiver @ #alice, ?extra = 7, @rest)
+  return [receiver, extra, rest]
+end
+require(#bob:act() == [#bob, 7, []])
+require(#bob:act(9) == [#bob, 9, []])
+require(#bob:act(9, 1, 2) == [#bob, 9, [1, 2]])
+assert Out(#bob:act())
+`
+	path, path_ok := write_temp_source(t, "mica_dispatch_modes_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}

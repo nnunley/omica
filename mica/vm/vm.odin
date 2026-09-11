@@ -7,6 +7,7 @@
 package vm
 
 import "core:mem"
+import "core:sync"
 import k "../kernel"
 import v "../var"
 
@@ -59,13 +60,6 @@ Frame :: struct {
 	caller_dst:    i32,
 }
 
-// An interned callable: a program function plus the values captured when its
-// fn literal was evaluated.
-Callable_Info :: struct {
-	function: i32,
-	captures: []v.Value,
-}
-
 // A compiled exception handler: errors raised at or below `frame` jump to the
 // absolute code offset `target` with the error delivered to `error_register`
 // (-1 when the handler takes no value). A Finally handler also intercepts
@@ -114,8 +108,6 @@ VM :: struct {
 	pending_resume: i32,
 	// Active exception handlers, innermost last.
 	handlers: [dynamic]Handler,
-	// Interned callable values, addressed by Function_ID payload.
-	callables: [dynamic]Callable_Info,
 	// Returns diverted through a finally body, innermost last.
 	pending_returns: [dynamic]Pending_Return,
 	// Free slot for host data, for example a builtin environment.
@@ -141,7 +133,6 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.pending_resume = -1
 	state.entry_function = -1
 	state.handlers = make([dynamic]Handler)
-	state.callables = make([dynamic]Callable_Info)
 	state.pending_returns = make([dynamic]Pending_Return)
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
@@ -149,12 +140,6 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 }
 
 vm_destroy :: proc(state: ^VM) {
-	for callable in state.callables {
-		if callable.captures != nil {
-			delete(callable.captures)
-		}
-	}
-	delete(state.callables)
 	delete(state.pending_returns)
 	delete(state.handlers)
 	delete(state.registers)
@@ -555,17 +540,21 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				captures[index] = state.registers[base + int(instr.c) + index]
 			}
 			captures[capture_count - 1] = v.Value(0)
-			callable_id := i32(len(state.callables))
-			append(&state.callables, Callable_Info {
+			sync.mutex_lock(&program.callables_mutex)
+			callable_id := i32(len(program.callables))
+			append(&program.callables, Callable_Info {
 				function = instr.b,
 				captures = captures,
 			})
 			value, value_ok := v.value_function_raw(u64(callable_id))
+			if value_ok {
+				program.callables[int(callable_id)].captures[capture_count - 1] = value
+			}
+			sync.mutex_unlock(&program.callables_mutex)
 			if !value_ok {
 				vm_fail(state, "E_TYPE", "callable index is out of range")
 				break
 			}
-			state.callables[int(callable_id)].captures[capture_count - 1] = value
 			state.registers[base + int(instr.a)] = value
 
 		case .Make_Function:
@@ -593,12 +582,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				vm_fail(state, "E_TYPE", "call target is not a function")
 				break
 			}
-			callable_index := int(v.function_id_raw(function_id))
-			if callable_index < 0 || callable_index >= len(state.callables) {
+			callable, callable_ok := vm_resolve_callable(state, function_id)
+			if !callable_ok {
 				vm_fail(state, "E_DISPATCH", "callable index is invalid")
 				break
 			}
-			callable := state.callables[callable_index]
 			function_index := int(callable.function)
 			if function_index < 0 || function_index >= len(program.functions) {
 				vm_fail(state, "E_DISPATCH", "function index is invalid")
@@ -692,12 +680,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				vm_fail(state, "E_TYPE", "call target is not a function")
 				break
 			}
-			callable_index := int(v.function_id_raw(function_id))
-			if callable_index < 0 || callable_index >= len(state.callables) {
+			callable, callable_ok := vm_resolve_callable(state, function_id)
+			if !callable_ok {
 				vm_fail(state, "E_DISPATCH", "callable index is invalid")
 				break
 			}
-			callable := state.callables[callable_index]
 			function_index := int(callable.function)
 			if function_index < 0 || function_index >= len(program.functions) {
 				vm_fail(state, "E_DISPATCH", "function index is invalid")
@@ -1663,11 +1650,28 @@ vm_list_args :: proc(state: ^VM, base: int, register: i32) -> ([]v.Value, bool) 
 	return args, true
 }
 
+// Resolves a function value to its callable, copying the info out under the
+// program callable lock.
+@(private)
+vm_resolve_callable :: proc(state: ^VM, id: v.Function_ID) -> (Callable_Info, bool) {
+	program := state.program
+	index := int(v.function_id_raw(id))
+	sync.mutex_lock(&program.callables_mutex)
+	defer sync.mutex_unlock(&program.callables_mutex)
+	if index < 0 || index >= len(program.callables) {
+		return {}, false
+	}
+	return program.callables[index], true
+}
+
 // Interns a callable, reusing an existing entry with the same function and
 // captured values. Takes ownership of `captures`.
 @(private)
 vm_intern_callable :: proc(state: ^VM, function: i32, captures: []v.Value) -> i32 {
-	for callable, index in state.callables {
+	program := state.program
+	sync.mutex_lock(&program.callables_mutex)
+	defer sync.mutex_unlock(&program.callables_mutex)
+	for callable, index in program.callables {
 		if callable.function != function || len(callable.captures) != len(captures) {
 			continue
 		}
@@ -1683,8 +1687,8 @@ vm_intern_callable :: proc(state: ^VM, function: i32, captures: []v.Value) -> i3
 			return i32(index)
 		}
 	}
-	index := len(state.callables)
-	append(&state.callables, Callable_Info {
+	index := len(program.callables)
+	append(&program.callables, Callable_Info {
 		function = function,
 		captures = captures,
 	})

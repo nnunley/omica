@@ -1685,22 +1685,12 @@ emit_role_dispatch :: proc(
 // Lowers a base64url byte literal such as `b"3q2-7w=="`.
 @(private)
 emit_bytes_literal :: proc(emitter: ^Emitter, bytes: Bytes_Literal) -> (int, bool) {
-	text := bytes.text
-	if len(text) < 3 || text[0] != 'b' || text[1] != '"' || text[len(text) - 1] != '"' {
-		push_error(emitter, "malformed byte literal")
-		return -1, false
-	}
-	decoded, decode_err := base64.decode(
-		text[2 : len(text) - 1],
-		base64.DEC_URL_TABLE,
-		nil,
-		emitter.allocator,
-	)
-	if decode_err != nil {
+	value, value_ok := bytes_literal_value(emitter, bytes.text)
+	if !value_ok {
 		push_error(emitter, "byte literal is not valid base64url")
 		return -1, false
 	}
-	return emit_constant(emitter, v.value_bytes(emitter.allocator, decoded)), true
+	return emit_constant(emitter, value), true
 }
 
 // Records parameter modes, required arity, and literal defaults on a function.
@@ -1773,6 +1763,9 @@ param_default_value :: proc(emitter: ^Emitter, expr: ^Expr) -> (v.Value, bool) {
 	case String_Literal:
 		return v.value_string(emitter.allocator, unquote_string(node.text, emitter.allocator)), true
 
+	case Bytes_Literal:
+		return bytes_literal_value(emitter, node.text)
+
 	case Bool_Literal:
 		return v.value_bool(node.value), true
 
@@ -1795,10 +1788,126 @@ param_default_value :: proc(emitter: ^Emitter, expr: ^Expr) -> (v.Value, bool) {
 
 	case Name:
 		if len(node.parts) == 1 && node.parts[0] == "none" {
-			return v.value_empty_relation(), true
+			return none_value(emitter.allocator), true
+		}
+
+	case Unary:
+		if node.op == .Neg {
+			operand, operand_ok := param_default_value(emitter, node.operand)
+			if !operand_ok {
+				return v.Value(0), false
+			}
+			if number, is_int := v.value_as_int(operand); is_int {
+				return v.value_int(-number)
+			}
+			if number, is_float := v.value_as_float(operand); is_float {
+				return v.value_float(-number)
+			}
+		}
+
+	case List_Literal:
+		values := make([]v.Value, len(node.elements), emitter.allocator)
+		defer delete(values, emitter.allocator)
+		for element, index in node.elements {
+			if _, is_splice := element^.(Splice); is_splice {
+				return v.Value(0), false
+			}
+			value, value_ok := param_default_value(emitter, element)
+			if !value_ok {
+				return v.Value(0), false
+			}
+			values[index] = value
+		}
+		return v.value_list(emitter.allocator, values), true
+
+	case Map_Literal:
+		entries := make([]v.Map_Entry, len(node.entries), emitter.allocator)
+		defer delete(entries, emitter.allocator)
+		for entry, index in node.entries {
+			key, key_ok := param_default_value(emitter, entry.key)
+			if !key_ok {
+				return v.Value(0), false
+			}
+			value, value_ok := param_default_value(emitter, entry.value)
+			if !value_ok {
+				return v.Value(0), false
+			}
+			entries[index] = v.Map_Entry{key = key, value = value}
+		}
+		return v.value_map(emitter.allocator, entries), true
+
+	case Call:
+		callee, is_name := node.callee^.(Name)
+		if !is_name || len(node.args) != 1 || node.args[0].has_role {
+			return v.Value(0), false
+		}
+		inner, inner_ok := param_default_value(emitter, node.args[0].expr)
+		if !inner_ok {
+			return v.Value(0), false
+		}
+		text := join_name(callee, emitter.allocator)
+		switch text {
+		case "some":
+			row := v.tuple_new(emitter.allocator, []v.Value{inner})
+			result, relation_err := v.value_relation(
+				emitter.allocator,
+				[]v.Symbol{v.symbol_intern("value")},
+				[]v.Tuple{row},
+			)
+			if relation_err != .None {
+				return v.Value(0), false
+			}
+			return result, true
+		case "ok", "err":
+			tag := "ok" if text == "ok" else "error"
+			row := v.tuple_new(
+				emitter.allocator,
+				[]v.Value{v.value_symbol(v.symbol_intern(tag)), inner},
+			)
+			result, relation_err := v.value_relation(
+				emitter.allocator,
+				[]v.Symbol{v.symbol_intern("case"), v.symbol_intern("value")},
+				[]v.Tuple{row},
+			)
+			if relation_err != .None {
+				return v.Value(0), false
+			}
+			return result, true
 		}
 	}
 	return v.Value(0), false
+}
+
+// The `none` literal: an empty relation headed by `value`.
+@(private)
+none_value :: proc(allocator: mem.Allocator) -> v.Value {
+	result, relation_err := v.value_relation(
+		allocator,
+		[]v.Symbol{v.symbol_intern("value")},
+		nil,
+	)
+	if relation_err != .None {
+		return v.Value(0)
+	}
+	return result
+}
+
+// Decodes a base64url byte literal.
+@(private)
+bytes_literal_value :: proc(emitter: ^Emitter, text: string) -> (v.Value, bool) {
+	if len(text) < 3 || text[0] != 'b' || text[1] != '"' || text[len(text) - 1] != '"' {
+		return v.Value(0), false
+	}
+	decoded, decode_err := base64.decode(
+		text[2 : len(text) - 1],
+		base64.DEC_URL_TABLE,
+		nil,
+		emitter.allocator,
+	)
+	if decode_err != nil {
+		return v.Value(0), false
+	}
+	return v.value_bytes(emitter.allocator, decoded), true
 }
 
 // Binds a self-recursive fn literal: the last capture slot holds the function

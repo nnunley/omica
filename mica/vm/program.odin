@@ -11,6 +11,7 @@ package vm
 import "core:fmt"
 import "core:mem"
 import "core:strings"
+import "core:sync"
 import v "../var"
 
 Op :: enum u8 {
@@ -217,7 +218,17 @@ Function :: struct {
 	defaults:       []i32,
 }
 
+// An interned callable: a program function plus the values captured when its
+// fn literal was evaluated. Callables live on the program so function values
+// remain valid across tasks that share the program.
+Callable_Info :: struct {
+	function: i32,
+	captures: []v.Value,
+}
+
 Program :: struct {
+	callables_mutex: sync.Mutex,
+	callables:       [dynamic]Callable_Info,
 	code:      []Instruction,
 	constants: []v.Value,
 	functions: []Function,
@@ -439,6 +450,7 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 	}
 	program.builtins = make([]v.Symbol, len(builder.builtins), alloc)
 	copy(program.builtins, builder.builtins[:])
+	program.callables = make([dynamic]Callable_Info, alloc)
 	program.entry = builder.entry
 	program.dispatch_method_selector_relation = builder.dispatch_method_selector_relation
 	program.dispatch_param_relation = builder.dispatch_param_relation
@@ -448,6 +460,12 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 }
 
 program_destroy :: proc(program: ^Program, alloc: mem.Allocator) {
+	for callable in program.callables {
+		if callable.captures != nil {
+			free(raw_data(callable.captures), alloc)
+		}
+	}
+	delete(program.callables)
 	free(raw_data(program.code), alloc)
 	free(raw_data(program.constants), alloc)
 	for function in program.functions {
@@ -542,10 +560,11 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if instr.b < 0 || int(instr.b) >= len(program.functions) {
 					return .Bad_Function
 				}
-				callee := program.functions[instr.b]
+				// flags hold the supplied argument count; optional parameters
+				// may be omitted.
+				argument_count := int(instr.flags)
 				if instr.c < 0 ||
-				   int(instr.c) + callee.param_count > register_count ||
-				   callee.param_count > register_count {
+				   int(instr.c) + argument_count > register_count {
 					return .Bad_Arguments
 				}
 				// Direct recursion is allowed; depth is a runtime concern.

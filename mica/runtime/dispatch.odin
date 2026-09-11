@@ -98,6 +98,14 @@ install_methods :: proc(
 
 			for param, position in verb.params {
 				restriction := method_restriction(env, param)
+				mode := k.PARAM_REQUIRED_MODE
+				switch param.mode {
+				case .Optional:
+					mode = k.PARAM_OPTIONAL_MODE
+				case .Rest:
+					mode = k.PARAM_REST_MODE
+				case .Required:
+				}
 				if err := k.transaction_assert(
 					&tx,
 					k.DISPATCH_PARAM_ID,
@@ -105,7 +113,7 @@ install_methods :: proc(
 						method_value,
 						v.value_symbol(v.symbol_intern(param.name)),
 						restriction,
-						value_int_must(i64(position)),
+						value_int_must(i64(position) + i64(mode) * 256),
 					}),
 				); err != k.Kernel_Error.None {
 					k.transaction_destroy(&tx)
@@ -143,6 +151,9 @@ method_install_error :: proc(env: ^Builtin_Env, name: string, err: k.Kernel_Erro
 // `#proto<_>` additionally requires the value to be a frob.
 @(private)
 method_restriction :: proc(env: ^Builtin_Env, param: c.Param) -> v.Value {
+	if param.mode == .Rest {
+		return k.rest_dispatch_restriction()
+	}
 	if !param.has_restriction || param.restriction == nil {
 		return k.unrestricted_dispatch_restriction()
 	}
