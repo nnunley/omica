@@ -1,5 +1,7 @@
 package var
 
+import "core:mem/virtual"
+import "core:strings"
 import "core:testing"
 
 @(private)
@@ -733,4 +735,175 @@ test_primitive_prototypes :: proc(t: ^testing.T) {
 		primitive_prototype_for_value(value_empty_relation()),
 		RELATION_PROTOTYPE,
 	)
+}
+
+@(test)
+test_symbol_edge_names :: proc(t: ^testing.T) {
+	empty := symbol_intern("")
+	empty_name, empty_ok := symbol_name(empty)
+	testing.expect(t, empty_ok)
+	testing.expect_value(t, empty_name, "")
+	testing.expect_value(t, symbol_intern(""), empty)
+
+	unicode_symbol := symbol_intern("λμδ")
+	unicode_name, unicode_ok := symbol_name(unicode_symbol)
+	testing.expect(t, unicode_ok)
+	testing.expect_value(t, unicode_name, "λμδ")
+
+	unknown := symbol_from_id(0xffff_fff0)
+	_, unknown_ok := symbol_name(unknown)
+	testing.expect(t, !unknown_ok)
+
+	round_trip := symbol_from_id(symbol_id(symbol_intern("round-trip-symbol")))
+	testing.expect_value(t, round_trip, symbol_intern("round-trip-symbol"))
+}
+
+@(test)
+test_deep_copy_error_and_frob :: proc(t: ^testing.T) {
+	source_arena := test_arena()
+	defer test_arena_destroy(source_arena)
+	dest_arena := test_arena()
+	defer test_arena_destroy(dest_arena)
+	source_alloc := virtual.arena_allocator(source_arena)
+	dest_alloc := virtual.arena_allocator(dest_arena)
+
+	message := strings.clone("why", source_alloc)
+	error_source := value_error(
+		source_alloc,
+		symbol_intern("copy-error"),
+		message,
+		true,
+		value_string(source_alloc, "payload"),
+		true,
+	)
+	error_copy := value_deep_copy(dest_alloc, error_source)
+	testing.expect(t, value_eq(error_source, error_copy))
+	testing.expect(t, value_payload(error_source) != value_payload(error_copy))
+
+	source_header, _ := value_as_error(error_source)
+	copy_header, _ := value_as_error(error_copy)
+	testing.expect(t, value_payload(source_header.value) != value_payload(copy_header.value))
+	copied_text, _ := value_as_string(copy_header.value)
+	testing.expect_value(t, copied_text, "payload")
+	testing.expect(
+		t,
+		raw_data(transmute([]u8)source_header.message) !=
+		raw_data(transmute([]u8)copy_header.message),
+	)
+
+	frob_source := value_frob(
+		source_alloc,
+		Identity(3),
+		value_list(source_alloc, []Value{value_string(source_alloc, "inner")}),
+	)
+	frob_copy := value_deep_copy(dest_alloc, frob_source)
+	testing.expect(t, value_eq(frob_source, frob_copy))
+
+	source_frob, _ := value_as_frob(frob_source)
+	copy_frob, _ := value_as_frob(frob_copy)
+	testing.expect(t, value_payload(source_frob.value) != value_payload(copy_frob.value))
+	source_list, _ := value_as_list(source_frob.value)
+	copy_list, _ := value_as_list(copy_frob.value)
+	testing.expect(t, value_payload(source_list[0]) != value_payload(copy_list[0]))
+}
+
+@(test)
+test_map_and_relation_equality :: proc(t: ^testing.T) {
+	alloc := context.temp_allocator
+
+	map_a := value_map(alloc, []Map_Entry {
+		{key = must_int(1), value = value_string(alloc, "a")},
+		{key = must_int(2), value = value_string(alloc, "b")},
+	})
+	map_b := value_map(alloc, []Map_Entry {
+		{key = must_int(2), value = value_string(alloc, "b")},
+		{key = must_int(1), value = value_string(alloc, "a")},
+	})
+	testing.expect(t, value_eq(map_a, map_b))
+
+	map_shorter := value_map(alloc, []Map_Entry {
+		{key = must_int(1), value = value_string(alloc, "a")},
+	})
+	testing.expect(t, !value_eq(map_a, map_shorter))
+
+	map_different_value := value_map(alloc, []Map_Entry {
+		{key = must_int(1), value = value_string(alloc, "a")},
+		{key = must_int(2), value = value_string(alloc, "z")},
+	})
+	testing.expect(t, !value_eq(map_a, map_different_value))
+
+	column := symbol_intern("equality-column")
+	row_one := tuple_new(alloc, []Value{must_int(1)})
+	row_two := tuple_new(alloc, []Value{must_int(2)})
+	relation_a, _ := value_relation(alloc, []Symbol{column}, []Tuple{row_one, row_two})
+	relation_b, _ := value_relation(alloc, []Symbol{column}, []Tuple{row_two, row_one})
+	testing.expect(t, value_eq(relation_a, relation_b))
+
+	relation_shorter, _ := value_relation(alloc, []Symbol{column}, []Tuple{row_one})
+	testing.expect(t, !value_eq(relation_a, relation_shorter))
+
+	other_column := symbol_intern("equality-column-other")
+	relation_other_heading, _ := value_relation(
+		alloc,
+		[]Symbol{other_column},
+		[]Tuple{row_one, row_two},
+	)
+	testing.expect(t, !value_eq(relation_a, relation_other_heading))
+}
+
+@(test)
+test_debug_nested_forms :: proc(t: ^testing.T) {
+	alloc := context.temp_allocator
+
+	list := value_list(alloc, []Value{value_string(alloc, "a"), must_int(1)})
+	testing.expect_value(t, value_to_debug_string(list, alloc), "{\"a\", 1}")
+
+	map_value := value_map(alloc, []Map_Entry {
+		{key = must_int(1), value = value_string(alloc, "b")},
+	})
+	testing.expect_value(t, value_to_debug_string(map_value, alloc), "[1: \"b\"]")
+}
+
+@(test)
+test_display_float_format :: proc(t: ^testing.T) {
+	alloc := context.temp_allocator
+	testing.expect_value(t, value_to_string(must_float(1.0), alloc), "1")
+	testing.expect_value(t, value_to_string(must_float(1.5), alloc), "1.5")
+	testing.expect_value(t, value_to_string(must_float(-2.25), alloc), "-2.25")
+	testing.expect_value(t, value_to_string(must_float(0.1), alloc), "0.1")
+}
+
+@(test)
+test_language_numeric_non_numeric_fallback :: proc(t: ^testing.T) {
+	symbol_a := sym("fallback-a")
+	symbol_b := sym("fallback-b")
+	testing.expect(t, language_numeric_cmp(symbol_a, symbol_b) == .Less)
+	testing.expect(t, language_numeric_cmp(symbol_b, symbol_a) == .Greater)
+	testing.expect(t, language_numeric_cmp(symbol_a, symbol_a) == .Equal)
+	testing.expect(t, language_numeric_eq(symbol_a, symbol_a))
+	testing.expect(t, !language_numeric_eq(symbol_a, symbol_b))
+
+	text := value_string(context.temp_allocator, "text")
+	testing.expect(t, language_numeric_cmp(must_int(1), text) != .Equal)
+}
+
+@(test)
+test_binding_helpers :: proc(t: ^testing.T) {
+	bound := binding_of(must_int(1))
+	bindings := []Binding{bound, bound, Binding{}}
+	testing.expect_value(t, binding_leading_bound_count(bindings), 2)
+
+	index, found := binding_first_unbound(bindings)
+	testing.expect(t, found)
+	testing.expect_value(t, index, 2)
+
+	all_bound := []Binding{bound, bound}
+	testing.expect_value(t, binding_leading_bound_count(all_bound), 2)
+	_, unfound := binding_first_unbound(all_bound)
+	testing.expect(t, !unfound)
+
+	boolean := value_bool(false)
+	as_bool, as_bool_ok := value_as_bool(boolean)
+	testing.expect(t, as_bool_ok)
+	testing.expect(t, !as_bool)
 }

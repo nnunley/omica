@@ -1606,3 +1606,353 @@ test_rule_evaluation_error_path :: proc(t: ^testing.T) {
 	_, unstratified_err := rules_evaluate(alloc, []Rule_Definition{unstratified}, snapshot)
 	testing.expect_value(t, unstratified_err, Kernel_Error.Unstratified_Negation)
 }
+
+@(private)
+Visit_Collect :: struct {
+	rows: [dynamic]v.Tuple,
+}
+
+@(private)
+visit_collect :: proc(user: rawptr, row: v.Tuple) -> bool {
+	append(&(^Visit_Collect)(user).rows, row)
+	return true
+}
+
+@(private)
+Visit_Stop :: struct {
+	seen: int,
+}
+
+@(private)
+visit_stop :: proc(user: rawptr, row: v.Tuple) -> bool {
+	(^Visit_Stop)(user).seen += 1
+	return false
+}
+
+@(test)
+test_frob_prototype_fallback :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	method_selector := create_relation(&kernel, 40, "MethodSelector", 2)
+	param := create_relation(&kernel, 41, "Param", 4)
+	delegates := create_relation(&kernel, 42, "Delegates", 3)
+	relations := Dispatch_Relations {
+		method_selector = method_selector,
+		param           = param,
+		delegates       = delegates,
+	}
+
+	method := must_int(100)
+	tx := kernel_begin(&kernel)
+	restriction := v.value_identity(v.FROB_PROTOTYPE)
+	transaction_assert(&tx, method_selector, tuple_of(method, sym("take")))
+	transaction_assert(&tx, param, tuple_of(method, sym("item"), restriction, must_int(0)))
+
+	source := Relation_Source{transaction = &tx, use_stored_derived = true}
+	delegate, _ := v.identity_new(5)
+
+	// A frob value matches through the frob prototype.
+	frob_value := v.value_frob(context.temp_allocator, delegate, must_int(1))
+	matches := applicable_methods(
+		&source,
+		relations,
+		sym("take"),
+		[]Role_Pair{{role = sym("item"), value = frob_value}},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, len(matches), 1)
+
+	// A plain identity value does not match the frob prototype.
+	plain := applicable_methods(
+		&source,
+		relations,
+		sym("take"),
+		[]Role_Pair{{role = sym("item"), value = v.value_identity(delegate)}},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, len(plain), 0)
+	commit_transaction(t, &tx)
+}
+
+@(test)
+test_kernel_visit_and_contains :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "HeldBy", 2)
+	actor := must_identity(1)
+	other := must_identity(3)
+	lamp := must_identity(2)
+	coin := must_identity(4)
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, relation, tuple_of(actor, lamp))
+	transaction_assert(&tx, relation, tuple_of(actor, coin))
+	transaction_assert(&tx, relation, tuple_of(other, lamp))
+	commit_transaction(t, &tx)
+
+	testing.expect(t, kernel_contains(&kernel, relation, tuple_of(actor, lamp)))
+	testing.expect(t, !kernel_contains(&kernel, relation, tuple_of(lamp, actor)))
+
+	unbound := []v.Binding{{}, {}}
+	collector := Visit_Collect{}
+	stopped := kernel_visit(&kernel, relation, unbound, visit_collect, &collector)
+	testing.expect(t, !stopped)
+	testing.expect_value(t, len(collector.rows), 3)
+	delete(collector.rows)
+
+	filtered := []v.Binding{v.binding_of(actor), {}}
+	filtered_collector := Visit_Collect{}
+	kernel_visit(&kernel, relation, filtered, visit_collect, &filtered_collector)
+	testing.expect_value(t, len(filtered_collector.rows), 2)
+	delete(filtered_collector.rows)
+
+	state := Visit_Stop{}
+	stop_result := kernel_visit(&kernel, relation, unbound, visit_stop, &state)
+	testing.expect(t, stop_result)
+	testing.expect_value(t, state.seen, 1)
+}
+
+@(test)
+test_dispatch_role_duplicates_use_first_role :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	method_selector := create_relation(&kernel, 40, "MethodSelector", 2)
+	param := create_relation(&kernel, 41, "Param", 4)
+	delegates := create_relation(&kernel, 42, "Delegates", 3)
+	relations := Dispatch_Relations {
+		method_selector = method_selector,
+		param           = param,
+		delegates       = delegates,
+	}
+
+	method := must_int(100)
+	expected := must_identity(1)
+	other := must_identity(2)
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, method_selector, tuple_of(method, sym("take")))
+	transaction_assert(&tx, param, tuple_of(method, sym("item"), expected, must_int(0)))
+
+	source := Relation_Source{transaction = &tx, use_stored_derived = true}
+
+	// The first role entry wins when the role repeats.
+	first_match := applicable_methods(
+		&source,
+		relations,
+		sym("take"),
+		[]Role_Pair {
+			{role = sym("item"), value = expected},
+			{role = sym("item"), value = other},
+		},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, len(first_match), 1)
+
+	second_match := applicable_methods(
+		&source,
+		relations,
+		sym("take"),
+		[]Role_Pair {
+			{role = sym("item"), value = other},
+			{role = sym("item"), value = expected},
+		},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, len(second_match), 0)
+	commit_transaction(t, &tx)
+}
+
+@(test)
+test_metadata_helpers :: proc(t: ^testing.T) {
+	positions := []u16{0, 1}
+	key_positions := []u16{0}
+	names := []v.Symbol{v.symbol_intern("meta-first"), v.symbol_intern("meta-second")}
+
+	metadata := relation_metadata(Relation_ID(1), v.symbol_intern("MetaHelpers"), 2)
+	metadata.indexes = []Index_Spec{index_spec(positions)}
+	metadata.conflict = conflict_functional(key_positions)
+	metadata.argument_names = names
+
+	cloned := metadata_clone(context.temp_allocator, metadata)
+	testing.expect_value(t, cloned.id, metadata.id)
+	testing.expect_value(t, cloned.arity, metadata.arity)
+	testing.expect_value(t, len(cloned.indexes), 1)
+	testing.expect_value(t, cloned.indexes[0].positions[0], u16(0))
+	testing.expect_value(t, cloned.conflict.kind, Conflict_Kind.Functional)
+	testing.expect_value(t, cloned.conflict.key_positions[0], u16(0))
+
+	// Mutating the source does not change the clone.
+	positions[0] = 1
+	key_positions[0] = 1
+	testing.expect_value(t, cloned.indexes[0].positions[0], u16(0))
+	testing.expect_value(t, cloned.conflict.key_positions[0], u16(0))
+
+	testing.expect(t, index_is_natural_full_tuple(index_spec([]u16{0, 1}), 2))
+	testing.expect(t, !index_is_natural_full_tuple(index_spec([]u16{1, 0}), 2))
+	testing.expect(t, !index_is_natural_full_tuple(index_spec([]u16{0}), 2))
+
+	bindings := []v.Binding {
+		v.binding_of(must_int(1)),
+		v.Binding{},
+		v.binding_of(must_int(2)),
+	}
+	testing.expect_value(t, index_leading_bound_count(index_spec([]u16{0, 2, 1}), bindings), 2)
+	testing.expect_value(t, index_leading_bound_count(index_spec([]u16{0, 1}), bindings), 1)
+	testing.expect_value(t, index_leading_bound_count(index_spec([]u16{1, 0}), bindings), 0)
+
+	name, name_ok := metadata_argument_name(cloned, 0)
+	testing.expect(t, name_ok)
+	testing.expect_value(t, name, names[0])
+	_, missing_name := metadata_argument_name(cloned, 7)
+	testing.expect(t, !missing_name)
+}
+
+@(test)
+test_snapshot_fork_and_version_inheritance :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "Forked", 2)
+
+	base := kernel_snapshot(&kernel)
+	testing.expect_value(t, base.version, u64(1))
+
+	fork := snapshot_fork(base)
+	testing.expect_value(t, fork.version, base.version + 1)
+	testing.expect(t, fork.parent == base)
+	testing.expect(t, snapshot_has_relation(fork, relation))
+	_, metadata_found := snapshot_relation_metadata(fork, relation)
+	testing.expect(t, metadata_found)
+
+	// A block materialized by a commit is visible in a later snapshot.
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, relation, tuple_of(must_identity(1), must_identity(2)))
+	commit_transaction(t, &tx)
+
+	published := kernel_snapshot(&kernel)
+	block, block_found := snapshot_relation_block(published, relation)
+	testing.expect(t, block_found)
+	testing.expect_value(t, relation_block_len(block), 1)
+
+	row, row_found := snapshot_tuple_for_key(
+		published,
+		relation,
+		[]u16{0},
+		[]v.Value{must_identity(1)},
+	)
+	testing.expect(t, row_found)
+	testing.expect_value(t, v.tuple_arity(row), 2)
+	_, missing_row := snapshot_tuple_for_key(
+		published,
+		relation,
+		[]u16{0},
+		[]v.Value{must_identity(9)},
+	)
+	testing.expect(t, !missing_row)
+
+	snapshot_release(published)
+	snapshot_release(fork)
+	snapshot_release(base)
+}
+
+@(test)
+test_transaction_derived_invalidation :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	item := create_relation(&kernel, 1, "Item", 1)
+	held := create_relation(&kernel, 2, "Held", 1)
+	free := create_relation(&kernel, 3, "Free", 1)
+
+	x := v.symbol_intern("x")
+	rule := rule_new(
+		free,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(item, []Term{term_var(x)})),
+			body_atom(atom_negated(held, []Term{term_var(x)})),
+		},
+	)
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(800), rule, "Free(x) :- Item(x), not Held(x).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	coin := must_identity(1)
+
+	tx := kernel_begin(&kernel)
+	testing.expect_value(t, transaction_base_version(&tx), kernel.current.version)
+
+	transaction_assert(&tx, item, tuple_of(coin))
+	before := transaction_rows(&tx, free, 1)
+	testing.expect(t, has_tuple(before[:], tuple_of(coin)))
+	delete(before)
+
+	// A write to a negated relation invalidates the derived cache.
+	transaction_assert(&tx, held, tuple_of(coin))
+	during := transaction_rows(&tx, free, 1)
+	testing.expect_value(t, len(during), 0)
+	delete(during)
+
+	// A retraction restores the derived fact.
+	transaction_retract(&tx, held, tuple_of(coin))
+	after := transaction_rows(&tx, free, 1)
+	testing.expect(t, has_tuple(after[:], tuple_of(coin)))
+	delete(after)
+
+	transaction_destroy(&tx)
+}
+
+@(test)
+test_derived_dedupe :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	pair := create_relation(&kernel, 1, "Pair", 2)
+	first := create_relation(&kernel, 2, "First", 1)
+
+	x := v.symbol_intern("x")
+	y := v.symbol_intern("y")
+	rule := rule_new(
+		first,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item{body_atom(atom_positive(pair, []Term{term_var(x), term_var(y)}))},
+	)
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(900), rule, "First(x) :- Pair(x, y).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, pair, tuple_of(must_identity(1), must_identity(1)))
+	transaction_assert(&tx, pair, tuple_of(must_identity(1), must_identity(2)))
+	transaction_assert(&tx, pair, tuple_of(must_identity(2), must_identity(3)))
+	commit_transaction(t, &tx)
+
+	// First(1) is derivable twice, but it appears once.
+	rows := kernel_rows(&kernel, first, 1)
+	testing.expect_value(t, len(rows), 2)
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_identity(1))))
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_identity(2))))
+	delete(rows)
+}
+
+@(test)
+test_kernel_next_relation_id :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	testing.expect_value(t, kernel_next_relation_id(&kernel), Relation_ID(1))
+	create_relation(&kernel, 1, "First", 1)
+	testing.expect_value(t, kernel_next_relation_id(&kernel), Relation_ID(2))
+	create_relation(&kernel, 5, "Fifth", 1)
+	testing.expect_value(t, kernel_next_relation_id(&kernel), Relation_ID(6))
+}

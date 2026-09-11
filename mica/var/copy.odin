@@ -8,6 +8,7 @@
 package var
 
 import "core:mem"
+import "core:strings"
 
 // Copies a value and all heap storage it references into `alloc`. Immediate
 // values are returned unchanged.
@@ -52,10 +53,14 @@ value_deep_copy :: proc(alloc: mem.Allocator, value: Value) -> Value {
 		return value_range(alloc, value_deep_copy(alloc, start), value_deep_copy(alloc, end), has_end)
 	case .Error:
 		error, _ := value_as_error(value)
+		message := error.message
+		if error.has_message {
+			message = strings.clone(error.message, alloc)
+		}
 		return value_error(
 			alloc,
 			error.code,
-			error.message,
+			message,
 			error.has_message,
 			value_deep_copy(alloc, error.value),
 			error.has_value,
