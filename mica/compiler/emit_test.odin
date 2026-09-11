@@ -475,3 +475,62 @@ test_emit_call_argument_marshalling :: proc(t: ^testing.T) {
 	testing.expect_value(t, vm.vm_run(&state), vm.VM_Status.Halted)
 	expect_int_result(t, &state, 5)
 }
+
+@(test)
+test_emit_two_name_for :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	source := "let xs = [10, 20, 30]\nlet total = 0\nfor index, value in xs\n  total = total + index + value\nend\ntotal"
+	program := compile_test_program(t, source, &ctx, allocator)
+	state := run_test_program(t, program, allocator)
+	defer vm.vm_destroy(&state)
+	expect_int_result(t, &state, 63)
+}
+
+@(test)
+test_emit_break_inside_while :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	source := "let i = 0\nwhile i < 10\n  i = i + 1\n  if i == 3\n    break\n  end\nend\ni"
+	program := compile_test_program(t, source, &ctx, allocator)
+	state := run_test_program(t, program, allocator)
+	defer vm.vm_destroy(&state)
+	expect_int_result(t, &state, 3)
+}
+
+@(test)
+test_emit_role_dispatch_spec :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	ctx.dispatch_method_selector_relation = 0x7fff_ff01
+	ctx.dispatch_param_relation = 0x7fff_ff02
+	ctx.dispatch_delegates_relation = 0x7fff_ff03
+	ctx.dispatch_method_program_relation = 0x7fff_ff04
+
+	program := compile_test_program(t, ":take(actor: #1, item: #2)", &ctx, allocator)
+	testing.expect_value(t, len(program.dispatch_specs), 1)
+	if len(program.dispatch_specs) == 1 {
+		spec := program.dispatch_specs[0]
+		name, name_ok := v.symbol_name(spec.selector)
+		testing.expect(t, name_ok)
+		testing.expect_value(t, name, "take")
+		testing.expect_value(t, len(spec.roles), 2)
+	}
+}

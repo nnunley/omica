@@ -502,3 +502,17 @@ test_parse_spawn :: proc(t: ^testing.T) {
 	_, delay_ok := spawn.delay^.(Float_Literal)
 	testing.expect(t, delay_ok)
 }
+
+@(test)
+test_parse_qualified_field_name :: proc(t: ^testing.T) {
+	source := "let seq = event.event/seq"
+	program := parse_ok(t, source)
+	expr := first_item_expr(t, program)
+	binding, _ := expr^.(Binding)
+	field, field_ok := binding.value^.(Field)
+	testing.expect(t, field_ok)
+	testing.expect_value(t, field.name, "event/seq")
+	receiver, receiver_ok := field.receiver^.(Name)
+	testing.expect(t, receiver_ok)
+	testing.expect_value(t, receiver.parts[0], "event")
+}
