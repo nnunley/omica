@@ -1738,6 +1738,8 @@ emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
 
 	body_jumps: [dynamic]int
 	defer delete(body_jumps)
+	catch_finally_pushes: [dynamic]int
+	defer delete(catch_finally_pushes)
 	previous_false := -1
 	for clause in try.catches {
 		if previous_false >= 0 {
@@ -1781,7 +1783,16 @@ emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
 			)
 			declare_local(emitter, clause.name, binding, false)
 		}
+		if try.has_finally {
+			append(
+				&catch_finally_pushes,
+				emit_instruction(emitter, .Push_Finally, 0, 0, 0, 0),
+			)
+		}
 		clause_register, clause_has_value := emit_block(emitter, clause.body)
+		if try.has_finally {
+			emit_instruction(emitter, .Pop_Handler, 0, 0, 0, 0)
+		}
 		scope_leave(emitter)
 		if clause_has_value {
 			vm.builder_emit(
@@ -1810,6 +1821,9 @@ emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
 	patch_jump(emitter, normal_jump, finally_target)
 	for jump in body_jumps {
 		patch_jump(emitter, jump, finally_target)
+	}
+	for push in catch_finally_pushes {
+		patch_handler_target(emitter, push, finally_target)
 	}
 
 	if try.has_finally {

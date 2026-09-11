@@ -1139,3 +1139,41 @@ require(loop_return() == 2)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Cleanup", 5)
 }
+
+@(test)
+test_run_finally_on_catch_return :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Cleanup, 1)
+verb caught(mode)
+  try
+    if mode == 1
+      raise E_RANGE, "bad"
+    end
+    return 1
+  catch err
+    if mode == 1
+      return 2
+    end
+    return 3
+  finally
+    assert Cleanup(1)
+  end
+end
+require(caught(1) == 2)
+require(caught(0) == 1)
+assert Cleanup(1)
+`
+	path, path_ok := write_temp_source(t, "mica_catch_return_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Cleanup", 1)
+}
