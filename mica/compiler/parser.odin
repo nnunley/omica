@@ -317,9 +317,22 @@ parse_params :: proc(parser: ^Parser) -> []Param {
 	params: [dynamic]Param
 	skip_newlines(parser)
 	for !at(parser, .RParen) && !at(parser, .Eof) {
+		param := Param{}
+		if at(parser, .Question) {
+			advance(parser)
+			param.mode = .Optional
+		} else if at(parser, .At) {
+			advance(parser)
+			param.mode = .Rest
+		}
 		name_token := expect(parser, .Ident, "expected parameter name")
-		param := Param{name = name_token.text}
-		if at(parser, .At) {
+		param.name = name_token.text
+		if param.mode == .Optional && at(parser, .Eq) {
+			advance(parser)
+			param.default = parse_expression(parser)
+			param.has_default = true
+		}
+		if at(parser, .At) && param.mode != .Rest {
 			advance(parser)
 			param.restriction = parse_unary(parser)
 			param.has_restriction = true

@@ -1222,3 +1222,45 @@ assert Out(fact(5))
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
+
+@(test)
+test_run_optional_rest_params :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Out, 1)
+verb greet(name, ?greeting = "hello", @extras)
+  return [name, greeting, extras]
+end
+require(greet("x") == ["x", "hello", []])
+require(greet("x", "yo") == ["x", "yo", []])
+require(greet("x", "yo", 1, 2) == ["x", "yo", [1, 2]])
+verb optional_none(a, ?b)
+  return b
+end
+require(optional_none(1) == none)
+verb collect(a, @rest)
+  return [a, rest]
+end
+require(collect(1) == [1, []])
+require(collect(1, 2, 3) == [1, [2, 3]])
+fn opt(x, ?y = 2) => x + y
+require(opt(1) == 3)
+let f = fn(a, ?b = 5, @rest) => [a, b, rest]
+let g = f
+require(g(1) == [1, 5, []])
+require(g(1, 2, 3, 4) == [1, 2, [3, 4]])
+assert Out(greet("z", "bonjour"))
+`
+	path, path_ok := write_temp_source(t, "mica_optional_params_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}

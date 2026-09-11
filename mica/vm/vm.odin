@@ -291,11 +291,15 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Call:
 			callee := program.functions[instr.b]
+			argument_count := int(instr.flags)
+			args := make([]v.Value, argument_count, context.temp_allocator)
+			for index in 0 ..< argument_count {
+				args[index] = state.registers[base + int(instr.c) + index]
+			}
 			callee_base := len(state.registers)
 			resize(&state.registers, callee_base + callee.register_count)
-			for index in 0 ..< callee.param_count {
-				state.registers[callee_base + index] =
-					state.registers[base + int(instr.c) + index]
+			if !vm_bind_params(state, callee, args, callee_base) {
+				break
 			}
 			append(&state.frames, Frame {
 				function      = int(instr.b),
@@ -603,18 +607,22 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			callee := program.functions[function_index]
 			capture_count := len(callable.captures)
 			argument_count := int(instr.flags)
-			if argument_count < callee.param_count {
-				vm_fail(state, "E_ARITY", "not enough arguments for function call")
-				break
+			args := make([]v.Value, argument_count, context.temp_allocator)
+			for index in 0 ..< argument_count {
+				args[index] = state.registers[base + int(instr.c) + index]
 			}
 			callee_base := len(state.registers)
 			resize(&state.registers, callee_base + callee.register_count)
 			for capture, index in callable.captures {
 				state.registers[callee_base + index] = capture
 			}
-			for index in 0 ..< callee.param_count {
-				state.registers[callee_base + capture_count + index] =
-					state.registers[base + int(instr.c) + index]
+			if !vm_bind_params(
+				state,
+				callee,
+				args,
+				callee_base + capture_count,
+			) {
+				break
 			}
 			append(&state.frames, Frame {
 				function      = function_index,
@@ -634,14 +642,10 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				break
 			}
 			callee := program.functions[instr.b]
-			if len(args) < callee.param_count {
-				vm_fail(state, "E_ARITY", "not enough arguments for function call")
-				break
-			}
 			callee_base := len(state.registers)
 			resize(&state.registers, callee_base + callee.register_count)
-			for index in 0 ..< callee.param_count {
-				state.registers[callee_base + index] = args[index]
+			if !vm_bind_params(state, callee, args, callee_base) {
+				break
 			}
 			append(&state.frames, Frame {
 				function      = int(instr.b),
@@ -704,18 +708,19 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				break
 			}
 			callee := program.functions[function_index]
-			if len(args) < callee.param_count {
-				vm_fail(state, "E_ARITY", "not enough arguments for function call")
-				break
-			}
 			capture_count := len(callable.captures)
 			callee_base := len(state.registers)
 			resize(&state.registers, callee_base + callee.register_count)
 			for capture, index in callable.captures {
 				state.registers[callee_base + index] = capture
 			}
-			for index in 0 ..< callee.param_count {
-				state.registers[callee_base + capture_count + index] = args[index]
+			if !vm_bind_params(
+				state,
+				callee,
+				args,
+				callee_base + capture_count,
+			) {
+				break
 			}
 			append(&state.frames, Frame {
 				function      = function_index,
@@ -1311,8 +1316,8 @@ vm_dispatch_call :: proc(
 	callee := program.functions[function_index]
 	callee_base := len(state.registers)
 	resize(&state.registers, callee_base + callee.register_count)
-	for index in 0 ..< min(callee.param_count, len(args)) {
-		state.registers[callee_base + index] = args[index]
+	if !vm_bind_params(state, callee, args, callee_base) {
+		return false
 	}
 	append(&state.frames, Frame {
 		function      = int(function_index),
@@ -1513,6 +1518,64 @@ vm_raised_error :: proc(state: ^VM, base: int, instr: Instruction) -> v.Value {
 	}
 	vm_fail(state, "E_TYPE", "raise expects an error code or error value")
 	return state.error
+}
+
+// The `none` value: an empty relation headed by `value`, matching the literal.
+@(private)
+vm_none_value :: proc(state: ^VM) -> v.Value {
+	result, _ := v.value_relation(
+		state.allocator,
+		[]v.Symbol{v.symbol_intern("value")},
+		nil,
+	)
+	return result
+}
+
+// Binds call arguments into a callee's parameter registers, applying optional
+// defaults and packing a rest parameter. `param_base` is the register where
+// parameters start (after any captures).
+@(private)
+vm_bind_params :: proc(
+	state: ^VM,
+	callee: Function,
+	args: []v.Value,
+	param_base: int,
+) -> bool {
+	program := state.program
+	required := int(callee.required_count)
+	non_rest := callee.param_count
+	if callee.has_rest {
+		non_rest -= 1
+	}
+	if len(args) < required || (!callee.has_rest && len(args) > non_rest) {
+		vm_fail(state, "E_ARITY", "wrong number of arguments for function call")
+		return false
+	}
+	for index in 0 ..< non_rest {
+		value: v.Value
+		if index < len(args) {
+			value = args[index]
+		} else if callee.defaults != nil &&
+		   index < len(callee.defaults) &&
+		   callee.defaults[index] >= 0 {
+			value = program.constants[callee.defaults[index]]
+		} else {
+			value = vm_none_value(state)
+		}
+		state.registers[param_base + index] = value
+	}
+	if callee.has_rest {
+		rest_count := len(args) - non_rest
+		if rest_count < 0 {
+			rest_count = 0
+		}
+		rest := make([]v.Value, rest_count, context.temp_allocator)
+		for index in 0 ..< rest_count {
+			rest[index] = args[non_rest + index]
+		}
+		state.registers[param_base + non_rest] = v.value_list(state.allocator, rest)
+	}
+	return true
 }
 
 // Returns the list value in `register` as call arguments.

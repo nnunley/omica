@@ -265,13 +265,24 @@ Raise :: struct {
 	parts: []^Expr,
 }
 
+Param_Mode :: enum {
+	Required,
+	Optional,
+	Rest,
+}
+
 // A function parameter with an optional role restriction and kind annotation.
+// Optional parameters take a default when the call omits them; a rest
+// parameter collects the remaining arguments into a list.
 Param :: struct {
-	name:           string,
-	restriction:    ^Expr,
+	name:            string,
+	restriction:     ^Expr,
 	has_restriction: bool,
-	kind:           string,
-	has_kind:       bool,
+	kind:            string,
+	has_kind:        bool,
+	mode:            Param_Mode,
+	default:         ^Expr,
+	has_default:     bool,
 }
 
 // A cell in a structural variant value. `name` is set for named fields.

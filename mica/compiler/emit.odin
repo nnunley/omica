@@ -135,6 +135,7 @@ compile_program :: proc(
 			false,
 		)
 		vm.builder_end_function(&builder)
+		_ = set_param_metadata(&emitter, index, verb.params)
 		emitter.functions[verb.name] = index
 		append(&verb_slots, index)
 	}
@@ -1283,7 +1284,7 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		vm.builder_emit(
 			emitter.builder,
 			.Call,
-			0,
+			u8(len(call.args)),
 			i32(destination),
 			i32(function_index),
 			i32(first_argument),
@@ -1615,6 +1616,104 @@ emit_bytes_literal :: proc(emitter: ^Emitter, bytes: Bytes_Literal) -> (int, boo
 	return emit_constant(emitter, v.value_bytes(emitter.allocator, decoded)), true
 }
 
+// Records parameter modes, required arity, and literal defaults on a function.
+@(private)
+set_param_metadata :: proc(emitter: ^Emitter, index: int, params: []Param) -> bool {
+	required := 0
+	seen_optional := false
+	has_rest := false
+	defaults := make([]i32, len(params), emitter.allocator)
+	ok := true
+	for param, position in params {
+		defaults[position] = -1
+		switch param.mode {
+		case .Required:
+			if seen_optional || has_rest {
+				push_error(emitter, "required parameters must come before optional or rest parameters")
+				ok = false
+			}
+			required += 1
+		case .Optional:
+			if has_rest {
+				push_error(emitter, "optional parameters must come before a rest parameter")
+				ok = false
+			}
+			seen_optional = true
+			if param.has_default {
+				value, value_ok := param_default_value(emitter, param.default)
+				if !value_ok {
+					push_error(emitter, "parameter defaults must be literal values")
+					ok = false
+				} else {
+					defaults[position] = i32(vm.builder_add_constant(
+						emitter.builder,
+						value,
+					))
+				}
+			}
+		case .Rest:
+			if has_rest {
+				push_error(emitter, "only one rest parameter is allowed")
+				ok = false
+			}
+			has_rest = true
+		}
+	}
+	function := &emitter.builder.functions[index]
+	function.required_count = u16(required)
+	function.has_rest = has_rest
+	function.defaults = defaults
+	return ok
+}
+
+@(private)
+param_default_value :: proc(emitter: ^Emitter, expr: ^Expr) -> (v.Value, bool) {
+	#partial switch node in expr^ {
+	case Int_Literal:
+		number, parsed := strconv.parse_i64(node.text)
+		if !parsed {
+			return v.Value(0), false
+		}
+		return v.value_int(number)
+
+	case Float_Literal:
+		number, parsed := strconv.parse_f64(node.text)
+		if !parsed {
+			return v.Value(0), false
+		}
+		return v.value_float(f32(number))
+
+	case String_Literal:
+		return v.value_string(emitter.allocator, unquote_string(node.text, emitter.allocator)), true
+
+	case Bool_Literal:
+		return v.value_bool(node.value), true
+
+	case Symbol_Literal:
+		return v.value_symbol(v.symbol_intern(unquote_string(node.name, emitter.allocator))), true
+
+	case Error_Code_Literal:
+		return v.value_error_code(v.symbol_intern(node.name)), true
+
+	case Identity_Literal:
+		if raw, parsed := strconv.parse_u64(node.name); parsed {
+			return v.value_identity_raw(raw)
+		}
+		if emitter.ctx != nil {
+			if value, found := emitter.ctx.identities[node.name]; found {
+				return value, true
+			}
+		}
+		return v.Value(0), false
+
+	case Name:
+		if len(node.parts) == 1 && node.parts[0] == "none" {
+			return v.value_empty_relation(), true
+		}
+	}
+	return v.Value(0), false
+}
+
 // Binds a self-recursive fn literal: the last capture slot holds the function
 // itself, so the body can call its own name.
 @(private)
@@ -1637,6 +1736,7 @@ emit_self_binding :: proc(
 	vm.builder_end_function(builder)
 	builder.open_function = saved_function
 	builder.open_offset = saved_offset
+	_ = set_param_metadata(emitter, index, fn.params)
 
 	captures := make([]Local, len(emitter.locals) + 1, emitter.allocator)
 	copy(captures, emitter.locals[:])
@@ -1686,6 +1786,7 @@ emit_fn_literal :: proc(emitter: ^Emitter, fn: Fn) -> (int, bool) {
 	vm.builder_end_function(builder)
 	builder.open_function = saved_function
 	builder.open_offset = saved_offset
+	_ = set_param_metadata(emitter, index, fn.params)
 
 	// Capture every visible local by value. Captures land in the callee's
 	// first registers, before the parameters.

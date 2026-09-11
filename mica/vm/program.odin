@@ -206,6 +206,12 @@ Function :: struct {
 	code_len:       int,
 	register_count: int,
 	param_count:    int,
+	// Parameters before `required_count` must be supplied by the caller.
+	// Optional parameters fall back to their constant default (or an empty
+	// relation); a rest parameter collects trailing arguments into a list.
+	required_count: u16,
+	has_rest:       bool,
+	defaults:       []i32,
 }
 
 Program :: struct {
@@ -268,6 +274,11 @@ builder_init :: proc(builder: ^Builder) {
 builder_destroy :: proc(builder: ^Builder) {
 	delete(builder.code)
 	delete(builder.constants)
+	for function in builder.functions {
+		if function.defaults != nil {
+			delete(function.defaults)
+		}
+	}
 	delete(builder.functions)
 	for pattern in builder.patterns {
 		delete(pattern.column_names)
@@ -389,6 +400,13 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 	copy(program.constants, builder.constants[:])
 	program.functions = make([]Function, len(builder.functions), alloc)
 	copy(program.functions, builder.functions[:])
+	for function, index in builder.functions {
+		if function.defaults != nil {
+			defaults := make([]i32, len(function.defaults), alloc)
+			copy(defaults, function.defaults)
+			program.functions[index].defaults = defaults
+		}
+	}
 	program.patterns = make([]Scan_Pattern, len(builder.patterns), alloc)
 	program.relation_shapes = make([]Relation_Shape, len(builder.relation_shapes), alloc)
 	for pattern, i in builder.patterns {
@@ -429,6 +447,11 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 program_destroy :: proc(program: ^Program, alloc: mem.Allocator) {
 	free(raw_data(program.code), alloc)
 	free(raw_data(program.constants), alloc)
+	for function in program.functions {
+		if function.defaults != nil {
+			free(raw_data(function.defaults), alloc)
+		}
+	}
 	free(raw_data(program.functions), alloc)
 	for pattern in program.patterns {
 		free(raw_data(pattern.column_names), alloc)
