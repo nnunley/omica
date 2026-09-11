@@ -371,6 +371,110 @@ scheduler_mailbox_send :: proc(
 	return true
 }
 
+// Delivers a subscription message through a sender handle, bounding the number
+// of queued messages that belong to `capability`. When the budget is reached
+// the queued messages are replaced by `marker` and overflow is true.
+scheduler_mailbox_deliver_subscription :: proc(
+	scheduler: ^Scheduler,
+	sender: v.Value,
+	capability: v.Value,
+	message: v.Value,
+	marker: v.Value,
+	budget: int,
+) -> (
+	ok: bool,
+	overflow: bool,
+) {
+	mailbox, _, target_ok := mailbox_target(scheduler, sender, true)
+	if !target_ok {
+		return false, false
+	}
+	sync.mutex_lock(&scheduler.lock)
+	defer sync.mutex_unlock(&scheduler.lock)
+	box, found := scheduler.mailboxes[mailbox]
+	if !found || box.closed || !mailbox_receiver_live_locked(scheduler, box) {
+		return false, false
+	}
+	queued := 0
+	for entry in box.messages {
+		if v.value_eq(subscription_message_capability(entry), capability) {
+			queued += 1
+		}
+	}
+	if queued >= budget {
+		overflow = true
+		subscription_messages_remove_locked(box, capability)
+	}
+	append(&box.messages, overflow ? marker : message)
+	scheduler_wake_mailbox_locked(scheduler, box)
+	sync.cond_broadcast(&scheduler.cond)
+	return true, overflow
+}
+
+// Replaces every queued message that belongs to `capability` with `value`.
+scheduler_mailbox_replace_subscription :: proc(
+	scheduler: ^Scheduler,
+	sender: v.Value,
+	capability: v.Value,
+	value: v.Value,
+) -> bool {
+	mailbox, _, target_ok := mailbox_target(scheduler, sender, true)
+	if !target_ok {
+		return false
+	}
+	sync.mutex_lock(&scheduler.lock)
+	defer sync.mutex_unlock(&scheduler.lock)
+	box, found := scheduler.mailboxes[mailbox]
+	if !found || box.closed || !mailbox_receiver_live_locked(scheduler, box) {
+		return false
+	}
+	subscription_messages_remove_locked(box, capability)
+	append(&box.messages, value)
+	scheduler_wake_mailbox_locked(scheduler, box)
+	sync.cond_broadcast(&scheduler.cond)
+	return true
+}
+
+@(private)
+mailbox_receiver_live_locked :: proc(scheduler: ^Scheduler, box: ^Mailbox) -> bool {
+	receiver_grant, receiver_found := k.capability_store_lookup(
+		&scheduler.kernel.capabilities,
+		box.receiver,
+	)
+	return receiver_found && k.capability_live(receiver_grant, 0, time.tick_now())
+}
+
+// Removes queued subscription messages for `capability`. The caller holds the
+// scheduler lock.
+@(private)
+subscription_messages_remove_locked :: proc(box: ^Mailbox, capability: v.Value) {
+	write := 0
+	for entry in box.messages {
+		if v.value_eq(subscription_message_capability(entry), capability) {
+			continue
+		}
+		box.messages[write] = entry
+		write += 1
+	}
+	resize(&box.messages, write)
+}
+
+// Returns the `:subscription` cell of a subscription message, or zero.
+@(private)
+subscription_message_capability :: proc(value: v.Value) -> v.Value {
+	entries, is_map := v.value_as_map(value)
+	if !is_map {
+		return v.Value(0)
+	}
+	key := v.value_symbol(v.symbol_intern("subscription"))
+	for entry in entries {
+		if v.value_eq(entry.key, key) {
+			return entry.value
+		}
+	}
+	return v.Value(0)
+}
+
 // Closes a mailbox from its receiver handle, revoking both endpoints.
 scheduler_mailbox_close :: proc(scheduler: ^Scheduler, receiver: v.Value) -> bool {
 	mailbox, _, ok := mailbox_target(scheduler, receiver, false)

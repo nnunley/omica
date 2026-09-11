@@ -1961,6 +1961,257 @@ assert Out(1)
 }
 
 @(test)
+test_run_relation_reflection_facts :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Plain, 2)
+make_functional_relation(:Keyed, 2, [0], :volatile)
+make_relation(:Out, 1)
+
+verb greet(name)
+  assert Out(1)
+end
+
+let plain_names = RelationName(?rel, :Plain)
+for found in plain_names
+  let plain = found[:rel]
+  require(len(ConflictPolicy(plain, :set)) == 1)
+  require(len(RelationDurability(plain, :durable)) == 1)
+end
+let keyed_names = RelationName(?rel, :Keyed)
+for found in keyed_names
+  let keyed = found[:rel]
+  require(len(ConflictPolicy(keyed, :functional)) == 1)
+  require(len(FunctionalKey(keyed, 0, 0)) == 1)
+  require(len(RelationDurability(keyed, :volatile)) == 1)
+  let indexes = Index(keyed, ?idx)
+  require(len(indexes) == 1)
+  let idx = indexes[0][:idx]
+  require(len(IndexPosition(idx, 0, 0)) == 1)
+  require(len(IndexPosition(idx, 1, 1)) == 1)
+  require(len(IndexStorageKind(idx, :btree)) == 1)
+end
+let methods = MethodSelector(?mm, :greet)
+require(len(methods) == 1)
+let m = methods[0][:mm]
+let sources = MethodSource(m, ?src)
+require(len(sources) == 1)
+let text = sources[0][:src]
+require(text != "")
+assert Out(2)
+`
+	path, path_ok := write_temp_source(t, "mica_reflection_facts_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
+
+@(test)
+test_run_subscription_relation_derived :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Base, 1)
+make_relation(:Derived, 1)
+make_relation(:Out, 1)
+Derived(x) :- Base(x)
+let [receiver, sender] = mailbox()
+let sub = subscribe_changes(sender, :relation, some(:Derived), [none], :changes)
+assert Base(1)
+commit()
+let first = mailbox_recv([receiver])
+let first_message = first[0][1][0]
+require(index_or(first_message, :kind, none) == :changes)
+require(index_or(first_message, :subject, none) == :relation)
+require(len(index_or(first_message, :assertions, [])) == 1)
+assert Base(2)
+commit()
+let second = mailbox_recv([receiver])
+let second_message = second[0][1][0]
+require(len(index_or(second_message, :assertions, [])) == 1)
+require(len(index_or(second_message, :retractions, [])) == 0)
+retract Base(1)
+commit()
+let third = mailbox_recv([receiver])
+let third_message = third[0][1][0]
+require(len(index_or(third_message, :assertions, [])) == 0)
+require(len(index_or(third_message, :retractions, [])) == 1)
+cancel_subscription(sub)
+assert Out(1)
+`
+	path, path_ok := write_temp_source(t, "mica_subscription_relation_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
+
+@(test)
+test_run_subscription_catalogue :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Base, 1)
+make_relation(:Derived, 1)
+make_relation(:Out, 1)
+Derived(x) :- Base(x)
+let [receiver, sender] = mailbox()
+let sub = subscribe_changes(sender, :catalogue, none, [], :snapshot)
+let ready = mailbox_recv([receiver])
+let message = ready[0][1][0]
+require(index_or(message, :kind, none) == :snapshot)
+require(index_or(message, :subject, none) == :catalogue)
+require(len(index_or(message, :entries, [])) > 0)
+let rules = Rule(?rule)
+for found in rules
+  disable_rule(found[:rule])
+end
+commit()
+let changed = mailbox_recv([receiver])
+let changes = changed[0][1][0]
+require(index_or(changes, :kind, none) == :changes)
+require(index_or(changes, :subject, none) == :catalogue)
+let entries = index_or(changes, :entries, [])
+require(len(entries) == 1)
+require(index_or(entries[0], :kind, none) == :rule_disabled)
+cancel_subscription(sub)
+assert Out(1)
+`
+	path, path_ok := write_temp_source(t, "mica_subscription_catalogue_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
+
+@(test)
+test_run_subscription_queue_budget :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Note, 1)
+make_relation(:Out, 1)
+let [receiver, sender] = mailbox()
+let sub = subscribe_changes(sender, :facts, some(:Note), [none], :changes, none, 1)
+assert Note(1)
+commit()
+assert Note(2)
+commit()
+let ready = mailbox_recv([receiver])
+let queued = ready[0][1]
+require(len(queued) == 1)
+require(index_or(queued[0], :kind, none) == :snapshot)
+require(len(index_or(queued[0], :assertions, [])) == 2)
+assert Note(3)
+assert Note(4)
+commit()
+let resynced = mailbox_recv([receiver])
+let snapshot = resynced[0][1][0]
+require(index_or(snapshot, :kind, none) == :snapshot)
+require(len(index_or(snapshot, :assertions, [])) == 4)
+cancel_subscription(sub)
+assert Out(1)
+`
+	path, path_ok := write_temp_source(t, "mica_subscription_budget_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
+
+@(test)
+test_run_subscription_revoked_marker :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Note, 1)
+make_relation(:Out, 1)
+let [receiver, sender] = mailbox()
+let sub = subscribe_changes(sender, :facts, some(:Note), [none], :changes)
+assert Note(1)
+commit()
+revoke_capability(sub)
+assert Note(2)
+commit()
+let ready = mailbox_recv([receiver])
+let queued = ready[0][1]
+require(len(queued) == 1)
+require(index_or(queued[0], :kind, none) == :revoked)
+assert Out(1)
+`
+	path, path_ok := write_temp_source(t, "mica_subscription_revoked_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
+
+@(test)
+test_run_subscription_catalogue_needs_root :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:Out, 1)
+let [receiver, sender] = mailbox()
+try
+  let sub = subscribe_changes(sender, :catalogue, none, [], :snapshot)
+  assert Out(0)
+catch err
+  assert Out(1)
+end
+`
+	path, path_ok := write_temp_source(t, "mica_subscription_catalogue_denied_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{actor = "alice"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
+
+@(test)
 test_run_assume_actor :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_identity(:alice)

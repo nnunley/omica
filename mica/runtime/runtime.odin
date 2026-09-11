@@ -369,6 +369,8 @@ run_files :: proc(
 ) -> Run_Result {
 	asts := make([dynamic]^c.Program_AST, allocator)
 	defer delete(asts)
+	sources := make([dynamic]string, allocator)
+	defer delete(sources)
 
 	for path in paths {
 		data, read_err := os.read_entire_file(path, allocator)
@@ -404,6 +406,7 @@ run_files :: proc(
 			)}
 		}
 		append(&asts, ast)
+		append(&sources, expanded)
 	}
 
 	ctx := c.Compile_Context {
@@ -470,7 +473,7 @@ run_files :: proc(
 		}
 	}
 
-	method_result := install_methods(&env, asts[:], &declarations)
+	method_result := install_methods(&env, asts[:], sources[:], &declarations)
 	if !method_result.ok {
 		return method_result
 	}
@@ -590,6 +593,120 @@ assert_relation_facts :: proc(
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "Arity", err)
 		}
+		durability_name := "durable"
+		if metadata.durability == .Volatile {
+			durability_name = "volatile"
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_RELATION_DURABILITY_ID,
+			v.tuple_new(env.allocator, []v.Value {
+				identity,
+				v.value_symbol(v.symbol_intern(durability_name)),
+			}),
+		); err != k.Kernel_Error.None {
+			return catalog_error(env, "RelationDurability", err)
+		}
+		for position in 0 ..< int(metadata.arity) {
+			name, has_name := k.metadata_argument_name(metadata, u16(position))
+			if !has_name {
+				continue
+			}
+			if err := k.transaction_assert(
+				&tx,
+				k.SYSTEM_ARGUMENT_NAME_ID,
+				v.tuple_new(env.allocator, []v.Value {
+					identity,
+					value_int_must(i64(position)),
+					v.value_symbol(name),
+				}),
+			); err != k.Kernel_Error.None {
+				return catalog_error(env, "ArgumentName", err)
+			}
+		}
+		policy_name := "set"
+		#partial switch metadata.conflict.kind {
+		case .Functional:
+			policy_name = "functional"
+		case .Event_Append:
+			policy_name = "event_append"
+		case .Set:
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_CONFLICT_POLICY_ID,
+			v.tuple_new(env.allocator, []v.Value {
+				identity,
+				v.value_symbol(v.symbol_intern(policy_name)),
+			}),
+		); err != k.Kernel_Error.None {
+			return catalog_error(env, "ConflictPolicy", err)
+		}
+		if metadata.conflict.kind == .Functional {
+			for position, slot in metadata.conflict.key_positions {
+				if err := k.transaction_assert(
+					&tx,
+					k.SYSTEM_FUNCTIONAL_KEY_ID,
+					v.tuple_new(env.allocator, []v.Value {
+						identity,
+						value_int_must(i64(slot)),
+						value_int_must(i64(position)),
+					}),
+				); err != k.Kernel_Error.None {
+					return catalog_error(env, "FunctionalKey", err)
+				}
+			}
+		}
+		// Ordinal 0 is the natural full-tuple index; explicit metadata indexes
+		// follow, matching the Rust catalogue's ordinal numbering.
+		for ordinal in 0 ..< 1 + len(metadata.indexes) {
+			index_value, index_ok := relation_index_identity(metadata.id, u16(ordinal))
+			if !index_ok {
+				return Run_Result{ok = false, message = "index identity is out of range"}
+			}
+			if err := k.transaction_assert(
+				&tx,
+				k.SYSTEM_INDEX_ID,
+				v.tuple_new(env.allocator, []v.Value{identity, index_value}),
+			); err != k.Kernel_Error.None {
+				return catalog_error(env, "Index", err)
+			}
+			positions: []u16
+			storage := "radix"
+			if ordinal == 0 {
+				natural := make([]u16, int(metadata.arity), context.temp_allocator)
+				for position in 0 ..< int(metadata.arity) {
+					natural[position] = u16(position)
+				}
+				positions = natural
+				storage = "btree"
+			} else {
+				positions = metadata.indexes[ordinal - 1].positions
+			}
+			for position, slot in positions {
+				if err := k.transaction_assert(
+					&tx,
+					k.SYSTEM_INDEX_POSITION_ID,
+					v.tuple_new(env.allocator, []v.Value {
+						index_value,
+						value_int_must(i64(slot)),
+						value_int_must(i64(position)),
+					}),
+				); err != k.Kernel_Error.None {
+					return catalog_error(env, "IndexPosition", err)
+				}
+			}
+			if err := k.transaction_assert(
+				&tx,
+				k.SYSTEM_INDEX_STORAGE_KIND_ID,
+				v.tuple_new(env.allocator, []v.Value {
+					index_value,
+					v.value_symbol(v.symbol_intern(storage)),
+				}),
+			); err != k.Kernel_Error.None {
+				return catalog_error(env, "IndexStorageKind", err)
+			}
+		}
 	}
 	committed, commit_err := k.transaction_commit(&tx)
 	if commit_err != k.Kernel_Error.None {
@@ -597,6 +714,14 @@ assert_relation_facts :: proc(
 	}
 	k.snapshot_release(committed)
 	return Run_Result{ok = true, message = "loaded"}
+}
+
+// Derives the identity of a relation's index at `ordinal`, mirroring the Rust
+// catalogue: raw * 65537 + ordinal, truncated to the identity payload.
+@(private)
+relation_index_identity :: proc(relation: k.Relation_ID, ordinal: u16) -> (v.Value, bool) {
+	raw := (u64(relation) * 65537 + u64(ordinal)) & v.IDENTITY_MAX
+	return v.value_identity_raw(raw)
 }
 
 @(private)
@@ -687,6 +812,15 @@ prescan_file :: proc(
 	ctx := env.ctx
 	created_metadata: [dynamic]k.Relation_Metadata
 	defer delete(created_metadata)
+	// Functional key slices are referenced by `created_metadata` until the
+	// catalog facts are asserted, so they are released at the end.
+	owned_functional_keys: [dynamic][dynamic]u16
+	defer {
+		for keys in owned_functional_keys {
+			delete(keys)
+		}
+		delete(owned_functional_keys)
+	}
 	for item in ast.items {
 		expression: ^c.Expr
 		#partial switch matched in item {
@@ -757,10 +891,18 @@ prescan_file :: proc(
 				}
 				metadata.conflict = k.conflict_functional(functional_keys[:])
 			}
+			durability_index := 2
+			if declared == "make_functional_relation" {
+				durability_index = 3
+			}
+			if len(call.args) > durability_index {
+				metadata.durability = relation_durability_argument(
+					call.args[durability_index].expr,
+				)
+			}
 
 			created, create_err := k.kernel_create_relation(env.kernel, metadata)
 			if create_err != k.Kernel_Error.None {
-				delete(functional_keys)
 				return Run_Result{ok = false, message = fmt.aprintf(
 					"cannot create relation %s: %v",
 					relation_name,
@@ -771,6 +913,11 @@ prescan_file :: proc(
 			k.snapshot_release(created)
 			ctx.relations[relation_name] = declarations.next_relation
 			append(&created_metadata, metadata)
+			if metadata.conflict.kind == .Functional {
+				append(&owned_functional_keys, functional_keys)
+			} else {
+				delete(functional_keys)
+			}
 
 			if metadata.conflict.kind == .Functional {
 				key_positions := make([]u16, len(metadata.conflict.key_positions), env.allocator)
@@ -780,7 +927,6 @@ prescan_file :: proc(
 					key_positions = key_positions,
 				}
 			}
-			delete(functional_keys)
 			declarations.next_relation += 1
 		}
 	}
@@ -1044,6 +1190,15 @@ symbol_text :: proc(expr: ^c.Expr) -> string {
 		return symbol.name[1 : len(symbol.name) - 1]
 	}
 	return symbol.name
+}
+
+// Reads an optional `:durable` or `:volatile` declaration argument.
+@(private)
+relation_durability_argument :: proc(expr: ^c.Expr) -> k.Relation_Durability {
+	if symbol_text(expr) == "volatile" {
+		return .Volatile
+	}
+	return .Durable
 }
 
 @(private)

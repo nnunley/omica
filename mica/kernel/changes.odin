@@ -10,11 +10,28 @@ import "core:mem"
 import "core:sync"
 import v "../var"
 
+// What kind of catalog change a record carries.
+Catalog_Change_Kind :: enum {
+	Relation_Created,
+	Rule_Installed,
+	Rule_Disabled,
+}
+
+// A catalog change visible at a version: a relation was created, a rule was
+// installed, or a rule's active flag was toggled.
+Catalog_Change :: struct {
+	kind:     Catalog_Change_Kind,
+	relation: Relation_ID,
+	rule:     v.Identity,
+	name:     v.Symbol,
+}
+
 Change_Record :: struct {
 	version:   u64,
 	relation:  Relation_ID,
 	asserted:  []v.Tuple,
 	retracted: []v.Tuple,
+	catalogue: []Catalog_Change,
 }
 
 Change_Feed :: struct {
@@ -50,6 +67,9 @@ changes_destroy :: proc(feed: ^Change_Feed) {
 		}
 		if record.retracted != nil {
 			delete(record.retracted, feed.allocator)
+		}
+		if record.catalogue != nil {
+			delete(record.catalogue, feed.allocator)
 		}
 	}
 	delete(feed.records)
@@ -110,6 +130,44 @@ changes_record_writes :: proc(
 		}
 		delete(record.asserted, feed.allocator)
 		delete(record.retracted, feed.allocator)
+		if record.catalogue != nil {
+			delete(record.catalogue, feed.allocator)
+		}
+		ordered_remove_first(&feed.records)
+	}
+}
+
+// Records catalog changes that became visible at `version`: relation creation,
+// rule installation, and rule toggles.
+changes_record_catalog :: proc(
+	feed: ^Change_Feed,
+	version: u64,
+	changes: []Catalog_Change,
+) {
+	if len(changes) == 0 {
+		return
+	}
+	sync.mutex_lock(&feed.lock)
+	defer sync.mutex_unlock(&feed.lock)
+	if version > feed.latest {
+		feed.latest = version
+	}
+	copied := make([]Catalog_Change, len(changes), feed.allocator)
+	copy(copied, changes)
+	append(&feed.records, Change_Record{version = version, catalogue = copied})
+	for len(feed.records) > feed.capacity {
+		record := feed.records[0]
+		for tuple in record.asserted {
+			tuple_deep_free(feed.allocator, tuple)
+		}
+		for tuple in record.retracted {
+			tuple_deep_free(feed.allocator, tuple)
+		}
+		delete(record.asserted, feed.allocator)
+		delete(record.retracted, feed.allocator)
+		if record.catalogue != nil {
+			delete(record.catalogue, feed.allocator)
+		}
 		ordered_remove_first(&feed.records)
 	}
 }

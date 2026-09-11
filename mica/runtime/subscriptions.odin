@@ -1,10 +1,15 @@
 // Change subscriptions.
 //
-// `subscribe_changes` registers a relation pattern and a mailbox sender handle.
+// `subscribe_changes` registers a subject pattern and a mailbox sender handle.
 // After every committed transaction the store drains the kernel change feed
 // from each subscription's cursor and posts change messages to the mailbox.
 // Subscription handles are capability-store entries, so they can be revoked
 // like any other capability or cancelled explicitly.
+//
+// Subjects:
+//   - :facts     matches extensional fact changes for a relation pattern.
+//   - :relation  matches the full relation result, including derived rows.
+//   - :catalogue matches relation and rule catalog changes; requires root.
 package mica_runtime
 
 import "core:mem"
@@ -13,13 +18,30 @@ import "core:time"
 import k "../kernel"
 import v "../var"
 
+// Default bound on queued messages per subscription in a mailbox.
+DEFAULT_SUBSCRIPTION_QUEUE_BUDGET :: 64
+
+@(private)
+Subscription_Subject :: enum {
+	Facts,
+	Relation,
+	Catalogue,
+}
+
 @(private)
 Subscription :: struct {
-	capability: v.Value,
-	sender:     v.Value,
-	relation:   k.Relation_ID,
-	bindings:   []v.Binding,
-	cursor:     u64,
+	capability:              v.Value,
+	sender:                  v.Value,
+	subject:                 Subscription_Subject,
+	relation:                k.Relation_ID,
+	bindings:                []v.Binding,
+	cursor:                  u64,
+	queue_budget:            int,
+	needs_resynchronization: bool,
+	revoked:                 bool,
+	// Deep-copied rows for :relation subjects. The snapshot that produced them
+	// may be reclaimed, so the subscription owns its baseline.
+	baseline:                []v.Tuple,
 }
 
 @(private)
@@ -43,6 +65,7 @@ subscriptions_destroy :: proc(store: ^Subscription_Store) {
 		if subscription.bindings != nil {
 			delete(subscription.bindings, store.allocator)
 		}
+		subscription_baseline_free(store.allocator, subscription.baseline)
 		free(subscription, store.allocator)
 	}
 	delete(store.entries)
@@ -55,11 +78,13 @@ subscriptions_destroy :: proc(store: ^Subscription_Store) {
 subscriptions_register :: proc(
 	env: ^Builtin_Env,
 	sender: v.Value,
+	subject: Subscription_Subject,
 	relation: k.Relation_ID,
 	bindings: []v.Binding,
 	initial_snapshot: bool,
 	cursor: u64,
 	has_cursor: bool,
+	queue_budget: int,
 ) -> (
 	v.Value,
 	bool,
@@ -68,12 +93,19 @@ subscriptions_register :: proc(
 		return v.Value(0), false
 	}
 	snapshot := k.kernel_snapshot(env.kernel)
+	defer k.snapshot_release(snapshot)
 	version := snapshot.version
-	k.snapshot_release(snapshot)
 
 	cursor_value := version
 	if has_cursor {
 		cursor_value = cursor
+	}
+
+	baseline: []v.Tuple
+	if subject == .Relation {
+		rows := subscription_scan_rows(env, subject, relation, bindings)
+		defer delete(rows)
+		baseline = subscription_baseline_capture(env, rows[:])
 	}
 
 	sync.mutex_lock(&env.subscriptions.lock)
@@ -85,32 +117,49 @@ subscriptions_register :: proc(
 	)
 	if !minted {
 		sync.mutex_unlock(&env.subscriptions.lock)
+		subscription_baseline_free(env.subscriptions.allocator, baseline)
 		return v.Value(0), false
 	}
 	subscription := new(Subscription, env.subscriptions.allocator)
 	subscription.capability = capability
 	subscription.sender = sender
+	subscription.subject = subject
 	subscription.relation = relation
 	subscription.bindings = make([]v.Binding, len(bindings), env.subscriptions.allocator)
 	copy(subscription.bindings, bindings)
 	subscription.cursor = cursor_value
+	subscription.queue_budget = queue_budget
+	subscription.baseline = baseline
 	env.subscriptions.entries[subscription_id] = subscription
 	sync.mutex_unlock(&env.subscriptions.lock)
 
 	if initial_snapshot && !has_cursor {
-		rows := subscription_scan_rows(env, relation, bindings)
-		defer delete(rows)
-		row_values := subscription_row_values(env, rows[:])
-		defer delete(row_values)
-		message := subscription_message(
-			env,
-			capability,
-			"snapshot",
-			version,
-			row_values[:],
-			nil,
-		)
-		_ = scheduler_mailbox_send(env.scheduler, sender, message)
+		switch subject {
+		case .Catalogue:
+			entries := subscription_catalogue_entries(env, snapshot)
+			defer delete(entries)
+			message := subscription_catalogue_message(
+				env,
+				capability,
+				"snapshot",
+				version,
+				entries[:],
+			)
+			_ = scheduler_mailbox_send(env.scheduler, sender, message)
+		case .Facts, .Relation:
+			rows := subscription_scan_rows(env, subject, relation, bindings)
+			defer delete(rows)
+			row_values := subscription_row_values(env, rows[:])
+			defer delete(row_values)
+			message := subscription_snapshot_message(
+				env,
+				capability,
+				subscription_subject_name(subject),
+				version,
+				row_values[:],
+			)
+			_ = scheduler_mailbox_send(env.scheduler, sender, message)
+		}
 	}
 	return capability, true
 }
@@ -188,6 +237,7 @@ subscriptions_release_locked :: proc(store: ^Subscription_Store, subscription_id
 		if subscription.bindings != nil {
 			delete(subscription.bindings, store.allocator)
 		}
+		subscription_baseline_free(store.allocator, subscription.baseline)
 		free(subscription, store.allocator)
 		delete_key(&store.entries, subscription_id)
 	}
@@ -206,6 +256,20 @@ subscriptions_dispatch :: proc(env: ^Builtin_Env) {
 	defer delete(to_release)
 	for subscription_id, subscription in store.entries {
 		if !subscription_is_live(env, subscription) {
+			// Replace whatever is queued with a final revoked marker so the
+			// consumer learns the subscription ended.
+			marker := subscription_marker_message(
+				env,
+				subscription.capability,
+				"revoked",
+				subscription.cursor,
+			)
+			_ = scheduler_mailbox_replace_subscription(
+				env.scheduler,
+				subscription.sender,
+				subscription.capability,
+				marker,
+			)
 			append(&to_release, subscription_id)
 			continue
 		}
@@ -240,16 +304,21 @@ Subscription_Collector :: struct {
 	subscription: ^Subscription,
 	asserted:     [dynamic]v.Value,
 	retracted:    [dynamic]v.Value,
+	catalogue:    [dynamic]k.Catalog_Change,
 }
 
 @(private)
 subscription_deliver :: proc(env: ^Builtin_Env, subscription: ^Subscription) -> bool {
+	if subscription.needs_resynchronization {
+		return subscription_resynchronize(env, subscription)
+	}
 	collector := Subscription_Collector {
 		env          = env,
 		subscription = subscription,
 	}
 	defer delete(collector.asserted)
 	defer delete(collector.retracted)
+	defer delete(collector.catalogue)
 
 	latest, within_window := k.changes_visit(
 		&env.kernel.changes,
@@ -258,40 +327,188 @@ subscription_deliver :: proc(env: ^Builtin_Env, subscription: ^Subscription) -> 
 		subscription_collect,
 	)
 	if !within_window {
-		rows := subscription_scan_rows(env, subscription.relation, subscription.bindings)
-		defer delete(rows)
-		row_values := subscription_row_values(env, rows[:])
-		defer delete(row_values)
-		message := subscription_message(
+		return subscription_resynchronize(env, subscription)
+	}
+
+	switch subscription.subject {
+	case .Catalogue:
+		if len(collector.catalogue) == 0 {
+			subscription.cursor = latest
+			return true
+		}
+		entries: [dynamic]v.Value
+		defer delete(entries)
+		for change in collector.catalogue {
+			append(&entries, subscription_catalogue_change_value(env, change))
+		}
+		message := subscription_catalogue_message(
 			env,
 			subscription.capability,
-			"snapshot",
+			"changes",
 			latest,
-			row_values[:],
-			nil,
+			entries[:],
 		)
+		return subscription_enqueue(env, subscription, message, latest, len(entries))
+
+	case .Facts:
+		if len(collector.asserted) == 0 && len(collector.retracted) == 0 {
+			subscription.cursor = latest
+			return true
+		}
+		message := subscription_changes_message(
+			env,
+			subscription.capability,
+			"facts",
+			latest,
+			collector.asserted[:],
+			collector.retracted[:],
+		)
+		return subscription_enqueue(
+			env,
+			subscription,
+			message,
+			latest,
+			len(collector.asserted) + len(collector.retracted),
+		)
+
+	case .Relation:
+		rows := subscription_scan_rows(
+			env,
+			.Relation,
+			subscription.relation,
+			subscription.bindings,
+		)
+		defer delete(rows)
+		assertions: [dynamic]v.Value
+		retractions: [dynamic]v.Value
+		defer delete(assertions)
+		defer delete(retractions)
+		subscription_baseline_diff(env, subscription, rows[:], &assertions, &retractions)
 		subscription.cursor = latest
-		return scheduler_mailbox_send(env.scheduler, subscription.sender, message)
+		if len(assertions) == 0 && len(retractions) == 0 {
+			return true
+		}
+		message := subscription_changes_message(
+			env,
+			subscription.capability,
+			"relation",
+			latest,
+			assertions[:],
+			retractions[:],
+		)
+		return subscription_enqueue(
+			env,
+			subscription,
+			message,
+			latest,
+			len(assertions) + len(retractions),
+		)
 	}
-	if len(collector.asserted) == 0 && len(collector.retracted) == 0 {
-		subscription.cursor = latest
-		return true
+	return true
+}
+
+// Sends a fresh snapshot so a consumer that missed changes or overflowed its
+// queue converges. Updates the baseline for :relation subjects.
+@(private)
+subscription_resynchronize :: proc(env: ^Builtin_Env, subscription: ^Subscription) -> bool {
+	snapshot := k.kernel_snapshot(env.kernel)
+	version := snapshot.version
+	defer k.snapshot_release(snapshot)
+
+	ok: bool
+	switch subscription.subject {
+	case .Catalogue:
+		entries := subscription_catalogue_entries(env, snapshot)
+		defer delete(entries)
+		message := subscription_catalogue_message(env, subscription.capability, "snapshot", version, entries[:])
+		ok = scheduler_mailbox_replace_subscription(
+			env.scheduler,
+			subscription.sender,
+			subscription.capability,
+			message,
+		)
+	case .Facts, .Relation:
+		rows := subscription_scan_rows(
+			env,
+			subscription.subject,
+			subscription.relation,
+			subscription.bindings,
+		)
+		defer delete(rows)
+		if subscription.subject == .Relation {
+			subscription_baseline_reset(env, subscription, rows[:])
+		}
+		row_values := subscription_row_values(env, rows[:])
+		defer delete(row_values)
+		message := subscription_snapshot_message(
+			env,
+			subscription.capability,
+			subscription_subject_name(subscription.subject),
+			version,
+			row_values[:],
+		)
+		ok = scheduler_mailbox_replace_subscription(
+			env.scheduler,
+			subscription.sender,
+			subscription.capability,
+			message,
+		)
 	}
-	message := subscription_message(
+	if ok {
+		subscription.needs_resynchronization = false
+		subscription.cursor = version
+	}
+	return ok
+}
+
+// Posts one message, enforcing the per-subscription queue budget.
+@(private)
+subscription_enqueue :: proc(
+	env: ^Builtin_Env,
+	subscription: ^Subscription,
+	message: v.Value,
+	cursor: u64,
+	entry_count: int,
+) -> bool {
+	if entry_count > subscription.queue_budget {
+		return subscription_resynchronize(env, subscription)
+	}
+	marker := subscription_marker_message(
 		env,
 		subscription.capability,
-		"changes",
-		latest,
-		collector.asserted[:],
-		collector.retracted[:],
+		"resynchronize",
+		cursor,
 	)
-	subscription.cursor = latest
-	return scheduler_mailbox_send(env.scheduler, subscription.sender, message)
+	ok, overflow := scheduler_mailbox_deliver_subscription(
+		env.scheduler,
+		subscription.sender,
+		subscription.capability,
+		message,
+		marker,
+		subscription.queue_budget,
+	)
+	if !ok {
+		return false
+	}
+	subscription.needs_resynchronization = overflow
+	subscription.cursor = cursor
+	return true
 }
 
 @(private)
 subscription_collect :: proc(user: rawptr, record: ^k.Change_Record) -> bool {
 	collector := (^Subscription_Collector)(user)
+	switch collector.subscription.subject {
+	case .Relation:
+		return true
+	case .Catalogue:
+		for change in record.catalogue {
+			append(&collector.catalogue, change)
+		}
+		return true
+	case .Facts:
+	}
+
 	if record.relation != collector.subscription.relation {
 		return true
 	}
@@ -343,8 +560,24 @@ subscription_row_values :: proc(env: ^Builtin_Env, rows: []v.Tuple) -> [dynamic]
 }
 
 @(private)
+subscription_subject_name :: proc(subject: Subscription_Subject) -> string {
+	switch subject {
+	case .Facts:
+		return "facts"
+	case .Relation:
+		return "relation"
+	case .Catalogue:
+		return "catalogue"
+	}
+	return "facts"
+}
+
+// Scans the current rows for a subject. `:facts` reads extensional rows only;
+// `:relation` includes derived rows.
+@(private)
 subscription_scan_rows :: proc(
 	env: ^Builtin_Env,
+	subject: Subscription_Subject,
 	relation: k.Relation_ID,
 	bindings: []v.Binding,
 ) -> [dynamic]v.Tuple {
@@ -353,10 +586,112 @@ subscription_scan_rows :: proc(
 	defer k.snapshot_release(snapshot)
 	source := k.Relation_Source {
 		snapshot           = snapshot,
-		use_stored_derived = true,
+		use_stored_derived = subject == .Relation,
 	}
 	k.relation_source_scan_into(&source, relation, bindings, &rows)
 	return rows
+}
+
+// --- Relation baselines ----------------------------------------------------
+
+@(private)
+subscription_baseline_capture :: proc(env: ^Builtin_Env, rows: []v.Tuple) -> []v.Tuple {
+	copies := make([]v.Tuple, len(rows), env.subscriptions.allocator)
+	for row, index in rows {
+		copies[index] = v.tuple_deep_copy(env.subscriptions.allocator, row)
+	}
+	return copies
+}
+
+@(private)
+subscription_baseline_free :: proc(alloc: mem.Allocator, baseline: []v.Tuple) {
+	for tuple in baseline {
+		subscription_tuple_free(alloc, tuple)
+	}
+	if baseline != nil {
+		delete(baseline, alloc)
+	}
+}
+
+@(private)
+subscription_tuple_free :: proc(alloc: mem.Allocator, tuple: v.Tuple) {
+	values := v.tuple_values(tuple)
+	for cell in values {
+		v.value_deep_free(alloc, cell)
+	}
+	delete(values, alloc)
+}
+
+// Replaces the baseline after a resynchronization.
+@(private)
+subscription_baseline_reset :: proc(
+	env: ^Builtin_Env,
+	subscription: ^Subscription,
+	rows: []v.Tuple,
+) {
+	alloc := env.subscriptions.allocator
+	subscription_baseline_free(alloc, subscription.baseline)
+	subscription.baseline = subscription_baseline_capture(env, rows)
+}
+
+// Diffs the current rows against the stored baseline, appending assertions and
+// retractions and updating the baseline.
+@(private)
+subscription_baseline_diff :: proc(
+	env: ^Builtin_Env,
+	subscription: ^Subscription,
+	rows: []v.Tuple,
+	assertions: ^[dynamic]v.Value,
+	retractions: ^[dynamic]v.Value,
+) {
+	alloc := env.subscriptions.allocator
+	present: [dynamic]bool
+	defer delete(present)
+	for row in rows {
+		found := false
+		for old in subscription.baseline {
+			if v.tuple_eq(old, row) {
+				found = true
+				break
+			}
+		}
+		append(&present, found)
+		if !found {
+			append(assertions, subscription_row_value(env, row))
+		}
+	}
+	kept: [dynamic]v.Tuple
+	for old in subscription.baseline {
+		found := false
+		for row in rows {
+			if v.tuple_eq(old, row) {
+				found = true
+				break
+			}
+		}
+		if found {
+			append(&kept, old)
+		} else {
+			append(retractions, subscription_row_value(env, old))
+			subscription_tuple_free(alloc, old)
+		}
+	}
+	for row, index in rows {
+		if !present[index] {
+			append(&kept, v.tuple_deep_copy(alloc, row))
+		}
+	}
+	if subscription.baseline != nil {
+		delete(subscription.baseline, alloc)
+	}
+	subscription.baseline = kept[:]
+}
+
+// --- Messages --------------------------------------------------------------
+
+@(private)
+subscription_message_key :: proc(name: string) -> v.Value {
+	return v.value_symbol(v.symbol_intern(name))
 }
 
 @(private)
@@ -365,28 +700,203 @@ subscription_message :: proc(
 	capability: v.Value,
 	kind: string,
 	cursor: u64,
-	asserted: []v.Value,
-	retracted: []v.Value,
+	fields: []v.Map_Entry,
 ) -> v.Value {
-	cursor_value, _ := v.value_int(i64(cursor))
+	entries: [6]v.Map_Entry
+	count := 0
+	entries[count] = v.Map_Entry {
+		key   = subscription_message_key("kind"),
+		value = v.value_symbol(v.symbol_intern(kind)),
+	}
+	count += 1
+	entries[count] = v.Map_Entry {
+		key   = subscription_message_key("subscription"),
+		value = capability,
+	}
+	count += 1
+	entries[count] = v.Map_Entry {
+		key   = subscription_message_key("cursor"),
+		value = value_int_must(i64(cursor)),
+	}
+	count += 1
+	for field in fields {
+		entries[count] = field
+		count += 1
+	}
+	return v.value_map(env.allocator, entries[:count])
+}
+
+@(private)
+subscription_changes_message :: proc(
+	env: ^Builtin_Env,
+	capability: v.Value,
+	subject: string,
+	cursor: u64,
+	assertions: []v.Value,
+	retractions: []v.Value,
+) -> v.Value {
+	return subscription_message(env, capability, "changes", cursor, []v.Map_Entry {
+		{
+			key   = subscription_message_key("subject"),
+			value = v.value_symbol(v.symbol_intern(subject)),
+		},
+		{
+			key   = subscription_message_key("assertions"),
+			value = v.value_list(env.allocator, assertions),
+		},
+		{
+			key   = subscription_message_key("retractions"),
+			value = v.value_list(env.allocator, retractions),
+		},
+	})
+}
+
+@(private)
+subscription_snapshot_message :: proc(
+	env: ^Builtin_Env,
+	capability: v.Value,
+	subject: string,
+	cursor: u64,
+	assertions: []v.Value,
+) -> v.Value {
+	return subscription_message(env, capability, "snapshot", cursor, []v.Map_Entry {
+		{
+			key   = subscription_message_key("subject"),
+			value = v.value_symbol(v.symbol_intern(subject)),
+		},
+		{
+			key   = subscription_message_key("assertions"),
+			value = v.value_list(env.allocator, assertions),
+		},
+		{
+			key   = subscription_message_key("retractions"),
+			value = v.value_list(env.allocator, []v.Value{}),
+		},
+	})
+}
+
+@(private)
+subscription_catalogue_message :: proc(
+	env: ^Builtin_Env,
+	capability: v.Value,
+	kind: string,
+	cursor: u64,
+	entries: []v.Value,
+) -> v.Value {
+	return subscription_message(env, capability, kind, cursor, []v.Map_Entry {
+		{
+			key   = subscription_message_key("subject"),
+			value = v.value_symbol(v.symbol_intern("catalogue")),
+		},
+		{
+			key   = subscription_message_key("entries"),
+			value = v.value_list(env.allocator, entries),
+		},
+	})
+}
+
+@(private)
+subscription_marker_message :: proc(
+	env: ^Builtin_Env,
+	capability: v.Value,
+	kind: string,
+	cursor: u64,
+) -> v.Value {
+	return subscription_message(env, capability, kind, cursor, nil)
+}
+
+// --- Catalogue -------------------------------------------------------------
+
+@(private)
+subscription_catalogue_entries :: proc(
+	env: ^Builtin_Env,
+	snapshot: ^k.Snapshot,
+) -> [dynamic]v.Value {
+	entries: [dynamic]v.Value
+	for metadata in snapshot.catalog {
+		identity, identity_ok := v.value_identity_raw(u64(metadata.id))
+		if !identity_ok {
+			continue
+		}
+		append(&entries, v.value_map(env.allocator, []v.Map_Entry {
+			{
+				key   = subscription_message_key("kind"),
+				value = v.value_symbol(v.symbol_intern("relation_created")),
+			},
+			{key = subscription_message_key("relation"), value = identity},
+			{key = subscription_message_key("name"), value = v.value_symbol(metadata.name)},
+		}))
+	}
+	for definition in snapshot.rules {
+		identity, identity_ok := v.value_identity_raw(u64(definition.id))
+		if !identity_ok {
+			continue
+		}
+		relation, relation_ok := v.value_identity_raw(u64(definition.rule.head_relation))
+		if !relation_ok {
+			continue
+		}
+		kind := "rule_installed"
+		if !definition.active {
+			kind = "rule_disabled"
+		}
+		append(&entries, v.value_map(env.allocator, []v.Map_Entry {
+			{
+				key   = subscription_message_key("kind"),
+				value = v.value_symbol(v.symbol_intern(kind)),
+			},
+			{key = subscription_message_key("rule"), value = identity},
+			{key = subscription_message_key("relation"), value = relation},
+		}))
+	}
+	return entries
+}
+
+@(private)
+subscription_catalogue_change_value :: proc(
+	env: ^Builtin_Env,
+	change: k.Catalog_Change,
+) -> v.Value {
+	identity, identity_ok := v.value_identity_raw(u64(change.rule))
+	relation, relation_ok := v.value_identity_raw(u64(change.relation))
+	switch change.kind {
+	case .Relation_Created:
+		if relation_ok {
+			return v.value_map(env.allocator, []v.Map_Entry {
+				{
+					key   = subscription_message_key("kind"),
+					value = v.value_symbol(v.symbol_intern("relation_created")),
+				},
+				{key = subscription_message_key("relation"), value = relation},
+				{key = subscription_message_key("name"), value = v.value_symbol(change.name)},
+			})
+		}
+	case .Rule_Installed:
+		if identity_ok && relation_ok {
+			return v.value_map(env.allocator, []v.Map_Entry {
+				{
+					key   = subscription_message_key("kind"),
+					value = v.value_symbol(v.symbol_intern("rule_installed")),
+				},
+				{key = subscription_message_key("rule"), value = identity},
+				{key = subscription_message_key("relation"), value = relation},
+			})
+		}
+	case .Rule_Disabled:
+		if identity_ok {
+			return v.value_map(env.allocator, []v.Map_Entry {
+				{
+					key   = subscription_message_key("kind"),
+					value = v.value_symbol(v.symbol_intern("rule_disabled")),
+				},
+				{key = subscription_message_key("rule"), value = identity},
+			})
+		}
+	}
 	return v.value_map(env.allocator, []v.Map_Entry {
 		{
-			key   = v.value_symbol(v.symbol_intern("kind")),
-			value = v.value_symbol(v.symbol_intern(kind)),
-		},
-		{key = v.value_symbol(v.symbol_intern("subscription")), value = capability},
-		{key = v.value_symbol(v.symbol_intern("cursor")), value = cursor_value},
-		{
-			key   = v.value_symbol(v.symbol_intern("subject")),
-			value = v.value_symbol(v.symbol_intern("facts")),
-		},
-		{
-			key   = v.value_symbol(v.symbol_intern("assertions")),
-			value = v.value_list(env.allocator, asserted),
-		},
-		{
-			key   = v.value_symbol(v.symbol_intern("retractions")),
-			value = v.value_list(env.allocator, retracted),
+			key   = subscription_message_key("kind"),
+			value = v.value_symbol(v.symbol_intern("unknown")),
 		},
 	})
 }

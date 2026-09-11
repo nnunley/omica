@@ -6,6 +6,7 @@
 package mica_runtime
 
 import "core:fmt"
+import "core:strings"
 import c "../compiler"
 import k "../kernel"
 import v "../var"
@@ -55,18 +56,24 @@ install_dispatch_relations :: proc(env: ^Builtin_Env) -> Run_Result {
 }
 
 // Records every verb in `asts` as a method. Function indices follow the same
-// order `compile_program` assigns: entry is 0, verbs start at 1.
+// order `compile_program` assigns: entry is 0, verbs start at 1. `sources`
+// holds the trimmed program text for each AST, recorded as MethodSource facts.
 @(private)
 install_methods :: proc(
 	env: ^Builtin_Env,
 	asts: []^c.Program_AST,
+	sources: []string,
 	declarations: ^Declarations,
 ) -> Run_Result {
 	tx := k.kernel_begin(env.kernel)
 	defer k.transaction_destroy(&tx)
 	function_index := 1
 
-	for ast in asts {
+	for ast, ast_index in asts {
+		source_text := ""
+		if ast_index < len(sources) {
+			source_text = strings.trim_space(sources[ast_index])
+		}
 		for item in ast.items {
 			verb, is_verb := item.(c.Verb_Item)
 			if !is_verb {
@@ -94,6 +101,19 @@ install_methods :: proc(
 				v.tuple_new(env.allocator, []v.Value{method_value, program_value}),
 			); err != k.Kernel_Error.None {
 				return method_install_error(env, verb.name, err)
+			}
+
+			if source_text != "" {
+				if err := k.transaction_assert(
+					&tx,
+					k.SYSTEM_METHOD_SOURCE_ID,
+					v.tuple_new(env.allocator, []v.Value {
+						method_value,
+						v.value_string(env.allocator, source_text),
+					}),
+				); err != k.Kernel_Error.None {
+					return method_install_error(env, verb.name, err)
+				}
 			}
 
 			for param, position in verb.params {

@@ -106,6 +106,7 @@ dispatch_relation_metadata :: proc(allocator := context.allocator) -> []Relation
 SYSTEM_RELATION_ID :: Relation_ID(0x7fff_fe01)
 SYSTEM_RELATION_NAME_ID :: Relation_ID(0x7fff_fe02)
 SYSTEM_ARITY_ID :: Relation_ID(0x7fff_fe03)
+SYSTEM_RELATION_DURABILITY_ID :: Relation_ID(0x7fff_fe1b)
 SYSTEM_RULE_ID :: Relation_ID(0x7fff_fe04)
 SYSTEM_RULE_HEAD_ID :: Relation_ID(0x7fff_fe05)
 SYSTEM_RULE_SOURCE_ID :: Relation_ID(0x7fff_fe06)
@@ -138,6 +139,11 @@ system_relation_metadata :: proc(allocator := context.allocator) -> []Relation_M
 		relation_metadata(SYSTEM_RELATION_ID, v.symbol_intern("Relation"), 1),
 		relation_metadata(SYSTEM_RELATION_NAME_ID, v.symbol_intern("RelationName"), 2),
 		relation_metadata(SYSTEM_ARITY_ID, v.symbol_intern("Arity"), 2),
+		relation_metadata(
+			SYSTEM_RELATION_DURABILITY_ID,
+			v.symbol_intern("RelationDurability"),
+			2,
+		),
 		relation_metadata(SYSTEM_RULE_ID, v.symbol_intern("Rule"), 1),
 		relation_metadata(SYSTEM_RULE_HEAD_ID, v.symbol_intern("RuleHead"), 2),
 		relation_metadata(SYSTEM_RULE_SOURCE_ID, v.symbol_intern("RuleSource"), 2),

@@ -1161,34 +1161,59 @@ builtin_subscribe_changes :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 	if !subject_ok {
 		return builtin_error(state, "E_TYPE", "subscription subject must be a symbol")
 	}
-	subject, subject_name_ok := v.symbol_name(subject_symbol)
-	if !subject_name_ok || (subject != "facts" && subject != "relation") {
+	subject_name, subject_name_ok := v.symbol_name(subject_symbol)
+	subject: Subscription_Subject
+	switch subject_name {
+	case "facts":
+		subject = .Facts
+	case "relation":
+		subject = .Relation
+	case "catalogue":
+		subject = .Catalogue
+	case:
+		subject_name_ok = false
+	}
+	if !subject_name_ok {
 		return builtin_error(state, "E_INVARG", "unsupported subscription subject")
+	}
+	if subject == .Catalogue && !(state.authority == nil || state.authority.root) {
+		return builtin_error(state, "E_PERMISSION", "catalogue subscriptions require root authority")
 	}
 
 	relation_value, has_relation := option_payload(args[2])
-	if !has_relation {
-		return builtin_error(state, "E_INVARG", "subscription needs a relation")
-	}
-	relation_symbol, relation_ok := v.value_as_symbol(relation_value)
-	if !relation_ok {
-		return builtin_error(state, "E_TYPE", "subscription relation must be a symbol")
-	}
-	relation_name, relation_name_ok := v.symbol_name(relation_symbol)
-	if !relation_name_ok {
-		return builtin_error(state, "E_INVARG", "unknown subscription relation")
-	}
-	relation, found := env.ctx.relations[relation_name]
-	if !found {
-		return builtin_error(state, "E_INVARG", "unknown subscription relation")
-	}
-	if !k.authority_can_read(state.authority, k.Relation_ID(relation)) {
-		return builtin_error(state, "E_PERMISSION", "subscription relation read denied")
+	relation_id: k.Relation_ID
+	if subject == .Catalogue {
+		if has_relation {
+			return builtin_error(state, "E_INVARG", "catalogue subscriptions take no relation")
+		}
+	} else {
+		if !has_relation {
+			return builtin_error(state, "E_INVARG", "subscription needs a relation")
+		}
+		relation_symbol, relation_ok := v.value_as_symbol(relation_value)
+		if !relation_ok {
+			return builtin_error(state, "E_TYPE", "subscription relation must be a symbol")
+		}
+		relation_name, relation_name_ok := v.symbol_name(relation_symbol)
+		if !relation_name_ok {
+			return builtin_error(state, "E_INVARG", "unknown subscription relation")
+		}
+		relation, found := env.ctx.relations[relation_name]
+		if !found {
+			return builtin_error(state, "E_INVARG", "unknown subscription relation")
+		}
+		if !k.authority_can_read(state.authority, k.Relation_ID(relation)) {
+			return builtin_error(state, "E_PERMISSION", "subscription relation read denied")
+		}
+		relation_id = k.Relation_ID(relation)
 	}
 
 	binding_list, bindings_ok := v.value_as_list(args[3])
 	if !bindings_ok {
 		return builtin_error(state, "E_TYPE", "subscription bindings must be a list")
+	}
+	if subject == .Catalogue && len(binding_list) != 0 {
+		return builtin_error(state, "E_INVARG", "catalogue subscriptions take no bindings")
 	}
 	bindings := make([]v.Binding, len(binding_list), context.temp_allocator)
 	for item, index in binding_list {
@@ -1211,23 +1236,36 @@ builtin_subscribe_changes :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 
 	cursor := u64(0)
 	has_cursor := false
-	if len(args) >= 6 && !v.value_is_empty_relation(args[5]) {
-		value, is_int := v.value_as_int(args[5])
-		if !is_int || value < 0 {
-			return builtin_error(state, "E_INVARG", "subscription cursor must be non-negative")
+	if len(args) >= 6 {
+		if value, has := option_payload(args[5]); has {
+			cursor_value, is_int := v.value_as_int(value)
+			if !is_int || cursor_value < 0 {
+				return builtin_error(state, "E_INVARG", "subscription cursor must be non-negative")
+			}
+			cursor = u64(cursor_value)
+			has_cursor = true
 		}
-		cursor = u64(value)
-		has_cursor = true
+	}
+
+	queue_budget := DEFAULT_SUBSCRIPTION_QUEUE_BUDGET
+	if len(args) >= 7 && !v.value_is_empty_relation(args[6]) {
+		budget_value, is_int := v.value_as_int(args[6])
+		if !is_int || budget_value < 1 {
+			return builtin_error(state, "E_INVARG", "queue budget must be positive")
+		}
+		queue_budget = int(budget_value)
 	}
 
 	capability, registered := subscriptions_register(
 		env,
 		sender,
-		k.Relation_ID(relation),
+		subject,
+		relation_id,
 		bindings,
 		initial == "snapshot",
 		cursor,
 		has_cursor,
+		queue_budget,
 	)
 	if !registered {
 		return builtin_error(state, "E_SUBSCRIPTION", "cannot register subscription")

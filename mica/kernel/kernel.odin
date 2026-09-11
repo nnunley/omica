@@ -608,6 +608,11 @@ kernel_create_relation :: proc(
 		if published {
 			kernel_retire(kernel, previous)
 			snapshot_release(current)
+			changes_record_catalog(&kernel.changes, next.version, []Catalog_Change{{
+				kind     = .Relation_Created,
+				relation = metadata.id,
+				name     = metadata.name,
+			}})
 			return next, .None
 		}
 		snapshot_release(next)
@@ -668,6 +673,11 @@ kernel_install_rule :: proc(
 		if published {
 			kernel_retire(kernel, previous)
 			snapshot_release(current)
+			changes_record_catalog(&kernel.changes, next.version, []Catalog_Change{{
+				kind     = .Rule_Installed,
+				relation = rule.head_relation,
+				rule     = id,
+			}})
 			return next, .None
 		}
 		snapshot_release(next)
@@ -691,12 +701,14 @@ kernel_set_rule_active :: proc(
 	for {
 		current := kernel_snapshot(kernel)
 		found := false
+		head_relation: Relation_ID
 		for definition in current.rules {
 			if definition.id == rule_id {
 				if definition.active == active {
 					return current, .None
 				}
 				found = true
+				head_relation = definition.rule.head_relation
 				break
 			}
 		}
@@ -716,6 +728,15 @@ kernel_set_rule_active :: proc(
 		if published {
 			kernel_retire(kernel, previous)
 			snapshot_release(current)
+			kind := Catalog_Change_Kind.Rule_Installed
+			if !active {
+				kind = .Rule_Disabled
+			}
+			changes_record_catalog(&kernel.changes, next.version, []Catalog_Change{{
+				kind     = kind,
+				relation = head_relation,
+				rule     = rule_id,
+			}})
 			return next, .None
 		}
 		snapshot_release(next)
