@@ -402,6 +402,50 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 	case Retract:
 		return emit_relation_write(emitter, n.atom, false)
 
+	case Match:
+		push_error(emitter, "match expressions are not lowered yet")
+		return -1, false
+
+	case Try:
+		push_error(emitter, "try expressions are not lowered yet")
+		return -1, false
+
+	case Raise:
+		push_error(emitter, "raise expressions are not lowered yet")
+		return -1, false
+
+	case Spawn:
+		push_error(emitter, "spawn expressions are not lowered yet")
+		return -1, false
+
+	case Structural_Literal:
+		push_error(emitter, "structural literals are not lowered yet")
+		return -1, false
+
+	case Dom_Text, Dom_Element:
+		push_error(emitter, "DOM markup is not lowered yet")
+		return -1, false
+
+	case Fn:
+		push_error(emitter, "fn literals are not lowered yet")
+		return -1, false
+
+	case Splice:
+		push_error(emitter, "splices are not lowered yet")
+		return -1, false
+
+	case Query_Variable:
+		push_error(emitter, "query variables are not lowered yet")
+		return -1, false
+
+	case Wildcard:
+		push_error(emitter, "wildcards are not lowered yet")
+		return -1, false
+
+	case Bytes_Literal:
+		push_error(emitter, "byte literals are not lowered yet")
+		return -1, false
+
 	case:
 		push_error(emitter, "this expression is not lowered yet")
 		return -1, false
