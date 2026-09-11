@@ -28,18 +28,15 @@ Kernel :: struct {
 	// in order while writes to different relations proceed in parallel.
 	relation_locks: [RELATION_LOCK_STRIPES]sync.Mutex,
 
-	// Serialises the rebase-and-publish window. Candidates are prepared in
-	// parallel; only this short window (adopt the winner's unchanged state,
-	// swap the pointer, retire the old snapshot) is exclusive.
-	publish_lock: sync.Mutex,
-
-	// Group commit. Prepared candidates queue here; the first thread to
-	// enqueue drains the batch and publishes every candidate in one snapshot,
-	// amortising publication over concurrent commits.
+	// Group publication. Prepared candidates queue here; the first task
+	// thread to enqueue drains the batch and publishes every candidate in one
+	// snapshot. This stops independent tasks from invalidating each other's
+	// candidates, which otherwise causes retry amplification under load.
 	commit_queue_lock: sync.Mutex,
 	commit_queue_cond: sync.Cond,
 	pending_commits:   [dynamic]^Commit_Entry,
 	committer_active:  bool,
+
 	// Reader-count reclamation (RCU-style). A reader increments `readers`
 	// around load-and-retain; a publisher swaps `current`, moves the previous
 	// snapshot to `retired`, and frees retired snapshots only while no reader
@@ -237,14 +234,13 @@ kernel_next_relation_id :: proc(kernel: ^Kernel) -> Relation_ID {
 	return Relation_ID(next)
 }
 
-// Publishes `next` if `expected` is still the published snapshot. The caller
-// must hold `kernel.publish_lock`, so the compare-exchange is deterministic:
-// on failure `expected` was retired by a publisher that did not hold the lock,
-// or the caller's reference is stale. On success the kernel holds a reference
-// to `next`. The previous snapshot is returned for the caller to retire after
-// releasing the publish lock, keeping the exclusive window to a pointer swap.
+// Publishes `next` if `expected` is still the published snapshot. Each task
+// commits on its own thread, so this is a direct compare-exchange: on failure
+// the caller holds the winner, rebases its prepared blocks in place, and tries
+// again. On success the kernel holds a reference to `next` and the previous
+// snapshot is returned for the caller to retire.
 @(private)
-kernel_publish_current :: proc(
+kernel_try_publish :: proc(
 	kernel: ^Kernel,
 	expected, next: ^Snapshot,
 ) -> (
@@ -265,6 +261,9 @@ kernel_publish_current :: proc(
 	snapshot_release(next)
 	return nil, false
 }
+
+// Maximum rebase attempts for a solo publication before reporting a conflict.
+PUBLISH_ATTEMPT_LIMIT :: 64
 
 // A prepared commit waiting for a group publication.
 Commit_Entry :: struct {
@@ -300,7 +299,8 @@ kernel_commit_wait :: proc(kernel: ^Kernel, entry: ^Commit_Entry) {
 	sync.mutex_unlock(&kernel.commit_queue_lock)
 }
 
-// Drains and publishes commit batches until the queue is empty.
+// Drains and publishes commit batches until the queue is empty. Any task
+// thread can be the committer; the role is not a dedicated thread.
 @(private)
 kernel_committer_drain :: proc(kernel: ^Kernel) {
 	for {
@@ -327,52 +327,52 @@ kernel_committer_drain :: proc(kernel: ^Kernel) {
 	}
 }
 
-// Merges every candidate's written blocks into one snapshot and publishes it
+// Merges every candidate's prepared blocks into one snapshot and publishes it
 // once. Candidates are stripe-protected and write disjoint relations, so the
-// merge is an adoption of prepared blocks.
+// merge adopts prepared blocks; only the surrounding snapshot arrays are
+// rebuilt. A lone candidate publishes directly.
 @(private)
 kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
-	sync.mutex_lock(&kernel.publish_lock)
-
-	// A lone candidate is published directly, adopting the latest snapshot's
-	// unchanged state in place. This keeps the uncontended commit path free of
-	// the merge machinery.
 	if len(batch) == 1 {
 		entry := batch[0]
-		base := kernel_snapshot(kernel)
-		if base == entry.base {
-			// The world did not move since this candidate was prepared; publish
-			// it directly.
-			previous, published := kernel_publish_current(
-				kernel,
-				base,
-				entry.candidate,
-			)
-			snapshot_release(base)
+		for _ in 0 ..< PUBLISH_ATTEMPT_LIMIT {
+			previous, published := kernel_try_publish(kernel, entry.base, entry.candidate)
 			if published {
-				sync.mutex_unlock(&kernel.publish_lock)
 				kernel_retire(kernel, previous)
+				snapshot_release(entry.base)
+				entry.base = nil
 				entry.published = entry.candidate
 				return
 			}
-		} else if transaction_rebase_in_place(kernel, entry.transaction, entry.candidate, base) {
-			previous, published := kernel_publish_current(
+			winner := kernel_snapshot(kernel)
+			if transaction_rebase_in_place(
 				kernel,
-				base,
+				entry.transaction,
 				entry.candidate,
-			)
-			snapshot_release(base)
-			if published {
-				sync.mutex_unlock(&kernel.publish_lock)
-				kernel_retire(kernel, previous)
-				entry.published = entry.candidate
-				return
+				winner,
+			) {
+				snapshot_release(entry.base)
+				entry.base = winner
+				continue
 			}
-		} else {
-			snapshot_release(base)
+			// The winner's shape changed (a catalog operation). Adopt it as
+			// the new base and rebuild the candidate from it.
+			snapshot_release(entry.candidate)
+			snapshot_release(entry.base)
+			entry.base = winner
+			entry.candidate = transaction_build_candidate(
+				kernel,
+				entry.transaction,
+				entry.base,
+			)
 		}
-		// Fall through to the merge path when the direct publish could not
-		// happen; the candidate is untouched by the failed compare-exchange.
+		// Give up rather than spin; the owner retries the transaction.
+		snapshot_release(entry.candidate)
+		snapshot_release(entry.base)
+		entry.candidate = nil
+		entry.base = nil
+		entry.published = nil
+		return
 	}
 
 	for {
@@ -386,14 +386,15 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 		}
 		snapshot_compute_derived(merged)
 
-		previous, published := kernel_publish_current(kernel, base, merged)
+		previous, published := kernel_try_publish(kernel, base, merged)
 		if published {
-			sync.mutex_unlock(&kernel.publish_lock)
 			kernel_retire(kernel, previous)
 			for entry in batch {
 				snapshot_retain(merged)
 				entry.published = merged
 				snapshot_release(entry.candidate)
+				snapshot_release(entry.base)
+				entry.base = nil
 			}
 			snapshot_release(base)
 			return
@@ -467,9 +468,7 @@ kernel_create_relation :: proc(
 		next := snapshot_fork(kernel, current)
 		snapshot_add_relation(next, metadata_clone(kernel.world_allocator, metadata))
 		snapshot_compute_derived(next)
-		sync.mutex_lock(&kernel.publish_lock)
-		previous, published := kernel_publish_current(kernel, current, next)
-		sync.mutex_unlock(&kernel.publish_lock)
+		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
 			snapshot_release(current)
@@ -529,9 +528,7 @@ kernel_install_rule :: proc(
 		}
 
 		snapshot_compute_derived(next)
-		sync.mutex_lock(&kernel.publish_lock)
-		previous, published := kernel_publish_current(kernel, current, next)
-		sync.mutex_unlock(&kernel.publish_lock)
+		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
 			snapshot_release(current)
@@ -575,9 +572,7 @@ kernel_disable_rule :: proc(
 			}
 		}
 		snapshot_compute_derived(next)
-		sync.mutex_lock(&kernel.publish_lock)
-		previous, published := kernel_publish_current(kernel, current, next)
-		sync.mutex_unlock(&kernel.publish_lock)
+		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
 			snapshot_release(current)

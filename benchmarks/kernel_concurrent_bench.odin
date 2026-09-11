@@ -487,6 +487,64 @@ bench_readers_during_writer :: proc(_: rawptr, _: int, _: int) {
 	assert(total_scans > 0)
 }
 
+// --- Task-model scaling ----------------------------------------------------
+//
+// One thread per task, one transaction per commit, each task on its own
+// relation. Total work is fixed; the thread count varies so the aggregate
+// commit rate shows whether independent tasks scale.
+
+TASK_SCALE_TOTAL_COMMITS :: 8192
+TASK_SCALE_THREAD_COUNTS := [4]int{1, 2, 4, 8}
+
+@(private)
+Task_Scale_State :: struct {
+	threads: int,
+}
+
+@(private)
+bench_task_scale :: proc(user: rawptr, _: int, _: int) {
+	state := (^Task_Scale_State)(user)
+	thread_count := state.threads
+	per_thread := TASK_SCALE_TOTAL_COMMITS / thread_count
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	relations := make([]k.Relation_ID, thread_count, context.temp_allocator)
+	workers := make([]Relation_Bench_Worker, thread_count, context.temp_allocator)
+	handles := make([]^thread.Thread, thread_count, context.temp_allocator)
+	for index in 0 ..< thread_count {
+		relations[index] = concurrent_relation(
+			&kernel,
+			u32(300 + index),
+			fmt.aprintf("TaskRelation%d", index, allocator = context.temp_allocator),
+			1,
+			k.conflict_set(),
+		)
+		workers[index] = Relation_Bench_Worker {
+			kernel   = &kernel,
+			relation = relations[index],
+			count    = per_thread,
+		}
+		handles[index] = thread.create_and_start_with_data(
+			&workers[index],
+			relation_bench_worker,
+		)
+	}
+	for index in 0 ..< thread_count {
+		thread.join(handles[index])
+		thread.destroy(handles[index])
+	}
+	for worker in workers {
+		assert(worker.failed == .None)
+		assert(worker.committed == per_thread)
+	}
+}
+
+@(private)
+task_scale_states: [len(TASK_SCALE_THREAD_COUNTS)]Task_Scale_State
+
 @(private)
 register_kernel_concurrent_benches :: proc(runner: ^mm.Runner) {
 	disjoint := mm.group(
@@ -532,6 +590,22 @@ register_kernel_concurrent_benches :: proc(runner: ^mm.Runner) {
 		bench_serial_relation_commits,
 		1,
 	)
+
+	tasks_group := mm.group(
+		runner,
+		"kernel/concurrent/tasks",
+		mm.throughput_per_op(TASK_SCALE_TOTAL_COMMITS, "commit"),
+	)
+	for thread_count, index in TASK_SCALE_THREAD_COUNTS {
+		task_scale_states[index] = Task_Scale_State{threads = thread_count}
+		mm.bench_capped(
+			tasks_group,
+			fmt.aprintf("threads_%d", thread_count),
+			&task_scale_states[index],
+			bench_task_scale,
+			1,
+		)
+	}
 
 	read_write := mm.group(
 		runner,

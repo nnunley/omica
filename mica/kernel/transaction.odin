@@ -481,11 +481,12 @@ optional_tuple_eq :: proc(a: v.Tuple, a_ok: bool, b: v.Tuple, b_ok: bool) -> boo
 // Commits the transaction, publishing a new snapshot. On success the returned
 // snapshot is caller-owned. The transaction must be destroyed by the caller.
 //
-// Commits to the same relation are serialised by striped relation locks so a
-// candidate is prepared against a stable relation block. Publications still
-// use a compare-exchange; when it loses a race to a commit on another relation,
-// the prepared blocks are re-slotted onto the winner instead of being rebuilt
-// (the moor commit pipeline's rebase). Only pointer and array work repeats.
+// A task owns one thread and one transaction. Commits to the same relation are
+// serialised by striped relation locks so a candidate is prepared against a
+// stable relation block; commits to different relations proceed concurrently.
+// Publication happens in groups: whichever task thread arrives first drains
+// the queued candidates and merges them into one snapshot, so independent
+// tasks do not invalidate one another's prepared work.
 transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Error) {
 	kernel := transaction.kernel
 
@@ -514,9 +515,9 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 	transaction_prepare_writes(transaction)
 	candidate := transaction_build_candidate(kernel, transaction, current)
 
-	// Hand the candidate to the group committer. One publication covers every
-	// candidate that arrives together, so the per-commit publish cost is
-	// amortised across concurrent commits.
+	// The entry owns its own reference to the base so the committer can
+	// replace it while rebasing; the task keeps its `current` reference.
+	snapshot_retain(current)
 	entry := Commit_Entry {
 		transaction = transaction,
 		base        = current,
@@ -606,8 +607,9 @@ transaction_rebase_in_place :: proc(
 			continue
 		}
 		if transaction_writes_relation(transaction, block.metadata.id) {
-			// Relation stripes prevent this; fall back if it ever happens.
-			return false
+			// Our prepared block is authoritative for a relation whose stripe
+			// we hold; the winner cannot have changed it.
+			continue
 		}
 		relation_block_retain(winner_block)
 		candidate.blocks[index] = winner_block
