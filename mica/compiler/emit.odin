@@ -419,8 +419,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return -1, false
 
 	case Structural_Literal:
-		push_error(emitter, "structural literals are not lowered yet")
-		return -1, false
+		return emit_frob(emitter, n)
 
 	case Dom_Text, Dom_Element:
 		push_error(emitter, "DOM markup is not lowered yet")
@@ -477,9 +476,17 @@ emit_identity :: proc(emitter: ^Emitter, literal: Identity_Literal) -> (int, boo
 @(private)
 emit_name :: proc(emitter: ^Emitter, name: Name) -> (int, bool) {
 	text := join_name(name, emitter.allocator)
+	if text == "none" {
+		empty, _ := v.value_relation(
+			emitter.allocator,
+			[]v.Symbol{v.symbol_intern("value")},
+			nil,
+		)
+		return emit_constant(emitter, empty), true
+	}
 	register, _, found := resolve_local(emitter, text)
 	if !found {
-		push_error(emitter, "unknown name")
+		push_error(emitter, fmt.aprintf("unknown name: %s", text, allocator = emitter.allocator))
 		return -1, false
 	}
 	destination := alloc_register(emitter)
@@ -515,6 +522,33 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 	return value_register, true
 }
 
+// Reserves a contiguous register block for `registers` and moves each value
+// into it. The VM reads call and build operands from consecutive registers.
+@(private)
+marshal_arguments :: proc(emitter: ^Emitter, registers: []int) -> int {
+	if len(registers) == 0 {
+		return 0
+	}
+	first := alloc_register(emitter)
+	for _ in 1 ..< len(registers) {
+		_ = alloc_register(emitter)
+	}
+	for register, index in registers {
+		if register == first + index {
+			continue
+		}
+		vm.builder_emit(
+			emitter.builder,
+			.Move,
+			0,
+			i32(first + index),
+			i32(register),
+			0,
+		)
+	}
+	return first
+}
+
 @(private)
 emit_assignment :: proc(emitter: ^Emitter, assignment: Assignment) -> (int, bool) {
 	if field, is_field := assignment.target^.(Field); is_field {
@@ -522,7 +556,7 @@ emit_assignment :: proc(emitter: ^Emitter, assignment: Assignment) -> (int, bool
 		if !receiver_ok {
 			return -1, false
 		}
-		_ = emit_constant(
+		symbol_register := emit_constant(
 			emitter,
 			v.value_symbol(v.symbol_intern(field.name)),
 		)
@@ -530,6 +564,7 @@ emit_assignment :: proc(emitter: ^Emitter, assignment: Assignment) -> (int, bool
 		if !value_ok {
 			return -1, false
 		}
+		first_argument := marshal_arguments(emitter, []int{receiver, symbol_register, value})
 		destination := alloc_register(emitter)
 		builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__set_field"))
 		vm.builder_emit(
@@ -538,7 +573,7 @@ emit_assignment :: proc(emitter: ^Emitter, assignment: Assignment) -> (int, bool
 			0,
 			i32(destination),
 			builtin,
-			i32(receiver),
+			i32(first_argument),
 		)
 		return value, true
 	}
@@ -660,6 +695,10 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		}
 	}
 
+	if text == "some" || text == "ok" || text == "err" {
+		return emit_standard_constructor(emitter, text, call)
+	}
+
 	// A relation query.
 	if emitter.ctx != nil {
 		if relation, found := emitter.ctx.relations[text]; found {
@@ -667,19 +706,16 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		}
 	}
 
-	first_argument := -1
-	for argument, index in call.args {
+	argument_registers := make([dynamic]int, 0, len(call.args), emitter.allocator)
+	defer delete(argument_registers)
+	for argument in call.args {
 		register, has_value := emit_expr(emitter, argument.expr)
 		if !has_value {
 			return -1, false
 		}
-		if index == 0 {
-			first_argument = register
-		}
+		append(&argument_registers, register)
 	}
-	if first_argument < 0 {
-		first_argument = 0
-	}
+	first_argument := marshal_arguments(emitter, argument_registers[:])
 
 	// A directly callable verb.
 	if function_index, found := emitter.functions[text]; found {
@@ -710,7 +746,7 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		return destination, true
 	}
 
-	push_error(emitter, "unknown callable")
+	push_error(emitter, fmt.aprintf("unknown callable: %s", text, allocator = emitter.allocator))
 	return -1, false
 }
 
@@ -784,6 +820,109 @@ emit_range :: proc(emitter: ^Emitter, range: Range_Literal) -> (int, bool) {
 	flags: u8 = range.has_end ? 1 : 0
 	vm.builder_emit(emitter.builder, .Build_Range, flags, i32(destination), i32(start), i32(end))
 	return destination, true
+}
+
+@(private)
+emit_frob :: proc(emitter: ^Emitter, frob: Structural_Literal) -> (int, bool) {
+	head, is_identity := frob.head^.(Identity_Literal)
+	if !is_identity {
+		push_error(emitter, "frob delegate must be an identity")
+		return -1, false
+	}
+	delegate, delegate_ok := emit_identity(emitter, head)
+	if !delegate_ok {
+		return -1, false
+	}
+	payload, payload_ok := emit_frob_payload(emitter, frob)
+	if !payload_ok {
+		return -1, false
+	}
+	if emitter.ctx == nil || !emitter.ctx.builtins["frob"] {
+		push_error(emitter, "frob is not available")
+		return -1, false
+	}
+
+	first_argument := marshal_arguments(emitter, []int{delegate, payload})
+
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("frob"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		0,
+		i32(destination),
+		builtin,
+		i32(first_argument),
+	)
+	return destination, true
+}
+
+@(private)
+emit_standard_constructor :: proc(
+	emitter: ^Emitter,
+	name: string,
+	call: Call,
+) -> (int, bool) {
+	if len(call.args) != 1 {
+		push_error(emitter, fmt.aprintf(
+			"%s expects one positional argument",
+			name,
+			allocator = emitter.allocator,
+		))
+		return -1, false
+	}
+	payload, payload_ok := emit_expr(emitter, call.args[0].expr)
+	if !payload_ok {
+		return -1, false
+	}
+
+	heading: []v.Symbol
+	first := 0
+	switch name {
+	case "some":
+		heading = []v.Symbol{v.symbol_intern("value")}
+		first = marshal_arguments(emitter, []int{payload})
+
+	case "ok", "err":
+		heading = []v.Symbol{v.symbol_intern("case"), v.symbol_intern("value")}
+		tag := "ok" if name == "ok" else "error"
+		tag_register := emit_constant(emitter, v.value_symbol(v.symbol_intern(tag)))
+		first = marshal_arguments(emitter, []int{tag_register, payload})
+	}
+
+	shape := vm.builder_add_relation_shape(emitter.builder, heading)
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Build_Relation,
+		0,
+		i32(destination),
+		shape,
+		i32(first),
+	)
+	return destination, true
+}
+
+@(private)
+emit_frob_payload :: proc(emitter: ^Emitter, frob: Structural_Literal) -> (int, bool) {
+	if frob.named {
+		entries := make([]Map_Entry_AST, len(frob.cells), emitter.allocator)
+		for cell, index in frob.cells {
+			entries[index] = Map_Entry_AST {
+				key   = cell.name,
+				value = cell.value,
+			}
+		}
+		return emit_map(emitter, Map_Literal{entries = entries})
+	}
+	if len(frob.cells) == 1 {
+		return emit_expr(emitter, frob.cells[0].value)
+	}
+	elements := make([]^Expr, len(frob.cells), emitter.allocator)
+	for cell, index in frob.cells {
+		elements[index] = cell.value
+	}
+	return emit_list(emitter, List_Literal{elements = elements})
 }
 
 @(private)
@@ -1001,7 +1140,7 @@ emit_relation_write :: proc(
 		relation, found = emitter.ctx.relations[name]
 	}
 	if !found {
-		push_error(emitter, "unknown relation in assert or retract")
+		push_error(emitter, fmt.aprintf("unknown relation in assert or retract: %s", name, allocator = emitter.allocator))
 		return -1, false
 	}
 
@@ -1014,8 +1153,9 @@ emit_relation_write :: proc(
 	}
 	shape := vm.builder_add_relation_shape(emitter.builder, heading)
 
-	first_argument := -1
-	for argument, index in call.args {
+	argument_registers := make([dynamic]int, 0, len(call.args), emitter.allocator)
+	defer delete(argument_registers)
+	for argument in call.args {
 		if argument.has_role {
 			push_error(emitter, "named-role relation atoms are not lowered yet")
 			return -1, false
@@ -1024,13 +1164,9 @@ emit_relation_write :: proc(
 		if !has_value {
 			return -1, false
 		}
-		if index == 0 {
-			first_argument = register
-		}
+		append(&argument_registers, register)
 	}
-	if first_argument < 0 {
-		first_argument = 0
-	}
+	first_argument := marshal_arguments(emitter, argument_registers[:])
 
 	row_register := alloc_register(emitter)
 	vm.builder_emit(
@@ -1328,6 +1464,7 @@ emit_field_read :: proc(emitter: ^Emitter, field: Field) -> (int, bool) {
 		return -1, false
 	}
 	symbol_register := emit_constant(emitter, v.value_symbol(v.symbol_intern(field.name)))
+	first_argument := marshal_arguments(emitter, []int{receiver, symbol_register})
 	destination := alloc_register(emitter)
 	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__get_field"))
 	vm.builder_emit(
@@ -1336,7 +1473,7 @@ emit_field_read :: proc(emitter: ^Emitter, field: Field) -> (int, bool) {
 		0,
 		i32(destination),
 		builtin,
-		i32(receiver),
+		i32(first_argument),
 	)
 	return destination, true
 }

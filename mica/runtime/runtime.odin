@@ -80,6 +80,7 @@ run_files :: proc(
 	ctx.builtins["make_functional_relation"] = true
 	ctx.builtins["emit"] = true
 	ctx.builtins["require"] = true
+	ctx.builtins["frob"] = true
 
 	env := Builtin_Env {
 		kernel    = kernel,
@@ -119,6 +120,11 @@ run_files :: proc(
 
 	compiled := c.compile_program(&program_ast, &ctx, allocator)
 	if len(compiled.errors) > 0 {
+		if _, show_all := os.lookup_env("MICA_ALL_ERRORS", context.allocator); show_all {
+			for compile_error in compiled.errors {
+				fmt.eprintln(compile_error.message)
+			}
+		}
 		return Run_Result{ok = false, message = compiled.errors[0].message}
 	}
 
@@ -352,6 +358,7 @@ register_builtins :: proc(state: ^vm.VM) {
 	vm.vm_register_builtin(state, v.symbol_intern("__get_field"), 2, builtin_get_field)
 	vm.vm_register_builtin(state, v.symbol_intern("emit"), 2, builtin_noop)
 	vm.vm_register_builtin(state, v.symbol_intern("require"), 1, builtin_require)
+	vm.vm_register_builtin(state, v.symbol_intern("frob"), 2, builtin_frob)
 }
 
 @(private)
@@ -383,6 +390,17 @@ builtin_make_identity :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 @(private)
 builtin_relation :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	return v.value_empty_relation(), true
+}
+
+@(private)
+builtin_frob :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	delegate, is_identity := v.value_as_identity(args[0])
+	if !is_identity {
+		vm.vm_set_error(state, "E_TYPE", "frob delegate must be an identity")
+		return v.Value(0), false
+	}
+	env := builtin_env(state)
+	return v.value_frob(env.allocator, delegate, args[1]), true
 }
 
 @(private)

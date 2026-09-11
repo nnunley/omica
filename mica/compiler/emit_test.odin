@@ -287,3 +287,149 @@ test_emit_map_pattern_over_variable :: proc(t: ^testing.T) {
 	testing.expect(t, identity_ok)
 	testing.expect_value(t, v.identity_raw(identity), u64(1))
 }
+
+@(private)
+constructor_case_index :: proc(heading: []v.Symbol) -> int {
+	for column, index in heading {
+		name, ok := v.symbol_name(column)
+		if ok && name == "case" {
+			return index
+		}
+	}
+	return -1
+}
+
+@(private)
+test_frob_builtin :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	delegate, is_identity := v.value_as_identity(args[0])
+	if !is_identity {
+		vm.vm_set_error(state, "E_TYPE", "frob delegate must be an identity")
+		return v.Value(0), false
+	}
+	return v.value_frob(state.allocator, delegate, args[1]), true
+}
+
+@(private)
+test_pair_lengths_builtin :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	left, left_ok := v.value_as_list(args[0])
+	right, right_ok := v.value_as_list(args[1])
+	if !left_ok || !right_ok {
+		vm.vm_set_error(state, "E_TYPE", "pair_lengths expects lists")
+		return v.Value(0), false
+	}
+	total, _ := v.value_int(i64(len(left) + len(right)))
+	return total, true
+}
+
+@(test)
+test_emit_frob_literal :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	ctx.builtins["frob"] = true
+	delegate, _ := v.value_identity_raw(0x42)
+	ctx.identities["thing"] = delegate
+
+	program := compile_test_program(t, "#thing<[1, 2]>", &ctx, allocator)
+	state: vm.VM
+	vm.vm_init(&state, program, allocator)
+	defer vm.vm_destroy(&state)
+	vm.vm_register_builtin(&state, v.symbol_intern("frob"), 2, test_frob_builtin)
+	testing.expect_value(t, vm.vm_run(&state), vm.VM_Status.Halted)
+
+	got_delegate, delegate_ok := v.value_frob_delegate(state.result)
+	testing.expect(t, delegate_ok)
+	testing.expect_value(t, v.identity_raw(got_delegate), u64(0x42))
+
+	payload, payload_ok := v.value_frob_value(state.result)
+	testing.expect(t, payload_ok)
+	values, list_ok := v.value_as_list(payload)
+	testing.expect(t, list_ok)
+	testing.expect_value(t, len(values), 2)
+}
+
+@(test)
+test_emit_standard_constructors :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	none_program := compile_test_program(t, "none", &ctx, allocator)
+	none_state := run_test_program(t, none_program, allocator)
+	defer vm.vm_destroy(&none_state)
+	none_relation, none_ok := v.value_as_relation(none_state.result)
+	testing.expect(t, none_ok)
+	testing.expect_value(t, len(none_relation.heading), 1)
+	testing.expect_value(t, len(none_relation.rows), 0)
+
+	some_program := compile_test_program(t, "some(7)", &ctx, allocator)
+	some_state := run_test_program(t, some_program, allocator)
+	defer vm.vm_destroy(&some_state)
+	some_relation, some_ok := v.value_as_relation(some_state.result)
+	testing.expect(t, some_ok)
+	testing.expect_value(t, len(some_relation.heading), 1)
+	testing.expect_value(t, len(some_relation.rows), 1)
+	some_row := v.tuple_values(some_relation.rows[0])
+	value, value_ok := v.value_as_int(some_row[0])
+	testing.expect(t, value_ok)
+	testing.expect_value(t, value, i64(7))
+
+	ok_program := compile_test_program(t, "ok(7)", &ctx, allocator)
+	ok_state := run_test_program(t, ok_program, allocator)
+	defer vm.vm_destroy(&ok_state)
+	ok_relation, ok_ok := v.value_as_relation(ok_state.result)
+	testing.expect(t, ok_ok)
+	testing.expect_value(t, len(ok_relation.heading), 2)
+	testing.expect_value(t, len(ok_relation.rows), 1)
+	ok_row := v.tuple_values(ok_relation.rows[0])
+	ok_case := constructor_case_index(ok_relation.heading)
+	testing.expect(t, ok_case >= 0)
+	tag, tag_ok := v.value_as_symbol(ok_row[ok_case])
+	testing.expect(t, tag_ok)
+	tag_name, tag_name_ok := v.symbol_name(tag)
+	testing.expect(t, tag_name_ok)
+	testing.expect_value(t, tag_name, "ok")
+
+	err_program := compile_test_program(t, "err(7)", &ctx, allocator)
+	err_state := run_test_program(t, err_program, allocator)
+	defer vm.vm_destroy(&err_state)
+	err_relation, err_ok := v.value_as_relation(err_state.result)
+	testing.expect(t, err_ok)
+	testing.expect_value(t, len(err_relation.rows), 1)
+	err_row := v.tuple_values(err_relation.rows[0])
+	err_case := constructor_case_index(err_relation.heading)
+	testing.expect(t, err_case >= 0)
+	err_tag, err_tag_ok := v.value_as_symbol(err_row[err_case])
+	testing.expect(t, err_tag_ok)
+	err_name, err_name_ok := v.symbol_name(err_tag)
+	testing.expect(t, err_name_ok)
+	testing.expect_value(t, err_name, "error")
+}
+
+@(test)
+test_emit_call_argument_marshalling :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	ctx.builtins["pair_lengths"] = true
+
+	program := compile_test_program(t, "pair_lengths([1, 2], [3, 4, 5])", &ctx, allocator)
+	state: vm.VM
+	vm.vm_init(&state, program, allocator)
+	defer vm.vm_destroy(&state)
+	vm.vm_register_builtin(&state, v.symbol_intern("pair_lengths"), 2, test_pair_lengths_builtin)
+	testing.expect_value(t, vm.vm_run(&state), vm.VM_Status.Halted)
+	expect_int_result(t, &state, 5)
+}
