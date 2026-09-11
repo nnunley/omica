@@ -1,10 +1,11 @@
 // Snapshot-published world state.
 //
-// A snapshot is immutable after publication. It owns an arena holding the
-// values, tuples, blocks, and metadata created for that version. Each snapshot
-// holds a reference to its parent snapshot so that values inherited from
-// earlier versions stay alive along the commit chain. Snapshots are
-// reference-counted; the last release destroys the arenas.
+// A snapshot is immutable after publication. All snapshot data - values,
+// tuples, blocks, metadata, and derived rows - lives in the kernel's shared
+// committed store, so a snapshot holds no arena of its own. Each snapshot
+// retains its parent so values inherited along the commit chain stay alive.
+// Snapshots are reference-counted; the last release frees the header only,
+// because the committed store outlives every snapshot.
 package kernel
 
 import "base:runtime"
@@ -25,7 +26,6 @@ Snapshot :: struct {
 	version:   u64,
 	parent:    ^Snapshot,
 	refs:      i32,
-	arena:     ^virtual.Arena,
 	allocator: mem.Allocator,
 	catalog:   []Relation_Metadata,
 	blocks:    []^Relation_Block,
@@ -33,26 +33,18 @@ Snapshot :: struct {
 	derived:   []Derived_Relation,
 }
 
-// Creates an empty snapshot at `version` with an optional retained parent.
-snapshot_create :: proc(version: u64, parent: ^Snapshot) -> ^Snapshot {
-	arena := new(virtual.Arena, runtime.default_allocator())
-	if err := virtual.arena_init_growing(arena); err != nil {
-		panic("failed to initialize snapshot arena")
-	}
-	return snapshot_create_with_arena(version, parent, arena)
-}
-
-// Creates an empty snapshot that takes ownership of `arena`.
-snapshot_create_with_arena :: proc(
+// Creates an empty snapshot at `version` with an optional retained parent. The
+// snapshot allocates from `allocator`, which must be the kernel's committed
+// store and must outlive the snapshot.
+snapshot_create :: proc(
 	version: u64,
 	parent: ^Snapshot,
-	arena: ^virtual.Arena,
+	allocator: mem.Allocator,
 ) -> ^Snapshot {
 	snapshot := new(Snapshot, runtime.default_allocator())
 	snapshot.version = version
 	snapshot.refs = 1
-	snapshot.arena = arena
-	snapshot.allocator = virtual.arena_allocator(arena)
+	snapshot.allocator = allocator
 	snapshot.catalog = make([]Relation_Metadata, 0, snapshot.allocator)
 	snapshot.blocks = make([]^Relation_Block, 0, snapshot.allocator)
 	snapshot.rules = make([]Rule_Definition, 0, snapshot.allocator)
@@ -92,21 +84,15 @@ snapshot_release :: proc(snapshot: ^Snapshot) {
 	sync.atomic_thread_fence(.Acquire)
 
 	parent := snapshot.parent
-	arena := snapshot.arena
 	snapshot.parent = nil
-	snapshot.arena = nil
-	if arena != nil {
-		virtual.arena_destroy(arena)
-		free(arena, runtime.default_allocator())
-	}
 	free(snapshot, runtime.default_allocator())
 	snapshot_release(parent)
 }
 
 // Creates a child snapshot that inherits the parent catalog, blocks, and
 // rules.
-snapshot_fork :: proc(parent: ^Snapshot) -> ^Snapshot {
-	snapshot := snapshot_create(parent.version + 1, parent)
+snapshot_fork :: proc(parent: ^Snapshot, allocator: mem.Allocator) -> ^Snapshot {
+	snapshot := snapshot_create(parent.version + 1, parent, allocator)
 
 	snapshot.catalog = make([]Relation_Metadata, len(parent.catalog), snapshot.allocator)
 	copy(snapshot.catalog, parent.catalog)

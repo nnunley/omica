@@ -45,12 +45,10 @@ Transaction :: struct {
 	read_only:     bool,
 }
 
-// Creates a transaction over the kernel's current snapshot.
+// Creates a transaction over the kernel's current snapshot. The transaction
+// takes a reset staging arena from the kernel pool.
 transaction_begin :: proc(kernel: ^Kernel) -> Transaction {
-	arena := new(virtual.Arena, runtime.default_allocator())
-	if err := virtual.arena_init_growing(arena); err != nil {
-		panic("failed to initialize transaction arena")
-	}
+	arena := kernel_take_arena(kernel)
 	base := kernel_snapshot(kernel)
 	return Transaction {
 		kernel = kernel,
@@ -70,8 +68,7 @@ transaction_destroy :: proc(transaction: ^Transaction) {
 	transaction.writes = nil
 
 	if transaction.arena != nil {
-		virtual.arena_destroy(transaction.arena)
-		free(transaction.arena, runtime.default_allocator())
+		kernel_return_arena(transaction.kernel, transaction.arena)
 		transaction.arena = nil
 	}
 	snapshot_release(transaction.base)
@@ -496,8 +493,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		}
 	}
 
-	fork := snapshot_create_with_arena(current.version + 1, current, transaction.arena)
-	transaction.arena = nil
+	fork := snapshot_create(current.version + 1, current, kernel.world_allocator)
 
 	fork.catalog = make([]Relation_Metadata, len(current.catalog), fork.allocator)
 	copy(fork.catalog, current.catalog)
@@ -512,7 +508,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 			continue
 		}
 
-		rows := make([dynamic]v.Tuple, 0, fork.allocator)
+		rows := make([dynamic]v.Tuple, 0, context.temp_allocator)
 		if block, has_block := snapshot_relation_block(current, writes.relation); has_block {
 			for row in block.tuples {
 				append(&rows, row)
@@ -527,7 +523,9 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		for entry in writes.entries {
 			switch entry.kind {
 			case .Assert:
-				append(&rows, entry.tuple)
+				// Staged tuples live in the transaction staging arena, which is
+				// recycled after commit, so copy them into the committed store.
+				append(&rows, v.tuple_deep_copy(kernel.world_allocator, entry.tuple))
 			case .Retract:
 				if has_base && relation_block_contains(base_block, entry.tuple) {
 					remove_tuple(&rows, entry.tuple)
@@ -535,7 +533,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 			}
 		}
 
-		block := relation_block_build(fork.allocator, metadata, rows[:])
+		block := relation_block_build(kernel.world_allocator, metadata, rows[:])
 		snapshot_set_block(fork, block)
 	}
 

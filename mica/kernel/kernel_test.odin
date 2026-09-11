@@ -1824,7 +1824,7 @@ test_snapshot_fork_and_version_inheritance :: proc(t: ^testing.T) {
 	base := kernel_snapshot(&kernel)
 	testing.expect_value(t, base.version, u64(1))
 
-	fork := snapshot_fork(base)
+	fork := snapshot_fork(base, kernel.world_allocator)
 	testing.expect_value(t, fork.version, base.version + 1)
 	testing.expect(t, fork.parent == base)
 	testing.expect(t, snapshot_has_relation(fork, relation))
