@@ -71,6 +71,11 @@ runtime_builtins := [?]Builtin_Spec {
 	{"dom_snapshot_payload", 3, builtin_dom_snapshot_payload},
 	{"embed_text", 2, builtin_embed_text},
 	{"from_literal", 1, builtin_from_literal},
+	{"mailbox", 0, builtin_mailbox},
+	{"mailbox_send", 2, builtin_mailbox_send},
+	{"mailbox_close", 1, builtin_mailbox_close},
+	{"mailbox_recv", 1, builtin_mailbox_recv},
+	{"external_request", 2, builtin_external_request},
 }
 
 @(private)
@@ -561,6 +566,53 @@ builtin_from_literal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 		return result_value(state.allocator, "error", problem), true
 	}
 	return result_value(state.allocator, "ok", value), true
+}
+
+@(private)
+builtin_mailbox :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	if env.scheduler == nil {
+		return builtin_error(state, "E_MAILBOX", "mailboxes need a running scheduler")
+	}
+	receiver, sender, ok := scheduler_mailbox_create(env.scheduler)
+	if !ok {
+		return builtin_error(state, "E_MAILBOX", "cannot create a mailbox")
+	}
+	return v.value_list(state.allocator, []v.Value{receiver, sender}), true
+}
+
+@(private)
+builtin_mailbox_send :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	if env.scheduler == nil {
+		return builtin_error(state, "E_MAILBOX", "mailboxes need a running scheduler")
+	}
+	if !scheduler_mailbox_send(env.scheduler, args[0], args[1]) {
+		return builtin_error(state, "E_MAILBOX", "mailbox_send expects a live sender capability")
+	}
+	return args[1], true
+}
+
+@(private)
+builtin_mailbox_close :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	if env.scheduler == nil {
+		return builtin_error(state, "E_MAILBOX", "mailboxes need a running scheduler")
+	}
+	if !scheduler_mailbox_close(env.scheduler, args[0]) {
+		return builtin_error(state, "E_MAILBOX", "mailbox_close expects a live receiver capability")
+	}
+	return v.value_empty_relation(), true
+}
+
+@(private)
+builtin_mailbox_recv :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	return builtin_error(state, "E_VM_FAULT", "mailbox_recv must be lowered to a VM op")
+}
+
+@(private)
+builtin_external_request :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	return builtin_error(state, "E_VM_FAULT", "external_request must be lowered to a VM op")
 }
 
 // --- Helpers ---------------------------------------------------------------

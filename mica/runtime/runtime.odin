@@ -35,6 +35,8 @@ Builtin_Env :: struct {
 	ctx:       ^c.Compile_Context,
 	fields:    map[string]Field_Info,
 	allocator: mem.Allocator,
+	// The scheduler that owns this world's mailboxes. Nil for a bare task.
+	scheduler: ^Scheduler,
 
 	// Runtime context identities returned by `endpoint()`, `actor()`, and
 	// `principal()`.
@@ -288,6 +290,7 @@ run_files :: proc(
 	scheduler: Scheduler
 	scheduler_init(&scheduler, kernel, Scheduler_Config{workers = 1}, allocator)
 	defer scheduler_destroy(&scheduler)
+	env.scheduler = &scheduler
 
 	id := scheduler_submit(&scheduler, task)
 	outcome := scheduler_wait(&scheduler, id)

@@ -31,6 +31,13 @@ Timer_Entry :: struct {
 }
 
 @(private)
+Mailbox :: struct {
+	messages: [dynamic]v.Value,
+	waiters:  [dynamic]Task_ID,
+	closed:   bool,
+}
+
+@(private)
 Scheduler_Entry :: struct {
 	task:          ^Task,
 	started:       bool,
@@ -39,6 +46,8 @@ Scheduler_Entry :: struct {
 	cancelled:     bool,
 	owned_program: bool,
 	arguments:     []v.Value,
+	has_pending:   bool,
+	pending_value: v.Value,
 	result:        Task_Outcome,
 	done:          bool,
 }
@@ -54,6 +63,9 @@ Scheduler :: struct {
 	ready:   [dynamic]Task_ID,
 	timers:  [dynamic]Timer_Entry,
 	entries: map[Task_ID]^Scheduler_Entry,
+
+	mailboxes:    map[u64]^Mailbox,
+	next_mailbox: u64,
 
 	threads: [dynamic]^thread.Thread,
 	timer:   ^thread.Thread,
@@ -73,6 +85,7 @@ scheduler_init :: proc(
 	scheduler.ready = make([dynamic]Task_ID, allocator)
 	scheduler.timers = make([dynamic]Timer_Entry, allocator)
 	scheduler.entries = make(map[Task_ID]^Scheduler_Entry, allocator)
+	scheduler.mailboxes = make(map[u64]^Mailbox, allocator)
 	scheduler.threads = make([dynamic]^thread.Thread, allocator)
 	scheduler.next_id = 1
 
@@ -99,6 +112,12 @@ scheduler_destroy :: proc(scheduler: ^Scheduler) {
 		free(entry.task, scheduler.allocator)
 		free(entry, scheduler.allocator)
 	}
+	for _, mailbox in scheduler.mailboxes {
+		delete(mailbox.messages)
+		delete(mailbox.waiters)
+		free(mailbox, scheduler.allocator)
+	}
+	delete(scheduler.mailboxes)
 	delete(scheduler.entries)
 	delete(scheduler.ready)
 	delete(scheduler.timers)
@@ -179,6 +198,7 @@ scheduler_cancel :: proc(scheduler: ^Scheduler, id: Task_ID) -> Task_Outcome {
 	entry.cancelled = true
 	entry.task.cancel_requested = true
 	if !entry.running {
+		scheduler_remove_mailbox_waiter_locked(scheduler, id)
 		entry.result = task_cancel(entry.task)
 		entry.done = true
 		sync.cond_broadcast(&scheduler.cond)
@@ -188,27 +208,19 @@ scheduler_cancel :: proc(scheduler: ^Scheduler, id: Task_ID) -> Task_Outcome {
 	return result
 }
 
-// Resumes a parked task with a value from the host. Returns false when the
-// task is unknown, terminal, or currently running.
+// Resumes a parked task with a value from the host. The task is queued for a
+// worker; returns false when the task is unknown, terminal, busy, or already
+// has a pending wakeup.
 scheduler_resume :: proc(scheduler: ^Scheduler, id: Task_ID, value: v.Value) -> bool {
 	sync.mutex_lock(&scheduler.lock)
 	entry, found := scheduler.entries[id]
-	if !found || entry.done || entry.running {
+	if !found || entry.done || entry.running || entry.has_pending {
 		sync.mutex_unlock(&scheduler.lock)
 		return false
 	}
-	entry.running = true
-	sync.mutex_unlock(&scheduler.lock)
-
-	outcome := task_resume_with(entry.task, value)
-	outcome = scheduler_run_spawns(scheduler, entry.task, outcome)
-
-	sync.mutex_lock(&scheduler.lock)
-	entry.running = false
-	if entry.cancelled && outcome.kind == .Pending {
-		outcome = task_cancel(entry.task)
-	}
-	scheduler_finish_locked(scheduler, id, entry, outcome)
+	entry.has_pending = true
+	entry.pending_value = value
+	append(&scheduler.ready, id)
 	sync.cond_broadcast(&scheduler.cond)
 	sync.mutex_unlock(&scheduler.lock)
 	return true
@@ -236,7 +248,9 @@ scheduler_finish_locked :: proc(
 				task_id    = id,
 				generation = entry.generation,
 			})
-		case .Host_Request, .Spawn, .Commit, .None:
+		case .Mailbox_Recv:
+			scheduler_park_mailbox_locked(scheduler, id, entry, outcome.millis)
+		case .Host_Request, .External_Request, .Spawn, .Commit, .None:
 			// Parked until a host resumes the task.
 		}
 	case .Complete, .Aborted:
@@ -259,6 +273,203 @@ scheduler_run_spawns :: proc(
 		result = task_resume_with(task, child_value)
 	}
 	return result
+}
+
+// --- Mailboxes -------------------------------------------------------------
+
+@(private)
+mailbox_receiver_capability :: proc(mailbox: u64) -> (v.Value, bool) {
+	id, id_ok := v.capability_id_new(mailbox << 1)
+	if !id_ok {
+		return v.Value(0), false
+	}
+	return v.value_capability(id), true
+}
+
+@(private)
+mailbox_sender_capability :: proc(mailbox: u64) -> (v.Value, bool) {
+	id, id_ok := v.capability_id_new((mailbox << 1) | 1)
+	if !id_ok {
+		return v.Value(0), false
+	}
+	return v.value_capability(id), true
+}
+
+@(private)
+mailbox_from_capability :: proc(value: v.Value) -> (mailbox: u64, is_sender: bool, ok: bool) {
+	id, id_ok := v.value_as_capability(value)
+	if !id_ok {
+		return 0, false, false
+	}
+	raw := v.capability_id_raw(id)
+	return raw >> 1, raw & 1 == 1, true
+}
+
+// Creates a mailbox and returns its receiver and sender capabilities.
+scheduler_mailbox_create :: proc(
+	scheduler: ^Scheduler,
+) -> (
+	receiver: v.Value,
+	sender: v.Value,
+	ok: bool,
+) {
+	sync.mutex_lock(&scheduler.lock)
+	scheduler.next_mailbox += 1
+	mailbox := scheduler.next_mailbox
+	box := new(Mailbox, scheduler.allocator)
+	box.messages = make([dynamic]v.Value, scheduler.allocator)
+	box.waiters = make([dynamic]Task_ID, scheduler.allocator)
+	scheduler.mailboxes[mailbox] = box
+	receiver_value, receiver_ok := mailbox_receiver_capability(mailbox)
+	sender_value, sender_ok := mailbox_sender_capability(mailbox)
+	sync.mutex_unlock(&scheduler.lock)
+	return receiver_value, sender_value, receiver_ok && sender_ok
+}
+
+// Delivers a value through a sender capability, waking the first waiter.
+scheduler_mailbox_send :: proc(
+	scheduler: ^Scheduler,
+	sender: v.Value,
+	value: v.Value,
+) -> bool {
+	mailbox, is_sender, ok := mailbox_from_capability(sender)
+	if !ok || !is_sender {
+		return false
+	}
+	sync.mutex_lock(&scheduler.lock)
+	box, found := scheduler.mailboxes[mailbox]
+	if !found || box.closed {
+		sync.mutex_unlock(&scheduler.lock)
+		return false
+	}
+	append(&box.messages, value)
+	scheduler_wake_mailbox_locked(scheduler, mailbox, box)
+	sync.cond_broadcast(&scheduler.cond)
+	sync.mutex_unlock(&scheduler.lock)
+	return true
+}
+
+scheduler_mailbox_close :: proc(scheduler: ^Scheduler, receiver: v.Value) -> bool {
+	mailbox, is_sender, ok := mailbox_from_capability(receiver)
+	if !ok || is_sender {
+		return false
+	}
+	sync.mutex_lock(&scheduler.lock)
+	box, found := scheduler.mailboxes[mailbox]
+	if found {
+		box.closed = true
+	}
+	sync.mutex_unlock(&scheduler.lock)
+	return found
+}
+
+// Wakes the first waiter of `box` with all queued messages for that mailbox.
+@(private)
+scheduler_wake_mailbox_locked :: proc(
+	scheduler: ^Scheduler,
+	mailbox: u64,
+	box: ^Mailbox,
+) {
+	if len(box.messages) == 0 || len(box.waiters) == 0 {
+		return
+	}
+	task_id := box.waiters[0]
+	ordered_remove(&box.waiters, 0)
+	entry, found := scheduler.entries[task_id]
+	if !found || entry.done || entry.has_pending {
+		return
+	}
+	receiver, receiver_ok := mailbox_receiver_capability(mailbox)
+	if !receiver_ok {
+		return
+	}
+	messages := v.value_list(scheduler.allocator, box.messages[:])
+	clear(&box.messages)
+	group := v.value_list(scheduler.allocator, []v.Value{receiver, messages})
+	entry.pending_value = v.value_list(scheduler.allocator, []v.Value{group})
+	entry.has_pending = true
+	entry.generation += 1
+	append(&scheduler.ready, task_id)
+}
+
+// Drains ready messages for the receivers of a task parked on `mailbox_recv`.
+// Returns false when nothing is ready.
+scheduler_mailbox_take :: proc(
+	scheduler: ^Scheduler,
+	task: ^Task,
+) -> (
+	v.Value,
+	bool,
+) {
+	receivers, is_list := v.value_as_list(task.state.request_value)
+	if !is_list || len(receivers) == 0 {
+		return v.Value(0), false
+	}
+	groups: [dynamic]v.Value
+	defer delete(groups)
+	sync.mutex_lock(&scheduler.lock)
+	for receiver in receivers {
+		mailbox, is_sender, ok := mailbox_from_capability(receiver)
+		if !ok || is_sender {
+			continue
+		}
+		box, found := scheduler.mailboxes[mailbox]
+		if !found || len(box.messages) == 0 {
+			continue
+		}
+		messages := v.value_list(scheduler.allocator, box.messages[:])
+		clear(&box.messages)
+		group := v.value_list(scheduler.allocator, []v.Value{receiver, messages})
+		append(&groups, group)
+	}
+	sync.mutex_unlock(&scheduler.lock)
+	if len(groups) == 0 {
+		return v.Value(0), false
+	}
+	return v.value_list(scheduler.allocator, groups[:]), true
+}
+
+@(private)
+scheduler_park_mailbox_locked :: proc(
+	scheduler: ^Scheduler,
+	id: Task_ID,
+	entry: ^Scheduler_Entry,
+	millis: i64,
+) {
+	receivers, is_list := v.value_as_list(entry.task.state.request_value)
+	if is_list {
+		for receiver in receivers {
+			mailbox, is_sender, ok := mailbox_from_capability(receiver)
+			if !ok || is_sender {
+				continue
+			}
+			box, found := scheduler.mailboxes[mailbox]
+			if !found {
+				continue
+			}
+			append(&box.waiters, id)
+		}
+	}
+	if millis > 0 {
+		entry.generation += 1
+		scheduler_push_timer(scheduler, Timer_Entry {
+			deadline   = time.tick_add(time.tick_now(), time.Duration(millis) * time.Millisecond),
+			task_id    = id,
+			generation = entry.generation,
+		})
+	}
+}
+
+@(private)
+scheduler_remove_mailbox_waiter_locked :: proc(scheduler: ^Scheduler, id: Task_ID) {
+	for _, box in scheduler.mailboxes {
+		for waiter, index in box.waiters {
+			if waiter == id {
+				ordered_remove(&box.waiters, index)
+				break
+			}
+		}
+	}
 }
 
 // Blocks until the task reaches a terminal outcome.
@@ -395,7 +606,11 @@ scheduler_worker_proc :: proc(data: rawptr) {
 		sync.mutex_unlock(&scheduler.lock)
 
 		outcome: Task_Outcome
-		if entry.started {
+		if entry.has_pending {
+			pending := entry.pending_value
+			entry.has_pending = false
+			outcome = task_resume_with(entry.task, pending)
+		} else if entry.started {
 			outcome = task_resume(entry.task)
 		} else {
 			outcome = task_run(entry.task)
@@ -405,6 +620,20 @@ scheduler_worker_proc :: proc(data: rawptr) {
 		// Spawns resume the parent immediately with the child id; the child
 		// runs on another worker.
 		outcome = scheduler_run_spawns(scheduler, entry.task, outcome)
+
+		// Mailbox receives with queued messages resume without parking.
+		for outcome.kind == .Pending && outcome.suspend == .Mailbox_Recv {
+			if messages, ready := scheduler_mailbox_take(scheduler, entry.task); ready {
+				outcome = task_resume_with(entry.task, messages)
+				continue
+			}
+			if outcome.millis == 0 {
+				empty := v.value_list(scheduler.allocator, nil)
+				outcome = task_resume_with(entry.task, empty)
+				continue
+			}
+			break
+		}
 
 		sync.mutex_lock(&scheduler.lock)
 		entry.running = false
@@ -448,6 +677,11 @@ scheduler_timer_proc :: proc(data: rawptr) {
 		pop(&scheduler.timers)
 		entry, found := scheduler.entries[next.task_id]
 		if found && !entry.done && entry.generation == next.generation {
+			if entry.result.suspend == .Mailbox_Recv {
+				scheduler_remove_mailbox_waiter_locked(scheduler, next.task_id)
+				entry.pending_value = v.value_list(scheduler.allocator, nil)
+				entry.has_pending = true
+			}
 			append(&scheduler.ready, next.task_id)
 		}
 		sync.cond_broadcast(&scheduler.cond)

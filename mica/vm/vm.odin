@@ -33,6 +33,12 @@ VM_Request :: enum {
 	Spawn,
 	// Suspend the task and ask the host for a value.
 	Host_Request,
+	// Suspend the task until a message arrives on one of `request_value`'s
+	// mailboxes, or until `request_millis` passes.
+	Mailbox_Recv,
+	// Suspend the task and ask the host to resolve `request_value` (a service
+	// symbol) with `request_payload`.
+	External_Request,
 }
 
 // A builtin procedure. It returns false after recording an error with
@@ -79,6 +85,11 @@ VM :: struct {
 	request_millis: i64,
 	// Dispatch spec index for a `.Spawn` request.
 	request_spec: i32,
+	// Primary request value: the receiver list for `.Mailbox_Recv`, or the
+	// service symbol for `.External_Request`.
+	request_value: v.Value,
+	// Secondary request value: the payload for `.External_Request`.
+	request_payload: v.Value,
 	// Register (frame-relative) that receives the resume value.
 	pending_resume: i32,
 	// Active exception handlers, innermost last.
@@ -101,6 +112,8 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.builtins = make([dynamic]VM_Builtin)
 	state.request = .None
 	state.request_spec = -1
+	state.request_value = v.Value(0)
+	state.request_payload = v.Value(0)
 	state.pending_resume = -1
 	state.entry_function = -1
 	state.handlers = make([dynamic]Handler)
@@ -174,6 +187,8 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 		state.status = .Ready
 		state.request = .None
 		state.request_spec = -1
+		state.request_value = v.Value(0)
+		state.request_payload = v.Value(0)
 	}
 	if state.status != .Ready {
 		return state.status
@@ -444,6 +459,41 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			state.request = .Spawn
 			state.request_spec = instr.b
 			state.request_millis = delay_millis
+			state.status = .Boundary
+			return .Boundary
+
+		case .Mailbox_Recv:
+			receivers := state.registers[base + int(instr.b)]
+			if _, is_list := v.value_as_list(receivers); !is_list {
+				vm_fail(state, "E_TYPE", "mailbox_recv expects a list of receivers")
+				break
+			}
+			timeout_millis := i64(-1)
+			if instr.flags & 1 != 0 {
+				millis, is_int := v.value_as_int(state.registers[base + int(instr.c)])
+				if !is_int || millis < 0 {
+					vm_fail(state, "E_TYPE", "mailbox_recv timeout must be a non-negative integer")
+					break
+				}
+				timeout_millis = millis
+			}
+			state.pending_resume = instr.a
+			state.request = .Mailbox_Recv
+			state.request_value = receivers
+			state.request_millis = timeout_millis
+			state.status = .Boundary
+			return .Boundary
+
+		case .External_Request:
+			service := state.registers[base + int(instr.b)]
+			if _, is_symbol := v.value_as_symbol(service); !is_symbol {
+				vm_fail(state, "E_TYPE", "external_request expects a service symbol")
+				break
+			}
+			state.pending_resume = instr.a
+			state.request = .External_Request
+			state.request_value = service
+			state.request_payload = state.registers[base + int(instr.c)]
 			state.status = .Boundary
 			return .Boundary
 

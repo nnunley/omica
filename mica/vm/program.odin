@@ -95,6 +95,12 @@ Op :: enum u8 {
 	// Dynamic_Dispatch: a = dst, b = selector register, c = roles map register.
 	// Resolves a method from a runtime selector symbol and role map.
 	Dynamic_Dispatch,
+	// Mailbox_Recv: a = dst, b = receivers list register, c = timeout register
+	// (when flags bit 0 is set). Suspends until a message is ready.
+	Mailbox_Recv,
+	// External_Request: a = dst, b = service symbol register, c = payload
+	// register. Suspends until the host resolves the request.
+	External_Request,
 	// Push_Handler: a = absolute catch target offset, b = register that
 	// receives the raised error (-1 when the handler takes no value).
 	Push_Handler,
@@ -638,6 +644,20 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				   !valid_register(instr.c, register_count) {
 					return .Bad_Register
 				}
+			case .Mailbox_Recv:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.b, register_count) {
+					return .Bad_Register
+				}
+				if instr.flags & 1 != 0 && !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
+			case .External_Request:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.b, register_count) ||
+				   !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
 			case .Push_Handler:
 				if instr.a < 0 {
 					return .Bad_Function
@@ -764,6 +784,10 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d r%d r%d", instr.a, instr.b, instr.c)
 			case .Dynamic_Dispatch:
 				fmt.sbprintf(&builder, " r%d <- r%d roles@r%d", instr.a, instr.b, instr.c)
+			case .Mailbox_Recv:
+				fmt.sbprintf(&builder, " r%d receivers@r%d", instr.a, instr.b)
+			case .External_Request:
+				fmt.sbprintf(&builder, " r%d %d@r%d", instr.a, instr.b, instr.c)
 			case .Push_Handler:
 				fmt.sbprintf(&builder, " ->%d r%d", instr.a, instr.b)
 			case .Pop_Handler:
@@ -842,6 +866,10 @@ op_name :: proc(op: Op) -> string {
 		return "raise"
 	case .Dynamic_Dispatch:
 		return "dynamic_dispatch"
+	case .Mailbox_Recv:
+		return "mailbox_recv"
+	case .External_Request:
+		return "external_request"
 	case .Push_Handler:
 		return "push_handler"
 	case .Pop_Handler:

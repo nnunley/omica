@@ -523,6 +523,32 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 		return emit_map_pattern_binding(emitter, binding, map_pattern)
 	}
 
+	if list_pattern, is_list_pattern := binding.pattern^.(List_Pattern); is_list_pattern {
+		if !has_value {
+			push_error(emitter, "list binding needs a value")
+			return -1, false
+		}
+		for element, index in list_pattern.elements {
+			binding_pattern, is_binding := element^.(Binding_Pattern)
+			if !is_binding {
+				push_error(emitter, "list pattern elements must be names")
+				return -1, false
+			}
+			index_register := emit_constant(emitter, int_value(i64(index)))
+			column := alloc_register(emitter)
+			vm.builder_emit(
+				emitter.builder,
+				.Index,
+				0,
+				i32(column),
+				i32(value_register),
+				i32(index_register),
+			)
+			declare_local(emitter, binding_pattern.name, column, binding.is_const)
+		}
+		return value_register, true
+	}
+
 	pattern, is_binding_pattern := binding.pattern^.(Binding_Pattern)
 	if !is_binding_pattern {
 		if call_pattern, is_call_pattern := binding.pattern^.(Call_Pattern); is_call_pattern {
@@ -848,6 +874,67 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 			i32(destination),
 			i32(selector),
 			i32(roles),
+		)
+		return destination, true
+	}
+
+	if text == "mailbox_recv" {
+		if len(call.args) < 1 || len(call.args) > 2 {
+			push_error(emitter, "mailbox_recv expects a receiver list and optional timeout")
+			return -1, false
+		}
+		receivers, receivers_ok := emit_expr(emitter, call.args[0].expr)
+		if !receivers_ok {
+			return -1, false
+		}
+		destination := alloc_register(emitter)
+		if len(call.args) == 2 {
+			timeout, timeout_ok := emit_expr(emitter, call.args[1].expr)
+			if !timeout_ok {
+				return -1, false
+			}
+			vm.builder_emit(
+				emitter.builder,
+				.Mailbox_Recv,
+				1,
+				i32(destination),
+				i32(receivers),
+				i32(timeout),
+			)
+		} else {
+			vm.builder_emit(
+				emitter.builder,
+				.Mailbox_Recv,
+				0,
+				i32(destination),
+				i32(receivers),
+				0,
+			)
+		}
+		return destination, true
+	}
+
+	if text == "external_request" {
+		if len(call.args) != 2 {
+			push_error(emitter, "external_request expects a service symbol and payload")
+			return -1, false
+		}
+		service, service_ok := emit_expr(emitter, call.args[0].expr)
+		if !service_ok {
+			return -1, false
+		}
+		payload, payload_ok := emit_expr(emitter, call.args[1].expr)
+		if !payload_ok {
+			return -1, false
+		}
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.External_Request,
+			0,
+			i32(destination),
+			i32(service),
+			i32(payload),
 		)
 		return destination, true
 	}

@@ -368,3 +368,50 @@ test_scheduler_spawn_child :: proc(t: ^testing.T) {
 	k.kernel_scan_into(&kernel, k.Relation_ID(1), []v.Binding{{}}, &rows)
 	testing.expect_value(t, len(rows), 1)
 }
+
+@(test)
+test_scheduler_external_request :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		service := i32(vm.builder_add_constant(
+			builder,
+			v.value_symbol(v.symbol_intern("svc")),
+		))
+		payload := i32(vm.builder_add_constant(builder, value_int_must(5)))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 3, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, service, 0)
+		vm.builder_emit(builder, .Load_Const, 0, 1, payload, 0)
+		vm.builder_emit(builder, .External_Request, 0, 2, 0, 1)
+		vm.builder_emit(builder, .Return, 0, 2, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
+	defer scheduler_destroy(&scheduler)
+
+	id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
+	testing.expect(t, scheduler_wait_suspended(&scheduler, id, .External_Request))
+
+	sync.mutex_lock(&scheduler.lock)
+	entry := scheduler.entries[id]
+	request_service, service_ok := v.value_as_symbol(entry.task.state.request_value)
+	request_payload, payload_ok := v.value_as_int(entry.task.state.request_payload)
+	sync.mutex_unlock(&scheduler.lock)
+	testing.expect(t, service_ok)
+	name, name_ok := v.symbol_name(request_service)
+	testing.expect(t, name_ok)
+	testing.expect_value(t, name, "svc")
+	testing.expect(t, payload_ok)
+	testing.expect_value(t, request_payload, i64(5))
+
+	testing.expect(t, scheduler_resume(&scheduler, id, value_int_must(99)))
+	outcome := scheduler_wait(&scheduler, id)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+	value, value_ok := v.value_as_int(outcome.value)
+	testing.expect(t, value_ok)
+	testing.expect_value(t, value, i64(99))
+}

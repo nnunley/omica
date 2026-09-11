@@ -21,6 +21,8 @@ Task_Suspend :: enum {
 	Sleep,
 	Host_Request,
 	Spawn,
+	Mailbox_Recv,
+	External_Request,
 }
 
 Task_Outcome_Kind :: enum {
@@ -164,7 +166,7 @@ task_run :: proc(task: ^Task) -> Task_Outcome {
 				task_begin_tx(task)
 				task.state.request = .None
 
-			case .Yield, .Sleep, .Spawn, .Host_Request:
+			case .Yield, .Sleep, .Spawn, .Host_Request, .Mailbox_Recv, .External_Request:
 				if err := task_commit(task); err != k.Kernel_Error.None {
 					return task_abort(task, "commit failed")
 				}
@@ -178,6 +180,10 @@ task_run :: proc(task: ^Task) -> Task_Outcome {
 					suspend = .Spawn
 				case .Host_Request:
 					suspend = .Host_Request
+				case .Mailbox_Recv:
+					suspend = .Mailbox_Recv
+				case .External_Request:
+					suspend = .External_Request
 				case .Commit, .None:
 					suspend = .None
 				}

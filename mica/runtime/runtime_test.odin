@@ -774,3 +774,101 @@ probe()
 	result := run_files(&kernel, []string{path}, context.temp_allocator)
 	testing.expect(t, !result.ok)
 }
+
+@(private)
+write_temp_source :: proc(t: ^testing.T, name: string, source: string) -> (string, bool) {
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return "", false
+	}
+	path := fmt.aprintf(
+		"%s/%s",
+		directory,
+		name,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the test file")
+		return "", false
+	}
+	return path, true
+}
+
+@(test)
+test_run_mailbox_roundtrip :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Got, 1)
+let [receiver, sender] = mailbox()
+mailbox_send(sender, 42)
+let ready = mailbox_recv([receiver])
+let first = ready[0][1][0]
+assert Got(first)
+mailbox_close(receiver)
+`
+	path, path_ok := write_temp_source(t, "mica_mailbox_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Got", 1)
+}
+
+@(test)
+test_run_mailbox_wakes_waiter :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Got, 1)
+verb deliver(receiver, sender_cap)
+  mailbox_send(sender_cap, 7)
+end
+let [receiver, sender] = mailbox()
+spawn :deliver(receiver: receiver, sender_cap: sender)
+let ready = mailbox_recv([receiver])
+let first = ready[0][1][0]
+assert Got(first)
+`
+	path, path_ok := write_temp_source(t, "mica_mailbox_wake_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Got", 1)
+}
+
+@(test)
+test_run_mailbox_timeout :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:TimedOut, 1)
+let [receiver, sender] = mailbox()
+let ready = mailbox_recv([receiver], 1)
+require(ready == [])
+assert TimedOut(1)
+`
+	path, path_ok := write_temp_source(t, "mica_mailbox_timeout_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "TimedOut", 1)
+}
