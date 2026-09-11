@@ -37,6 +37,9 @@ Builtin_Env :: struct {
 	allocator: mem.Allocator,
 	// The scheduler that owns this world's mailboxes. Nil for a bare task.
 	scheduler: ^Scheduler,
+	// When true, tasks mint authority for `actor` at init. The entry task in
+	// `run_files` stays root so declarations and grants can load.
+	enforce_authority: bool,
 
 	// Runtime context identities returned by `endpoint()`, `actor()`, and
 	// `principal()`.
@@ -66,6 +69,187 @@ write_mica_string_literal :: proc(builder: ^strings.Builder, text: string) {
 		}
 	}
 	strings.write_byte(builder, '"')
+}
+
+// Rewrites `grant [role] subject` blocks into policy assertions, mirroring the
+// Rust source task. `read:`/`write:`/`invoke:` targets are symbols; `effect`
+// takes no targets.
+@(private)
+expand_grant_blocks :: proc(
+	source: string,
+	allocator: mem.Allocator,
+) -> (
+	string,
+	Run_Result,
+) {
+	if !strings.contains(source, "grant ") {
+		return source, Run_Result{ok = true}
+	}
+	lines := strings.split(source, "\n", context.temp_allocator)
+	builder: strings.Builder
+	strings.builder_init(&builder, allocator)
+	index := 0
+	for index < len(lines) {
+		line := lines[index]
+		trimmed := strings.trim_space(line)
+		kind, subject, is_grant := grant_header(trimmed)
+		if !is_grant {
+			strings.write_string(&builder, line)
+			strings.write_byte(&builder, '\n')
+			index += 1
+			continue
+		}
+
+		index += 1
+		operation := ""
+		closed := false
+		for index < len(lines) {
+			body := strings.trim_space(lines[index])
+			if body == "end" {
+				closed = true
+				index += 1
+				break
+			}
+			if body == "" || strings.has_prefix(body, "//") {
+				index += 1
+				continue
+			}
+			if section, rest, is_section := grant_section(body); is_section {
+				operation = section
+				if !write_grant_assertions(
+					&builder,
+					kind,
+					subject,
+					operation,
+					rest,
+					allocator,
+				) {
+					return "", Run_Result {
+						ok      = false,
+						message = "malformed grant target",
+					}
+				}
+				index += 1
+				continue
+			}
+			if operation != "" {
+				if !write_grant_assertions(
+					&builder,
+					kind,
+					subject,
+					operation,
+					body,
+					allocator,
+				) {
+					return "", Run_Result {
+						ok      = false,
+						message = "malformed grant target",
+					}
+				}
+			}
+			index += 1
+		}
+		if !closed {
+			return "", Run_Result{ok = false, message = "unterminated grant block"}
+		}
+	}
+	return strings.to_string(builder), Run_Result{ok = true}
+}
+
+@(private)
+grant_header :: proc(line: string) -> (kind: string, subject: string, ok: bool) {
+	if !strings.has_prefix(line, "grant ") {
+		return "", "", false
+	}
+	rest := strings.trim_space(strings.trim_prefix(line, "grant "))
+	if strings.has_prefix(rest, "role ") {
+		role := strings.trim_space(strings.trim_prefix(rest, "role "))
+		if role == "" {
+			return "", "", false
+		}
+		return "role", role, true
+	}
+	if rest == "" {
+		return "", "", false
+	}
+	return "actor", rest, true
+}
+
+@(private)
+grant_section :: proc(line: string) -> (operation: string, rest: string, ok: bool) {
+	if line == "read" {
+		return "read", "", true
+	}
+	if strings.has_prefix(line, "read:") {
+		return "read", strings.trim_space(strings.trim_prefix(line, "read:")), true
+	}
+	if line == "write" {
+		return "write", "", true
+	}
+	if strings.has_prefix(line, "write:") {
+		return "write", strings.trim_space(strings.trim_prefix(line, "write:")), true
+	}
+	if line == "invoke" {
+		return "invoke", "", true
+	}
+	if strings.has_prefix(line, "invoke:") {
+		return "invoke", strings.trim_space(strings.trim_prefix(line, "invoke:")), true
+	}
+	if line == "effect" {
+		return "effect", "", true
+	}
+	return "", "", false
+}
+
+@(private)
+write_grant_assertions :: proc(
+	builder: ^strings.Builder,
+	kind: string,
+	subject: string,
+	operation: string,
+	targets: string,
+	allocator: mem.Allocator,
+) -> bool {
+	relation: string
+	if operation == "read" {
+		relation = "RoleCanRead" if kind == "role" else "CanRead"
+	} else if operation == "write" {
+		relation = "RoleCanWrite" if kind == "role" else "CanWrite"
+	} else if operation == "invoke" {
+		relation = "RoleCanInvoke" if kind == "role" else "CanInvoke"
+	} else if operation == "effect" {
+		relation = "RoleCanEffect" if kind == "role" else "CanEffect"
+		strings.write_string(builder, "assert ")
+		strings.write_string(builder, relation)
+		strings.write_byte(builder, '(')
+		strings.write_string(builder, subject)
+		strings.write_string(builder, ")\n")
+		return true
+	} else {
+		return false
+	}
+
+	tokens := strings.split(targets, ",", context.temp_allocator)
+	for token in tokens {
+		for raw_target in strings.split(token, " ", context.temp_allocator) {
+			target := strings.trim_space(raw_target)
+			if target == "" {
+				continue
+			}
+			if target[0] != ':' {
+				return false
+			}
+			strings.write_string(builder, "assert ")
+			strings.write_string(builder, relation)
+			strings.write_byte(builder, '(')
+			strings.write_string(builder, subject)
+			strings.write_string(builder, ", ")
+			strings.write_string(builder, target)
+			strings.write_string(builder, ")\n")
+		}
+	}
+	_ = allocator
+	return true
 }
 
 // Replaces `include_text("relative/path")` calls with string literals holding
@@ -166,12 +350,20 @@ substitute_include_text :: proc(
 	return strings.to_string(builder), Run_Result{ok = true}
 }
 
+// Options for loading and running a world.
+Run_Options :: struct {
+	// Name of the declared identity that spawned tasks run as. Empty keeps
+	// every task at root.
+	actor: string,
+}
+
 // Compiles and runs a set of fileins as one world against `kernel`. On success
 // the transaction is committed.
 run_files :: proc(
 	kernel: ^k.Kernel,
 	paths: []string,
 	allocator := context.allocator,
+	options := Run_Options{},
 ) -> Run_Result {
 	asts := make([dynamic]^c.Program_AST, allocator)
 	defer delete(asts)
@@ -190,6 +382,10 @@ run_files :: proc(
 			filepath.dir(path),
 			allocator,
 		)
+		if !expand_result.ok {
+			return expand_result
+		}
+		expanded, expand_result = expand_grant_blocks(expanded, allocator)
 		if !expand_result.ok {
 			return expand_result
 		}
@@ -249,6 +445,18 @@ run_files :: proc(
 			return result
 		}
 	}
+	if options.actor != "" {
+		actor_value, actor_found := ctx.identities[options.actor]
+		if !actor_found {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"unknown authority actor: %s",
+				options.actor,
+				allocator = allocator,
+			)}
+		}
+		env.actor = actor_value
+	}
+
 	for path, index in paths {
 		result := install_rules(&env, kernel, asts[index], &declarations, path)
 		if !result.ok {
@@ -286,6 +494,9 @@ run_files :: proc(
 	// boundary and spawned children run on the same scheduler pool.
 	task := new(Task, allocator)
 	task_init(task, 0, kernel, compiled.program, &env, allocator)
+	if options.actor != "" {
+		env.enforce_authority = true
+	}
 
 	scheduler: Scheduler
 	scheduler_init(&scheduler, kernel, Scheduler_Config{workers = 1}, allocator)

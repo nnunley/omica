@@ -53,6 +53,11 @@ Task :: struct {
 	has_tx:  bool,
 	outcome: Task_Outcome,
 
+	// Policy-derived authority, minted at init when the environment enforces
+	// it. Tasks without one run with root access.
+	authority:     k.Authority,
+	has_authority: bool,
+
 	// Set by the scheduler; a running task aborts at its next boundary.
 	cancel_requested: bool,
 }
@@ -80,11 +85,36 @@ task_init :: proc(
 	vm.vm_set_workspace(&task.state, &task.source, &task.tx)
 	task.state.user = env
 	register_runtime_builtins(&task.state)
+	if env != nil && env.enforce_authority {
+		if actor, has_actor := v.value_as_identity(env.actor); has_actor {
+			snapshot := k.kernel_snapshot(kernel)
+			source := k.Relation_Source {
+				snapshot = snapshot,
+			}
+			task.authority = k.authority_from_actor(&source, actor, allocator)
+			k.snapshot_release(snapshot)
+			task.has_authority = true
+			vm.vm_set_authority(&task.state, &task.authority)
+		}
+	}
 	task_begin_tx(task)
+}
+
+// Replaces the task's authority, taking ownership of `authority`.
+task_set_authority :: proc(task: ^Task, authority: k.Authority) {
+	if task.has_authority {
+		k.authority_destroy(&task.authority)
+	}
+	task.authority = authority
+	task.has_authority = true
+	vm.vm_set_authority(&task.state, &task.authority)
 }
 
 task_destroy :: proc(task: ^Task) {
 	task_discard_tx(task)
+	if task.has_authority {
+		k.authority_destroy(&task.authority)
+	}
 	vm.vm_destroy(&task.state)
 }
 

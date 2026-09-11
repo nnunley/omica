@@ -7,6 +7,7 @@
 package vm
 
 import "core:mem"
+import "core:strings"
 import "core:sync"
 import k "../kernel"
 import v "../var"
@@ -110,6 +111,8 @@ VM :: struct {
 	handlers: [dynamic]Handler,
 	// Returns diverted through a finally body, innermost last.
 	pending_returns: [dynamic]Pending_Return,
+	// Task authority. Nil means root access.
+	authority: ^k.Authority,
 	// Free slot for host data, for example a builtin environment.
 	user:        rawptr,
 	// Values copied into the entry function's parameter registers before the
@@ -156,6 +159,11 @@ vm_resume_with :: proc(state: ^VM, value: v.Value) {
 	frame := state.frames[len(state.frames) - 1]
 	state.registers[frame.register_base + int(state.pending_resume)] = value
 	state.pending_resume = -1
+}
+
+// Sets the authority used for permission checks. Nil means root access.
+vm_set_authority :: proc(state: ^VM, authority: ^k.Authority) {
+	state.authority = authority
 }
 
 // Starts execution at `function_index` instead of the program entry.
@@ -517,6 +525,10 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			return .Boundary
 
 		case .External_Request:
+			if !k.authority_can_effect(state.authority) {
+				vm_fail(state, "E_PERMISSION", "effect denied")
+				break
+			}
 			service := state.registers[base + int(instr.b)]
 			if _, is_symbol := v.value_as_symbol(service); !is_symbol {
 				vm_fail(state, "E_TYPE", "external_request expects a service symbol")
@@ -653,6 +665,10 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				break
 			}
 			name := program.builtins[instr.b]
+			if !vm_builtin_allowed(state, name) {
+				vm_fail(state, "E_PERMISSION", "builtin invoke denied")
+				break
+			}
 			matched := false
 			for builtin in state.builtins {
 				if builtin.name != name {
@@ -1033,6 +1049,10 @@ vm_index :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 @(private)
 vm_builtin_call :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	name := state.program.builtins[instr.b]
+	if !vm_builtin_allowed(state, name) {
+		vm_fail(state, "E_PERMISSION", "builtin invoke denied")
+		return false
+	}
 	for builtin in state.builtins {
 		if builtin.name != name {
 			continue
@@ -1088,6 +1108,10 @@ vm_scan_rows :: proc(
 ) -> bool {
 	if state.source == nil {
 		vm_fail(state, "E_NO_SOURCE", "relation scan has no source")
+		return false
+	}
+	if !k.authority_can_read(state.authority, k.Relation_ID(pattern.relation)) {
+		vm_fail(state, "E_PERMISSION", "relation read denied")
 		return false
 	}
 	bindings := vm_pattern_bindings(state, base, pattern, context.temp_allocator)
@@ -1217,6 +1241,10 @@ vm_apply_write :: proc(
 	}
 	tuple := relation.rows[0]
 	relation_id := k.Relation_ID(u32(instr.a))
+	if !k.authority_can_write(state.authority, relation_id) {
+		vm_fail(state, "E_PERMISSION", "relation write denied")
+		return false
+	}
 	err: k.Kernel_Error
 	if assert_write {
 		err = k.transaction_assert(state.transaction, relation_id, tuple)
@@ -1273,9 +1301,20 @@ vm_dispatch_call :: proc(
 		param           = k.Relation_ID(program.dispatch_param_relation),
 		delegates       = k.Relation_ID(program.dispatch_delegates_relation),
 	}
-	entries := k.applicable_method_entries(state.source, relations, selector, roles)
-	if len(entries) == 0 {
+	all_entries := k.applicable_method_entries(state.source, relations, selector, roles)
+	if len(all_entries) == 0 {
 		vm_fail(state, "E_DISPATCH", "no applicable method")
+		return false
+	}
+	entries: [dynamic]k.Applicable_Method
+	defer delete(entries)
+	for entry in all_entries {
+		if k.authority_can_invoke_method(state.authority, entry.method) {
+			append(&entries, entry)
+		}
+	}
+	if len(entries) == 0 {
+		vm_fail(state, "E_PERMISSION", "method invoke denied")
 		return false
 	}
 	if len(entries) > 1 {
@@ -1372,14 +1411,25 @@ vm_positional_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> boo
 		param           = k.Relation_ID(program.dispatch_param_relation),
 		delegates       = k.Relation_ID(program.dispatch_delegates_relation),
 	}
-	entries := k.applicable_positional_method_entries(
+	all_entries := k.applicable_positional_method_entries(
 		state.source,
 		relations,
 		selector,
 		args,
 	)
-	if len(entries) == 0 {
+	if len(all_entries) == 0 {
 		vm_fail(state, "E_DISPATCH", "no applicable method")
+		return false
+	}
+	entries: [dynamic]k.Applicable_Method
+	defer delete(entries)
+	for entry in all_entries {
+		if k.authority_can_invoke_method(state.authority, entry.method) {
+			append(&entries, entry)
+		}
+	}
+	if len(entries) == 0 {
+		vm_fail(state, "E_PERMISSION", "method invoke denied")
 		return false
 	}
 	if len(entries) > 1 {
@@ -1648,6 +1698,23 @@ vm_list_args :: proc(state: ^VM, base: int, register: i32) -> ([]v.Value, bool) 
 		return nil, false
 	}
 	return args, true
+}
+
+// Internal builtins (`__` prefix) are always invocable; other builtins need an
+// invoke grant when the task has a non-root authority.
+@(private)
+vm_builtin_allowed :: proc(state: ^VM, name: v.Symbol) -> bool {
+	if state.authority == nil || state.authority.root {
+		return true
+	}
+	text, _ := v.symbol_name(name)
+	if strings.has_prefix(text, "__") {
+		return true
+	}
+	if text == "emit" {
+		return k.authority_can_effect(state.authority)
+	}
+	return k.authority_can_invoke_builtin(state.authority, name)
 }
 
 // Resolves a function value to its callable, copying the info out under the

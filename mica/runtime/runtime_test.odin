@@ -1439,3 +1439,121 @@ assert Out(#bob:act())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
+
+@(test)
+test_run_authority_grants :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_identity(:reader)
+make_relation(:RoleCanRead, 2)
+make_relation(:RoleCanWrite, 2)
+make_relation(:Secret, 1)
+make_relation(:Leak, 1)
+assert Delegates(#alice, #reader, 0)
+assert Secret(1)
+grant role #reader
+  read:
+    :Secret
+  write:
+    :Leak
+end
+commit()
+verb peek()
+  assert Leak(len(Secret(1)))
+end
+spawn :peek()
+suspend()
+`
+	path, path_ok := write_temp_source(t, "mica_authority_grant_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{actor = "alice"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Leak", 1)
+}
+
+@(test)
+test_run_authority_denies_unlisted :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+make_relation(:CanInvoke, 2)
+make_relation(:CanEffect, 1)
+make_relation(:Secret, 1)
+make_relation(:DeniedRead, 1)
+make_relation(:DeniedInvoke, 1)
+make_relation(:DeniedEffect, 1)
+make_relation(:AllowedRead, 1)
+make_relation(:AllowedInvoke, 1)
+make_relation(:AllowedEffect, 1)
+assert Secret(1)
+grant #alice
+  write:
+    :DeniedRead
+    :DeniedInvoke
+    :DeniedEffect
+    :AllowedRead
+    :AllowedInvoke
+    :AllowedEffect
+end
+commit()
+verb peek()
+  try
+    let rows = Secret(1)
+    assert AllowedRead(1)
+  catch err
+    assert DeniedRead(1)
+  end
+  try
+    let text = string_concat("a", "b")
+    assert AllowedInvoke(1)
+  catch err
+    assert DeniedInvoke(1)
+  end
+  try
+    external_request(:svc, 1)
+    assert AllowedEffect(1)
+  catch err
+    assert DeniedEffect(1)
+  end
+end
+spawn :peek()
+suspend()
+`
+	path, path_ok := write_temp_source(t, "mica_authority_denied_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{actor = "alice"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "DeniedRead", 1)
+	expect_relation_rows(t, &kernel, "DeniedInvoke", 1)
+	expect_relation_rows(t, &kernel, "DeniedEffect", 1)
+	expect_relation_rows(t, &kernel, "AllowedRead", 0)
+	expect_relation_rows(t, &kernel, "AllowedInvoke", 0)
+	expect_relation_rows(t, &kernel, "AllowedEffect", 0)
+}

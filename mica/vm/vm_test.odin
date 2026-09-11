@@ -729,3 +729,69 @@ test_vm_raise_aborts_with_error :: proc(t: ^testing.T) {
 	testing.expect_value(t, code_name, "E_RANGE")
 	testing.expect_value(t, error.message, "out of range")
 }
+
+@(test)
+test_vm_authority_denies_and_root_allows :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	kernel, relation := relation_setup()
+	defer k.kernel_destroy(&kernel)
+
+	owner := v.symbol_intern("owner")
+	item := v.symbol_intern("item")
+	row := v.tuple_new(alloc, []v.Value{must_identity(1), must_identity(2)})
+	relation_value, relation_err := v.value_relation(
+		alloc,
+		[]v.Symbol{owner, item},
+		[]v.Tuple{row},
+	)
+	testing.expect_value(t, relation_err, v.Relation_Value_Error.None)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+	row_constant := i32(builder_add_constant(&builder, relation_value))
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder, .Load_Const, 0, 0, row_constant, 0)
+	builder_emit(&builder, .Assert, 0, i32(relation), 0, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	source := k.Relation_Source{snapshot = kernel.current, use_stored_derived = true}
+	tx := k.kernel_begin(&kernel)
+	defer k.transaction_destroy(&tx)
+
+	authority := k.authority_empty(alloc)
+	defer k.authority_destroy(&authority)
+
+	denied: VM
+	vm_init(&denied, program, alloc)
+	defer vm_destroy(&denied)
+	vm_set_workspace(&denied, &source, &tx)
+	vm_set_authority(&denied, &authority)
+	testing.expect_value(t, vm_run(&denied), VM_Status.Failed)
+	error, error_ok := v.value_as_error(denied.error)
+	testing.expect(t, error_ok)
+	code, code_ok := v.symbol_name(error.code)
+	testing.expect(t, code_ok)
+	testing.expect_value(t, code, "E_PERMISSION")
+
+	root: VM
+	vm_init(&root, program, alloc)
+	defer vm_destroy(&root)
+	vm_set_workspace(&root, &source, &tx)
+	testing.expect_value(t, vm_run(&root), VM_Status.Halted)
+	committed, commit_err := k.transaction_commit(&tx)
+	testing.expect_value(t, commit_err, k.Kernel_Error.None)
+	k.snapshot_release(committed)
+
+	rows := make([dynamic]v.Tuple)
+	defer delete(rows)
+	k.kernel_scan_into(&kernel, relation, []v.Binding{{}, {}}, &rows)
+	testing.expect_value(t, len(rows), 1)
+}
