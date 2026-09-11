@@ -521,21 +521,21 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 
 	case Query_Variable:
 		push_error(emitter, fmt.aprintf(
-			"query variables are not lowered yet: ?%s",
+			"query variable ?%s is only valid inside a relation query",
 			n.name,
 			allocator = emitter.allocator,
 		))
 		return -1, false
 
 	case Wildcard:
-		push_error(emitter, "wildcards are not lowered yet")
+		push_error(emitter, "wildcards are only valid in patterns")
 		return -1, false
 
 	case Bytes_Literal:
 		return emit_bytes_literal(emitter, n)
 
 	case:
-		push_error(emitter, "this expression is not lowered yet")
+		push_error(emitter, "unsupported expression form")
 		return -1, false
 	}
 }
