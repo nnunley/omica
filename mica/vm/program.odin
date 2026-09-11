@@ -80,10 +80,15 @@ Op :: enum u8 {
 	// Dispatch: a = dst, b = dispatch spec index. Resolves a method from the
 	// selector and role arguments, then calls its program.
 	Dispatch,
-	// Yield: suspends the task and makes it runnable again.
+	// Yield: suspends the task and makes it runnable again. a = destination
+	// register for the resume value.
 	Yield,
-	// Sleep: b = register holding an integer number of milliseconds.
+	// Sleep: a = destination register for the resume value, b = register
+	// holding an integer number of milliseconds.
 	Sleep,
+	// Spawn: a = destination register for the child task id, b = dispatch spec
+	// index, c = delay register (-1 when absent). flags bit 0 marks a delay.
+	Spawn,
 }
 
 // A cell in a relation scan pattern.
@@ -583,9 +588,28 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 					}
 				}
 			case .Yield:
-			case .Sleep:
-				if !valid_register(instr.b, register_count) {
+				if !valid_register(instr.a, register_count) {
 					return .Bad_Register
+				}
+			case .Sleep:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.b, register_count) {
+					return .Bad_Register
+				}
+			case .Spawn:
+				if !valid_register(instr.a, register_count) {
+					return .Bad_Register
+				}
+				if instr.b < 0 || int(instr.b) >= len(program.dispatch_specs) {
+					return .Bad_Function
+				}
+				if instr.flags & 1 != 0 && !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
+				for role in program.dispatch_specs[instr.b].roles {
+					if !valid_register(role.register, register_count) {
+						return .Bad_Register
+					}
 				}
 			}
 		}
@@ -696,9 +720,11 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 			case .Dispatch:
 				fmt.sbprintf(&builder, " r%d spec%d", instr.a, instr.b)
 			case .Yield:
-				fmt.sbprintf(&builder, "")
+				fmt.sbprintf(&builder, " r%d", instr.a)
 			case .Sleep:
-				fmt.sbprintf(&builder, " r%d", instr.b)
+				fmt.sbprintf(&builder, " r%d r%d", instr.a, instr.b)
+			case .Spawn:
+				fmt.sbprintf(&builder, " r%d spec%d", instr.a, instr.b)
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -767,6 +793,8 @@ op_name :: proc(op: Op) -> string {
 		return "yield"
 	case .Sleep:
 		return "sleep"
+	case .Spawn:
+		return "spawn"
 	}
 	return "?"
 }

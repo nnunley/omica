@@ -1,6 +1,7 @@
 package mica_runtime
 
 import "core:fmt"
+import "core:sync"
 import "core:testing"
 import "core:time"
 import k "../kernel"
@@ -186,4 +187,184 @@ test_scheduler_parallel_tasks :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(rows), 1)
 		delete(rows)
 	}
+}
+
+@(private)
+scheduler_wait_suspended :: proc(
+	scheduler: ^Scheduler,
+	id: Task_ID,
+	suspend: Task_Suspend,
+) -> bool {
+	for _ in 0 ..< 2000 {
+		sync.mutex_lock(&scheduler.lock)
+		entry, found := scheduler.entries[id]
+		parked := found &&
+			entry.result.kind == .Pending &&
+			entry.result.suspend == suspend
+		sync.mutex_unlock(&scheduler.lock)
+		if parked {
+			return true
+		}
+		time.sleep(time.Millisecond)
+	}
+	return false
+}
+
+@(test)
+test_scheduler_resume_with_value :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
+		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
+	defer scheduler_destroy(&scheduler)
+
+	id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
+	testing.expect(t, scheduler_wait_suspended(&scheduler, id, .Sleep))
+
+	testing.expect(t, scheduler_resume(&scheduler, id, value_int_must(42)))
+
+	outcome := scheduler_wait(&scheduler, id)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+	value, value_ok := v.value_as_int(outcome.value)
+	testing.expect(t, value_ok)
+	testing.expect_value(t, value, i64(42))
+}
+
+@(test)
+test_scheduler_cancel_parked :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
+		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
+	defer scheduler_destroy(&scheduler)
+
+	id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
+	testing.expect(t, scheduler_wait_suspended(&scheduler, id, .Sleep))
+
+	outcome := scheduler_cancel(&scheduler, id)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Aborted)
+	testing.expect(t, scheduler_idle(&scheduler))
+}
+
+@(test)
+test_scheduler_spawn_child :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	metadata := k.dispatch_relation_metadata(context.temp_allocator)
+	for entry in metadata {
+		created, create_err := k.kernel_create_relation(&kernel, entry)
+		testing.expect_value(t, create_err, k.Kernel_Error.None)
+		k.snapshot_release(created)
+	}
+
+	method_value, identity_ok := v.value_identity_raw(0)
+	testing.expect(t, identity_ok)
+	install := k.kernel_begin(&kernel)
+	defer k.transaction_destroy(&install)
+	testing.expect_value(
+		t,
+		k.transaction_assert(
+			&install,
+			k.DISPATCH_METHOD_SELECTOR_ID,
+			v.tuple_new(context.temp_allocator, []v.Value {
+				method_value,
+				v.value_symbol(v.symbol_intern("child")),
+			}),
+		),
+		k.Kernel_Error.None,
+	)
+	testing.expect_value(
+		t,
+		k.transaction_assert(
+			&install,
+			k.DISPATCH_METHOD_PROGRAM_ID,
+			v.tuple_new(context.temp_allocator, []v.Value {
+				method_value,
+				value_int_must(0),
+			}),
+		),
+		k.Kernel_Error.None,
+	)
+	committed, commit_err := k.transaction_commit(&install)
+	testing.expect_value(t, commit_err, k.Kernel_Error.None)
+	k.snapshot_release(committed)
+
+	metadata_flag := k.relation_metadata(
+		k.Relation_ID(1),
+		v.symbol_intern("Flag"),
+		1,
+	)
+	flag_snapshot, flag_err := k.kernel_create_relation(&kernel, metadata_flag)
+	testing.expect_value(t, flag_err, k.Kernel_Error.None)
+	k.snapshot_release(flag_snapshot)
+
+	// Function 0 is the spawned child body; function 1 is the parent.
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		cell := v.tuple_new(context.temp_allocator, []v.Value{value_int_must(7)})
+		row, row_err := v.value_relation(
+			context.temp_allocator,
+			[]v.Symbol{v.symbol_intern("value")},
+			[]v.Tuple{cell},
+		)
+		assert(row_err == .None)
+		flag := vm.builder_add_constant(builder, row)
+
+		vm.builder_begin_function(builder, v.symbol_intern("child"), 0, 2, false)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(flag), 0)
+		vm.builder_emit(builder, .Assert, 0, 1, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+
+		spec := vm.builder_add_dispatch_spec(
+			builder,
+			v.symbol_intern("child"),
+			nil,
+		)
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Spawn, 0, i32(spec), 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 2})
+	defer scheduler_destroy(&scheduler)
+
+	parent_id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
+	outcome := scheduler_wait(&scheduler, parent_id)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+	child_raw, child_ok := v.value_as_int(outcome.value)
+	testing.expect(t, child_ok)
+
+	child_outcome := scheduler_wait(&scheduler, Task_ID(child_raw))
+	testing.expect_value(t, child_outcome.kind, Task_Outcome_Kind.Complete)
+
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(&kernel, k.Relation_ID(1), []v.Binding{{}}, &rows)
+	testing.expect_value(t, len(rows), 1)
 }

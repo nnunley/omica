@@ -28,6 +28,11 @@ VM_Request :: enum {
 	Yield,
 	// Suspend the task until at least `request_millis` have passed.
 	Sleep,
+	// Suspend the task and ask the host to start a child task described by
+	// `request_spec`, then resume with the child's task id.
+	Spawn,
+	// Suspend the task and ask the host for a value.
+	Host_Request,
 }
 
 // A builtin procedure. It returns false after recording an error with
@@ -60,10 +65,21 @@ VM :: struct {
 	transaction: ^k.Transaction,
 	builtins:    [dynamic]VM_Builtin,
 	request:     VM_Request,
-	// Sleep duration in milliseconds when `request == .Sleep`.
+	// Sleep duration in milliseconds when `request == .Sleep`, or the child
+	// start delay when `request == .Spawn`.
 	request_millis: i64,
+	// Dispatch spec index for a `.Spawn` request.
+	request_spec: i32,
+	// Register (frame-relative) that receives the resume value.
+	pending_resume: i32,
 	// Free slot for host data, for example a builtin environment.
 	user:        rawptr,
+	// Values copied into the entry function's parameter registers before the
+	// first run. The caller keeps them alive.
+	entry_arguments: []v.Value,
+	// When non-negative, the function index to start at instead of the program
+	// entry. Used to start spawned method tasks.
+	entry_function: i32,
 }
 
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
@@ -73,6 +89,9 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.frames = make([dynamic]Frame)
 	state.builtins = make([dynamic]VM_Builtin)
 	state.request = .None
+	state.request_spec = -1
+	state.pending_resume = -1
+	state.entry_function = -1
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
 	state.status = .Ready
@@ -82,6 +101,35 @@ vm_destroy :: proc(state: ^VM) {
 	delete(state.registers)
 	delete(state.frames)
 	delete(state.builtins)
+}
+
+// Writes a resume value into the register the suspended instruction named.
+// Does nothing when the suspension has no destination.
+vm_resume_with :: proc(state: ^VM, value: v.Value) {
+	if state.pending_resume < 0 || len(state.frames) == 0 {
+		return
+	}
+	frame := state.frames[len(state.frames) - 1]
+	state.registers[frame.register_base + int(state.pending_resume)] = value
+	state.pending_resume = -1
+}
+
+// Starts execution at `function_index` instead of the program entry.
+vm_set_entry_function :: proc(state: ^VM, function_index: i32) {
+	state.entry_function = function_index
+}
+
+// Seeds the entry function's parameter registers.
+vm_set_entry_arguments :: proc(state: ^VM, arguments: []v.Value) {
+	state.entry_arguments = arguments
+}
+
+// Returns the frame-relative register base of the suspended frame.
+vm_frame_base :: proc(state: ^VM) -> int {
+	if len(state.frames) == 0 {
+		return 0
+	}
+	return state.frames[len(state.frames) - 1].register_base
 }
 
 // Registers a builtin procedure under `name`. Returns its index.
@@ -112,6 +160,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 	if state.status == .Boundary {
 		state.status = .Ready
 		state.request = .None
+		state.request_spec = -1
 	}
 	if state.status != .Ready {
 		return state.status
@@ -120,6 +169,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 	program := state.program
 	if len(state.frames) == 0 {
 		entry := program.entry
+		if state.entry_function >= 0 {
+			entry = int(state.entry_function)
+		}
 		entry_function := program.functions[entry]
 		append(&state.frames, Frame {
 			function      = entry,
@@ -129,6 +181,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			caller_dst    = -1,
 		})
 		resize(&state.registers, entry_function.register_count)
+		for argument, index in state.entry_arguments {
+			state.registers[index] = argument
+		}
 	}
 
 	for {
@@ -328,6 +383,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			return .Boundary
 
 		case .Yield:
+			state.pending_resume = instr.a
 			state.request = .Yield
 			state.status = .Boundary
 			return .Boundary
@@ -338,8 +394,26 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				vm_fail(state, "E_TYPE", "sleep duration must be a non-negative integer")
 				return .Failed
 			}
+			state.pending_resume = instr.a
 			state.request = .Sleep
 			state.request_millis = millis
+			state.status = .Boundary
+			return .Boundary
+
+		case .Spawn:
+			delay_millis := i64(0)
+			if instr.flags & 1 != 0 {
+				millis, is_int := v.value_as_int(state.registers[base + int(instr.c)])
+				if !is_int || millis < 0 {
+					vm_fail(state, "E_TYPE", "spawn delay must be a non-negative integer")
+					return .Failed
+				}
+				delay_millis = millis
+			}
+			state.pending_resume = instr.a
+			state.request = .Spawn
+			state.request_spec = instr.b
+			state.request_millis = delay_millis
 			state.status = .Boundary
 			return .Boundary
 

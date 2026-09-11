@@ -163,3 +163,63 @@ test_task_writes_survive_suspend :: proc(t: ^testing.T) {
 	k.kernel_scan_into(&kernel, k.Relation_ID(1), []v.Binding{{}}, &rows)
 	testing.expect_value(t, len(rows), 2)
 }
+
+@(test)
+test_task_resume_with_value :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		one := vm.builder_add_constant(builder, value_int_must(1))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(one), 0)
+		vm.builder_emit(builder, .Yield, 0, 0, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	task: Task
+	task_init(&task, 5, &kernel, program, nil)
+	defer task_destroy(&task)
+
+	outcome := task_run(&task)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Pending)
+	testing.expect_value(t, outcome.suspend, Task_Suspend.Yield)
+
+	outcome = task_resume_with(&task, value_int_must(99))
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+	value, value_ok := v.value_as_int(outcome.value)
+	testing.expect(t, value_ok)
+	testing.expect_value(t, value, i64(99))
+}
+
+@(test)
+test_task_cancel_parked :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		delay := vm.builder_add_constant(builder, value_int_must(5))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
+		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	task: Task
+	task_init(&task, 6, &kernel, program, nil)
+	defer task_destroy(&task)
+
+	outcome := task_run(&task)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Pending)
+
+	outcome = task_cancel(&task)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Aborted)
+	testing.expect_value(t, outcome.message, "cancelled")
+
+	outcome = task_resume(&task)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Aborted)
+}

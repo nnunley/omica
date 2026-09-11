@@ -50,6 +50,9 @@ Task :: struct {
 	source:  k.Relation_Source,
 	has_tx:  bool,
 	outcome: Task_Outcome,
+
+	// Set by the scheduler; a running task aborts at its next boundary.
+	cancel_requested: bool,
 }
 
 // Creates a task over `kernel`. The caller owns `program` and `env` and must
@@ -132,6 +135,9 @@ task_abort :: proc(task: ^Task, message: string) -> Task_Outcome {
 // Runs the task until it completes, aborts, or suspends.
 task_run :: proc(task: ^Task) -> Task_Outcome {
 	for {
+		if task.cancel_requested {
+			return task_abort(task, "cancelled")
+		}
 		status := vm.vm_run(&task.state)
 		switch status {
 		case .Halted:
@@ -158,11 +164,23 @@ task_run :: proc(task: ^Task) -> Task_Outcome {
 				task_begin_tx(task)
 				task.state.request = .None
 
-			case .Yield, .Sleep:
+			case .Yield, .Sleep, .Spawn, .Host_Request:
 				if err := task_commit(task); err != k.Kernel_Error.None {
 					return task_abort(task, "commit failed")
 				}
-				suspend := task.state.request == .Yield ? Task_Suspend.Yield : Task_Suspend.Sleep
+				suspend: Task_Suspend
+				switch task.state.request {
+				case .Yield:
+					suspend = .Yield
+				case .Sleep:
+					suspend = .Sleep
+				case .Spawn:
+					suspend = .Spawn
+				case .Host_Request:
+					suspend = .Host_Request
+				case .Commit, .None:
+					suspend = .None
+				}
 				millis := task.state.request_millis
 				task_end_tx(task)
 				task.state.request = .None
@@ -184,7 +202,7 @@ task_run :: proc(task: ^Task) -> Task_Outcome {
 	}
 }
 
-// Resumes a suspended task from its next boundary.
+// Resumes a suspended task from its next boundary without delivering a value.
 task_resume :: proc(task: ^Task) -> Task_Outcome {
 	if task.outcome.kind != .Pending {
 		return task.outcome
@@ -194,4 +212,28 @@ task_resume :: proc(task: ^Task) -> Task_Outcome {
 	}
 	task.outcome.suspend = .None
 	return task_run(task)
+}
+
+// Resumes a suspended task, delivering `value` to the register the suspended
+// instruction named (a no-op when the instruction has no result register).
+task_resume_with :: proc(task: ^Task, value: v.Value) -> Task_Outcome {
+	if task.outcome.kind != .Pending {
+		return task.outcome
+	}
+	if !task.has_tx {
+		task_begin_tx(task)
+	}
+	vm.vm_resume_with(&task.state, value)
+	task.outcome.suspend = .None
+	return task_run(task)
+}
+
+// Requests cancellation. A parked task aborts immediately; a running task
+// aborts at its next boundary.
+task_cancel :: proc(task: ^Task) -> Task_Outcome {
+	task.cancel_requested = true
+	if task.outcome.kind != .Pending {
+		return task.outcome
+	}
+	return task_abort(task, "cancelled")
 }
