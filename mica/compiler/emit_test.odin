@@ -534,3 +534,39 @@ test_emit_role_dispatch_spec :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(spec.roles), 2)
 	}
 }
+
+@(test)
+test_emit_spawn_spec :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	program := compile_test_program(
+		t,
+		"spawn :take(actor: #1, item: #2) after 500",
+		&ctx,
+		allocator,
+	)
+	testing.expect_value(t, len(program.dispatch_specs), 1)
+	if len(program.dispatch_specs) == 1 {
+		spec := program.dispatch_specs[0]
+		name, name_ok := v.symbol_name(spec.selector)
+		testing.expect(t, name_ok)
+		testing.expect_value(t, name, "take")
+		testing.expect_value(t, len(spec.roles), 2)
+	}
+
+	spawns := 0
+	for instruction in program.code {
+		if instruction.op != .Spawn {
+			continue
+		}
+		spawns += 1
+		testing.expect_value(t, instruction.flags, u8(1))
+	}
+	testing.expect_value(t, spawns, 1)
+}

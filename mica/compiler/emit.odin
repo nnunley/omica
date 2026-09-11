@@ -427,8 +427,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return -1, false
 
 	case Spawn:
-		push_error(emitter, "spawn expressions are not lowered yet")
-		return -1, false
+		return emit_spawn(emitter, n)
 
 	case Structural_Literal:
 		return emit_frob(emitter, n)
@@ -764,6 +763,47 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		return emit_standard_constructor(emitter, text, call)
 	}
 
+	if text == "commit" {
+		if len(call.args) != 0 {
+			push_error(emitter, "commit expects no arguments")
+			return -1, false
+		}
+		vm.builder_emit(emitter.builder, .Commit, 0, 0, 0, 0)
+		return -1, false
+	}
+
+	if text == "suspend" {
+		if len(call.args) > 1 {
+			push_error(emitter, "suspend expects zero or one argument")
+			return -1, false
+		}
+		destination := alloc_register(emitter)
+		if len(call.args) == 1 {
+			duration, has_value := emit_expr(emitter, call.args[0].expr)
+			if !has_value {
+				return -1, false
+			}
+			vm.builder_emit(
+				emitter.builder,
+				.Sleep,
+				0,
+				i32(destination),
+				i32(duration),
+				0,
+			)
+		} else {
+			vm.builder_emit(
+				emitter.builder,
+				.Yield,
+				0,
+				i32(destination),
+				0,
+				0,
+			)
+		}
+		return destination, true
+	}
+
 	// A relation query.
 	if emitter.ctx != nil {
 		if relation, found := emitter.ctx.relations[text]; found {
@@ -1010,6 +1050,67 @@ emit_role_dispatch :: proc(
 		i32(destination),
 		spec,
 		0,
+	)
+	return destination, true
+}
+
+// Lowers `spawn :verb(role: value, ...) [after millis]` to a Spawn
+// instruction. The destination register receives the child task id when the
+// parent resumes.
+@(private)
+emit_spawn :: proc(emitter: ^Emitter, spawn: Spawn) -> (int, bool) {
+	call, is_call := spawn.call^.(Call)
+	if !is_call {
+		push_error(emitter, "spawn target must be a symbol call")
+		return -1, false
+	}
+	selector, is_symbol := call.callee^.(Symbol_Literal)
+	if !is_symbol {
+		push_error(emitter, "spawn target must use a symbol selector like :verb(...)")
+		return -1, false
+	}
+
+	roles := make([dynamic]vm.Dispatch_Role, 0, len(call.args), emitter.allocator)
+	defer delete(roles)
+	for argument in call.args {
+		if !argument.has_role {
+			push_error(emitter, "spawn arguments must use explicit role names")
+			return -1, false
+		}
+		register, has_value := emit_expr(emitter, argument.expr)
+		if !has_value {
+			return -1, false
+		}
+		append(&roles, vm.Dispatch_Role {
+			role     = v.symbol_intern(argument.role),
+			register = i32(register),
+		})
+	}
+	spec := vm.builder_add_dispatch_spec(
+		emitter.builder,
+		v.symbol_intern(selector.name),
+		roles[:],
+	)
+
+	flags := u8(0)
+	delay_register := i32(0)
+	if spawn.has_delay {
+		delay, has_value := emit_expr(emitter, spawn.delay)
+		if !has_value {
+			return -1, false
+		}
+		flags = 1
+		delay_register = i32(delay)
+	}
+
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Spawn,
+		flags,
+		i32(destination),
+		spec,
+		delay_register,
 	)
 	return destination, true
 }

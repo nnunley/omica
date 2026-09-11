@@ -135,52 +135,34 @@ run_files :: proc(
 		return Run_Result{ok = false, message = compiled.errors[0].message}
 	}
 
-	tx := k.kernel_begin(kernel)
-	defer k.transaction_destroy(&tx)
-	source := k.Relation_Source {
-		transaction        = &tx,
-		use_stored_derived = true,
-	}
+	// Run the world's entry function as a task. The task commits at each
+	// boundary and spawned children run on the same scheduler pool.
+	task := new(Task, allocator)
+	task_init(task, 0, kernel, compiled.program, &env, allocator)
 
-	state: vm.VM
-	vm.vm_init(&state, compiled.program, allocator)
-	defer vm.vm_destroy(&state)
-	vm.vm_set_workspace(&state, &source, &tx)
-	state.user = &env
-	register_runtime_builtins(&state)
+	scheduler: Scheduler
+	scheduler_init(&scheduler, kernel, Scheduler_Config{workers = 1}, allocator)
+	defer scheduler_destroy(&scheduler)
 
-	for {
-		status := vm.vm_run(&state)
-		#partial switch status {
-		case .Halted:
-			committed, commit_err := k.transaction_commit(&tx)
-			if commit_err != k.Kernel_Error.None {
-				return Run_Result{ok = false, message = "commit failed"}
+	id := scheduler_submit(&scheduler, task)
+	outcome := scheduler_wait(&scheduler, id)
+	#partial switch outcome.kind {
+	case .Complete:
+		return Run_Result{ok = true, message = "loaded"}
+
+	case .Aborted:
+		if task.state.error != v.Value(0) {
+			return Run_Result {
+				ok      = false,
+				message = format_error(task.state.error, allocator),
 			}
-			k.snapshot_release(committed)
-			return Run_Result{ok = true, message = "loaded"}
-
-		case .Boundary:
-			if state.request != .Commit {
-				return Run_Result{ok = false, message = "unknown host request"}
-			}
-			committed, commit_err := k.transaction_commit(&tx)
-			if commit_err != k.Kernel_Error.None {
-				return Run_Result{ok = false, message = "commit failed"}
-			}
-			k.snapshot_release(committed)
-			k.transaction_destroy(&tx)
-			tx = k.kernel_begin(kernel)
-			source.transaction = &tx
-			state.request = .None
-
-		case .Failed:
-			return Run_Result{ok = false, message = format_error(state.error, allocator)}
-
-		case .Ready:
-			return Run_Result{ok = false, message = "vm did not run"}
 		}
+		return Run_Result{ok = false, message = outcome.message}
+
+	case .Pending:
+		return Run_Result{ok = false, message = "task did not finish"}
 	}
+	return Run_Result{ok = false, message = "task did not finish"}
 }
 
 // Compiles and runs one filein against `kernel`. On success the transaction is
