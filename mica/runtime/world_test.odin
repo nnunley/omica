@@ -120,3 +120,61 @@ end
 	}
 	expect_relation_rows(t, &kernel, "Out", 8)
 }
+
+@(test)
+test_world_call_with_facts :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:In, 1)
+make_relation(:Out, 1)
+verb probe(x)
+  let found = In(?v)
+  for row in found
+    assert Out(row[:v])
+  end
+end
+`
+	path, path_ok := write_temp_source(t, "mica_world_facts_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "world start failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	snapshot := k.kernel_snapshot(&kernel)
+	metadata, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("In"))
+	k.snapshot_release(snapshot)
+	testing.expect(t, found)
+	in_value, _ := v.value_int(42)
+	placeholder, _ := v.value_int(0)
+	facts := []World_Fact{{
+		relation = metadata.id,
+		tuple    = v.tuple_new(context.temp_allocator, []v.Value{in_value}),
+	}}
+	result := world_submit_call_with_facts(
+		world,
+		"probe",
+		[]k.Role_Pair{role_x(placeholder)},
+		facts,
+	)
+	testing.expect_value(t, result.error, Dispatch_Error.None)
+	if result.id == 0 {
+		return
+	}
+	outcome := world_wait(world, result.id)
+	world_release(world, result.id)
+	testing.expectf(t, outcome.kind == .Complete, "probe failed: %s", outcome.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}

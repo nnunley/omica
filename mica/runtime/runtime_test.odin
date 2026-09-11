@@ -2352,16 +2352,20 @@ verb work(call_cap, out_cap, denied_cap, phase_cap)
   use_capability(out_cap)
   use_capability(denied_cap)
   use_capability(phase_cap)
-  if actor() == #alice
-    assert Phase(1)
-  else
-    assert Phase(2)
+  if let some(current) = actor()
+    if current == #alice
+      assert Phase(1)
+    else
+      assert Phase(2)
+    end
   end
   assume_actor(#bob)
-  if actor() == #bob
-    assert Phase(3)
-  else
-    assert Phase(4)
+  if let some(adopted) = actor()
+    if adopted == #bob
+      assert Phase(3)
+    else
+      assert Phase(4)
+    end
   end
   assert Out(len(Secret(1)))
   try
@@ -2394,4 +2398,54 @@ suspend()
 	expect_relation_rows(t, &kernel, "Out", 1)
 	expect_relation_rows(t, &kernel, "Denied", 1)
 	expect_relation_rows(t, &kernel, "Phase", 2)
+}
+
+@(test)
+test_run_truthiness_and_options :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Flag, 1)
+make_relation(:Out, 1)
+
+verb probe()
+  let empty = Flag(2)
+  if Flag(1)
+    assert Out(1)
+  end
+  if not Flag(2)
+    assert Out(2)
+  end
+  if not empty
+    assert Out(3)
+  end
+  if actor()
+    assert Out(4)
+  end
+  if let some(current) = actor()
+    assert Out(5)
+  end
+  if let some(p) = principal()
+    assert Out(6)
+  end
+  if sync_signature(1, "payload") > 0
+    assert Out(7)
+  end
+  return none
+end
+
+assert Flag(1)
+probe()
+`
+	path, path_ok := write_temp_source(t, "mica_truthiness_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 7)
 }

@@ -48,7 +48,7 @@ routes_destroy :: proc(routes: ^Routes) {
 
 routes_handle :: proc(user: rawptr, request: ^Http_Request, response: ^Http_Response) {
 	routes := (^Routes)(user)
-	path := request_path(request.target)
+	path := http_request_path(request.target)
 
 	if request.method != "GET" {
 		response.headers = allow_get_headers
@@ -84,8 +84,7 @@ routes_handle :: proc(user: rawptr, request: ^Http_Request, response: ^Http_Resp
 }
 
 // Strips the query string from a request target.
-@(private)
-request_path :: proc(target: string) -> string {
+http_request_path :: proc(target: string) -> string {
 	query := strings.index_byte(target, '?')
 	if query < 0 {
 		return target

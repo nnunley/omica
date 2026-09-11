@@ -708,9 +708,28 @@ scheduler_push_timer :: proc(scheduler: ^Scheduler, entry: Timer_Entry) {
 	scheduler.timers[insert] = entry
 }
 
+// Why a dispatch submission failed.
+Dispatch_Error :: enum {
+	None,
+	// No method matched the selector and roles.
+	No_Method,
+	// The method has no program index or it is not an integer.
+	No_Program,
+	// The method parameters cannot bind to the supplied roles.
+	Arguments,
+	// A prepared fact could not be asserted; see `kernel`.
+	Fact,
+}
+
+Dispatch_Result :: struct {
+	id:     Task_ID,
+	error:  Dispatch_Error,
+	kernel: k.Kernel_Error,
+}
+
 // Resolves `selector` with `roles` and submits a task that starts at the
-// method's function in `program`. Returns 0 when no method resolves or its
-// parameters cannot bind.
+// method's function in `program`. `facts` are asserted into the task
+// transaction before it starts. A zero id means the submission failed.
 scheduler_submit_dispatch :: proc(
 	scheduler: ^Scheduler,
 	env: ^Builtin_Env,
@@ -718,7 +737,8 @@ scheduler_submit_dispatch :: proc(
 	selector: v.Value,
 	roles: []k.Role_Pair,
 	delay_millis: i64,
-) -> Task_ID {
+	facts: []World_Fact = nil,
+) -> Dispatch_Result {
 	snapshot := k.kernel_snapshot(scheduler.kernel)
 	defer k.snapshot_release(snapshot)
 	source := k.Relation_Source {
@@ -738,7 +758,7 @@ scheduler_submit_dispatch :: proc(
 		context.temp_allocator,
 	)
 	if len(entries) == 0 {
-		return 0
+		return Dispatch_Result{error = .No_Method}
 	}
 	method := entries[0]
 	program_value, found := k.dispatch_method_program(
@@ -747,11 +767,11 @@ scheduler_submit_dispatch :: proc(
 		method.method,
 	)
 	if !found {
-		return 0
+		return Dispatch_Result{error = .No_Program}
 	}
 	function_index, is_int := v.value_as_int(program_value)
 	if !is_int {
-		return 0
+		return Dispatch_Result{error = .No_Program}
 	}
 	arguments, args_ok := k.dispatch_method_args(
 		method.params,
@@ -759,20 +779,28 @@ scheduler_submit_dispatch :: proc(
 		scheduler.allocator,
 	)
 	if !args_ok {
-		return 0
+		return Dispatch_Result{error = .Arguments}
 	}
 
 	task := new(Task, scheduler.allocator)
 	task_init(task, 0, scheduler.kernel, program, env, scheduler.allocator)
+	for fact in facts {
+		if err := k.transaction_assert(&task.tx, fact.relation, fact.tuple); err != .None {
+			task_destroy(task)
+			free(task, scheduler.allocator)
+			return Dispatch_Result{error = .Fact, kernel = err}
+		}
+	}
 	vm.vm_set_entry_function(&task.state, i32(function_index))
 	vm.vm_set_entry_arguments(&task.state, arguments)
-	return scheduler_submit_task(
+	id := scheduler_submit_task(
 		scheduler,
 		task,
 		delay_millis,
 		false,
 		arguments,
 	)
+	return Dispatch_Result{id = id}
 }
 
 // Builds a child task from a parent's `.Spawn` suspension. The selector and
@@ -791,7 +819,7 @@ scheduler_spawn_child :: proc(scheduler: ^Scheduler, parent: ^Task) -> Task_ID {
 			value = parent.state.registers[base + int(role.register)],
 		}
 	}
-	return scheduler_submit_dispatch(
+	result := scheduler_submit_dispatch(
 		scheduler,
 		parent.env,
 		parent.program,
@@ -799,6 +827,7 @@ scheduler_spawn_child :: proc(scheduler: ^Scheduler, parent: ^Task) -> Task_ID {
 		roles,
 		parent.state.request_millis,
 	)
+	return result.id
 }
 
 @(private)

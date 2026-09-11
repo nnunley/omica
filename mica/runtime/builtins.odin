@@ -154,7 +154,10 @@ builtin_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	if len(args) != 0 {
 		return builtin_error(state, "E_INVARG", "actor expects no arguments")
 	}
-	return state.actor, true
+	if v.value_is_empty_relation(state.actor) {
+		return option_none_value(state.allocator), true
+	}
+	return option_some_value(state.allocator, state.actor), true
 }
 
 @(private)
@@ -162,7 +165,10 @@ builtin_principal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	if len(args) != 0 {
 		return builtin_error(state, "E_INVARG", "principal expects no arguments")
 	}
-	return state.principal, true
+	if v.value_is_empty_relation(state.principal) {
+		return option_none_value(state.allocator), true
+	}
+	return option_some_value(state.allocator, state.principal), true
 }
 
 @(private)
@@ -482,7 +488,8 @@ builtin_sync_signature :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool
 	for byte in transmute([]u8)payload {
 		hash = (hash ~ u64(byte)) * u64(0x0000_0100_0000_01b3)
 	}
-	hash &= 0x7fff_ffff_ffff_ffff
+	// Mica integers are 56-bit; the mask matches Rust's SIGNATURE_MASK.
+	hash &= 0x007f_ffff_ffff_ffff
 	result, _ := v.value_int(i64(hash))
 	return result, true
 }

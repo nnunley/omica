@@ -23,6 +23,12 @@ World_Config :: struct {
 	workers: int,
 }
 
+// A relation write applied to a task transaction before it starts.
+World_Fact :: struct {
+	relation: k.Relation_ID,
+	tuple:    v.Tuple,
+}
+
 World :: struct {
 	kernel:    ^k.Kernel,
 	allocator: mem.Allocator,
@@ -96,6 +102,26 @@ world_submit_call :: proc(
 	roles: []k.Role_Pair,
 	delay_millis := i64(0),
 ) -> Task_ID {
+	result := scheduler_submit_dispatch(
+		&world.scheduler,
+		&world.env,
+		world.program,
+		v.value_symbol(v.symbol_intern(selector)),
+		roles,
+		delay_millis,
+	)
+	return result.id
+}
+
+// Submits a call whose task transaction starts with `facts`. Returns a
+// Dispatch_Result so callers can report why a submission failed.
+world_submit_call_with_facts :: proc(
+	world: ^World,
+	selector: string,
+	roles: []k.Role_Pair,
+	facts: []World_Fact,
+	delay_millis := i64(0),
+) -> Dispatch_Result {
 	return scheduler_submit_dispatch(
 		&world.scheduler,
 		&world.env,
@@ -103,6 +129,7 @@ world_submit_call :: proc(
 		v.value_symbol(v.symbol_intern(selector)),
 		roles,
 		delay_millis,
+		facts,
 	)
 }
 
@@ -114,6 +141,15 @@ world_wait :: proc(world: ^World, id: Task_ID) -> Task_Outcome {
 // Frees a terminal task entry after its outcome is read.
 world_release :: proc(world: ^World, id: Task_ID) {
 	scheduler_release(&world.scheduler, id)
+}
+
+// The world's default principal and actor identities.
+world_principal :: proc(world: ^World) -> v.Value {
+	return world.env.principal
+}
+
+world_actor :: proc(world: ^World) -> v.Value {
+	return world.env.actor
 }
 
 // Submits a call, waits for it, and frees the task entry.

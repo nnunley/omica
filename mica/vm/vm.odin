@@ -6,6 +6,7 @@
 // and builtin calls are added on top of this core.
 package vm
 
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -339,12 +340,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 
 		case .Branch:
-			condition, is_bool := v.value_as_bool(state.registers[base + int(instr.a)])
-			if !is_bool {
-				vm_fail(state, "E_TYPE", "branch condition is not a boolean")
-				break
-			}
-			if condition {
+			if vm_truthy(state.registers[base + int(instr.a)]) {
 				state.frames[top].ip += int(instr.b)
 			}
 
@@ -1660,6 +1656,24 @@ vm_binary :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	return true
 }
 
+// Truthiness mirrors the Rust VM: booleans use their value, lists and
+// relations are true when non-empty, and every other kind is true.
+@(private)
+vm_truthy :: proc(value: v.Value) -> bool {
+	#partial switch v.value_kind(value) {
+	case .Bool:
+		result, _ := v.value_as_bool(value)
+		return result
+	case .List:
+		values, _ := v.value_as_list(value)
+		return len(values) > 0
+	case .Relation:
+		relation, _ := v.value_as_relation(value)
+		return len(relation.rows) > 0
+	}
+	return true
+}
+
 @(private)
 vm_unary :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	source := state.registers[base + int(instr.b)]
@@ -1674,12 +1688,7 @@ vm_unary :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		}
 		state.registers[base + int(instr.a)] = result
 	case .Not:
-		boolean, ok := v.value_as_bool(source)
-		if !ok {
-			vm_fail(state, "E_TYPE", "not expects a boolean")
-			return false
-		}
-		state.registers[base + int(instr.a)] = v.value_bool(!boolean)
+		state.registers[base + int(instr.a)] = v.value_bool(!vm_truthy(source))
 	}
 	return true
 }
