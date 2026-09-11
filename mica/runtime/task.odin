@@ -84,6 +84,9 @@ task_init :: proc(
 	}
 	vm.vm_set_workspace(&task.state, &task.source, &task.tx)
 	task.state.user = env
+	if env != nil {
+		vm.vm_set_identities(&task.state, env.endpoint, env.actor, env.principal)
+	}
 	vm.vm_set_mailbox_validator(&task.state, mailbox_receivers_live, env)
 	register_runtime_builtins(&task.state)
 	if env != nil && env.enforce_authority {

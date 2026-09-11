@@ -460,6 +460,7 @@ run_files :: proc(
 			)}
 		}
 		env.actor = actor_value
+		env.principal = actor_value
 	}
 
 	for path, index in paths {
@@ -603,6 +604,7 @@ Rule_Fact :: struct {
 	id:     v.Identity,
 	head:   k.Relation_ID,
 	source: string,
+	active: bool,
 }
 
 // Assert the catalog facts that describe rules: Rule, RuleHead, and RuleSource.
@@ -645,6 +647,16 @@ assert_rule_facts :: proc(env: ^Builtin_Env, rules: []Rule_Fact) -> Run_Result {
 			}),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "RuleSource", err)
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_ACTIVE_RULE_ID,
+			v.tuple_new(env.allocator, []v.Value {
+				identity,
+				v.value_bool(rule_fact.active),
+			}),
+		); err != k.Kernel_Error.None {
+			return catalog_error(env, "ActiveRule", err)
 		}
 	}
 	committed, commit_err := k.transaction_commit(&tx)
@@ -822,6 +834,7 @@ install_rules :: proc(
 			id     = v.Identity(declarations.next_rule),
 			head   = rule.head_relation,
 			source = path,
+			active = true,
 		})
 		declarations.next_rule += 1
 	}

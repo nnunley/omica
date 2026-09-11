@@ -797,12 +797,16 @@ apply_guard :: proc(
 	return out, .None
 }
 
+// Chooses the next body item. Ready guards and negations run first as cheap
+// filters; otherwise the positive atom with the most bound variables wins,
+// breaking ties by estimated relation size so small relations drive the join.
 @(private)
 pick_body_item :: proc(
 	rule: Rule,
 	used: []bool,
 	bindings: [][]v.Binding,
 	slots: ^Slot_Map,
+	source: ^Relation_Source,
 ) -> (
 	int,
 	Kernel_Error,
@@ -814,7 +818,7 @@ pick_body_item :: proc(
 		switch item.kind {
 		case .Atom:
 			if !item.atom.negated {
-				return i, .None
+				continue
 			}
 			if binding_all_bound(item.atom.terms, bindings, slots) {
 				return i, .None
@@ -827,6 +831,29 @@ pick_body_item :: proc(
 		}
 	}
 
+	best := -1
+	best_bound := -1
+	best_rows := 0
+	for index in 0 ..< len(rule.body) {
+		if used[index] {
+			continue
+		}
+		item := rule.body[index]
+		if item.kind != .Atom || item.atom.negated {
+			continue
+		}
+		bound := atom_bound_count(&item.atom, bindings, slots)
+		rows := rules_source_cardinality(source, item.atom.relation)
+		if best < 0 || bound > best_bound || (bound == best_bound && rows < best_rows) {
+			best = index
+			best_bound = bound
+			best_rows = rows
+		}
+	}
+	if best >= 0 {
+		return best, .None
+	}
+
 	for item, i in rule.body {
 		if used[i] {
 			continue
@@ -836,6 +863,47 @@ pick_body_item :: proc(
 		}
 	}
 	return -1, .Unsafe_Guard
+}
+
+// Counts the variable terms of an atom that are already bound.
+@(private)
+atom_bound_count :: proc(atom: ^Atom, bindings: [][]v.Binding, slots: ^Slot_Map) -> int {
+	if len(bindings) == 0 {
+		return 0
+	}
+	binding := bindings[0]
+	count := 0
+	for term in atom.terms {
+		if term.kind == .Var && term_is_bound(term, binding, slots) {
+			count += 1
+		}
+	}
+	return count
+}
+
+// Estimates how many rows a relation contributes to a scan: the delta size
+// during semi-naive evaluation, otherwise the visible block length.
+@(private)
+rules_source_cardinality :: proc(source: ^Relation_Source, relation: Relation_ID) -> int {
+	if source != nil && source.delta_active &&
+	   source.delta != nil &&
+	   relation == source.delta_relation {
+		return len(rules_derived_rows(source.delta, relation))
+	}
+	block: ^Relation_Block
+	if source != nil && source.snapshot != nil {
+		if found, ok := snapshot_relation_block(source.snapshot, relation); ok {
+			block = found
+		}
+	} else if source != nil && source.transaction != nil {
+		if found, ok := snapshot_relation_block(source.transaction.base, relation); ok {
+			block = found
+		}
+	}
+	if block == nil {
+		return 0
+	}
+	return relation_block_len(block)
 }
 
 @(private)
@@ -859,7 +927,7 @@ rules_apply :: proc(
 	used := make([]bool, len(rule.body), alloc)
 	remaining := len(rule.body)
 	for remaining > 0 {
-		index, pick_err := pick_body_item(rule, used, bindings[:], &slots)
+		index, pick_err := pick_body_item(rule, used, bindings[:], &slots, source)
 		if pick_err != .None {
 			return 0, pick_err
 		}

@@ -1918,3 +1918,114 @@ assert Out(decoded)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 3)
 }
+
+@(test)
+test_run_rule_enable_disable :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Base, 1)
+make_relation(:Derived, 1)
+make_relation(:Out, 1)
+Derived(x) :- Base(x)
+assert Base(1)
+commit()
+require(len(Derived(1)) == 1)
+let rules = Rule(?rule)
+let rule_count = 0
+for found in rules
+  disable_rule(found[:rule])
+  rule_count = rule_count + 1
+end
+require(rule_count == 1)
+commit()
+require(len(Derived(1)) == 0)
+for found in rules
+  enable_rule(found[:rule])
+end
+commit()
+require(len(Derived(1)) == 1)
+assert Out(1)
+`
+	path, path_ok := write_temp_source(t, "mica_rule_toggle_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
+
+@(test)
+test_run_assume_actor :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_identity(:bob)
+make_identity(:carol)
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+make_relation(:session/CanAssumeActor, 2)
+make_relation(:Secret, 1)
+make_relation(:Out, 1)
+make_relation(:Denied, 1)
+make_relation(:Phase, 1)
+assert CanRead(#bob, :Secret)
+assert session/CanAssumeActor(#alice, #bob)
+assert Secret(1)
+let call_cap = mint_capability(:invoke, [:assume_actor, :actor])
+let out_cap = mint_capability(:write, :Out)
+let denied_cap = mint_capability(:write, :Denied)
+let phase_cap = mint_capability(:write, :Phase)
+commit()
+verb work(call_cap, out_cap, denied_cap, phase_cap)
+  use_capability(call_cap)
+  use_capability(out_cap)
+  use_capability(denied_cap)
+  use_capability(phase_cap)
+  if actor() == #alice
+    assert Phase(1)
+  else
+    assert Phase(2)
+  end
+  assume_actor(#bob)
+  if actor() == #bob
+    assert Phase(3)
+  else
+    assert Phase(4)
+  end
+  assert Out(len(Secret(1)))
+  try
+    assume_actor(#carol)
+    assert Denied(0)
+  catch err
+    assert Denied(1)
+  end
+end
+spawn :work(call_cap: call_cap, out_cap: out_cap, denied_cap: denied_cap, phase_cap: phase_cap)
+suspend()
+`
+	path, path_ok := write_temp_source(t, "mica_assume_actor_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{actor = "alice"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+	expect_relation_rows(t, &kernel, "Denied", 1)
+	expect_relation_rows(t, &kernel, "Phase", 2)
+}

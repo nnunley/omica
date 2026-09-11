@@ -119,6 +119,11 @@ SYSTEM_INDEX_STORAGE_KIND_ID :: Relation_ID(0x7fff_fe0d)
 SYSTEM_SUBJECT_FACT_ID :: Relation_ID(0x7fff_fe0e)
 SYSTEM_MENTIONED_FACT_ID :: Relation_ID(0x7fff_fe14)
 SYSTEM_EXTENSIONAL_MENTIONED_FACT_ID :: Relation_ID(0x7fff_fe15)
+SYSTEM_ENDPOINT_ID :: Relation_ID(0x7fff_fe16)
+SYSTEM_ENDPOINT_ACTOR_ID :: Relation_ID(0x7fff_fe17)
+SYSTEM_ENDPOINT_PRINCIPAL_ID :: Relation_ID(0x7fff_fe18)
+SYSTEM_ENDPOINT_PROTOCOL_ID :: Relation_ID(0x7fff_fe19)
+SYSTEM_ENDPOINT_OPEN_ID :: Relation_ID(0x7fff_fe1a)
 SYSTEM_PROGRAM_BYTES_ID :: Relation_ID(0x7fff_fe0f)
 SYSTEM_METHOD_SOURCE_ID :: Relation_ID(0x7fff_fe10)
 SYSTEM_SOURCE_OWNS_FACT_ID :: Relation_ID(0x7fff_fe11)
@@ -155,6 +160,11 @@ system_relation_metadata :: proc(allocator := context.allocator) -> []Relation_M
 		relation_metadata(SYSTEM_SOURCE_OWNS_FACT_ID, v.symbol_intern("SourceOwnsFact"), 3),
 		relation_metadata(SYSTEM_SOURCE_OWNS_RULE_ID, v.symbol_intern("SourceOwnsRule"), 2),
 		relation_metadata(SYSTEM_SOURCE_OWNS_RELATION_ID, v.symbol_intern("SourceOwnsRelation"), 2),
+		relation_metadata(SYSTEM_ENDPOINT_ID, v.symbol_intern("Endpoint"), 1),
+		relation_metadata(SYSTEM_ENDPOINT_ACTOR_ID, v.symbol_intern("EndpointActor"), 2),
+		relation_metadata(SYSTEM_ENDPOINT_PRINCIPAL_ID, v.symbol_intern("EndpointPrincipal"), 2),
+		relation_metadata(SYSTEM_ENDPOINT_PROTOCOL_ID, v.symbol_intern("EndpointProtocol"), 2),
+		relation_metadata(SYSTEM_ENDPOINT_OPEN_ID, v.symbol_intern("EndpointOpen"), 1),
 	}
 	metadata := make([]Relation_Metadata, len(entries), allocator)
 	copy(metadata, entries[:])

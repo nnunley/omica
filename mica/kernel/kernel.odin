@@ -675,11 +675,12 @@ kernel_install_rule :: proc(
 	}
 }
 
-// Deactivates a rule and publishes a new snapshot. The returned snapshot is
-// caller-owned.
-kernel_disable_rule :: proc(
+// Sets a rule's active flag and publishes a new snapshot with recomputed
+// derived relations. The returned snapshot is caller-owned.
+kernel_set_rule_active :: proc(
 	kernel: ^Kernel,
 	rule_id: v.Identity,
+	active: bool,
 ) -> (
 	^Snapshot,
 	Kernel_Error,
@@ -692,6 +693,9 @@ kernel_disable_rule :: proc(
 		found := false
 		for definition in current.rules {
 			if definition.id == rule_id {
+				if definition.active == active {
+					return current, .None
+				}
 				found = true
 				break
 			}
@@ -704,7 +708,7 @@ kernel_disable_rule :: proc(
 		next := snapshot_fork(kernel, current)
 		for &definition in next.rules {
 			if definition.id == rule_id {
-				definition.active = false
+				definition.active = active
 			}
 		}
 		snapshot_compute_derived(next)
@@ -717,6 +721,30 @@ kernel_disable_rule :: proc(
 		snapshot_release(next)
 		snapshot_release(current)
 	}
+}
+
+// Deactivates a rule and publishes a new snapshot. The returned snapshot is
+// caller-owned.
+kernel_disable_rule :: proc(
+	kernel: ^Kernel,
+	rule_id: v.Identity,
+) -> (
+	^Snapshot,
+	Kernel_Error,
+) {
+	return kernel_set_rule_active(kernel, rule_id, false)
+}
+
+// Activates a rule and publishes a new snapshot. The returned snapshot is
+// caller-owned.
+kernel_enable_rule :: proc(
+	kernel: ^Kernel,
+	rule_id: v.Identity,
+) -> (
+	^Snapshot,
+	Kernel_Error,
+) {
+	return kernel_set_rule_active(kernel, rule_id, true)
 }
 
 // Visits visible tuples of a relation in the current snapshot, including

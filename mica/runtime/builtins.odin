@@ -81,6 +81,9 @@ runtime_builtins := [?]Builtin_Spec {
 	{"restrict_capability", 2, builtin_restrict_capability},
 	{"revoke_capability", 1, builtin_revoke_capability},
 	{"drop_capability", 1, builtin_drop_capability},
+	{"assume_actor", 1, builtin_assume_actor},
+	{"enable_rule", 1, builtin_enable_rule},
+	{"disable_rule", 1, builtin_disable_rule},
 	{"json_encode", 1, builtin_json_encode},
 	{"json_decode", 1, builtin_json_decode},
 	{"json_null", 0, builtin_json_null},
@@ -143,7 +146,7 @@ builtin_endpoint :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	if len(args) != 0 {
 		return builtin_error(state, "E_INVARG", "endpoint expects no arguments")
 	}
-	return builtin_env(state).endpoint, true
+	return state.endpoint, true
 }
 
 @(private)
@@ -151,7 +154,7 @@ builtin_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	if len(args) != 0 {
 		return builtin_error(state, "E_INVARG", "actor expects no arguments")
 	}
-	return builtin_env(state).actor, true
+	return state.actor, true
 }
 
 @(private)
@@ -159,7 +162,95 @@ builtin_principal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	if len(args) != 0 {
 		return builtin_error(state, "E_INVARG", "principal expects no arguments")
 	}
-	return builtin_env(state).principal, true
+	return state.principal, true
+}
+
+@(private)
+builtin_assume_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	env := builtin_env(state)
+	if len(args) != 1 {
+		return builtin_error(state, "E_INVARG", "assume_actor expects one identity")
+	}
+	actor_value, is_identity := v.value_as_identity(args[0])
+	if !is_identity {
+		return builtin_error(state, "E_TYPE", "assume_actor expects an identity")
+	}
+	if !actor_assumption_allowed(state, actor_value) {
+		return builtin_error(state, "E_PERMISSION", "actor assumption denied")
+	}
+
+	previous_actor := state.actor
+	state.actor = args[0]
+
+	// Refresh the task's authority for the new actor, preserving adopted
+	// capability grants.
+	if state.authority != nil && !state.authority.root {
+		adopted: [dynamic]^k.Capability_Grant
+		defer delete(adopted)
+		for grant in state.authority.capabilities {
+			k.capability_retain(grant)
+			append(&adopted, grant)
+		}
+		snapshot := k.kernel_snapshot(env.kernel)
+		source := k.Relation_Source {
+			snapshot = snapshot,
+		}
+		k.authority_destroy(state.authority)
+		state.authority^ = k.authority_from_actor(
+			&source,
+			actor_value,
+			env.allocator,
+		)
+		k.snapshot_release(snapshot)
+		for grant in adopted {
+			k.authority_adopt_capability(state.authority, grant)
+			k.capability_release(grant)
+		}
+	}
+
+	// Record the endpoint binding for the current endpoint.
+	if state.transaction != nil && !v.value_is_empty_relation(state.endpoint) {
+		_ = k.transaction_retract(
+			state.transaction,
+			k.SYSTEM_ENDPOINT_ACTOR_ID,
+			v.tuple_new(env.allocator, []v.Value{state.endpoint, previous_actor}),
+		)
+		_ = k.transaction_assert(
+			state.transaction,
+			k.SYSTEM_ENDPOINT_ACTOR_ID,
+			v.tuple_new(env.allocator, []v.Value{state.endpoint, args[0]}),
+		)
+	}
+	return v.value_bool(true), true
+}
+
+// The caller may assume an actor when it has grant authority or when the
+// principal policy allows it.
+@(private)
+actor_assumption_allowed :: proc(state: ^vm.VM, actor: v.Identity) -> bool {
+	if k.authority_can_grant(state.authority) {
+		return true
+	}
+	env := builtin_env(state)
+	relation, found := env.ctx.relations["session/CanAssumeActor"]
+	if !found || state.transaction == nil {
+		return false
+	}
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	source := k.Relation_Source {
+		transaction = state.transaction,
+	}
+	k.relation_source_scan_into(
+		&source,
+		k.Relation_ID(relation),
+		[]v.Binding{
+			v.binding_of(state.principal),
+			v.binding_of(v.value_identity(actor)),
+		},
+		&rows,
+	)
+	return len(rows) > 0
 }
 
 @(private)
@@ -949,6 +1040,63 @@ kernel_version :: proc(env: ^Builtin_Env) -> u64 {
 	snapshot := k.kernel_snapshot(env.kernel)
 	defer k.snapshot_release(snapshot)
 	return snapshot.version
+}
+
+@(private)
+builtin_enable_rule :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	return rule_active_builtin(state, args, true)
+}
+
+@(private)
+builtin_disable_rule :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	return rule_active_builtin(state, args, false)
+}
+
+@(private)
+rule_active_builtin :: proc(
+	state: ^vm.VM,
+	args: []v.Value,
+	active: bool,
+) -> (v.Value, bool) {
+	env := builtin_env(state)
+	if !k.authority_can_grant(state.authority) {
+		return builtin_error(state, "E_PERMISSION", "rule administration denied")
+	}
+	if len(args) != 1 {
+		return builtin_error(state, "E_INVARG", "rule administration expects a rule id")
+	}
+	rule_value := args[0]
+	raw: u64
+	if identity, is_identity := v.value_as_identity(rule_value); is_identity {
+		raw = v.identity_raw(identity)
+	} else if number, is_int := v.value_as_int(rule_value); is_int && number >= 0 {
+		raw = u64(number)
+	} else {
+		return builtin_error(state, "E_TYPE", "rule id must be an identity or integer")
+	}
+
+	updated, err := k.kernel_set_rule_active(env.kernel, v.Identity(raw), active)
+	if err != k.Kernel_Error.None {
+		if err == .No_Such_Rule {
+			return builtin_error(state, "E_INVARG", "unknown rule")
+		}
+		return builtin_error(state, "E_RULE", "rule update failed")
+	}
+	k.snapshot_release(updated)
+
+	if state.transaction != nil {
+		_ = k.transaction_retract(
+			state.transaction,
+			k.SYSTEM_ACTIVE_RULE_ID,
+			v.tuple_new(env.allocator, []v.Value{rule_value, v.value_bool(!active)}),
+		)
+		_ = k.transaction_assert(
+			state.transaction,
+			k.SYSTEM_ACTIVE_RULE_ID,
+			v.tuple_new(env.allocator, []v.Value{rule_value, v.value_bool(active)}),
+		)
+	}
+	return v.value_bool(true), true
 }
 
 @(private)

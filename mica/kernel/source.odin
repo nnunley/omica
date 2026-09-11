@@ -60,6 +60,12 @@ relation_source_visit :: proc(
 		return true
 	}
 
+	// Stored derived rows are evaluated lazily per transaction, so reads see
+	// both committed rules and this transaction's writes.
+	if source.use_stored_derived && source.transaction != nil {
+		_ = transaction_evaluate_derived(source.transaction)
+	}
+
 	delta_active := source.delta_active && source.delta != nil && relation == source.delta_relation
 	if delta_active {
 		if rules_derived_visit(source.delta, relation, bindings, visit, user) {

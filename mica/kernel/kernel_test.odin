@@ -2044,3 +2044,147 @@ test_semi_naive_recursion_branching_and_cycles :: proc(t: ^testing.T) {
 	}
 	delete(rows)
 }
+
+@(test)
+test_event_append_ignores_retract_conflicts :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	set_relation := create_relation_with(
+		&kernel,
+		60,
+		"SetRel",
+		1,
+		conflict_set(),
+		nil,
+	)
+	append_relation := create_relation_with(
+		&kernel,
+		61,
+		"AppendRel",
+		1,
+		conflict_event_append(),
+		nil,
+	)
+
+	seed := kernel_begin(&kernel)
+	testing.expect_value(
+		t,
+		transaction_assert(&seed, set_relation, tuple_of(must_int(1))),
+		Kernel_Error.None,
+	)
+	testing.expect_value(
+		t,
+		transaction_assert(&seed, append_relation, tuple_of(must_int(1))),
+		Kernel_Error.None,
+	)
+	commit_transaction(t, &seed)
+
+	// A transaction that asserted a tuple in its base conflicts when another
+	// transaction removed it first under the set policy.
+	set_first := kernel_begin(&kernel)
+	set_second := kernel_begin(&kernel)
+	testing.expect_value(
+		t,
+		transaction_retract(&set_first, set_relation, tuple_of(must_int(1))),
+		Kernel_Error.None,
+	)
+	testing.expect_value(
+		t,
+		transaction_assert(&set_second, set_relation, tuple_of(must_int(1))),
+		Kernel_Error.None,
+	)
+	commit_transaction(t, &set_first)
+	_, set_err := transaction_commit(&set_second)
+	testing.expect_value(t, set_err, Kernel_Error.Conflict)
+	transaction_destroy(&set_second)
+
+	// The same sequence succeeds under the event-append policy.
+	append_first := kernel_begin(&kernel)
+	append_second := kernel_begin(&kernel)
+	testing.expect_value(
+		t,
+		transaction_retract(
+			&append_first,
+			append_relation,
+			tuple_of(must_int(1)),
+		),
+		Kernel_Error.None,
+	)
+	testing.expect_value(
+		t,
+		transaction_assert(
+			&append_second,
+			append_relation,
+			tuple_of(must_int(1)),
+		),
+		Kernel_Error.None,
+	)
+	commit_transaction(t, &append_first)
+	commit_transaction(t, &append_second)
+
+	rows := kernel_rows(&kernel, append_relation, 1)
+	defer delete(rows)
+	testing.expect_value(t, len(rows), 1)
+}
+
+@(test)
+test_rule_planner_prefers_selective_atom :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	big := create_relation(&kernel, 80, "Big", 2)
+	small := create_relation(&kernel, 81, "Small", 1)
+	head := create_relation(&kernel, 82, "Head", 1)
+
+	tx := kernel_begin(&kernel)
+	for index in 0 ..< 100 {
+		testing.expect_value(
+			t,
+			transaction_assert(
+				&tx,
+				big,
+				tuple_of(must_int(i64(index)), must_int(i64(index) + 1)),
+			),
+			Kernel_Error.None,
+		)
+	}
+	testing.expect_value(
+		t,
+		transaction_assert(&tx, small, tuple_of(must_int(1))),
+		Kernel_Error.None,
+	)
+	commit_transaction(t, &tx)
+
+	x := v.symbol_intern("x")
+	y := v.symbol_intern("y")
+	rule := rule_new(
+		head,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(big, []Term{term_var(x), term_var(y)})),
+			body_atom(atom_positive(small, []Term{term_var(y)})),
+		},
+	)
+	slots: Slot_Map
+	slot_map_init(&slots, rule, context.temp_allocator)
+	initial := make([]v.Binding, len(slots.symbols), context.temp_allocator)
+	bindings := make([][]v.Binding, 1, context.temp_allocator)
+	bindings[0] = initial
+	used := make([]bool, len(rule.body), context.temp_allocator)
+	source := Relation_Source{snapshot = kernel.current}
+
+	// Neither atom is bound, so the smaller relation drives the join.
+	index, err := pick_body_item(rule, used, bindings, &slots, &source)
+	testing.expect_value(t, err, Kernel_Error.None)
+	testing.expect_value(t, index, 1)
+
+	// Once Small binds y, Big remains the only unbound atom.
+	used[1] = true
+	bindings[0][slot_map_slot(&slots, y)] = v.binding_of(must_int(1))
+	index, err = pick_body_item(rule, used, bindings, &slots, &source)
+	testing.expect_value(t, err, Kernel_Error.None)
+	testing.expect_value(t, index, 0)
+}

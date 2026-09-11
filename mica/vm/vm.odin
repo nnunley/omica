@@ -115,6 +115,10 @@ VM :: struct {
 	// Execution limits. Zero means unlimited.
 	max_call_depth:     int,
 	instruction_budget: u64,
+	// Runtime context identities: endpoint, actor, and principal.
+	endpoint:  v.Value,
+	actor:     v.Value,
+	principal: v.Value,
 	// Task authority. Nil means root access.
 	authority: ^k.Authority,
 	// Optional validator run before a Mailbox_Recv suspends, so an invalid
@@ -187,6 +191,19 @@ vm_set_instruction_budget :: proc(state: ^VM, budget: u64) {
 // Sets the authority used for permission checks. Nil means root access.
 vm_set_authority :: proc(state: ^VM, authority: ^k.Authority) {
 	state.authority = authority
+}
+
+// Sets the runtime context identities returned by `endpoint`, `actor`, and
+// `principal`.
+vm_set_identities :: proc(
+	state: ^VM,
+	endpoint: v.Value,
+	actor: v.Value,
+	principal: v.Value,
+) {
+	state.endpoint = endpoint
+	state.actor = actor
+	state.principal = principal
 }
 
 // Registers a validator for mailbox receiver lists. It returns false when no
