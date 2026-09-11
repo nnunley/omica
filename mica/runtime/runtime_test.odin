@@ -100,9 +100,124 @@ test_builtin_string_surface :: proc(t: ^testing.T) {
 	testing.expect_value(t, text, "abc")
 }
 
+@(private)
+expect_int_builtin :: proc(
+	t: ^testing.T,
+	ctx: ^c.Compile_Context,
+	source: string,
+	expected: i64,
+) {
+	state := compile_and_run(t, source, ctx)
+	defer vm.vm_destroy(&state)
+	value, ok := v.value_as_int(state.result)
+	testing.expectf(t, ok, "%s: result is not an int", source)
+	if ok {
+		testing.expectf(t, value == expected, "%s = %d, expected %d", source, value, expected)
+	}
+}
+
+@(private)
+expect_string_builtin :: proc(
+	t: ^testing.T,
+	ctx: ^c.Compile_Context,
+	source: string,
+	expected: string,
+) {
+	state := compile_and_run(t, source, ctx)
+	defer vm.vm_destroy(&state)
+	value, ok := v.value_as_string(state.result)
+	testing.expectf(t, ok, "%s: result is not a string", source)
+	if ok {
+		testing.expectf(t, value == expected, "%s = %q, expected %q", source, value, expected)
+	}
+}
+
+@(private)
+expect_bool_builtin :: proc(
+	t: ^testing.T,
+	ctx: ^c.Compile_Context,
+	source: string,
+	expected: bool,
+) {
+	state := compile_and_run(t, source, ctx)
+	defer vm.vm_destroy(&state)
+	value, ok := v.value_as_bool(state.result)
+	testing.expectf(t, ok, "%s: result is not a bool", source)
+	if ok {
+		testing.expectf(t, value == expected, "%s = %v, expected %v", source, value, expected)
+	}
+}
+
+@(private)
+expect_builtin_error :: proc(
+	t: ^testing.T,
+	ctx: ^c.Compile_Context,
+	source: string,
+	expected_code: string,
+) {
+	ast, parse_errors := c.parse_program(source, context.temp_allocator)
+	testing.expectf(t, len(parse_errors) == 0, "parse errors for %q: %v", source, parse_errors)
+	compiled := c.compile_program(ast, ctx, context.temp_allocator)
+	testing.expectf(t, len(compiled.errors) == 0, "compile errors for %q: %v", source, compiled.errors)
+
+	state: vm.VM
+	vm.vm_init(&state, compiled.program, context.temp_allocator)
+	defer vm.vm_destroy(&state)
+	register_runtime_builtins(&state)
+	testing.expectf(t, vm.vm_run(&state) == .Failed, "%s should fail", source)
+	error, error_ok := v.value_as_error(state.error)
+	testing.expectf(t, error_ok, "%s: no error value", source)
+	if error_ok {
+		code, _ := v.symbol_name(error.code)
+		testing.expectf(t, code == expected_code, "%s raised %s, expected %s", source, code, expected_code)
+	}
+}
+
 @(test)
-test_builtin_splice_and_set_index :: proc(t: ^testing.T) {
+test_scalar_builtins :: proc(t: ^testing.T) {
 	ctx := c.Compile_Context {
+		builtins   = make(map[string]bool),
+		relations  = make(map[string]u32),
+		identities = make(map[string]v.Value),
+	}
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	install_builtin_names(&ctx)
+
+	expect_int_builtin(t, &ctx, `string_len("héllo")`, 5)
+	expect_string_builtin(t, &ctx, `string_slice("héllo", 1, 4)`, "éll")
+	expect_string_builtin(t, &ctx, `string_join(["a", "b", "c"], "-")`, "a-b-c")
+	expect_bool_builtin(t, &ctx, `string_starts_with("hello", "he")`, true)
+	expect_bool_builtin(t, &ctx, `string_starts_with("hello", "lo")`, false)
+	expect_bool_builtin(t, &ctx, `string_contains("hello", "ell")`, true)
+	expect_bool_builtin(t, &ctx, `string_contains("hello", "xyz")`, false)
+	expect_bool_builtin(t, &ctx, `string_equal_fold("HeLLo", "hello")`, true)
+	expect_string_builtin(t, &ctx, `lower("HeLLo")`, "hello")
+	expect_int_builtin(t, &ctx, `edit_distance("kitten", "sitting")`, 3)
+	expect_string_builtin(
+		t,
+		&ctx,
+		`url_decode_component(url_encode_component("a b&c"))`,
+		"a b&c",
+	)
+	expect_int_builtin(t, &ctx, `len(sort([3, 1, 2]))`, 3)
+
+	expect_builtin_error(t, &ctx, `string_len(1)`, "E_TYPE")
+	expect_builtin_error(t, &ctx, `string_slice("abc", 2, 1)`, "E_INDEX")
+	expect_builtin_error(t, &ctx, `string_slice("abc", 0, 9)`, "E_INDEX")
+	expect_builtin_error(t, &ctx, `string_slice("abc", "a", 1)`, "E_TYPE")
+	expect_builtin_error(t, &ctx, `string_join([1], "-")`, "E_TYPE")
+	expect_builtin_error(t, &ctx, `lower(3)`, "E_TYPE")
+	expect_builtin_error(t, &ctx, `words(3)`, "E_TYPE")
+	expect_builtin_error(t, &ctx, `sort(1)`, "E_TYPE")
+	expect_builtin_error(t, &ctx, `edit_distance(1, "a")`, "E_TYPE")
+	expect_builtin_error(t, &ctx, `map_pairs([1])`, "E_TYPE")
+	expect_builtin_error(t, &ctx, `url_decode_component("%zz")`, "E_URL")
+}
+
+@(test)
+test_builtin_splice_and_set_index :: proc(t: ^testing.T) {	ctx := c.Compile_Context {
 		builtins   = make(map[string]bool),
 		relations  = make(map[string]u32),
 		identities = make(map[string]v.Value),

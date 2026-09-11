@@ -860,3 +860,123 @@ test_vm_instruction_budget :: proc(t: ^testing.T) {
 	testing.expect(t, code_ok)
 	testing.expect_value(t, code, "E_BUDGET")
 }
+
+@(test)
+test_vm_dispatch_opcode :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	for metadata in k.dispatch_relation_metadata(alloc) {
+		created, err := k.kernel_create_relation(&kernel, metadata)
+		if err != k.Kernel_Error.None {
+			testing.expectf(t, false, "cannot create dispatch relation: %v", err)
+			return
+		}
+		k.snapshot_release(created)
+	}
+
+	method_one, one_ok := v.value_identity_raw(0x2001)
+	method_two, two_ok := v.value_identity_raw(0x2002)
+	testing.expect(t, one_ok && two_ok)
+	selector := v.value_symbol(v.symbol_intern("greet"))
+
+	tx := k.kernel_begin(&kernel)
+	_ = k.transaction_assert(
+		&tx,
+		k.DISPATCH_METHOD_SELECTOR_ID,
+		v.tuple_new(alloc, []v.Value{method_one, selector}),
+	)
+	_ = k.transaction_assert(
+		&tx,
+		k.DISPATCH_METHOD_PROGRAM_ID,
+		v.tuple_new(alloc, []v.Value{method_one, must_int(1)}),
+	)
+	committed, commit_err := k.transaction_commit(&tx)
+	testing.expect_value(t, commit_err, k.Kernel_Error.None)
+	k.snapshot_release(committed)
+	k.transaction_destroy(&tx)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+	builder.dispatch_method_selector_relation = u32(k.DISPATCH_METHOD_SELECTOR_ID)
+	builder.dispatch_param_relation = u32(k.DISPATCH_PARAM_ID)
+	builder.dispatch_delegates_relation = u32(k.DISPATCH_DELEGATES_ID)
+	builder.dispatch_method_program_relation = u32(k.DISPATCH_METHOD_PROGRAM_ID)
+
+	answer := constant(&builder, 42)
+	seven := constant(&builder, 7)
+	spec := builder_add_dispatch_spec(&builder, v.symbol_intern("greet"), nil)
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder, .Dispatch, 0, spec, 0, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	builder_begin_function(&builder, v.symbol_intern("method_one"), 0, 2, false)
+	builder_emit(&builder, .Load_Const, 0, 0, answer, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	builder_begin_function(&builder, v.symbol_intern("method_two"), 0, 2, false)
+	builder_emit(&builder, .Load_Const, 0, 0, seven, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	snapshot := k.kernel_snapshot(&kernel)
+	defer k.snapshot_release(snapshot)
+	source := k.Relation_Source {
+		snapshot = snapshot,
+	}
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	state.source = &source
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect_value(t, state.result, must_int(42))
+
+	tx_two := k.kernel_begin(&kernel)
+	_ = k.transaction_assert(
+		&tx_two,
+		k.DISPATCH_METHOD_SELECTOR_ID,
+		v.tuple_new(alloc, []v.Value{method_two, selector}),
+	)
+	_ = k.transaction_assert(
+		&tx_two,
+		k.DISPATCH_METHOD_PROGRAM_ID,
+		v.tuple_new(alloc, []v.Value{method_two, must_int(2)}),
+	)
+	committed_two, commit_two_err := k.transaction_commit(&tx_two)
+	testing.expect_value(t, commit_two_err, k.Kernel_Error.None)
+	k.snapshot_release(committed_two)
+	k.transaction_destroy(&tx_two)
+
+	ambiguous_snapshot := k.kernel_snapshot(&kernel)
+	defer k.snapshot_release(ambiguous_snapshot)
+	ambiguous_source := k.Relation_Source {
+		snapshot = ambiguous_snapshot,
+	}
+
+	ambiguous_state: VM
+	vm_init(&ambiguous_state, program, alloc)
+	defer vm_destroy(&ambiguous_state)
+	ambiguous_state.source = &ambiguous_source
+
+	testing.expect_value(t, vm_run(&ambiguous_state), VM_Status.Failed)
+	error, error_ok := v.value_as_error(ambiguous_state.error)
+	testing.expect(t, error_ok)
+	code, code_ok := v.symbol_name(error.code)
+	testing.expect(t, code_ok)
+	testing.expect_value(t, code, "E_DISPATCH")
+	testing.expect_value(t, error.message, "ambiguous method dispatch")
+}
