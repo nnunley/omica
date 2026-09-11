@@ -1,5 +1,6 @@
 package var
 
+import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
 import "core:testing"
@@ -906,4 +907,27 @@ test_binding_helpers :: proc(t: ^testing.T) {
 	as_bool, as_bool_ok := value_as_bool(boolean)
 	testing.expect(t, as_bool_ok)
 	testing.expect(t, !as_bool)
+}
+
+@(test)
+test_symbol_cache_cycles_through_many_names :: proc(t: ^testing.T) {
+	first := symbol_intern("cache-cycle-first")
+	buffer: [32]u8
+	for index in 0 ..< 64 {
+		name := fmt.bprintf(buffer[:], "cache-cycle-%d", index)
+		_ = symbol_intern(name)
+	}
+
+	// The name fell out of the thread-local cache but the table still owns it.
+	again := symbol_intern("cache-cycle-first")
+	testing.expect_value(t, again, first)
+
+	name, name_ok := symbol_name(again)
+	testing.expect(t, name_ok)
+	testing.expect_value(t, name, "cache-cycle-first")
+
+	// Repeated interning is stable across cache refills.
+	for _ in 0 ..< 8 {
+		testing.expect_value(t, symbol_intern("cache-cycle-first"), first)
+	}
 }
