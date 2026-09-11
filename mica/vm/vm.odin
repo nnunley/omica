@@ -14,6 +14,25 @@ VM_Status :: enum {
 	Ready,
 	Halted,
 	Failed,
+	// The VM stopped at a host boundary; inspect `request`, act, and call
+	// `vm_run` again to continue.
+	Boundary,
+}
+
+// A request from the VM to its host.
+VM_Request :: enum {
+	None,
+	Commit,
+}
+
+// A builtin procedure. It returns false after recording an error with
+// `vm_set_error`.
+Builtin_Proc :: proc(state: ^VM, args: []v.Value) -> (v.Value, bool)
+
+VM_Builtin :: struct {
+	name: v.Symbol,
+	argc: int,
+	run:  Builtin_Proc,
 }
 
 Frame :: struct {
@@ -34,6 +53,8 @@ VM :: struct {
 	status:      VM_Status,
 	source:      ^k.Relation_Source,
 	transaction: ^k.Transaction,
+	builtins:    [dynamic]VM_Builtin,
+	request:     VM_Request,
 }
 
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
@@ -41,6 +62,8 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.allocator = allocator
 	state.registers = make([dynamic]v.Value)
 	state.frames = make([dynamic]Frame)
+	state.builtins = make([dynamic]VM_Builtin)
+	state.request = .None
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
 	state.status = .Ready
@@ -49,6 +72,18 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 vm_destroy :: proc(state: ^VM) {
 	delete(state.registers)
 	delete(state.frames)
+	delete(state.builtins)
+}
+
+// Registers a builtin procedure under `name`. Returns its index.
+vm_register_builtin :: proc(
+	state: ^VM,
+	name: v.Symbol,
+	argc: int,
+	run: Builtin_Proc,
+) -> int {
+	append(&state.builtins, VM_Builtin{name = name, argc = argc, run = run})
+	return len(state.builtins) - 1
 }
 
 // Sets the relation read source and write transaction for relation
@@ -65,21 +100,27 @@ vm_set_workspace :: proc(
 // Runs the program from its entry function until it returns. Read
 // `state.result` on success and `state.error` on failure.
 vm_run :: proc(state: ^VM) -> VM_Status {
+	if state.status == .Boundary {
+		state.status = .Ready
+		state.request = .None
+	}
 	if state.status != .Ready {
 		return state.status
 	}
 
 	program := state.program
-	entry := program.entry
-	entry_function := program.functions[entry]
-	append(&state.frames, Frame {
-		function      = entry,
-		ip            = entry_function.code_offset,
-		register_base = 0,
-		caller_base   = 0,
-		caller_dst    = -1,
-	})
-	resize(&state.registers, entry_function.register_count)
+	if len(state.frames) == 0 {
+		entry := program.entry
+		entry_function := program.functions[entry]
+		append(&state.frames, Frame {
+			function      = entry,
+			ip            = entry_function.code_offset,
+			register_base = 0,
+			caller_base   = 0,
+			caller_dst    = -1,
+		})
+		resize(&state.registers, entry_function.register_count)
+	}
 
 	for {
 		top := len(state.frames) - 1
@@ -246,8 +287,144 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			if !vm_retract_where(state, instr) {
 				return .Failed
 			}
+
+		case .Build_Relation:
+			if !vm_build_relation(state, base, instr) {
+				return .Failed
+			}
+
+		case .Index:
+			if !vm_index(state, base, instr) {
+				return .Failed
+			}
+
+		case .Builtin_Call:
+			if !vm_builtin_call(state, base, instr) {
+				return .Failed
+			}
+
+		case .Commit:
+			state.request = .Commit
+			state.status = .Boundary
+			return .Boundary
 		}
 	}
+}
+
+@(private)
+vm_build_relation :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	shape := state.program.relation_shapes[instr.b]
+	values := make([]v.Value, len(shape.heading), context.temp_allocator)
+	for index in 0 ..< len(values) {
+		values[index] = state.registers[base + int(instr.c) + index]
+	}
+	row := v.tuple_new(state.allocator, values)
+	result, err := v.value_relation(state.allocator, shape.heading, []v.Tuple{row})
+	if err != .None {
+		vm_fail(state, "E_RELATION", "relation heading is invalid")
+		return false
+	}
+	state.registers[base + int(instr.a)] = result
+	return true
+}
+
+@(private)
+vm_index :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	collection := state.registers[base + int(instr.b)]
+	key := state.registers[base + int(instr.c)]
+	result: v.Value
+
+	#partial switch v.value_kind(collection) {
+	case .List:
+		index, is_int := v.value_as_int(key)
+		if !is_int {
+			vm_fail(state, "E_TYPE", "list index is not an integer")
+			return false
+		}
+		values, _ := v.value_as_list(collection)
+		if index < 0 || int(index) >= len(values) {
+			vm_fail(state, "E_INDEX", "list index out of range")
+			return false
+		}
+		result = values[index]
+
+	case .Map:
+		entries, _ := v.value_as_map(collection)
+		found := false
+		for entry in entries {
+			if v.value_eq(entry.key, key) {
+				result = entry.value
+				found = true
+				break
+			}
+		}
+		if !found {
+			vm_fail(state, "E_KEY", "map key is not present")
+			return false
+		}
+
+	case .Relation:
+		symbol, is_symbol := v.value_as_symbol(key)
+		if !is_symbol {
+			vm_fail(state, "E_TYPE", "relation column key is not a symbol")
+			return false
+		}
+		relation, _ := v.value_as_relation(collection)
+		position := -1
+		for column, index in relation.heading {
+			if column == symbol {
+				position = index
+				break
+			}
+		}
+		if position < 0 {
+			vm_fail(state, "E_KEY", "relation column is not present")
+			return false
+		}
+		if len(relation.rows) == 0 {
+			result = v.value_list(state.allocator, nil)
+		} else if len(relation.rows) == 1 {
+			result = v.tuple_values(relation.rows[0])[position]
+		} else {
+			cells := make([]v.Value, len(relation.rows), context.temp_allocator)
+			for row, index in relation.rows {
+				cells[index] = v.tuple_values(row)[position]
+			}
+			result = v.value_list(state.allocator, cells)
+		}
+
+	case:
+		vm_fail(state, "E_TYPE", "index expects a list, map, or relation")
+		return false
+	}
+
+	state.registers[base + int(instr.a)] = result
+	return true
+}
+
+@(private)
+vm_builtin_call :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	name := state.program.builtins[instr.b]
+	for builtin in state.builtins {
+		if builtin.name != name {
+			continue
+		}
+		args := make([]v.Value, builtin.argc, context.temp_allocator)
+		for index in 0 ..< builtin.argc {
+			args[index] = state.registers[base + int(instr.c) + index]
+		}
+		result, ok := builtin.run(state, args)
+		if !ok {
+			if state.error == v.value_empty_relation() {
+				vm_fail(state, "E_BUILTIN", "builtin failed")
+			}
+			return false
+		}
+		state.registers[base + int(instr.a)] = result
+		return true
+	}
+	vm_fail(state, "E_UNKNOWN_BUILTIN", "builtin is not registered")
+	return false
 }
 
 @(private)
@@ -503,8 +680,8 @@ vm_unary :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	return true
 }
 
-@(private)
-vm_fail :: proc(state: ^VM, code: string, message: string) {
+// Records an error and marks the VM failed. Available to builtins.
+vm_set_error :: proc(state: ^VM, code: string, message: string) {
 	state.error = v.value_error(
 		state.allocator,
 		v.symbol_intern(code),
@@ -514,4 +691,9 @@ vm_fail :: proc(state: ^VM, code: string, message: string) {
 		false,
 	)
 	state.status = .Failed
+}
+
+@(private)
+vm_fail :: proc(state: ^VM, code: string, message: string) {
+	vm_set_error(state, code, message)
 }

@@ -56,6 +56,15 @@ Op :: enum u8 {
 	Retract,
 	// Retract_Where: b = pattern index. Retracts every matching row.
 	Retract_Where,
+	// Build_Relation: a = dst, b = relation shape index, c = first cell
+	// register. Builds a single-row relation value.
+	Build_Relation,
+	// Index: a = dst, b = collection register, c = key register.
+	Index,
+	// Builtin_Call: a = dst, b = builtin index, c = first argument register.
+	Builtin_Call,
+	// Commit: requests a transaction commit from the host.
+	Commit,
 }
 
 // A cell in a relation scan pattern.
@@ -79,6 +88,11 @@ Scan_Pattern :: struct {
 	relation:     u32,
 	column_names: []v.Symbol,
 	cells:        []Pattern_Cell,
+}
+
+// The heading of a relation value built at runtime.
+Relation_Shape :: struct {
+	heading: []v.Symbol,
 }
 
 Bin_Op :: enum u8 {
@@ -120,8 +134,10 @@ Program :: struct {
 	code:      []Instruction,
 	constants: []v.Value,
 	functions: []Function,
-	patterns:  []Scan_Pattern,
-	entry:     int,
+	patterns:        []Scan_Pattern,
+	relation_shapes: []Relation_Shape,
+	builtins:        []v.Symbol,
+	entry:           int,
 }
 
 Program_Error :: enum {
@@ -140,10 +156,12 @@ Builder :: struct {
 	code:          [dynamic]Instruction,
 	constants:     [dynamic]v.Value,
 	functions:     [dynamic]Function,
-	patterns:      [dynamic]Scan_Pattern,
-	entry:         int,
-	open_function: int,
-	open_offset:   int,
+	patterns:        [dynamic]Scan_Pattern,
+	relation_shapes: [dynamic]Relation_Shape,
+	builtins:        [dynamic]v.Symbol,
+	entry:           int,
+	open_function:   int,
+	open_offset:     int,
 }
 
 builder_init :: proc(builder: ^Builder) {
@@ -151,6 +169,8 @@ builder_init :: proc(builder: ^Builder) {
 	builder.constants = make([dynamic]v.Value)
 	builder.functions = make([dynamic]Function)
 	builder.patterns = make([dynamic]Scan_Pattern)
+	builder.relation_shapes = make([dynamic]Relation_Shape)
+	builder.builtins = make([dynamic]v.Symbol)
 	builder.entry = -1
 	builder.open_function = -1
 }
@@ -164,6 +184,25 @@ builder_destroy :: proc(builder: ^Builder) {
 		delete(pattern.cells)
 	}
 	delete(builder.patterns)
+	for shape in builder.relation_shapes {
+		delete(shape.heading)
+	}
+	delete(builder.relation_shapes)
+	delete(builder.builtins)
+}
+
+// Adds a relation value heading, copying it. Returns the shape index.
+builder_add_relation_shape :: proc(builder: ^Builder, heading: []v.Symbol) -> i32 {
+	names := make([]v.Symbol, len(heading))
+	copy(names, heading)
+	append(&builder.relation_shapes, Relation_Shape{heading = names})
+	return i32(len(builder.relation_shapes) - 1)
+}
+
+// Adds a builtin reference by name. Returns the builtin index.
+builder_add_builtin :: proc(builder: ^Builder, name: v.Symbol) -> i32 {
+	append(&builder.builtins, name)
+	return i32(len(builder.builtins) - 1)
 }
 
 // Adds a scan pattern, copying its slices. Returns the pattern index.
@@ -236,6 +275,7 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 	program.functions = make([]Function, len(builder.functions), alloc)
 	copy(program.functions, builder.functions[:])
 	program.patterns = make([]Scan_Pattern, len(builder.patterns), alloc)
+	program.relation_shapes = make([]Relation_Shape, len(builder.relation_shapes), alloc)
 	for pattern, i in builder.patterns {
 		names := make([]v.Symbol, len(pattern.column_names), alloc)
 		copy(names, pattern.column_names)
@@ -247,6 +287,13 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 			cells        = cells,
 		}
 	}
+	for shape, i in builder.relation_shapes {
+		heading := make([]v.Symbol, len(shape.heading), alloc)
+		copy(heading, shape.heading)
+		program.relation_shapes[i] = Relation_Shape{heading = heading}
+	}
+	program.builtins = make([]v.Symbol, len(builder.builtins), alloc)
+	copy(program.builtins, builder.builtins[:])
 	program.entry = builder.entry
 	return program
 }
@@ -260,6 +307,11 @@ program_destroy :: proc(program: ^Program, alloc: mem.Allocator) {
 		free(raw_data(pattern.cells), alloc)
 	}
 	free(raw_data(program.patterns), alloc)
+	for shape in program.relation_shapes {
+		free(raw_data(shape.heading), alloc)
+	}
+	free(raw_data(program.relation_shapes), alloc)
+	free(raw_data(program.builtins), alloc)
 	free(program, alloc)
 }
 
@@ -396,6 +448,36 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if !valid_register(instr.b, register_count) {
 					return .Bad_Register
 				}
+			case .Build_Relation:
+				if !valid_register(instr.a, register_count) {
+					return .Bad_Register
+				}
+				if instr.b < 0 || int(instr.b) >= len(program.relation_shapes) {
+					return .Bad_Function
+				}
+				arity := len(program.relation_shapes[instr.b].heading)
+				for cell in 0 ..< arity {
+					if !valid_register(instr.c + i32(cell), register_count) {
+						return .Bad_Register
+					}
+				}
+			case .Index:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.b, register_count) ||
+				   !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
+			case .Builtin_Call:
+				if !valid_register(instr.a, register_count) {
+					return .Bad_Register
+				}
+				if instr.b < 0 || int(instr.b) >= len(program.builtins) {
+					return .Bad_Function
+				}
+				if !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
+			case .Commit:
 			}
 		}
 	}
@@ -487,6 +569,15 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " rel%d r%d", instr.a, instr.b)
 			case .Retract_Where:
 				fmt.sbprintf(&builder, " pat%d", instr.b)
+			case .Build_Relation:
+				fmt.sbprintf(&builder, " r%d shape%d r%d..", instr.a, instr.b, instr.c)
+			case .Index:
+				fmt.sbprintf(&builder, " r%d r%d r%d", instr.a, instr.b, instr.c)
+			case .Builtin_Call:
+				builtin_name, _ := v.symbol_name(program.builtins[instr.b])
+				fmt.sbprintf(&builder, " r%d %s args@r%d", instr.a, builtin_name, instr.c)
+			case .Commit:
+				fmt.sbprintf(&builder, "")
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -533,6 +624,14 @@ op_name :: proc(op: Op) -> string {
 		return "retract"
 	case .Retract_Where:
 		return "retract_where"
+	case .Build_Relation:
+		return "build_relation"
+	case .Index:
+		return "index"
+	case .Builtin_Call:
+		return "builtin_call"
+	case .Commit:
+		return "commit"
 	}
 	return "?"
 }

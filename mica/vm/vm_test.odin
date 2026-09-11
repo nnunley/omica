@@ -579,3 +579,111 @@ test_vm_retract_where :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(rows), 1)
 	delete(rows)
 }
+
+@(test)
+test_vm_build_relation_and_index :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	owner := v.symbol_intern("owner")
+	item := v.symbol_intern("item")
+	shape := builder_add_relation_shape(&builder, []v.Symbol{owner, item})
+	owner_value := i32(builder_add_constant(&builder, must_identity(1)))
+	item_value := i32(builder_add_constant(&builder, must_identity(2)))
+	item_symbol := i32(builder_add_constant(&builder, v.value_symbol(item)))
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 5, true)
+	builder_emit(&builder, .Load_Const, 0, 0, owner_value, 0)
+	builder_emit(&builder, .Load_Const, 0, 1, item_value, 0)
+	builder_emit(&builder, .Build_Relation, 0, 2, shape, 0)
+	builder_emit(&builder, .Load_Const, 0, 3, item_symbol, 0)
+	builder_emit(&builder, .Index, 0, 4, 2, 3)
+	builder_emit(&builder, .Return, 0, 4, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect_value(t, state.result, must_identity(2))
+}
+
+@(private)
+double_builtin :: proc(state: ^VM, args: []v.Value) -> (v.Value, bool) {
+	two, _ := v.value_int(2)
+	result, ok := v.value_checked_mul(args[0], two)
+	if !ok {
+		vm_set_error(state, "E_ARITHMETIC", "double failed")
+		return v.Value(0), false
+	}
+	return result, true
+}
+
+@(test)
+test_vm_builtin_call :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	twenty_one := constant(&builder, 21)
+	builtin := builder_add_builtin(&builder, v.symbol_intern("double"))
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder, .Load_Const, 0, 0, twenty_one, 0)
+	builder_emit(&builder, .Builtin_Call, 0, 1, builtin, 0)
+	builder_emit(&builder, .Return, 0, 1, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	vm_register_builtin(&state, v.symbol_intern("double"), 1, double_builtin)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect_value(t, state.result, must_int(42))
+}
+
+@(test)
+test_vm_commit_boundary_resumes :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	seven := constant(&builder, 7)
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder, .Commit, 0, 0, 0, 0)
+	builder_emit(&builder, .Load_Const, 0, 0, seven, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Boundary)
+	testing.expect_value(t, state.request, VM_Request.Commit)
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect_value(t, state.result, must_int(7))
+}
