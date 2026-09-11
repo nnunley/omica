@@ -360,169 +360,37 @@ Run_Options :: struct {
 }
 
 // Compiles and runs a set of fileins as one world against `kernel`. On success
-// the transaction is committed.
+// the transaction is committed. The world is destroyed on return; use
+// `world_start` to keep one alive.
 run_files :: proc(
 	kernel: ^k.Kernel,
 	paths: []string,
 	allocator := context.allocator,
 	options := Run_Options{},
 ) -> Run_Result {
-	asts := make([dynamic]^c.Program_AST, allocator)
-	defer delete(asts)
-	sources := make([dynamic]string, allocator)
-	defer delete(sources)
-
-	for path in paths {
-		data, read_err := os.read_entire_file(path, allocator)
-		if read_err != nil {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"cannot read %s",
-				path,
-				allocator = allocator,
-			)}
-		}
-		expanded, expand_result := substitute_include_text(
-			string(data),
-			filepath.dir(path),
-			allocator,
-		)
-		if !expand_result.ok {
-			return expand_result
-		}
-		expanded, expand_result = expand_grant_blocks(expanded, allocator)
-		if !expand_result.ok {
-			return expand_result
-		}
-		ast, parse_errors := c.parse_program(expanded, allocator)
-		if len(parse_errors) > 0 {
-			first := parse_errors[0]
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"%s:%d:%d: %s",
-				path,
-				first.line,
-				first.column,
-				first.message,
-				allocator = allocator,
-			)}
-		}
-		append(&asts, ast)
-		append(&sources, expanded)
+	world, start_result := world_start(
+		kernel,
+		paths,
+		allocator,
+		World_Config{actor = options.actor, workers = 1},
+	)
+	if !start_result.ok {
+		return start_result
 	}
+	defer world_destroy(world)
 
-	ctx := c.Compile_Context {
-		builtins   = make(map[string]bool, allocator),
-		relations  = make(map[string]u32, allocator),
-		identities = make(map[string]v.Value, allocator),
-	}
-	install_builtin_names(&ctx)
-	install_primitive_identities(&ctx)
-
-	env := Builtin_Env {
-		kernel    = kernel,
-		ctx       = &ctx,
-		fields    = make(map[string]Field_Info, allocator),
-		allocator = allocator,
-	}
-
-	subscriptions_init(&env.subscriptions, allocator)
-	defer subscriptions_destroy(&env.subscriptions)
-
-	declarations := Declarations {
-		next_relation = 1,
-		next_identity = 0x1000,
-		next_rule     = 1,
-	}
-	endpoint_identity, endpoint_ok := v.value_identity_raw(declarations.next_identity)
-	declarations.next_identity += 1
-	actor_identity, actor_ok := v.value_identity_raw(declarations.next_identity)
-	declarations.next_identity += 1
-	if endpoint_ok && actor_ok {
-		env.endpoint = endpoint_identity
-		env.actor = actor_identity
-		env.principal = actor_identity
-	}
-
-	dispatch_result := install_dispatch_relations(&env)
-	if !dispatch_result.ok {
-		return dispatch_result
-	}
-
-	for ast in asts {
-		result := prescan_file(&env, ast, &declarations)
-		if !result.ok {
-			return result
-		}
-	}
-	if options.actor != "" {
-		actor_value, actor_found := ctx.identities[options.actor]
-		if !actor_found {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"unknown authority actor: %s",
-				options.actor,
-				allocator = allocator,
-			)}
-		}
-		env.actor = actor_value
-		env.principal = actor_value
-	}
-
-	for path, index in paths {
-		result := install_rules(&env, kernel, asts[index], &declarations, path)
-		if !result.ok {
-			return result
-		}
-	}
-
-	method_result := install_methods(&env, asts[:], sources[:], &declarations)
-	if !method_result.ok {
-		return method_result
-	}
-
-	items := make([dynamic]c.Item, allocator)
-	defer delete(items)
-	for ast in asts {
-		for item in ast.items {
-			append(&items, item)
-		}
-	}
-	program_ast := c.Program_AST {
-		items = items[:],
-	}
-
-	compiled := c.compile_program(&program_ast, &ctx, allocator)
-	if len(compiled.errors) > 0 {
-		if _, show_all := os.lookup_env("MICA_ALL_ERRORS", context.allocator); show_all {
-			for compile_error in compiled.errors {
-				fmt.eprintln(compile_error.message)
-			}
-		}
-		return Run_Result{ok = false, message = compiled.errors[0].message}
-	}
-
-	// Run the world's entry function as a task. The task commits at each
-	// boundary and spawned children run on the same scheduler pool.
-	task := new(Task, allocator)
-	task_init(task, 0, kernel, compiled.program, &env, allocator)
-	if options.actor != "" {
-		env.enforce_authority = true
-	}
-
-	scheduler: Scheduler
-	scheduler_init(&scheduler, kernel, Scheduler_Config{workers = 1}, allocator)
-	defer scheduler_destroy(&scheduler)
-	env.scheduler = &scheduler
-
-	id := scheduler_submit(&scheduler, task)
-	outcome := scheduler_wait(&scheduler, id)
+	outcome := world_wait(world, world.entry)
 	#partial switch outcome.kind {
 	case .Complete:
 		return Run_Result{ok = true, message = "loaded"}
 
 	case .Aborted:
-		if task.state.error != v.Value(0) {
-			return Run_Result {
-				ok      = false,
-				message = format_error(task.state.error, allocator),
+		if entry, found := world.scheduler.entries[world.entry]; found {
+			if entry.task.state.error != v.Value(0) {
+				return Run_Result {
+					ok      = false,
+					message = format_error(entry.task.state.error, allocator),
+				}
 			}
 		}
 		return Run_Result{ok = false, message = outcome.message}

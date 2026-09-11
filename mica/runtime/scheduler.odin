@@ -658,6 +658,30 @@ scheduler_wait :: proc(scheduler: ^Scheduler, id: Task_ID) -> Task_Outcome {
 	}
 }
 
+// Frees a terminal task entry. Call after reading the outcome. The outcome's
+// value stays valid because owner values live in the world allocator.
+scheduler_release :: proc(scheduler: ^Scheduler, id: Task_ID) {
+	entry: ^Scheduler_Entry
+	sync.mutex_lock(&scheduler.lock)
+	if found, exists := scheduler.entries[id]; exists && found.done {
+		delete_key(&scheduler.entries, id)
+		entry = found
+	}
+	sync.mutex_unlock(&scheduler.lock)
+	if entry == nil {
+		return
+	}
+	if entry.owned_program {
+		vm.program_destroy(entry.task.program, scheduler.allocator)
+	}
+	if entry.arguments != nil {
+		delete(entry.arguments, scheduler.allocator)
+	}
+	task_destroy(entry.task)
+	free(entry.task, scheduler.allocator)
+	free(entry, scheduler.allocator)
+}
+
 // Returns true when every submitted task has reached a terminal outcome.
 scheduler_idle :: proc(scheduler: ^Scheduler) -> bool {
 	sync.mutex_lock(&scheduler.lock)
@@ -684,23 +708,17 @@ scheduler_push_timer :: proc(scheduler: ^Scheduler, entry: Timer_Entry) {
 	scheduler.timers[insert] = entry
 }
 
-// Builds a child task from a parent's `.Spawn` suspension. The selector and
-// role values are resolved through the kernel's dispatch relations to the
-// method's function, which the child starts at in the shared world program.
-// The parent is resumed with the child's task id.
-@(private)
-scheduler_spawn_child :: proc(scheduler: ^Scheduler, parent: ^Task) -> Task_ID {
-	spec := parent.program.dispatch_specs[parent.state.request_spec]
-	base := vm.vm_frame_base(&parent.state)
-
-	roles := make([]k.Role_Pair, len(spec.roles), context.temp_allocator)
-	for role, index in spec.roles {
-		roles[index] = k.Role_Pair {
-			role  = v.value_symbol(role.role),
-			value = parent.state.registers[base + int(role.register)],
-		}
-	}
-
+// Resolves `selector` with `roles` and submits a task that starts at the
+// method's function in `program`. Returns 0 when no method resolves or its
+// parameters cannot bind.
+scheduler_submit_dispatch :: proc(
+	scheduler: ^Scheduler,
+	env: ^Builtin_Env,
+	program: ^vm.Program,
+	selector: v.Value,
+	roles: []k.Role_Pair,
+	delay_millis: i64,
+) -> Task_ID {
 	snapshot := k.kernel_snapshot(scheduler.kernel)
 	defer k.snapshot_release(snapshot)
 	source := k.Relation_Source {
@@ -712,7 +730,6 @@ scheduler_spawn_child :: proc(scheduler: ^Scheduler, parent: ^Task) -> Task_ID {
 		param           = k.DISPATCH_PARAM_ID,
 		delegates       = k.DISPATCH_DELEGATES_ID,
 	}
-	selector := v.value_symbol(spec.selector)
 	entries := k.applicable_method_entries(
 		&source,
 		relations,
@@ -746,15 +763,41 @@ scheduler_spawn_child :: proc(scheduler: ^Scheduler, parent: ^Task) -> Task_ID {
 	}
 
 	task := new(Task, scheduler.allocator)
-	task_init(task, 0, scheduler.kernel, parent.program, parent.env, scheduler.allocator)
+	task_init(task, 0, scheduler.kernel, program, env, scheduler.allocator)
 	vm.vm_set_entry_function(&task.state, i32(function_index))
 	vm.vm_set_entry_arguments(&task.state, arguments)
 	return scheduler_submit_task(
 		scheduler,
 		task,
-		parent.state.request_millis,
+		delay_millis,
 		false,
 		arguments,
+	)
+}
+
+// Builds a child task from a parent's `.Spawn` suspension. The selector and
+// role values are resolved through the kernel's dispatch relations to the
+// method's function, which the child starts at in the shared world program.
+// The parent is resumed with the child's task id.
+@(private)
+scheduler_spawn_child :: proc(scheduler: ^Scheduler, parent: ^Task) -> Task_ID {
+	spec := parent.program.dispatch_specs[parent.state.request_spec]
+	base := vm.vm_frame_base(&parent.state)
+
+	roles := make([]k.Role_Pair, len(spec.roles), context.temp_allocator)
+	for role, index in spec.roles {
+		roles[index] = k.Role_Pair {
+			role  = v.value_symbol(role.role),
+			value = parent.state.registers[base + int(role.register)],
+		}
+	}
+	return scheduler_submit_dispatch(
+		scheduler,
+		parent.env,
+		parent.program,
+		v.value_symbol(spec.selector),
+		roles,
+		parent.state.request_millis,
 	)
 }
 
