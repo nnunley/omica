@@ -1070,6 +1070,27 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		return destination, true
 	}
 
+	if text == "len" {
+		if len(call.args) != 1 {
+			push_error(emitter, "len expects one argument")
+			return -1, false
+		}
+		operand, operand_ok := emit_expr(emitter, call.args[0].expr)
+		if !operand_ok {
+			return -1, false
+		}
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Len,
+			0,
+			i32(destination),
+			i32(operand),
+			0,
+		)
+		return destination, true
+	}
+
 	if text == "commit" {
 		if len(call.args) != 0 {
 			push_error(emitter, "commit expects no arguments")
@@ -1712,24 +1733,22 @@ emit_match :: proc(emitter: ^Emitter, matched: Match) -> (int, bool) {
 
 	for match_case in matched.cases {
 		scope_enter(emitter)
-		test, test_ok := emit_match_pattern(emitter, subject, match_case.pattern)
-		if !test_ok {
+		if !emit_match_pattern(
+			emitter,
+			subject,
+			match_case.pattern,
+			&next_case_patches,
+		) {
 			scope_leave(emitter)
 			return -1, false
 		}
-		test_branch := emit_instruction(emitter, .Branch, 0, test, 0, 0)
-		append(&next_case_patches, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
-		patch_jump(emitter, test_branch, current_offset(emitter))
-
 		if match_case.has_guard {
 			guard, guard_ok := emit_expr(emitter, match_case.guard)
 			if !guard_ok {
 				scope_leave(emitter)
 				return -1, false
 			}
-			guard_branch := emit_instruction(emitter, .Branch, 0, guard, 0, 0)
-			append(&next_case_patches, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
-			patch_jump(emitter, guard_branch, current_offset(emitter))
+			emit_match_fail_test(emitter, guard, &next_case_patches)
 		}
 
 		body_register, body_has_value := emit_block(emitter, match_case.body)
@@ -1757,6 +1776,18 @@ emit_match :: proc(emitter: ^Emitter, matched: Match) -> (int, bool) {
 	return result, true
 }
 
+// Emits `if !test { goto next case }`.
+@(private)
+emit_match_fail_test :: proc(
+	emitter: ^Emitter,
+	test: int,
+	next_case_patches: ^[dynamic]int,
+) {
+	branch := emit_instruction(emitter, .Branch, 0, test, 0, 0)
+	append(next_case_patches, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
+	patch_jump(emitter, branch, current_offset(emitter))
+}
+
 @(private)
 emit_read_column :: proc(
 	emitter: ^Emitter,
@@ -1779,15 +1810,19 @@ emit_read_column :: proc(
 	return column
 }
 
+// Emits a pattern test that matches `subject` against `pattern`. Each test is
+// followed immediately by a branch to the next case, so later reads only run
+// after earlier tests pass.
 @(private)
 emit_match_pattern :: proc(
 	emitter: ^Emitter,
 	subject: int,
 	pattern: ^Pattern,
-) -> (int, bool) {
+	next_case_patches: ^[dynamic]int,
+) -> bool {
 	#partial switch node in pattern^ {
 	case Wildcard_Pattern:
-		return emit_constant(emitter, v.value_bool(true)), true
+		return true
 
 	case Binding_Pattern:
 		destination := alloc_register(emitter)
@@ -1800,12 +1835,12 @@ emit_match_pattern :: proc(
 			0,
 		)
 		declare_local(emitter, node.name, destination, false)
-		return emit_constant(emitter, v.value_bool(true)), true
+		return true
 
 	case Literal_Pattern:
 		literal, literal_ok := emit_expr(emitter, node.value)
 		if !literal_ok {
-			return -1, false
+			return false
 		}
 		test := alloc_register(emitter)
 		vm.builder_emit(
@@ -1816,14 +1851,220 @@ emit_match_pattern :: proc(
 			i32(subject),
 			i32(literal),
 		)
-		return test, true
+		emit_match_fail_test(emitter, test, next_case_patches)
+		return true
 
 	case Call_Pattern:
-		return emit_match_call_pattern(emitter, subject, node)
+		return emit_match_call_pattern(emitter, subject, node, next_case_patches)
+
+	case List_Pattern:
+		return emit_match_list_pattern(emitter, subject, node, next_case_patches)
+
+	case Map_Pattern:
+		return emit_match_map_pattern(emitter, subject, node, next_case_patches)
 	}
 
 	push_error(emitter, "this match pattern is not lowered yet")
-	return -1, false
+	return false
+}
+
+// Emits `__index_option(subject, key)` and a presence test. Returns the option
+// register; the caller runs only when the presence test passed.
+@(private)
+emit_pattern_lookup :: proc(
+	emitter: ^Emitter,
+	subject: int,
+	key_register: int,
+	next_case_patches: ^[dynamic]int,
+) -> int {
+	first := marshal_arguments(emitter, []int{subject, key_register})
+	option := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__index_option"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		0,
+		i32(option),
+		builtin,
+		i32(first),
+	)
+	test := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Is_Truthy,
+		0,
+		i32(test),
+		i32(option),
+		0,
+	)
+	emit_match_fail_test(emitter, test, next_case_patches)
+	return option
+}
+
+@(private)
+emit_pattern_lookup_symbol :: proc(
+	emitter: ^Emitter,
+	subject: int,
+	name: string,
+	next_case_patches: ^[dynamic]int,
+) -> int {
+	key := emit_constant(emitter, v.value_symbol(v.symbol_intern(name)))
+	return emit_pattern_lookup(emitter, subject, key, next_case_patches)
+}
+
+// Matches a list pattern. Without a rest element the length must match
+// exactly; with `@rest` the fixed elements must be present and the middle is
+// bound to the rest name.
+@(private)
+emit_match_list_pattern :: proc(
+	emitter: ^Emitter,
+	subject: int,
+	pattern: List_Pattern,
+	next_case_patches: ^[dynamic]int,
+) -> bool {
+	first := marshal_arguments(emitter, []int{subject})
+	length_option := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__len_option"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		0,
+		i32(length_option),
+		builtin,
+		i32(first),
+	)
+	length_presence := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Is_Truthy,
+		0,
+		i32(length_presence),
+		i32(length_option),
+		0,
+	)
+	emit_match_fail_test(emitter, length_presence, next_case_patches)
+	length_register := emit_read_column(emitter, length_option, "value")
+
+	rest_index := -1
+	for element, index in pattern.elements {
+		if _, is_rest := element^.(Rest_Pattern); is_rest {
+			rest_index = index
+			break
+		}
+	}
+	fixed_count := len(pattern.elements)
+	if rest_index >= 0 {
+		fixed_count -= 1
+	}
+	length_value := emit_constant(emitter, int_value(i64(fixed_count)))
+	length_test := alloc_register(emitter)
+	op := vm.Bin_Op.Eq
+	if rest_index >= 0 {
+		op = vm.Bin_Op.Ge
+	}
+	vm.builder_emit(
+		emitter.builder,
+		.Binary,
+		u8(op),
+		i32(length_test),
+		i32(length_register),
+		i32(length_value),
+	)
+	emit_match_fail_test(emitter, length_test, next_case_patches)
+
+	for element, index in pattern.elements {
+		if rest, is_rest := element^.(Rest_Pattern); is_rest {
+			if !emit_match_rest_binding(
+				emitter,
+				subject,
+				length_register,
+				rest.name,
+				index,
+				len(pattern.elements) - index - 1,
+			) {
+				return false
+			}
+			continue
+		}
+
+		item_index := emit_constant(emitter, int_value(i64(index)))
+		option := emit_pattern_lookup(
+			emitter,
+			subject,
+			item_index,
+			next_case_patches,
+		)
+		item := emit_read_column(emitter, option, "value")
+		if !emit_match_pattern(emitter, item, element, next_case_patches) {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+emit_match_rest_binding :: proc(
+	emitter: ^Emitter,
+	subject: int,
+	length_register: int,
+	name: string,
+	start: int,
+	trailing: int,
+) -> bool {
+	start_register := emit_constant(emitter, int_value(i64(start)))
+	end_register := 0
+	if trailing == 0 {
+		end_register = emit_constant(emitter, int_value(-1))
+	} else {
+		trailing_register := emit_constant(emitter, int_value(i64(trailing)))
+		end_register = alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Binary,
+			u8(vm.Bin_Op.Sub),
+			i32(end_register),
+			i32(length_register),
+			i32(trailing_register),
+		)
+	}
+	first := marshal_arguments(emitter, []int{subject, start_register, end_register})
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__list_slice"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		3,
+		i32(destination),
+		builtin,
+		i32(first),
+	)
+	declare_local(emitter, name, destination, false)
+	return true
+}
+
+// Matches a map pattern by reading each entry's value and matching it
+// recursively.
+@(private)
+emit_match_map_pattern :: proc(
+	emitter: ^Emitter,
+	subject: int,
+	pattern: Map_Pattern,
+	next_case_patches: ^[dynamic]int,
+) -> bool {
+	for entry in pattern.entries {
+		key_name := pattern_key_name(entry, emitter.allocator)
+		option := emit_pattern_lookup_symbol(
+			emitter,
+			subject,
+			key_name,
+			next_case_patches,
+		)
+		value := emit_read_column(emitter, option, "value")
+		if !emit_match_pattern(emitter, value, entry.pattern, next_case_patches) {
+			return false
+		}
+	}
+	return true
 }
 
 @(private)
@@ -1831,31 +2072,44 @@ emit_match_call_pattern :: proc(
 	emitter: ^Emitter,
 	subject: int,
 	pattern: Call_Pattern,
-) -> (int, bool) {
-	test := alloc_register(emitter)
+	next_case_patches: ^[dynamic]int,
+) -> bool {
+	value_option := -1
 	if pattern.name == "some" {
-		vm.builder_emit(
-			emitter.builder,
-			.Is_Truthy,
-			0,
-			i32(test),
-			i32(subject),
-			0,
+		value_option = emit_pattern_lookup_symbol(
+			emitter,
+			subject,
+			"value",
+			next_case_patches,
 		)
 	} else if pattern.name == "ok" || pattern.name == "err" {
 		expected_name := pattern.name == "err" ? "error" : "ok"
-		actual := emit_read_column(emitter, subject, "case")
+		case_option := emit_pattern_lookup_symbol(
+			emitter,
+			subject,
+			"case",
+			next_case_patches,
+		)
+		case_value := emit_read_column(emitter, case_option, "value")
 		expected := emit_constant(
 			emitter,
 			v.value_symbol(v.symbol_intern(expected_name)),
 		)
+		test := alloc_register(emitter)
 		vm.builder_emit(
 			emitter.builder,
 			.Binary,
 			u8(vm.Bin_Op.Eq),
 			i32(test),
-			i32(actual),
+			i32(case_value),
 			i32(expected),
+		)
+		emit_match_fail_test(emitter, test, next_case_patches)
+		value_option = emit_pattern_lookup_symbol(
+			emitter,
+			subject,
+			"value",
+			next_case_patches,
 		)
 	} else {
 		push_error(emitter, fmt.aprintf(
@@ -1863,22 +2117,22 @@ emit_match_call_pattern :: proc(
 			pattern.name,
 			allocator = emitter.allocator,
 		))
-		return -1, false
+		return false
 	}
 
 	if len(pattern.args) == 1 {
 		binding, is_binding := pattern.args[0]^.(Binding_Pattern)
 		if !is_binding {
 			push_error(emitter, "match pattern arguments must be names")
-			return -1, false
+			return false
 		}
-		column := emit_read_column(emitter, subject, "value")
+		column := emit_read_column(emitter, value_option, "value")
 		declare_local(emitter, binding.name, column, false)
 	} else if len(pattern.args) > 1 {
 		push_error(emitter, "match constructors take at most one binding")
-		return -1, false
+		return false
 	}
-	return test, true
+	return true
 }
 
 // Lowers a DOM text node to the `dom_text` builtin.

@@ -1002,3 +1002,40 @@ assert Result(sum3(@xs))
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Result", 1)
 }
+
+@(test)
+test_run_match_collection_patterns :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Out, 1)
+verb classify(value)
+  return match value
+  case [a, b]
+    a + b
+  case [first, @rest]
+    first + len(rest)
+  case {:kind -> :pair, :left -> l, :right -> r}
+    l * r
+  case _
+    -1
+  end
+end
+require(classify([1, 2]) == 3)
+require(classify([5, 6, 7]) == 7)
+require(classify({:kind -> :pair, :left -> 3, :right -> 4}) == 12)
+require(classify(:nope) == -1)
+assert Out(classify([1, 2]))
+`
+	path, path_ok := write_temp_source(t, "mica_match_patterns_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}

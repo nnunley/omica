@@ -52,6 +52,9 @@ runtime_builtins := [?]Builtin_Spec {
 	{"edit_distance", 2, builtin_edit_distance},
 	{"parse_ordinal", 1, builtin_parse_ordinal},
 	{"__list_concat", -1, builtin_list_concat},
+	{"__list_slice", 3, builtin_list_slice},
+	{"__index_option", 2, builtin_index_option},
+	{"__len_option", 1, builtin_len_option},
 	{"__set_index", 3, builtin_set_index},
 	{"to_symbol", 1, builtin_to_symbol},
 	{"map_pairs", 1, builtin_map_pairs},
@@ -931,6 +934,90 @@ builtin_sort :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		return v.value_cmp(a, b) == .Less
 	})
 	return v.value_list(state.allocator, sorted), true
+}
+
+@(private)
+builtin_list_slice :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	items, is_list := v.value_as_list(args[0])
+	if !is_list {
+		return v.value_list(state.allocator, nil), true
+	}
+	start, start_ok := v.value_as_int(args[1])
+	end, end_ok := v.value_as_int(args[2])
+	if !start_ok || !end_ok {
+		return builtin_error(state, "E_TYPE", "__list_slice bounds must be integers")
+	}
+	length := i64(len(items))
+	if end < 0 {
+		end = length
+	}
+	if start < 0 || start > length || end < start || end > length {
+		return v.value_list(state.allocator, nil), true
+	}
+	return v.value_list(state.allocator, items[int(start):int(end)]), true
+}
+
+// Returns some(length) for a list, map, or relation, and none otherwise.
+@(private)
+builtin_len_option :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	length := 0
+	#partial switch v.value_kind(args[0]) {
+	case .List:
+		values, _ := v.value_as_list(args[0])
+		length = len(values)
+	case .Map:
+		entries, _ := v.value_as_map(args[0])
+		length = len(entries)
+	case .Relation:
+		relation, _ := v.value_as_relation(args[0])
+		length = len(relation.rows)
+	case:
+		return option_none_value(state.allocator), true
+	}
+	converted, converted_ok := v.value_int(i64(length))
+	if !converted_ok {
+		return option_none_value(state.allocator), true
+	}
+	return option_some_value(state.allocator, converted), true
+}
+
+// Looks up a collection element for pattern matching. Returns some(value)
+// when present and none otherwise; never raises.
+@(private)
+builtin_index_option :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	collection := args[0]
+	key := args[1]
+	#partial switch v.value_kind(collection) {
+	case .List:
+		items, _ := v.value_as_list(collection)
+		index, index_ok := v.value_as_int(key)
+		if index_ok && index >= 0 && int(index) < len(items) {
+			return option_some_value(state.allocator, items[index]), true
+		}
+	case .Map:
+		entries, _ := v.value_as_map(collection)
+		for entry in entries {
+			if v.value_eq(entry.key, key) {
+				return option_some_value(state.allocator, entry.value), true
+			}
+		}
+	case .Relation:
+		relation, _ := v.value_as_relation(collection)
+		if len(relation.rows) == 0 {
+			return option_none_value(state.allocator), true
+		}
+		symbol, symbol_ok := v.value_as_symbol(key)
+		if symbol_ok {
+			for column, position in relation.heading {
+				if column == symbol {
+					values := v.tuple_values(relation.rows[0])
+					return option_some_value(state.allocator, values[position]), true
+				}
+			}
+		}
+	case:
+	}
+	return option_none_value(state.allocator), true
 }
 
 @(private)
