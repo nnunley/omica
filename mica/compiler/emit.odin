@@ -520,7 +520,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return emit_fn_literal(emitter, n)
 
 	case Splice:
-		push_error(emitter, "splices are not lowered yet")
+		push_error(emitter, "splices are only valid inside collections and calls")
 		return -1, false
 
 	case Query_Variable:
@@ -631,7 +631,7 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 		if call_pattern, is_call_pattern := binding.pattern^.(Call_Pattern); is_call_pattern {
 			return emit_call_pattern_binding(emitter, binding, call_pattern)
 		}
-		push_error(emitter, "this binding pattern is not lowered yet")
+		push_error(emitter, "this pattern is only valid in a scatter binding")
 		return -1, false
 	}
 
@@ -2270,7 +2270,7 @@ emit_match_pattern :: proc(
 		return emit_match_map_pattern(emitter, subject, node, next_case_patches)
 	}
 
-	push_error(emitter, "this match pattern is not lowered yet")
+	push_error(emitter, "this pattern is not valid in a match case")
 	return false
 }
 
