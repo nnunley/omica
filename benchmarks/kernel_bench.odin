@@ -20,6 +20,15 @@ scan_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
 	return true
 }
 
+// Visits and reads a column, like a real filter or projection.
+@(private)
+scan_checksum_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
+	sink := (^Sink)(user)
+	identity, _ := v.value_as_identity(v.tuple_values(row)[0])
+	sink.value = sink.value + v.identity_raw(identity)
+	return true
+}
+
 // --- Store benchmarks ------------------------------------------------------
 //
 // The corpus matches the Rust relation_index_benches shape: 128 groups by 128
@@ -117,6 +126,24 @@ bench_scan_full :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Store_State)(user)
 	for _ in 0 ..< chunk {
 		k.relation_block_visit(state.primary_block, state.unbound, scan_visit, &state.sink)
+	}
+	state.sink.value = mm.black_box(state.sink.value)
+}
+
+@(private)
+bench_scan_full_checksum :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Store_State)(user)
+	for _ in 0 ..< chunk {
+		k.relation_block_visit(state.primary_block, state.unbound, scan_checksum_visit, &state.sink)
+	}
+	state.sink.value = mm.black_box(state.sink.value)
+}
+
+@(private)
+bench_scan_prefix_checksum :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Store_State)(user)
+	for _ in 0 ..< chunk {
+		k.relation_block_visit(state.primary_block, state.prefix, scan_checksum_visit, &state.sink)
 	}
 	state.sink.value = mm.black_box(state.sink.value)
 }
@@ -706,7 +733,9 @@ register_kernel_benches :: proc(runner: ^mm.Runner) {
 	store_state := store_state_init()
 	store_group := mm.group(runner, "kernel/store")
 	mm.bench(store_group, "scan_full_16k", store_state, bench_scan_full)
+	mm.bench(store_group, "scan_full_checksum_16k", store_state, bench_scan_full_checksum)
 	mm.bench(store_group, "scan_prefix_16k", store_state, bench_scan_prefix)
+	mm.bench(store_group, "scan_prefix_checksum_16k", store_state, bench_scan_prefix_checksum)
 	mm.bench(store_group, "scan_index_16k", store_state, bench_scan_index)
 	mm.bench_capped(store_group, "rebuild_16k", store_state, bench_store_rebuild, 8)
 
