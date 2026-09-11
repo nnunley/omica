@@ -296,6 +296,32 @@ rule_validate_safety :: proc(rule: Rule, alloc: mem.Allocator) -> Kernel_Error {
 	return .None
 }
 
+// Validates that every atom and the head of a rule use the arity of their
+// relation. Unknown relations fail with `Unknown_Relation`.
+rule_validate_arity :: proc(rule: Rule, snapshot: ^Snapshot) -> Kernel_Error {
+	head, head_found := snapshot_relation_metadata(snapshot, rule.head_relation)
+	if !head_found {
+		return .Unknown_Relation
+	}
+	if int(head.arity) != len(rule.head_terms) {
+		return .Arity_Mismatch
+	}
+
+	for item in rule.body {
+		if item.kind != .Atom {
+			continue
+		}
+		metadata, found := snapshot_relation_metadata(snapshot, item.atom.relation)
+		if !found {
+			return .Unknown_Relation
+		}
+		if int(metadata.arity) != len(item.atom.terms) {
+			return .Arity_Mismatch
+		}
+	}
+	return .None
+}
+
 // Orders rules into strata by dependency, adding one level for negation.
 // Returns false when positive recursion through negation prevents
 // stratification. Maps and result slices are allocated from `alloc`.

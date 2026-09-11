@@ -43,7 +43,8 @@ write_value :: proc(builder: ^strings.Builder, v: Value) {
 		strings.write_string(builder, s)
 	case .Bytes:
 		data, _ := value_as_bytes(v)
-		fmt.sbprintf(builder, "b\"%s\"", base64.encode(data, base64.ENC_URL_TABLE))
+		encoded := base64.encode(data, base64.ENC_URL_TABLE, context.temp_allocator)
+		fmt.sbprintf(builder, "b\"%s\"", encoded)
 	case .List:
 		values, _ := value_as_list(v)
 		strings.write_byte(builder, '{')

@@ -72,6 +72,19 @@ kernel_rows :: proc(kernel: ^Kernel, relation: Relation_ID, arity: int) -> [dyna
 }
 
 @(private)
+snapshot_rows :: proc(
+	snapshot: ^Snapshot,
+	relation: Relation_ID,
+	arity: int,
+) -> [dynamic]v.Tuple {
+	bindings := make([]v.Binding, arity, context.temp_allocator)
+	rows: [dynamic]v.Tuple
+	source := Relation_Source{snapshot = snapshot, use_stored_derived = true}
+	relation_source_scan_into(&source, relation, bindings, &rows)
+	return rows
+}
+
+@(private)
 transaction_rows :: proc(tx: ^Transaction, relation: Relation_ID, arity: int) -> [dynamic]v.Tuple {
 	bindings := make([]v.Binding, arity, context.temp_allocator)
 	rows: [dynamic]v.Tuple
@@ -105,6 +118,52 @@ churn_temp :: proc() {
 			data[i] = 0xAA
 		}
 	}
+}
+
+@(test)
+test_snapshot_retain_release_keeps_old_version_readable :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "Flag", 1)
+	first := must_int(1)
+	second := must_int(2)
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, relation, tuple_of(first))
+	commit_transaction(t, &tx)
+
+	// Retain the published version before the next commit.
+	old := kernel_snapshot(&kernel)
+	old_version := old.version
+
+	tx2 := kernel_begin(&kernel)
+	transaction_assert(&tx2, relation, tuple_of(second))
+	commit_transaction(t, &tx2)
+
+	testing.expect(t, kernel.current.version > old_version)
+
+	// The retained version reads the old row set only.
+	rows := snapshot_rows(old, relation, 1)
+	testing.expect(t, has_tuple(rows[:], tuple_of(first)))
+	testing.expect(t, !has_tuple(rows[:], tuple_of(second)))
+	delete(rows)
+	testing.expect(t, snapshot_contains(old, relation, tuple_of(first)))
+	testing.expect(t, !snapshot_contains(old, relation, tuple_of(second)))
+
+	// The published version reads both rows.
+	current_rows := kernel_rows(&kernel, relation, 1)
+	testing.expect(t, has_tuple(current_rows[:], tuple_of(first)))
+	testing.expect(t, has_tuple(current_rows[:], tuple_of(second)))
+	delete(current_rows)
+
+	snapshot_release(old)
+
+	// The kernel stays usable after the retained reference is released.
+	after_release := kernel_rows(&kernel, relation, 1)
+	testing.expect_value(t, len(after_release), 2)
+	delete(after_release)
 }
 
 @(test)
@@ -352,6 +411,47 @@ test_secondary_index_scan_returns_matching_rows :: proc(t: ^testing.T) {
 	kernel_scan_into(&kernel, relation, bindings, &rows)
 	testing.expect_value(t, len(rows), 2)
 	delete(rows)
+}
+
+@(test)
+test_rule_rejects_atom_and_head_arity_mismatch :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	base := create_relation(&kernel, 1, "Base", 2)
+	derived := create_relation(&kernel, 2, "Derived", 2)
+
+	x := v.symbol_intern("x")
+	y := v.symbol_intern("y")
+
+	// The head has one term but the relation has arity 2.
+	bad_head := rule_new(
+		derived,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item{body_atom(atom_positive(base, []Term{term_var(x), term_var(y)}))},
+	)
+	_, head_err := kernel_install_rule(&kernel, v.Identity(1), bad_head, "bad head")
+	testing.expect_value(t, head_err, Kernel_Error.Arity_Mismatch)
+
+	// The body atom has one term but the relation has arity 2.
+	bad_body := rule_new(
+		derived,
+		[]Term{term_var(x), term_var(y)},
+		[]Rule_Body_Item{body_atom(atom_positive(base, []Term{term_var(x)}))},
+	)
+	_, body_err := kernel_install_rule(&kernel, v.Identity(2), bad_body, "bad body")
+	testing.expect_value(t, body_err, Kernel_Error.Arity_Mismatch)
+
+	// A correct rule still installs.
+	good := rule_new(
+		derived,
+		[]Term{term_var(x), term_var(y)},
+		[]Rule_Body_Item{body_atom(atom_positive(base, []Term{term_var(x), term_var(y)}))},
+	)
+	snapshot, good_err := kernel_install_rule(&kernel, v.Identity(3), good, "good")
+	testing.expect_value(t, good_err, Kernel_Error.None)
+	snapshot_release(snapshot)
 }
 
 @(test)
@@ -693,4 +793,691 @@ test_dispatch_matches_primitive_prototype :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, len(rejects), 0)
 	commit_transaction(t, &tx)
+}
+
+@(private)
+must_float :: proc(f: f32) -> v.Value {
+	value, ok := v.value_float(f)
+	assert(ok)
+	return value
+}
+
+@(test)
+test_transaction_error_matrix :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "HeldBy", 2)
+
+	tx := kernel_begin(&kernel)
+	defer transaction_destroy(&tx)
+
+	testing.expect_value(
+		t,
+		transaction_assert(&tx, Relation_ID(99), tuple_of(must_identity(1), must_identity(2))),
+		Kernel_Error.Unknown_Relation,
+	)
+	testing.expect_value(
+		t,
+		transaction_assert(&tx, relation, tuple_of(must_identity(1))),
+		Kernel_Error.Arity_Mismatch,
+	)
+	testing.expect_value(
+		t,
+		transaction_retract(&tx, relation, tuple_of(must_identity(1))),
+		Kernel_Error.Arity_Mismatch,
+	)
+
+	capability := v.value_capability(v.Capability_ID(1))
+	testing.expect_value(
+		t,
+		transaction_assert(&tx, relation, tuple_of(must_identity(1), capability)),
+		Kernel_Error.Non_Persistent_Value,
+	)
+	testing.expect_value(
+		t,
+		transaction_retract(&tx, relation, tuple_of(must_identity(1), capability)),
+		Kernel_Error.Non_Persistent_Value,
+	)
+}
+
+@(test)
+test_create_relation_rejects_duplicates_and_invalid_metadata :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	create_relation(&kernel, 1, "HeldBy", 2)
+
+	duplicate_name := relation_metadata(Relation_ID(2), v.symbol_intern("HeldBy"), 2)
+	_, name_err := kernel_create_relation(&kernel, duplicate_name)
+	testing.expect_value(t, name_err, Kernel_Error.Duplicate_Relation_Name)
+
+	duplicate_id := relation_metadata(Relation_ID(1), v.symbol_intern("Other"), 2)
+	_, id_err := kernel_create_relation(&kernel, duplicate_id)
+	testing.expect_value(t, id_err, Kernel_Error.Invalid_Metadata)
+
+	bad_index := relation_metadata(Relation_ID(3), v.symbol_intern("BadIndex"), 2)
+	bad_index.indexes = []Index_Spec{index_spec([]u16{5})}
+	_, index_err := kernel_create_relation(&kernel, bad_index)
+	testing.expect_value(t, index_err, Kernel_Error.Invalid_Metadata)
+
+	keys := [1]u16{7}
+	bad_key := relation_metadata(Relation_ID(4), v.symbol_intern("BadKey"), 2)
+	bad_key.conflict = conflict_functional(keys[:])
+	_, key_err := kernel_create_relation(&kernel, bad_key)
+	testing.expect_value(t, key_err, Kernel_Error.Invalid_Metadata)
+}
+
+@(test)
+test_retract_ignores_tuple_absent_from_base :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "HeldBy", 2)
+	held := tuple_of(must_identity(1), must_identity(2))
+
+	// The slow transaction retracts a tuple that its base does not hold.
+	slow := kernel_begin(&kernel)
+	testing.expect_value(
+		t,
+		transaction_retract(&slow, relation, held),
+		Kernel_Error.None,
+	)
+
+	// Another transaction asserts the tuple first.
+	fast := kernel_begin(&kernel)
+	transaction_assert(&fast, relation, held)
+	commit_transaction(t, &fast)
+
+	// The rebased retract must not remove the tuple that the base lacked.
+	commit_transaction(t, &slow)
+
+	rows := kernel_rows(&kernel, relation, 2)
+	testing.expect(t, has_tuple(rows[:], held))
+	delete(rows)
+}
+
+@(test)
+test_multi_stratum_rules_negate_derived_relation :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	exit := create_relation(&kernel, 1, "Exit", 2)
+	node := create_relation(&kernel, 2, "Node", 1)
+	reachable := create_relation(&kernel, 3, "Reachable", 2)
+	unreachable := create_relation(&kernel, 4, "Unreachable", 2)
+
+	from := v.symbol_intern("from")
+	to := v.symbol_intern("to")
+	mid := v.symbol_intern("mid")
+
+	base_rule := rule_new(
+		reachable,
+		[]Term{term_var(from), term_var(to)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(exit, []Term{term_var(from), term_var(to)})),
+		},
+	)
+	recursive_rule := rule_new(
+		reachable,
+		[]Term{term_var(from), term_var(to)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(exit, []Term{term_var(from), term_var(mid)})),
+			body_atom(atom_positive(reachable, []Term{term_var(mid), term_var(to)})),
+		},
+	)
+	// The negated atom reads a derived relation from the stratum below.
+	negation_rule := rule_new(
+		unreachable,
+		[]Term{term_var(from), term_var(to)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(node, []Term{term_var(from)})),
+			body_atom(atom_positive(node, []Term{term_var(to)})),
+			body_atom(atom_negated(reachable, []Term{term_var(from), term_var(to)})),
+		},
+	)
+
+	rules := []Rule{base_rule, recursive_rule, negation_rule}
+	for rule, index in rules {
+		snapshot, err := kernel_install_rule(&kernel, v.Identity(400 + index), rule, "multi stratum")
+		testing.expect_value(t, err, Kernel_Error.None)
+		snapshot_release(snapshot)
+	}
+
+	a := must_identity(1)
+	b := must_identity(2)
+	c := must_identity(3)
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, node, tuple_of(a))
+	transaction_assert(&tx, node, tuple_of(b))
+	transaction_assert(&tx, node, tuple_of(c))
+	transaction_assert(&tx, exit, tuple_of(a, b))
+	transaction_assert(&tx, exit, tuple_of(b, c))
+	commit_transaction(t, &tx)
+
+	rows := kernel_rows(&kernel, unreachable, 2)
+	testing.expect_value(t, len(rows), 6)
+	testing.expect(t, !has_tuple(rows[:], tuple_of(a, b)))
+	testing.expect(t, has_tuple(rows[:], tuple_of(a, a)))
+	testing.expect(t, has_tuple(rows[:], tuple_of(c, b)))
+	delete(rows)
+
+	// A new edge closes the cycle, so no pair stays unreachable.
+	tx2 := kernel_begin(&kernel)
+	transaction_assert(&tx2, exit, tuple_of(c, a))
+	commit_transaction(t, &tx2)
+
+	rows2 := kernel_rows(&kernel, unreachable, 2)
+	testing.expect_value(t, len(rows2), 0)
+	delete(rows2)
+}
+
+@(test)
+test_disable_rule_removes_derived_facts :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	base := create_relation(&kernel, 1, "Base", 1)
+	derived := create_relation(&kernel, 2, "Derived", 1)
+
+	x := v.symbol_intern("x")
+	rule := rule_new(
+		derived,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item{body_atom(atom_positive(base, []Term{term_var(x)}))},
+	)
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(500), rule, "Derived(x) :- Base(x).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	value := must_identity(1)
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, base, tuple_of(value))
+	commit_transaction(t, &tx)
+
+	before := kernel_rows(&kernel, derived, 1)
+	testing.expect(t, has_tuple(before[:], tuple_of(value)))
+	delete(before)
+
+	disabled, disable_err := kernel_disable_rule(&kernel, v.Identity(500))
+	testing.expect_value(t, disable_err, Kernel_Error.None)
+	snapshot_release(disabled)
+
+	after := kernel_rows(&kernel, derived, 1)
+	testing.expect_value(t, len(after), 0)
+	delete(after)
+
+	_, missing_err := kernel_disable_rule(&kernel, v.Identity(501))
+	testing.expect_value(t, missing_err, Kernel_Error.No_Such_Rule)
+}
+
+@(test)
+test_guard_operators :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	number := create_relation(&kernel, 1, "Number", 1)
+	selected := create_relation(&kernel, 2, "Selected", 2)
+
+	ops := [6]Rule_Comparison_Op{.Eq, .Ne, .Lt, .Le, .Gt, .Ge}
+	x := v.symbol_intern("x")
+
+	for op, index in ops {
+		rule := rule_new(
+			selected,
+			[]Term{term_value(must_int(i64(index))), term_var(x)},
+			[]Rule_Body_Item {
+				body_atom(atom_positive(number, []Term{term_var(x)})),
+				body_guard(rule_guard(op, term_var(x), term_value(must_int(2)))),
+			},
+		)
+		snapshot, err := kernel_install_rule(&kernel, v.Identity(600 + index), rule, "guard op")
+		testing.expect_value(t, err, Kernel_Error.None)
+		snapshot_release(snapshot)
+	}
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, number, tuple_of(must_int(1)))
+	transaction_assert(&tx, number, tuple_of(must_int(2)))
+	transaction_assert(&tx, number, tuple_of(must_int(3)))
+	transaction_assert(&tx, number, tuple_of(must_float(2.0)))
+	commit_transaction(t, &tx)
+
+	rows := kernel_rows(&kernel, selected, 2)
+	testing.expect_value(t, len(rows), 12)
+
+	// Eq matches both numeric forms of two.
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_int(0), must_int(2))))
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_int(0), must_float(2.0))))
+	// Ne rejects both.
+	testing.expect(t, !has_tuple(rows[:], tuple_of(must_int(1), must_int(2))))
+	testing.expect(t, !has_tuple(rows[:], tuple_of(must_int(1), must_float(2.0))))
+	// Lt keeps one.
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_int(2), must_int(1))))
+	// Le keeps three.
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_int(3), must_float(2.0))))
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_int(3), must_int(1))))
+	// Gt keeps one.
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_int(4), must_int(3))))
+	// Ge keeps three.
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_int(5), must_int(3))))
+	testing.expect(t, has_tuple(rows[:], tuple_of(must_int(5), must_float(2.0))))
+	delete(rows)
+}
+
+@(private)
+Stop_State :: struct {
+	visited: int,
+	limit:   int,
+}
+
+@(private)
+stopping_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
+	state := (^Stop_State)(user)
+	state.visited += 1
+	return state.visited < state.limit
+}
+
+@(test)
+test_store_search_paths_match_linear_filter :: proc(t: ^testing.T) {
+	alloc := context.temp_allocator
+	metadata := relation_metadata(Relation_ID(1), v.symbol_intern("store-search"), 3)
+	metadata.indexes = []Index_Spec {
+		index_spec([]u16{2}),
+		index_spec([]u16{1, 0}),
+		index_spec([]u16{0}),
+	}
+
+	rows: [dynamic]v.Tuple
+	for i in 0 ..< 200 {
+		cells := []v.Value {
+			must_int(i64(i % 10)),
+			must_int(i64((i / 10) % 5)),
+			must_int(i64(i)),
+		}
+		append(&rows, v.tuple_new(alloc, cells))
+	}
+	block := relation_block_build(alloc, metadata, rows[:])
+	testing.expect_value(t, relation_block_len(block), 200)
+	delete(rows)
+
+	patterns := [][3]int {
+		{1, 0, 0}, // position 0 bound
+		{0, 1, 0}, // position 1 bound
+		{1, 0, 1}, // positions 0 and 2 bound, non-contiguous
+		{0, 0, 1}, // position 2 bound, secondary index path
+		{1, 1, 1}, // fully bound
+		{0, 0, 0}, // unbound
+	}
+
+	source_row := block.tuples[17]
+	for pattern in patterns {
+		bindings: [3]v.Binding
+		for bound, i in pattern {
+			if bound == 1 {
+				bindings[i] = v.binding_of(v.tuple_values(source_row)[i])
+			}
+		}
+
+		visited: [dynamic]v.Tuple
+		relation_block_scan_into(block, bindings[:], &visited)
+
+		expected: [dynamic]v.Tuple
+		for row in block.tuples {
+			if v.tuple_matches_bindings(row, bindings[:]) {
+				append(&expected, row)
+			}
+		}
+
+		testing.expect_value(t, len(visited), len(expected))
+		for row in expected {
+			testing.expect(t, has_tuple(visited[:], row))
+		}
+		delete(visited)
+		delete(expected)
+	}
+
+	// A visitor that returns false ends the scan.
+	state := Stop_State{limit = 5}
+	relation_block_visit(block, []v.Binding{{}, {}, {}}, stopping_visit, &state)
+	testing.expect_value(t, state.visited, 5)
+}
+
+@(test)
+test_dispatch_prefers_more_specific_method :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	method_selector := create_relation(&kernel, 40, "MethodSelector", 2)
+	param := create_relation(&kernel, 41, "Param", 4)
+	delegates := create_relation(&kernel, 42, "Delegates", 3)
+	relations := Dispatch_Relations {
+		method_selector = method_selector,
+		param           = param,
+		delegates       = delegates,
+	}
+
+	child := must_identity(2)
+	parent := must_identity(11)
+	specific := must_int(100)
+	general := must_int(101)
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, method_selector, tuple_of(specific, sym("take")))
+	transaction_assert(&tx, method_selector, tuple_of(general, sym("take")))
+	transaction_assert(&tx, param, tuple_of(specific, sym("item"), child, must_int(0)))
+	transaction_assert(&tx, param, tuple_of(general, sym("item"), parent, must_int(0)))
+	transaction_assert(&tx, delegates, tuple_of(child, parent, must_int(0)))
+
+	source := Relation_Source{transaction = &tx, use_stored_derived = true}
+	roles := []Role_Pair{{role = sym("item"), value = child}}
+	methods := applicable_methods(&source, relations, sym("take"), roles, context.temp_allocator)
+	testing.expect_value(t, len(methods), 1)
+	if len(methods) == 1 {
+		testing.expect(t, v.value_eq(methods[0], specific))
+	}
+	commit_transaction(t, &tx)
+}
+
+@(test)
+test_closure_handles_cycles :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	delegates := create_relation(&kernel, 1, "Delegates", 3)
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, delegates, tuple_of(must_identity(1), must_identity(2), must_int(0)))
+	transaction_assert(&tx, delegates, tuple_of(must_identity(2), must_identity(3), must_int(0)))
+	transaction_assert(&tx, delegates, tuple_of(must_identity(3), must_identity(1), must_int(0)))
+	commit_transaction(t, &tx)
+
+	source := Relation_Source{snapshot = kernel.current, use_stored_derived = true}
+	testing.expect(t, delegates_reaches(&source, delegates, must_identity(1), must_identity(3)))
+	testing.expect(t, delegates_reaches(&source, delegates, must_identity(3), must_identity(2)))
+	testing.expect(t, delegates_reaches(&source, delegates, must_identity(3), must_identity(1)))
+
+	prototypes := delegates_star_from(&source, delegates, must_identity(1), context.temp_allocator)
+	testing.expect_value(t, len(prototypes), 3)
+
+	// A cycle makes the starting child reachable again, so each of the three
+	// children contributes three pairs.
+	pairs := delegates_star(&source, delegates, context.temp_allocator)
+	testing.expect_value(t, len(pairs), 9)
+	testing.expect(t, has_tuple(pairs, tuple_of(must_identity(1), must_identity(3))))
+	testing.expect(t, has_tuple(pairs, tuple_of(must_identity(3), must_identity(2))))
+	testing.expect(t, has_tuple(pairs, tuple_of(must_identity(2), must_identity(2))))
+}
+
+@(test)
+test_rule_validation_errors :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	base := create_relation(&kernel, 1, "Base", 1)
+	derived := create_relation(&kernel, 2, "Derived", 1)
+
+	x := v.symbol_intern("x")
+	y := v.symbol_intern("y")
+
+	// Unknown head relation.
+	unknown_head := rule_new(
+		Relation_ID(99),
+		[]Term{term_var(x)},
+		[]Rule_Body_Item{body_atom(atom_positive(base, []Term{term_var(x)}))},
+	)
+	_, unknown_head_err := kernel_install_rule(&kernel, v.Identity(1), unknown_head, "unknown head")
+	testing.expect_value(t, unknown_head_err, Kernel_Error.Unknown_Relation)
+
+	// Unknown body relation.
+	unknown_body := rule_new(
+		derived,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item{body_atom(atom_positive(Relation_ID(99), []Term{term_var(x)}))},
+	)
+	_, unknown_body_err := kernel_install_rule(&kernel, v.Identity(2), unknown_body, "unknown body")
+	testing.expect_value(t, unknown_body_err, Kernel_Error.Unknown_Relation)
+
+	// The guard reads a variable that no positive atom binds.
+	unsafe_guard := rule_new(
+		derived,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(base, []Term{term_var(x)})),
+			body_guard(rule_guard(.Eq, term_var(y), term_value(must_int(1)))),
+		},
+	)
+	_, unsafe_guard_err := kernel_install_rule(&kernel, v.Identity(3), unsafe_guard, "unsafe guard")
+	testing.expect_value(t, unsafe_guard_err, Kernel_Error.Unsafe_Guard)
+
+	// The head reads a variable that no positive atom binds.
+	unbound_head := rule_new(
+		derived,
+		[]Term{term_var(y)},
+		[]Rule_Body_Item{body_atom(atom_positive(base, []Term{term_var(x)}))},
+	)
+	_, unbound_head_err := kernel_install_rule(&kernel, v.Identity(4), unbound_head, "unbound head")
+	testing.expect_value(t, unbound_head_err, Kernel_Error.Unbound_Head_Variable)
+}
+
+@(test)
+test_rule_terms_constants_and_repeated_variables :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	query := create_relation(&kernel, 1, "Query", 2)
+	selected := create_relation(&kernel, 2, "Selected", 1)
+	pair := create_relation(&kernel, 3, "Pair", 2)
+	same := create_relation(&kernel, 4, "Same", 1)
+
+	x := v.symbol_intern("x")
+
+	// Selected(x) :- Query(x, 5), a constant in the body.
+	constant_rule := rule_new(
+		selected,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(query, []Term{term_var(x), term_value(must_int(5))})),
+		},
+	)
+	snapshot, constant_err := kernel_install_rule(&kernel, v.Identity(700), constant_rule, "constant")
+	testing.expect_value(t, constant_err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	// Same(x) :- Pair(x, x), a repeated variable in one atom.
+	repeated_rule := rule_new(
+		same,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(pair, []Term{term_var(x), term_var(x)})),
+		},
+	)
+	snapshot2, repeated_err := kernel_install_rule(&kernel, v.Identity(701), repeated_rule, "repeated")
+	testing.expect_value(t, repeated_err, Kernel_Error.None)
+	snapshot_release(snapshot2)
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, query, tuple_of(must_int(1), must_int(5)))
+	transaction_assert(&tx, query, tuple_of(must_int(2), must_int(6)))
+	transaction_assert(&tx, query, tuple_of(must_int(3), must_int(5)))
+	transaction_assert(&tx, pair, tuple_of(must_int(1), must_int(1)))
+	transaction_assert(&tx, pair, tuple_of(must_int(1), must_int(2)))
+	transaction_assert(&tx, pair, tuple_of(must_int(3), must_int(3)))
+	commit_transaction(t, &tx)
+
+	selected_rows := kernel_rows(&kernel, selected, 1)
+	testing.expect_value(t, len(selected_rows), 2)
+	testing.expect(t, has_tuple(selected_rows[:], tuple_of(must_int(1))))
+	testing.expect(t, has_tuple(selected_rows[:], tuple_of(must_int(3))))
+	delete(selected_rows)
+
+	same_rows := kernel_rows(&kernel, same, 1)
+	testing.expect_value(t, len(same_rows), 2)
+	testing.expect(t, has_tuple(same_rows[:], tuple_of(must_int(1))))
+	testing.expect(t, has_tuple(same_rows[:], tuple_of(must_int(3))))
+	delete(same_rows)
+}
+
+@(test)
+test_empty_commit_and_idempotent_writes :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "HeldBy", 2)
+	present := tuple_of(must_identity(1), must_identity(2))
+	absent := tuple_of(must_identity(3), must_identity(4))
+
+	version_before := kernel.current.version
+	empty := kernel_begin(&kernel)
+	commit_transaction(t, &empty)
+	testing.expect_value(t, kernel.current.version, version_before + 1)
+
+	seed := kernel_begin(&kernel)
+	transaction_assert(&seed, relation, present)
+	commit_transaction(t, &seed)
+
+	// Assert of a present tuple and retract of an absent tuple change nothing.
+	tx := kernel_begin(&kernel)
+	testing.expect_value(t, transaction_assert(&tx, relation, present), Kernel_Error.None)
+	testing.expect_value(t, transaction_retract(&tx, relation, absent), Kernel_Error.None)
+	commit_transaction(t, &tx)
+
+	rows := kernel_rows(&kernel, relation, 2)
+	testing.expect_value(t, len(rows), 1)
+	testing.expect(t, has_tuple(rows[:], present))
+	delete(rows)
+}
+
+@(test)
+test_conflict_in_one_relation_rolls_back_the_others :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	first := create_relation(&kernel, 1, "First", 2)
+	second := create_relation(&kernel, 2, "Second", 2)
+	contested := tuple_of(must_identity(1), must_identity(2))
+	other := tuple_of(must_identity(3), must_identity(4))
+
+	seed := kernel_begin(&kernel)
+	transaction_assert(&seed, first, contested)
+	commit_transaction(t, &seed)
+
+	slow := kernel_begin(&kernel)
+	transaction_assert(&slow, first, contested)
+	transaction_assert(&slow, second, other)
+
+	fast := kernel_begin(&kernel)
+	transaction_retract(&fast, first, contested)
+	commit_transaction(t, &fast)
+
+	snapshot, err := transaction_commit(&slow)
+	testing.expect_value(t, err, Kernel_Error.Conflict)
+	if snapshot != nil {
+		snapshot_release(snapshot)
+	}
+	transaction_destroy(&slow)
+
+	// The write to the second relation must not appear.
+	rows := kernel_rows(&kernel, second, 2)
+	testing.expect_value(t, len(rows), 0)
+	delete(rows)
+}
+
+@(test)
+test_dispatch_frob_only_restrictions :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	method_selector := create_relation(&kernel, 40, "MethodSelector", 2)
+	param := create_relation(&kernel, 41, "Param", 4)
+	delegates := create_relation(&kernel, 42, "Delegates", 3)
+	relations := Dispatch_Relations {
+		method_selector = method_selector,
+		param           = param,
+		delegates       = delegates,
+	}
+
+	method := must_int(100)
+	required_delegate_id, _ := v.identity_new(11)
+	child_delegate_id, _ := v.identity_new(2)
+	required_delegate := v.value_identity(required_delegate_id)
+	child_delegate := v.value_identity(child_delegate_id)
+
+	tx := kernel_begin(&kernel)
+	restriction := frob_only_dispatch_restriction(context.temp_allocator, v.Identity(11))
+	transaction_assert(&tx, method_selector, tuple_of(method, sym("take")))
+	transaction_assert(&tx, param, tuple_of(method, sym("item"), restriction, must_int(0)))
+	transaction_assert(&tx, delegates, tuple_of(child_delegate, required_delegate, must_int(0)))
+
+	source := Relation_Source{transaction = &tx, use_stored_derived = true}
+
+	matches := applicable_methods(
+		&source,
+		relations,
+		sym("take"),
+		[]Role_Pair {
+			{
+				role  = sym("item"),
+				value = v.value_frob(context.temp_allocator, required_delegate_id, must_int(1)),
+			},
+		},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, len(matches), 1)
+
+	// The frob delegate can reach the required delegate through delegation.
+	inherited := applicable_methods(
+		&source,
+		relations,
+		sym("take"),
+		[]Role_Pair {
+			{
+				role  = sym("item"),
+				value = v.value_frob(context.temp_allocator, child_delegate_id, must_int(1)),
+			},
+		},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, len(inherited), 1)
+
+	// A plain value is not a frob, so the frob-only restriction rejects it.
+	rejected := applicable_methods(
+		&source,
+		relations,
+		sym("take"),
+		[]Role_Pair{{role = sym("item"), value = required_delegate}},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, len(rejected), 0)
+	commit_transaction(t, &tx)
+}
+
+@(test)
+test_snapshot_metadata_lookup_by_name :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "HeldBy", 2)
+
+	metadata, found := snapshot_relation_metadata_named(kernel.current, v.symbol_intern("HeldBy"))
+	testing.expect(t, found)
+	testing.expect_value(t, metadata.id, relation)
+
+	_, missing := snapshot_relation_metadata_named(kernel.current, v.symbol_intern("NoSuchRelation"))
+	testing.expect(t, !missing)
 }

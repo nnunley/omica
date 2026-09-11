@@ -2,10 +2,11 @@
 package kernel
 
 import "core:mem"
+import "core:slice"
 import v "../var"
 
 // Returns all transitive delegation pairs `(child, prototype)` reachable
-// through the delegates relation.
+// through the delegates relation. The output is sorted.
 delegates_star :: proc(
 	source: ^Relation_Source,
 	delegates_relation: Relation_ID,
@@ -23,9 +24,20 @@ delegates_star :: proc(
 	for edge in edges {
 		children[v.tuple_values(edge)[0]] = true
 	}
+	delete(edges)
 
-	pairs: [dynamic]v.Tuple
+	child_values := make([]v.Value, len(children), alloc)
+	child_count := 0
 	for child in children {
+		child_values[child_count] = child
+		child_count += 1
+	}
+	slice.sort_by(child_values, proc(a, b: v.Value) -> bool {
+		return v.value_cmp(a, b) == .Less
+	})
+
+	pairs := make([dynamic]v.Tuple, 0, alloc)
+	for child in child_values {
 		prototypes := delegates_star_from(source, delegates_relation, child, alloc)
 		for proto in prototypes {
 			tuple := make([]v.Value, 2, alloc)
@@ -34,11 +46,14 @@ delegates_star :: proc(
 			append(&pairs, v.tuple_from_slice(tuple))
 		}
 	}
+	slice.sort_by(pairs[:], proc(a, b: v.Tuple) -> bool {
+		return v.tuple_cmp(a, b) == .Less
+	})
 	return pairs[:]
 }
 
 // Returns all prototypes reachable from `child` through the delegates
-// relation.
+// relation. The output is sorted.
 delegates_star_from :: proc(
 	source: ^Relation_Source,
 	delegates_relation: Relation_ID,
@@ -76,6 +91,9 @@ delegates_star_from :: proc(
 	owned := make([]v.Value, len(result), alloc)
 	copy(owned, result[:])
 	delete(result)
+	slice.sort_by(owned, proc(a, b: v.Value) -> bool {
+		return v.value_cmp(a, b) == .Less
+	})
 	return owned
 }
 

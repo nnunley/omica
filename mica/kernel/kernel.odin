@@ -93,13 +93,8 @@ kernel_install_rule :: proc(
 	Kernel_Error,
 ) {
 	current := kernel.current
-	if !snapshot_has_relation(current, rule.head_relation) {
-		return nil, .Unknown_Relation
-	}
-	for item in rule.body {
-		if item.kind == .Atom && !snapshot_has_relation(current, item.atom.relation) {
-			return nil, .Unknown_Relation
-		}
+	if err := rule_validate_arity(rule, current); err != .None {
+		return nil, err
 	}
 
 	scratch := new(virtual.Arena)
