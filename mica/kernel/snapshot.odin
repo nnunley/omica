@@ -306,33 +306,6 @@ snapshot_active_rules :: proc(snapshot: ^Snapshot, alloc: mem.Allocator) -> []Ru
 	return rules[:write]
 }
 
-// Allocates a derived relation row set into the snapshot allocator, sorting
-// and deduplicating the rows.
-snapshot_set_derived :: proc(
-	snapshot: ^Snapshot,
-	relation: Relation_ID,
-	rows: []v.Tuple,
-) {
-	tuples := make([]v.Tuple, len(rows), snapshot.allocator)
-	copy(tuples, rows)
-	tuples = canonicalize_tuples(tuples)
-
-	derived := snapshot.derived
-	found := false
-	for entry, i in derived {
-		if entry.relation == relation {
-			derived[i] = Derived_Relation{relation = relation, tuples = tuples}
-			found = true
-			break
-		}
-	}
-	if !found {
-		next := make([]Derived_Relation, len(derived) + 1, snapshot.allocator)
-		copy(next, derived)
-		next[len(derived)] = Derived_Relation{relation = relation, tuples = tuples}
-		snapshot.derived = next
-	}
-}
 
 @(private)
 canonicalize_tuples :: proc(tuples: []v.Tuple) -> []v.Tuple {

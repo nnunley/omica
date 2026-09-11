@@ -7,11 +7,6 @@ import v "../var"
 // Stable relation identity.
 Relation_ID :: distinct u32
 
-// Returns the numeric id of a relation.
-relation_id_raw :: proc(id: Relation_ID) -> u32 {
-	return u32(id)
-}
-
 // How concurrent changes to a relation are validated at commit.
 Conflict_Kind :: enum {
 	// Tuples form a set; a concurrent retraction of an asserted tuple conflicts.

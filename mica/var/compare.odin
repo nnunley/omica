@@ -5,7 +5,6 @@
 // comparison is in `language_cmp`.
 package var
 
-import "core:slice"
 
 // Result of a three-way comparison.
 Ordering :: enum i8 {
@@ -249,20 +248,3 @@ value_cmp :: proc(left, right: Value) -> Ordering {
 	return value_cmp_same_kind(left, right, left_kind)
 }
 
-// Sorts and deduplicates a slice of values in place, returning the unique
-// prefix. The slice is modified.
-@(private)
-values_canonicalize :: proc(values: []Value) -> []Value {
-	slice.sort_by(values, proc(a, b: Value) -> bool {
-		return value_cmp(a, b) == .Less
-	})
-	write := 0
-	for value in values {
-		if write > 0 && value_eq(values[write - 1], value) {
-			continue
-		}
-		values[write] = value
-		write += 1
-	}
-	return values[:write]
-}
