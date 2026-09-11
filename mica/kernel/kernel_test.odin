@@ -1956,3 +1956,88 @@ test_kernel_next_relation_id :: proc(t: ^testing.T) {
 	create_relation(&kernel, 5, "Fifth", 1)
 	testing.expect_value(t, kernel_next_relation_id(&kernel), Relation_ID(6))
 }
+
+@(test)
+test_semi_naive_recursion_branching_and_cycles :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	exit := create_relation(&kernel, 1, "Exit", 2)
+	reachable := create_relation(&kernel, 2, "Reachable", 2)
+
+	from := v.symbol_intern("from")
+	to := v.symbol_intern("to")
+	mid := v.symbol_intern("mid")
+
+	base_rule := rule_new(
+		reachable,
+		[]Term{term_var(from), term_var(to)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(exit, []Term{term_var(from), term_var(to)})),
+		},
+	)
+	recursive_rule := rule_new(
+		reachable,
+		[]Term{term_var(from), term_var(to)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(reachable, []Term{term_var(from), term_var(mid)})),
+			body_atom(atom_positive(exit, []Term{term_var(mid), term_var(to)})),
+		},
+	)
+	snapshot, base_err := kernel_install_rule(&kernel, v.Identity(1), base_rule, "base")
+	testing.expect_value(t, base_err, Kernel_Error.None)
+	snapshot_release(snapshot)
+	recursive_snapshot, recursive_err := kernel_install_rule(
+		&kernel,
+		v.Identity(2),
+		recursive_rule,
+		"recursive",
+	)
+	testing.expect_value(t, recursive_err, Kernel_Error.None)
+	snapshot_release(recursive_snapshot)
+
+	// a->b, a->c, b->d, c->d, d->e, e->b. The b/d/e component is a cycle.
+	a := must_identity(1)
+	b := must_identity(2)
+	c := must_identity(3)
+	d := must_identity(4)
+	e := must_identity(5)
+
+	edges := [][2]v.Value{{a, b}, {a, c}, {b, d}, {c, d}, {d, e}, {e, b}}
+	tx := kernel_begin(&kernel)
+	for edge in edges {
+		testing.expect_value(
+			t,
+			transaction_assert(&tx, exit, tuple_of(edge[0], edge[1])),
+			Kernel_Error.None,
+		)
+	}
+	commit_transaction(t, &tx)
+
+	expected := [][2]v.Value {
+		{a, b},
+		{a, c},
+		{a, d},
+		{a, e},
+		{b, b},
+		{b, d},
+		{b, e},
+		{c, b},
+		{c, d},
+		{c, e},
+		{d, b},
+		{d, d},
+		{d, e},
+		{e, b},
+		{e, d},
+		{e, e},
+	}
+
+	rows := kernel_rows(&kernel, reachable, 2)
+	testing.expect_value(t, len(rows), len(expected))
+	for pair in expected {
+		testing.expect(t, has_tuple(rows[:], tuple_of(pair[0], pair[1])))
+	}
+	delete(rows)
+}

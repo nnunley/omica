@@ -167,10 +167,12 @@ rule_definition_clone :: proc(
 }
 
 // Derived facts accumulated during rule evaluation. All storage comes from the
-// evaluation arena supplied by the caller.
+// evaluation arena supplied by the caller. Each relation keeps a hash bucket
+// map so membership checks do not scan the row set.
 Rule_Derived :: struct {
 	relations: [dynamic]Relation_ID,
 	rows:      [dynamic][dynamic]v.Tuple,
+	buckets:   [dynamic]map[u64][dynamic]int,
 }
 
 // Creates an empty derived set whose storage is allocated from `alloc`.
@@ -178,6 +180,7 @@ rules_derived_create :: proc(alloc: mem.Allocator) -> Rule_Derived {
 	return Rule_Derived {
 		relations = make([dynamic]Relation_ID, 0, alloc),
 		rows      = make([dynamic][dynamic]v.Tuple, 0, alloc),
+		buckets   = make([dynamic]map[u64][dynamic]int, 0, alloc),
 	}
 }
 
@@ -199,22 +202,40 @@ rules_derived_add :: proc(
 	relation: Relation_ID,
 	tuple: v.Tuple,
 ) -> bool {
+	hash := v.tuple_hash(tuple)
 	for entry, i in derived.relations {
 		if entry != relation {
 			continue
 		}
-		for row in derived.rows[i] {
-			if v.tuple_eq(row, tuple) {
-				return false
+		bucket := &derived.buckets[i]
+		if row_indexes, found := bucket[hash]; found {
+			for row_index in row_indexes {
+				if v.tuple_eq(derived.rows[i][row_index], tuple) {
+					return false
+				}
 			}
 		}
+		index := len(derived.rows[i])
 		append(&derived.rows[i], tuple)
+		row_indexes, found := bucket[hash]
+		if !found {
+			row_indexes = make([dynamic]int, 0, alloc)
+		}
+		append(&row_indexes, index)
+		bucket[hash] = row_indexes
 		return true
 	}
+
 	append(&derived.relations, relation)
 	rows := make([dynamic]v.Tuple, 0, alloc)
 	append(&rows, tuple)
 	append(&derived.rows, rows)
+
+	row_indexes := make([dynamic]int, 0, alloc)
+	append(&row_indexes, 0)
+	bucket := make(map[u64][dynamic]int, alloc)
+	bucket[hash] = row_indexes
+	append(&derived.buckets, bucket)
 	return true
 }
 
@@ -420,6 +441,11 @@ rules_evaluate :: proc(
 // Evaluates active rule definitions into `result`, reading extensional facts
 // from `source` and adding derived facts to both `result` and the source's
 // derived layer. All evaluation storage and result storage come from `alloc`.
+//
+// Evaluation is semi-naive: a stratum is first evaluated over the current
+// state, then re-evaluated while restricting one recursive body atom at a time
+// to the facts that the previous round derived. Re-deriving old facts is thus
+// avoided.
 rules_evaluate_source :: proc(
 	alloc: mem.Allocator,
 	definitions: []Rule_Definition,
@@ -431,6 +457,9 @@ rules_evaluate_source :: proc(
 	previous_allocator := context.allocator
 	context.allocator = alloc
 	defer context.allocator = previous_allocator
+
+	source.delta = nil
+	source.delta_active = false
 
 	rules := make([]Rule, len(definitions), alloc)
 	write := 0
@@ -451,18 +480,46 @@ rules_evaluate_source :: proc(
 	}
 
 	for stratum in strata {
-		for {
-			added := 0
+		stratum_heads := make(map[Relation_ID]bool, alloc)
+		for rule in stratum {
+			stratum_heads[rule.head_relation] = true
+		}
+
+		// Seed the fixpoint with one full evaluation of the stratum.
+		delta := rules_derived_create(alloc)
+		for rule in stratum {
+			if _, err := rules_apply(rule, source, result, &delta, alloc); err != .None {
+				return err
+			}
+		}
+
+		// Each round evaluates the delta variants of every recursive atom.
+		for len(delta.relations) > 0 {
+			next := rules_derived_create(alloc)
 			for rule in stratum {
-				rule_added, err := rules_apply(rule, source, result, alloc)
-				if err != .None {
-					return err
+				for item, index in rule.body {
+					if item.kind != .Atom || item.atom.negated {
+						continue
+					}
+					if !stratum_heads[item.atom.relation] {
+						continue
+					}
+					if len(rules_derived_rows(&delta, item.atom.relation)) == 0 {
+						continue
+					}
+
+					source.delta = &delta
+					source.delta_relation = item.atom.relation
+					source.delta_active = true
+					_, err := rules_apply(rule, source, result, &next, alloc)
+					source.delta_active = false
+					source.delta = nil
+					if err != .None {
+						return err
+					}
 				}
-				added += rule_added
 			}
-			if added == 0 {
-				break
-			}
+			delta = next
 		}
 	}
 	return .None
@@ -786,6 +843,7 @@ rules_apply :: proc(
 	rule: Rule,
 	source: ^Relation_Source,
 	result: ^Rule_Derived,
+	delta: ^Rule_Derived,
 	alloc: mem.Allocator,
 ) -> (
 	int,
@@ -839,6 +897,9 @@ rules_apply :: proc(
 		}
 		tuple := v.tuple_from_slice(values)
 		if rules_derived_add(result, alloc, rule.head_relation, tuple) {
+			if delta != nil {
+				_ = rules_derived_add(delta, alloc, rule.head_relation, tuple)
+			}
 			added += 1
 		}
 	}

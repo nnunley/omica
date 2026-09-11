@@ -9,11 +9,18 @@ package kernel
 import v "../var"
 
 // A source of relation tuples for rule evaluation and dispatch matching.
+//
+// When `delta_active` is true, reads of `delta_relation` come from `delta`
+// plus extensional facts only. This serves semi-naive rule evaluation, where
+// one body atom reads the facts derived in the previous round.
 Relation_Source :: struct {
 	snapshot:           ^Snapshot,
 	transaction:        ^Transaction,
 	derived:            ^Rule_Derived,
 	use_stored_derived: bool,
+	delta:              ^Rule_Derived,
+	delta_relation:     Relation_ID,
+	delta_active:       bool,
 }
 
 @(private)
@@ -51,6 +58,14 @@ relation_source_visit :: proc(
 	}
 	if state.stopped {
 		return true
+	}
+
+	delta_active := source.delta_active && source.delta != nil && relation == source.delta_relation
+	if delta_active {
+		if rules_derived_visit(source.delta, relation, bindings, visit, user) {
+			return true
+		}
+		return false
 	}
 
 	if source.derived != nil {

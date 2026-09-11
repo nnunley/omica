@@ -380,3 +380,50 @@ test_deep_copy_is_independent :: proc(t: ^testing.T) {
 		value_payload(tuple_values(copied_relation_view.rows[0])[0]),
 	)
 }
+
+@(test)
+test_value_hash_matches_equality :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	rng := rng_init(0x5eed_face)
+	symbols := []Symbol {
+		symbol_intern("hash-alpha"),
+		symbol_intern("hash-beta"),
+		symbol_intern("hash-gamma"),
+	}
+
+	values: [48]Value
+	for i in 0 ..< len(values) {
+		values[i] = random_value(&rng, alloc, symbols, 0)
+	}
+
+	consistent := true
+	for a in values {
+		for b in values {
+			if value_eq(a, b) && value_hash(a) != value_hash(b) {
+				consistent = false
+			}
+		}
+	}
+	testing.expect(t, consistent)
+
+	// Tuple hashing follows tuple equality.
+	rows: [16]Tuple
+	for i in 0 ..< len(rows) {
+		row_values := make([]Value, 2, alloc)
+		row_values[0] = random_value(&rng, alloc, symbols, 1)
+		row_values[1] = random_value(&rng, alloc, symbols, 1)
+		rows[i] = tuple_from_slice(row_values)
+	}
+	tuple_consistent := true
+	for a in rows {
+		for b in rows {
+			if tuple_eq(a, b) && tuple_hash(a) != tuple_hash(b) {
+				tuple_consistent = false
+			}
+		}
+	}
+	testing.expect(t, tuple_consistent)
+}
