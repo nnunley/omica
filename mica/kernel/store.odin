@@ -7,15 +7,75 @@
 package kernel
 
 import "core:mem"
+import "core:mem/virtual"
 import "core:slice"
 import "core:sort"
+import "core:sync"
 import v "../var"
 
 // A relation's materialized tuple state.
+//
+// A block is immutable once built and reference-counted. Blocks built by the
+// commit path own their storage: the tuple graph and index arrays live in a
+// pooled arena that is returned when the last snapshot referencing the block
+// releases it. Caller-built blocks (tests, benchmarks) leave `arena` nil and
+// are freed by the caller's allocator.
 Relation_Block :: struct {
 	metadata: Relation_Metadata,
 	tuples:   []v.Tuple,
 	indexes:  []Secondary_Index,
+	refs:     i32,
+	arena:    ^virtual.Arena,
+	pool:     ^Arena_Pool,
+	storage:  mem.Allocator,
+}
+
+// Increments a block's reference count. Thread-safe.
+relation_block_retain :: proc(block: ^Relation_Block) {
+	if block == nil {
+		return
+	}
+	sync.atomic_add_explicit(&block.refs, 1, .Relaxed)
+}
+
+// Decrements a block's reference count, returning its arena to the pool or
+// freeing a caller-owned block when the last reference is released.
+relation_block_release :: proc(block: ^Relation_Block) {
+	if block == nil {
+		return
+	}
+	if sync.atomic_sub_explicit(&block.refs, 1, .Acq_Rel) != 1 {
+		return
+	}
+
+	if block.arena != nil && block.pool != nil {
+		// The block struct itself lives in the arena, so nothing may touch it
+		// after the pooled arena is reset.
+		arena_pool_return(block.pool, block.arena)
+		return
+	}
+	free(block, block.storage)
+}
+
+// Builds a block that owns deep copies of `tuples` in an arena from the
+// kernel's pool. The commit path uses this so old blocks can be reclaimed.
+relation_block_owned :: proc(
+	kernel: ^Kernel,
+	metadata: Relation_Metadata,
+	tuples: []v.Tuple,
+) -> ^Relation_Block {
+	arena := arena_pool_take(kernel.arena_pool)
+	alloc := virtual.arena_allocator(arena)
+
+	owned := make([]v.Tuple, len(tuples), alloc)
+	for tuple, index in tuples {
+		owned[index] = v.tuple_deep_copy(alloc, tuple)
+	}
+
+	block := relation_block_build(alloc, metadata, owned)
+	block.arena = arena
+	block.pool = kernel.arena_pool
+	return block
 }
 
 // A sorted row-index array over selected argument positions.
@@ -28,6 +88,8 @@ Secondary_Index :: struct {
 relation_block_empty :: proc(alloc: mem.Allocator, metadata: Relation_Metadata) -> ^Relation_Block {
 	block := new(Relation_Block, alloc)
 	block.metadata = metadata
+	block.storage = alloc
+	block.refs = 1
 	block.tuples = make([]v.Tuple, 0, alloc)
 
 	index_count := 0

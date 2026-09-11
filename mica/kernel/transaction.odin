@@ -493,12 +493,15 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		}
 	}
 
-	fork := snapshot_create(current.version + 1, current, kernel.world_allocator)
+	fork := snapshot_create(kernel, current.version + 1, current)
 
 	fork.catalog = make([]Relation_Metadata, len(current.catalog), fork.allocator)
 	copy(fork.catalog, current.catalog)
 	fork.blocks = make([]^Relation_Block, len(current.blocks), fork.allocator)
-	copy(fork.blocks, current.blocks)
+	for block, index in current.blocks {
+		relation_block_retain(block)
+		fork.blocks[index] = block
+	}
 	fork.rules = make([]Rule_Definition, len(current.rules), fork.allocator)
 	copy(fork.rules, current.rules)
 
@@ -523,9 +526,10 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		for entry in writes.entries {
 			switch entry.kind {
 			case .Assert:
-				// Staged tuples live in the transaction staging arena, which is
-				// recycled after commit, so copy them into the committed store.
-				append(&rows, v.tuple_deep_copy(kernel.world_allocator, entry.tuple))
+				// The owned block deep-copies its input rows, so the staged
+				// tuple can be referenced here even though the staging arena is
+				// recycled after commit.
+				append(&rows, entry.tuple)
 			case .Retract:
 				if has_base && relation_block_contains(base_block, entry.tuple) {
 					remove_tuple(&rows, entry.tuple)
@@ -533,7 +537,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 			}
 		}
 
-		block := relation_block_build(kernel.world_allocator, metadata, rows[:])
+		block := relation_block_owned(kernel, metadata, rows[:])
 		snapshot_set_block(fork, block)
 	}
 

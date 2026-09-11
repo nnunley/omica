@@ -725,7 +725,7 @@ bench_snapshot_fork :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Txn_State)(user)
 	for _ in 0 ..< chunk {
 		current := k.kernel_snapshot(&state.kernel)
-		fork := k.snapshot_fork(current, k.kernel_world_allocator(&state.kernel))
+		fork := k.snapshot_fork(&state.kernel, current)
 		k.snapshot_release(current)
 		k.snapshot_release(fork)
 	}

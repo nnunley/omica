@@ -22,16 +22,66 @@ import v "../var"
 Kernel :: struct {
 	current:     ^Snapshot,
 	commit_lock: sync.Mutex,
+	// Guards the `current` pointer swap and snapshot load-and-retain. Held
+	// only for those operations, never for a whole commit, so readers never
+	// wait on commit work. This closes the load-then-retain race that letting
+	// publishers free unreferenced snapshots would otherwise open.
+	snapshot_lock: sync.Mutex,
 
-	// Committed data lives here for the life of the kernel. All snapshots
-	// allocate from `world_allocator`.
+	// Relation metadata and rule definitions live here for the life of the
+	// kernel; blocks and snapshots reference their slices.
 	world:           ^virtual.Arena,
 	world_allocator: mem.Allocator,
 
-	// Staging arenas are pooled and reset between transactions, so a hot
-	// commit path performs no arena creation at all.
-	pool_lock:  sync.Mutex,
-	arena_pool: [dynamic]^virtual.Arena,
+	// Arenas for transaction staging, snapshot arrays, derived rows, and
+	// block payloads. Arenas are reset on release and reused, so the hot path
+	// performs no arena creation at all.
+	arena_pool: ^Arena_Pool,
+}
+
+// A pool of reset-able virtual arenas shared by transactions, snapshots, and
+// relation blocks. Thread-safe.
+Arena_Pool :: struct {
+	lock:   sync.Mutex,
+	arenas: [dynamic]^virtual.Arena,
+}
+
+arena_pool_init :: proc(pool: ^Arena_Pool) {
+	pool.arenas = make([dynamic]^virtual.Arena)
+}
+
+arena_pool_take :: proc(pool: ^Arena_Pool) -> ^virtual.Arena {
+	sync.mutex_lock(&pool.lock)
+	if len(pool.arenas) > 0 {
+		arena := pop(&pool.arenas)
+		sync.mutex_unlock(&pool.lock)
+		return arena
+	}
+	sync.mutex_unlock(&pool.lock)
+
+	arena := new(virtual.Arena, runtime.default_allocator())
+	if err := virtual.arena_init_growing(arena); err != nil {
+		panic("failed to initialize a pooled arena")
+	}
+	return arena
+}
+
+arena_pool_return :: proc(pool: ^Arena_Pool, arena: ^virtual.Arena) {
+	if arena == nil {
+		return
+	}
+	virtual.arena_free_all(arena)
+	sync.mutex_lock(&pool.lock)
+	append(&pool.arenas, arena)
+	sync.mutex_unlock(&pool.lock)
+}
+
+arena_pool_destroy :: proc(pool: ^Arena_Pool) {
+	for arena in pool.arenas {
+		virtual.arena_destroy(arena)
+		free(arena, runtime.default_allocator())
+	}
+	delete(pool.arenas)
 }
 
 // Creates a kernel with an empty snapshot and an empty committed store.
@@ -41,22 +91,25 @@ kernel_init :: proc(kernel: ^Kernel) {
 		panic("failed to initialize the committed store arena")
 	}
 	kernel.world_allocator = virtual.arena_allocator(kernel.world)
-	kernel.arena_pool = make([dynamic]^virtual.Arena)
-	kernel.current = snapshot_create(0, nil, kernel.world_allocator)
+	kernel.arena_pool = new(Arena_Pool, runtime.default_allocator())
+	arena_pool_init(kernel.arena_pool)
+	kernel.current = snapshot_create(kernel, 0, nil)
 }
 
 // Releases the published snapshot, the committed store, and the staging pool.
 // The caller must guarantee no other thread uses the kernel.
 kernel_destroy :: proc(kernel: ^Kernel) {
+	sync.mutex_lock(&kernel.snapshot_lock)
 	current := sync.atomic_load(&kernel.current)
 	sync.atomic_store(&kernel.current, nil)
+	sync.mutex_unlock(&kernel.snapshot_lock)
 	snapshot_release(current)
 
-	for arena in kernel.arena_pool {
-		virtual.arena_destroy(arena)
-		free(arena, runtime.default_allocator())
+	if kernel.arena_pool != nil {
+		arena_pool_destroy(kernel.arena_pool)
+		free(kernel.arena_pool, runtime.default_allocator())
+		kernel.arena_pool = nil
 	}
-	delete(kernel.arena_pool)
 
 	if kernel.world != nil {
 		virtual.arena_destroy(kernel.world)
@@ -67,43 +120,21 @@ kernel_destroy :: proc(kernel: ^Kernel) {
 
 // Returns a reset staging arena, creating one on demand.
 kernel_take_arena :: proc(kernel: ^Kernel) -> ^virtual.Arena {
-	sync.mutex_lock(&kernel.pool_lock)
-	if len(kernel.arena_pool) > 0 {
-		arena := pop(&kernel.arena_pool)
-		sync.mutex_unlock(&kernel.pool_lock)
-		return arena
-	}
-	sync.mutex_unlock(&kernel.pool_lock)
-
-	arena := new(virtual.Arena, runtime.default_allocator())
-	if err := virtual.arena_init_growing(arena); err != nil {
-		panic("failed to initialize a transaction arena")
-	}
-	return arena
+	return arena_pool_take(kernel.arena_pool)
 }
 
 // Resets `arena` and returns it to the pool for reuse.
 kernel_return_arena :: proc(kernel: ^Kernel, arena: ^virtual.Arena) {
-	if arena == nil {
-		return
-	}
-	virtual.arena_free_all(arena)
-	sync.mutex_lock(&kernel.pool_lock)
-	append(&kernel.arena_pool, arena)
-	sync.mutex_unlock(&kernel.pool_lock)
-}
-
-// Returns the committed store allocator. Callers that fork snapshots use it
-// directly.
-kernel_world_allocator :: proc(kernel: ^Kernel) -> mem.Allocator {
-	return kernel.world_allocator
+	arena_pool_return(kernel.arena_pool, arena)
 }
 
 // Returns a retained reference to the current snapshot. The caller must
 // release it.
 kernel_snapshot :: proc(kernel: ^Kernel) -> ^Snapshot {
+	sync.mutex_lock(&kernel.snapshot_lock)
 	current := sync.atomic_load(&kernel.current)
 	snapshot_retain(current)
+	sync.mutex_unlock(&kernel.snapshot_lock)
 	return current
 }
 
@@ -130,8 +161,14 @@ kernel_next_relation_id :: proc(kernel: ^Kernel) -> Relation_ID {
 @(private)
 kernel_publish_locked :: proc(kernel: ^Kernel, next: ^Snapshot) {
 	snapshot_retain(next)
+
+	// Swap under the snapshot lock so a concurrent load-and-retain either sees
+	// `next` or holds a reference to `previous` before it is released below.
+	sync.mutex_lock(&kernel.snapshot_lock)
 	previous := sync.atomic_load(&kernel.current)
 	sync.atomic_store(&kernel.current, next)
+	sync.mutex_unlock(&kernel.snapshot_lock)
+
 	snapshot_release(previous)
 }
 
@@ -158,8 +195,8 @@ kernel_create_relation :: proc(
 		return nil, err
 	}
 
-	next := snapshot_fork(current, kernel.world_allocator)
-	snapshot_add_relation(next, metadata_clone(next.allocator, metadata))
+	next := snapshot_fork(kernel, current)
+	snapshot_add_relation(next, metadata_clone(kernel.world_allocator, metadata))
 	snapshot_compute_derived(next)
 	kernel_publish_locked(kernel, next)
 	return next, .None
@@ -198,8 +235,11 @@ kernel_install_rule :: proc(
 		return nil, err
 	}
 
-	next := snapshot_fork(current, kernel.world_allocator)
-	snapshot_add_rule(next, rule_definition_clone(next.allocator, rule_definition(id, rule, source)))
+	next := snapshot_fork(kernel, current)
+	snapshot_add_rule(
+		next,
+		rule_definition_clone(kernel.world_allocator, rule_definition(id, rule, source)),
+	)
 
 	active := snapshot_active_rules(next, scratch_alloc)
 	if _, ok := rules_stratify(active, scratch_alloc); !ok {
@@ -236,7 +276,7 @@ kernel_disable_rule :: proc(
 		return nil, .No_Such_Rule
 	}
 
-	next := snapshot_fork(current, kernel.world_allocator)
+	next := snapshot_fork(kernel, current)
 	for &definition in next.rules {
 		if definition.id == rule_id {
 			definition.active = false

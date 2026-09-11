@@ -22,10 +22,17 @@ Derived_Relation :: struct {
 }
 
 // Immutable world state at a version.
+//
+// A snapshot owns an arena for its catalog/blocks/rules arrays and derived
+// rows, plus one reference to every block in `blocks`. It does not own its
+// parent: `parent` is a borrowed link for version ancestry only, because block
+// reference counts keep shared data alive independently of the version chain.
 Snapshot :: struct {
 	version:   u64,
 	parent:    ^Snapshot,
 	refs:      i32,
+	arena:     ^virtual.Arena,
+	pool:      ^Arena_Pool,
 	allocator: mem.Allocator,
 	catalog:   []Relation_Metadata,
 	blocks:    []^Relation_Block,
@@ -33,27 +40,21 @@ Snapshot :: struct {
 	derived:   []Derived_Relation,
 }
 
-// Creates an empty snapshot at `version` with an optional retained parent. The
-// snapshot allocates from `allocator`, which must be the kernel's committed
-// store and must outlive the snapshot.
-snapshot_create :: proc(
-	version: u64,
-	parent: ^Snapshot,
-	allocator: mem.Allocator,
-) -> ^Snapshot {
+// Creates an empty snapshot with arrays allocated from a pooled arena owned by
+// the snapshot. `parent` is borrowed, not retained.
+snapshot_create :: proc(kernel: ^Kernel, version: u64, parent: ^Snapshot) -> ^Snapshot {
+	arena := arena_pool_take(kernel.arena_pool)
 	snapshot := new(Snapshot, runtime.default_allocator())
 	snapshot.version = version
 	snapshot.refs = 1
-	snapshot.allocator = allocator
+	snapshot.parent = parent
+	snapshot.arena = arena
+	snapshot.pool = kernel.arena_pool
+	snapshot.allocator = virtual.arena_allocator(arena)
 	snapshot.catalog = make([]Relation_Metadata, 0, snapshot.allocator)
 	snapshot.blocks = make([]^Relation_Block, 0, snapshot.allocator)
 	snapshot.rules = make([]Rule_Definition, 0, snapshot.allocator)
 	snapshot.derived = make([]Derived_Relation, 0, snapshot.allocator)
-
-	if parent != nil {
-		snapshot_retain(parent)
-		snapshot.parent = parent
-	}
 	return snapshot
 }
 
@@ -74,30 +75,37 @@ snapshot_release :: proc(snapshot: ^Snapshot) {
 	if snapshot == nil {
 		return
 	}
-	// Only the releaser that observed the last reference may free. The other
-	// releasers must not touch the snapshot after their decrement.
-	if sync.atomic_sub_explicit(&snapshot.refs, 1, .Release) != 1 {
+	// Only the releaser that observed the last reference may free. Acq_Rel
+	// pairs with earlier decrements so the freeing thread sees every write
+	// made while other holders still had references; the other releasers must
+	// not touch the snapshot after their decrement.
+	if sync.atomic_sub_explicit(&snapshot.refs, 1, .Acq_Rel) != 1 {
 		return
 	}
-	// Acquire pairs with the release decrements so the freeing thread sees all
-	// writes made while other holders still had references.
-	sync.atomic_thread_fence(.Acquire)
 
-	parent := snapshot.parent
-	snapshot.parent = nil
+	for block in snapshot.blocks {
+		relation_block_release(block)
+	}
+	snapshot.blocks = nil
+	if snapshot.arena != nil {
+		arena_pool_return(snapshot.pool, snapshot.arena)
+		snapshot.arena = nil
+	}
 	free(snapshot, runtime.default_allocator())
-	snapshot_release(parent)
 }
 
 // Creates a child snapshot that inherits the parent catalog, blocks, and
-// rules.
-snapshot_fork :: proc(parent: ^Snapshot, allocator: mem.Allocator) -> ^Snapshot {
-	snapshot := snapshot_create(parent.version + 1, parent, allocator)
+// rules. The child takes its own reference to every inherited block.
+snapshot_fork :: proc(kernel: ^Kernel, parent: ^Snapshot) -> ^Snapshot {
+	snapshot := snapshot_create(kernel, parent.version + 1, parent)
 
 	snapshot.catalog = make([]Relation_Metadata, len(parent.catalog), snapshot.allocator)
 	copy(snapshot.catalog, parent.catalog)
 	snapshot.blocks = make([]^Relation_Block, len(parent.blocks), snapshot.allocator)
-	copy(snapshot.blocks, parent.blocks)
+	for block, index in parent.blocks {
+		relation_block_retain(block)
+		snapshot.blocks[index] = block
+	}
 	snapshot.rules = make([]Rule_Definition, len(parent.rules), snapshot.allocator)
 	copy(snapshot.rules, parent.rules)
 
@@ -240,6 +248,7 @@ snapshot_set_block :: proc(snapshot: ^Snapshot, block: ^Relation_Block) {
 	for existing, i in snapshot.blocks {
 		if existing.metadata.id == block.metadata.id {
 			snapshot.blocks[i] = block
+			relation_block_release(existing)
 			replaced = true
 			break
 		}
@@ -347,7 +356,7 @@ derived_relations_from :: proc(alloc: mem.Allocator, derived: ^Rule_Derived) -> 
 	for relation, i in derived.relations {
 		rows := make([]v.Tuple, len(derived.rows[i]), alloc)
 		for row, j in derived.rows[i] {
-			rows[j] = v.tuple_new(alloc, v.tuple_values(row))
+			rows[j] = v.tuple_deep_copy(alloc, row)
 		}
 		relations[i] = Derived_Relation {
 			relation = relation,
