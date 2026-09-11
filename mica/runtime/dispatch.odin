@@ -41,6 +41,16 @@ install_dispatch_relations :: proc(env: ^Builtin_Env) -> Run_Result {
 	env.ctx.dispatch_param_relation = u32(k.DISPATCH_PARAM_ID)
 	env.ctx.dispatch_delegates_relation = u32(k.DISPATCH_DELEGATES_ID)
 	env.ctx.dispatch_method_program_relation = u32(k.DISPATCH_METHOD_PROGRAM_ID)
+
+	all: [dynamic]k.Relation_Metadata
+	defer delete(all)
+	for metadata in groups {
+		append(&all, ..metadata)
+	}
+	fact_result := assert_relation_facts(env, all[:])
+	if !fact_result.ok {
+		return fact_result
+	}
 	return Run_Result{ok = true, message = "loaded"}
 }
 

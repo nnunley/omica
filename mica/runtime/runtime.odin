@@ -327,6 +327,125 @@ Declarations :: struct {
 	next_rule:     u64,
 }
 
+// Assert the catalog facts that describe relations: Relation, RelationName, and
+// Arity. The system relations are installed empty, so the runtime records the
+// facts as the world loads.
+@(private)
+assert_relation_facts :: proc(
+	env: ^Builtin_Env,
+	relations: []k.Relation_Metadata,
+) -> Run_Result {
+	if len(relations) == 0 {
+		return Run_Result{ok = true, message = "loaded"}
+	}
+	tx := k.kernel_begin(env.kernel)
+	defer k.transaction_destroy(&tx)
+	for metadata in relations {
+		identity, identity_ok := v.value_identity_raw(u64(metadata.id))
+		if !identity_ok {
+			return Run_Result{ok = false, message = "relation identity is out of range"}
+		}
+		arity_value, arity_ok := v.value_int(i64(metadata.arity))
+		if !arity_ok {
+			return Run_Result{ok = false, message = "relation arity is out of range"}
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_RELATION_ID,
+			v.tuple_new(env.allocator, []v.Value{identity}),
+		); err != k.Kernel_Error.None {
+			return catalog_error(env, "Relation", err)
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_RELATION_NAME_ID,
+			v.tuple_new(env.allocator, []v.Value{identity, v.value_symbol(metadata.name)}),
+		); err != k.Kernel_Error.None {
+			return catalog_error(env, "RelationName", err)
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_ARITY_ID,
+			v.tuple_new(env.allocator, []v.Value{identity, arity_value}),
+		); err != k.Kernel_Error.None {
+			return catalog_error(env, "Arity", err)
+		}
+	}
+	committed, commit_err := k.transaction_commit(&tx)
+	if commit_err != k.Kernel_Error.None {
+		return catalog_error(env, "Relation", commit_err)
+	}
+	k.snapshot_release(committed)
+	return Run_Result{ok = true, message = "loaded"}
+}
+
+@(private)
+Rule_Fact :: struct {
+	id:     v.Identity,
+	head:   k.Relation_ID,
+	source: string,
+}
+
+// Assert the catalog facts that describe rules: Rule, RuleHead, and RuleSource.
+@(private)
+assert_rule_facts :: proc(env: ^Builtin_Env, rules: []Rule_Fact) -> Run_Result {
+	if len(rules) == 0 {
+		return Run_Result{ok = true, message = "loaded"}
+	}
+	tx := k.kernel_begin(env.kernel)
+	defer k.transaction_destroy(&tx)
+	for rule_fact in rules {
+		identity, identity_ok := v.value_identity_raw(u64(rule_fact.id))
+		if !identity_ok {
+			return Run_Result{ok = false, message = "rule identity is out of range"}
+		}
+		head, head_ok := v.value_identity_raw(u64(rule_fact.head))
+		if !head_ok {
+			return Run_Result{ok = false, message = "rule head identity is out of range"}
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_RULE_ID,
+			v.tuple_new(env.allocator, []v.Value{identity}),
+		); err != k.Kernel_Error.None {
+			return catalog_error(env, "Rule", err)
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_RULE_HEAD_ID,
+			v.tuple_new(env.allocator, []v.Value{identity, head}),
+		); err != k.Kernel_Error.None {
+			return catalog_error(env, "RuleHead", err)
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_RULE_SOURCE_ID,
+			v.tuple_new(env.allocator, []v.Value {
+				identity,
+				v.value_string(env.allocator, rule_fact.source),
+			}),
+		); err != k.Kernel_Error.None {
+			return catalog_error(env, "RuleSource", err)
+		}
+	}
+	committed, commit_err := k.transaction_commit(&tx)
+	if commit_err != k.Kernel_Error.None {
+		return catalog_error(env, "Rule", commit_err)
+	}
+	k.snapshot_release(committed)
+	return Run_Result{ok = true, message = "loaded"}
+}
+
+@(private)
+catalog_error :: proc(env: ^Builtin_Env, name: string, err: k.Kernel_Error) -> Run_Result {
+	return Run_Result{ok = false, message = fmt.aprintf(
+		"cannot record catalog facts for %s: %v",
+		name,
+		err,
+		allocator = env.allocator,
+	)}
+}
+
 // Pre-scans one file's top-level declarations into the shared compile context.
 @(private)
 prescan_file :: proc(
@@ -335,6 +454,8 @@ prescan_file :: proc(
 	declarations: ^Declarations,
 ) -> Run_Result {
 	ctx := env.ctx
+	created_metadata: [dynamic]k.Relation_Metadata
+	defer delete(created_metadata)
 	for item in ast.items {
 		expression: ^c.Expr
 		#partial switch matched in item {
@@ -418,6 +539,7 @@ prescan_file :: proc(
 			}
 			k.snapshot_release(created)
 			ctx.relations[relation_name] = declarations.next_relation
+			append(&created_metadata, metadata)
 
 			if metadata.conflict.kind == .Functional {
 				key_positions := make([]u16, len(metadata.conflict.key_positions), env.allocator)
@@ -431,6 +553,10 @@ prescan_file :: proc(
 			declarations.next_relation += 1
 		}
 	}
+	fact_result := assert_relation_facts(env, created_metadata[:])
+	if !fact_result.ok {
+		return fact_result
+	}
 	return Run_Result{ok = true, message = "loaded"}
 }
 
@@ -443,6 +569,8 @@ install_rules :: proc(
 	declarations: ^Declarations,
 	path: string,
 ) -> Run_Result {
+	facts: [dynamic]Rule_Fact
+	defer delete(facts)
 	for item in ast.items {
 		rule_item, is_rule := item.(c.Rule_Item)
 		if !is_rule {
@@ -471,7 +599,16 @@ install_rules :: proc(
 			)}
 		}
 		k.snapshot_release(installed)
+		append(&facts, Rule_Fact {
+			id     = v.Identity(declarations.next_rule),
+			head   = rule.head_relation,
+			source = path,
+		})
 		declarations.next_rule += 1
+	}
+	fact_result := assert_rule_facts(env, facts[:])
+	if !fact_result.ok {
+		return fact_result
 	}
 	return Run_Result{ok = true, message = "loaded"}
 }
