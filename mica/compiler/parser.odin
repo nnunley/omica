@@ -753,6 +753,10 @@ parse_raise :: proc(parser: ^Parser) -> ^Expr {
 @(private)
 parse_fn :: proc(parser: ^Parser) -> ^Expr {
 	advance(parser)
+	name := ""
+	if at(parser, .Ident) && peek_at(parser, 1).kind == .LParen {
+		name = advance(parser).text
+	}
 	expect(parser, .LParen, "expected '(' after 'fn'")
 	params := parse_params(parser)
 	expect(parser, .RParen, "expected ')' after parameters")
@@ -761,12 +765,20 @@ parse_fn :: proc(parser: ^Parser) -> ^Expr {
 		advance(parser)
 		result.expression_body = parse_expression(parser)
 		result.has_expression_body = true
+	} else {
+		skip_separators(parser)
+		result.body = parse_block_until(parser, []Token_Kind{.End})
+		expect(parser, .End, "expected 'end' to close fn")
+	}
+	if name == "" {
 		return expr_node(parser, result)
 	}
-	skip_separators(parser)
-	result.body = parse_block_until(parser, []Token_Kind{.End})
-	expect(parser, .End, "expected 'end' to close fn")
-	return expr_node(parser, result)
+	// A named fn is a self-recursive binding.
+	return expr_node(parser, Binding {
+		pattern    = pattern_node(parser, Binding_Pattern{name = name}),
+		value      = expr_node(parser, result),
+		has_value  = true,
+	})
 }
 
 // --- Expressions -----------------------------------------------------------

@@ -540,6 +540,30 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			state.status = .Boundary
 			return .Boundary
 
+		case .Make_Self_Function:
+			capture_count := int(instr.flags)
+			if capture_count == 0 {
+				vm_fail(state, "E_VM_FAULT", "self function needs a capture slot")
+				break
+			}
+			captures := make([]v.Value, capture_count, state.allocator)
+			for index in 0 ..< capture_count {
+				captures[index] = state.registers[base + int(instr.c) + index]
+			}
+			captures[capture_count - 1] = v.Value(0)
+			callable_id := i32(len(state.callables))
+			append(&state.callables, Callable_Info {
+				function = instr.b,
+				captures = captures,
+			})
+			value, value_ok := v.value_function_raw(u64(callable_id))
+			if !value_ok {
+				vm_fail(state, "E_TYPE", "callable index is out of range")
+				break
+			}
+			state.callables[int(callable_id)].captures[capture_count - 1] = value
+			state.registers[base + int(instr.a)] = value
+
 		case .Make_Function:
 			if instr.b < 0 || int(instr.b) >= len(program.functions) {
 				vm_fail(state, "E_TYPE", "function index is out of range")

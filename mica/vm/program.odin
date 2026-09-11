@@ -115,6 +115,9 @@ Op :: enum u8 {
 	// Make_Function: a = dst, b = function index. Wraps a program function as
 	// a first-class function value.
 	Make_Function,
+	// Make_Self_Function: like Make_Function, but the last capture slot is
+	// overwritten with the new function value so it can call itself.
+	Make_Self_Function,
 	// Call_Value: a = dst, b = function value register, c = first argument
 	// register. flags holds the argument count.
 	Call_Value,
@@ -709,6 +712,21 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 						return .Bad_Register
 					}
 				}
+			case .Make_Self_Function:
+				if instr.flags == 0 {
+					return .Bad_Register
+				}
+				if !valid_register(instr.a, register_count) {
+					return .Bad_Register
+				}
+				if instr.b < 0 || int(instr.b) >= len(program.functions) {
+					return .Bad_Function
+				}
+				for offset in 0 ..< int(instr.flags) {
+					if !valid_register(instr.c + i32(offset), register_count) {
+						return .Bad_Register
+					}
+				}
 			case .Call_Value:
 				if !valid_register(instr.a, register_count) ||
 				   !valid_register(instr.b, register_count) {
@@ -871,6 +889,8 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, "")
 			case .Make_Function:
 				fmt.sbprintf(&builder, " r%d fn%d", instr.a, instr.b)
+			case .Make_Self_Function:
+				fmt.sbprintf(&builder, " r%d fn%d captures@r%d", instr.a, instr.b, instr.c)
 			case .Call_Value:
 				fmt.sbprintf(&builder, " r%d r%d args@r%d", instr.a, instr.b, instr.c)
 			case .Call_Splice:
@@ -967,6 +987,8 @@ op_name :: proc(op: Op) -> string {
 		return "resume_return"
 	case .Make_Function:
 		return "make_function"
+	case .Make_Self_Function:
+		return "make_self_function"
 	case .Call_Value:
 		return "call_value"
 	case .Call_Splice:

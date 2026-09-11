@@ -585,6 +585,14 @@ emit_name :: proc(emitter: ^Emitter, name: Name) -> (int, bool) {
 
 @(private)
 emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
+	if pattern, is_binding := binding.pattern^.(Binding_Pattern); is_binding {
+		if binding.has_value {
+			if fn, is_fn := binding.value^.(Fn); is_fn {
+				return emit_self_binding(emitter, pattern.name, fn, binding.is_const)
+			}
+		}
+	}
+
 	value_register := -1
 	has_value := false
 	if binding.has_value {
@@ -1605,6 +1613,59 @@ emit_bytes_literal :: proc(emitter: ^Emitter, bytes: Bytes_Literal) -> (int, boo
 		return -1, false
 	}
 	return emit_constant(emitter, v.value_bytes(emitter.allocator, decoded)), true
+}
+
+// Binds a self-recursive fn literal: the last capture slot holds the function
+// itself, so the body can call its own name.
+@(private)
+emit_self_binding :: proc(
+	emitter: ^Emitter,
+	name: string,
+	fn: Fn,
+	is_const: bool,
+) -> (int, bool) {
+	builder := emitter.builder
+	saved_function := builder.open_function
+	saved_offset := builder.open_offset
+	index := vm.builder_begin_function(
+		builder,
+		v.symbol_intern("fn"),
+		len(fn.params),
+		0,
+		false,
+	)
+	vm.builder_end_function(builder)
+	builder.open_function = saved_function
+	builder.open_offset = saved_offset
+
+	captures := make([]Local, len(emitter.locals) + 1, emitter.allocator)
+	copy(captures, emitter.locals[:])
+	scratch := alloc_register(emitter)
+	captures[len(emitter.locals)] = Local{name = name, register = scratch}
+
+	capture_registers := make([]int, len(captures), emitter.allocator)
+	defer delete(capture_registers, emitter.allocator)
+	for capture, capture_index in captures {
+		capture_registers[capture_index] = capture.register
+	}
+	first_capture := marshal_arguments(emitter, capture_registers)
+	append(&emitter.pending_functions, Pending_Function {
+		index    = index,
+		fn       = fn,
+		captures = captures,
+	})
+
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		builder,
+		.Make_Self_Function,
+		u8(len(captures)),
+		i32(destination),
+		i32(index),
+		i32(first_capture),
+	)
+	declare_local(emitter, name, destination, is_const)
+	return destination, true
 }
 
 // Reserves a function slot for a fn literal and emits a Make_Function. The

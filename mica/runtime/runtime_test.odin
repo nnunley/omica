@@ -1177,3 +1177,48 @@ assert Cleanup(1)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Cleanup", 1)
 }
+
+@(test)
+test_run_recursion :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Out, 1)
+let fact = fn(n)
+  if n <= 1
+    return 1
+  end
+  return n * fact(n - 1)
+end
+fn fib(n)
+  if n < 2
+    return n
+  end
+  return fib(n - 1) + fib(n - 2)
+end
+fn tripled(x) => x * 3
+require(fact(5) == 120)
+require(fib(10) == 55)
+require(tripled(7) == 21)
+let other = fn(n)
+  if n <= 0
+    return 0
+  end
+  return 1 + other(n - 1)
+end
+require(other(4) == 4)
+require(fact(4) == 24)
+assert Out(fact(5))
+`
+	path, path_ok := write_temp_source(t, "mica_recursion_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
