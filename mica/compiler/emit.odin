@@ -48,6 +48,15 @@ Scope :: struct {
 	local_mark:    int,
 }
 
+// A fn literal queued for body emission after the main and verb pass. The
+// function slot is reserved during expression emission so callers can refer to
+// its index.
+@(private)
+Pending_Function :: struct {
+	index: int,
+	fn:    Fn,
+}
+
 @(private)
 Emitter :: struct {
 	builder:       ^vm.Builder,
@@ -63,6 +72,7 @@ Emitter :: struct {
 	continue_targets: [dynamic]int,
 	loop_depth: int,
 	empty_constant: int,
+	pending_functions: [dynamic]Pending_Function,
 }
 
 // Compiles a parsed program into a VM program. `main` is the entry function;
@@ -92,6 +102,7 @@ compile_program :: proc(
 		functions = make(map[string]int),
 		break_patches = make([dynamic]int),
 		continue_targets = make([dynamic]int),
+		pending_functions = make([dynamic]Pending_Function),
 	}
 	defer {
 		delete(emitter.scopes)
@@ -99,22 +110,37 @@ compile_program :: proc(
 		delete(emitter.functions)
 		delete(emitter.break_patches)
 		delete(emitter.continue_targets)
+		delete(emitter.pending_functions)
 	}
 
-	// Assign verb function indices before emitting so calls can resolve.
-	function_index := 1
+	// Reserve the entry and verb function slots before emitting bodies. fn
+	// literals append their slots during emission, so reserving verbs first
+	// keeps their indices stable.
+	main_index := vm.builder_begin_function(&builder, v.symbol_intern("main"), 0, 0, true)
+	vm.builder_end_function(&builder)
+	verb_slots: [dynamic]int
+	defer delete(verb_slots)
 	for item in ast.items {
 		verb, is_verb := item.(Verb_Item)
-		if is_verb {
-			emitter.functions[verb.name] = function_index
-			function_index += 1
+		if !is_verb {
+			continue
 		}
+		index := vm.builder_begin_function(
+			&builder,
+			v.symbol_intern(verb.name),
+			len(verb.params),
+			0,
+			false,
+		)
+		vm.builder_end_function(&builder)
+		emitter.functions[verb.name] = index
+		append(&verb_slots, index)
 	}
 
 	emitter.empty_constant = vm.builder_add_constant(&builder, v.value_empty_relation())
 
 	// Entry function.
-	main_index := vm.builder_begin_function(&builder, v.symbol_intern("main"), 0, 0, true)
+	vm.builder_reopen_function(&builder, main_index)
 	last_register := -1
 	for item in ast.items {
 		expr_item, is_expr := item.(Expr_Item)
@@ -135,18 +161,15 @@ compile_program :: proc(
 	builder.functions[main_index].register_count = emitter.max_register
 
 	// Verb bodies.
+	verb_index := 0
 	for item in ast.items {
 		verb, is_verb := item.(Verb_Item)
 		if !is_verb {
 			continue
 		}
-		index := vm.builder_begin_function(
-			&builder,
-			v.symbol_intern(verb.name),
-			len(verb.params),
-			0,
-			false,
-		)
+		index := verb_slots[verb_index]
+		verb_index += 1
+		vm.builder_reopen_function(&builder, index)
 		emitter.next_register = len(verb.params)
 		emitter.max_register = emitter.next_register
 		scope_enter(&emitter)
@@ -164,6 +187,46 @@ compile_program :: proc(
 		vm.builder_emit(&builder, .Return, 0, i32(body_register), 0, 0)
 		vm.builder_end_function(&builder)
 		builder.functions[index].register_count = emitter.max_register
+	}
+
+	// Emit queued fn literal bodies now that all outer code is placed.
+	pending_index := 0
+	for pending_index < len(emitter.pending_functions) {
+		pending := emitter.pending_functions[pending_index]
+		pending_index += 1
+		vm.builder_reopen_function(&builder, pending.index)
+		saved_next := emitter.next_register
+		saved_max := emitter.max_register
+		saved_locals := len(emitter.locals)
+		resize(&emitter.locals, 0)
+		emitter.next_register = len(pending.fn.params)
+		emitter.max_register = emitter.next_register
+		scope_enter(&emitter)
+		for param, param_index in pending.fn.params {
+			declare_local(&emitter, param.name, param_index, false)
+		}
+		return_register := -1
+		if pending.fn.has_expression_body {
+			register, has_value := emit_expr(&emitter, pending.fn.expression_body)
+			if has_value {
+				return_register = register
+			}
+		} else {
+			register, has_value := emit_block(&emitter, pending.fn.body)
+			if has_value {
+				return_register = register
+			}
+		}
+		if return_register < 0 {
+			return_register = emit_constant(&emitter, v.value_empty_relation())
+		}
+		vm.builder_emit(&builder, .Return, 0, i32(return_register), 0, 0)
+		scope_leave(&emitter)
+		builder.functions[pending.index].register_count = emitter.max_register
+		vm.builder_end_function(&builder)
+		resize(&emitter.locals, saved_locals)
+		emitter.next_register = saved_next
+		emitter.max_register = saved_max
 	}
 
 	program := vm.builder_build(&builder, allocator)
@@ -436,8 +499,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return emit_dom_element(emitter, n)
 
 	case Fn:
-		push_error(emitter, "fn literals are not lowered yet")
-		return -1, false
+		return emit_fn_literal(emitter, n)
 
 	case Splice:
 		push_error(emitter, "splices are not lowered yet")
@@ -823,8 +885,31 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		if symbol, is_symbol := call.callee^.(Symbol_Literal); is_symbol {
 			return emit_role_dispatch(emitter, symbol, call)
 		}
-		push_error(emitter, "call target must be a name")
-		return -1, false
+		// A computed call target: call the function value it evaluates to.
+		target, target_ok := emit_expr(emitter, call.callee)
+		if !target_ok {
+			return -1, false
+		}
+		argument_registers := make([dynamic]int, 0, len(call.args), emitter.allocator)
+		defer delete(argument_registers)
+		for argument in call.args {
+			register, has_value := emit_expr(emitter, argument.expr)
+			if !has_value {
+				return -1, false
+			}
+			append(&argument_registers, register)
+		}
+		first_argument := marshal_arguments(emitter, argument_registers[:])
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Call_Value,
+			u8(len(call.args)),
+			i32(destination),
+			i32(target),
+			i32(first_argument),
+		)
+		return destination, true
 	}
 	text := join_name(callee, emitter.allocator)
 
@@ -1022,6 +1107,20 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 			u8(len(call.args)),
 			i32(destination),
 			builtin,
+			i32(first_argument),
+		)
+		return destination, true
+	}
+
+	// A local holding a function value: an indirect call.
+	if local_register, _, found := resolve_local(emitter, text); found {
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Call_Value,
+			u8(len(call.args)),
+			i32(destination),
+			i32(local_register),
 			i32(first_argument),
 		)
 		return destination, true
@@ -1225,6 +1324,39 @@ emit_role_dispatch :: proc(
 		0,
 		i32(destination),
 		spec,
+		0,
+	)
+	return destination, true
+}
+
+// Reserves a function slot for a fn literal and emits a Make_Function. The
+// body is emitted after the outer pass, which lets the literal recurse and be
+// stored before its body exists.
+@(private)
+emit_fn_literal :: proc(emitter: ^Emitter, fn: Fn) -> (int, bool) {
+	builder := emitter.builder
+	saved_function := builder.open_function
+	saved_offset := builder.open_offset
+	index := vm.builder_begin_function(
+		builder,
+		v.symbol_intern("fn"),
+		len(fn.params),
+		0,
+		false,
+	)
+	vm.builder_end_function(builder)
+	builder.open_function = saved_function
+	builder.open_offset = saved_offset
+
+	append(&emitter.pending_functions, Pending_Function{index = index, fn = fn})
+
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		builder,
+		.Make_Function,
+		0,
+		i32(destination),
+		i32(index),
 		0,
 	)
 	return destination, true

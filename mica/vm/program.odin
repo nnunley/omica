@@ -106,6 +106,12 @@ Op :: enum u8 {
 	Push_Handler,
 	// Pop_Handler: removes the innermost handler.
 	Pop_Handler,
+	// Make_Function: a = dst, b = function index. Wraps a program function as
+	// a first-class function value.
+	Make_Function,
+	// Call_Value: a = dst, b = function value register, c = first argument
+	// register. flags holds the argument count.
+	Call_Value,
 }
 
 // A cell in a relation scan pattern.
@@ -336,6 +342,13 @@ builder_begin_function :: proc(
 		builder.entry = index
 	}
 	return index
+}
+
+// Reopens an existing function slot so its body can be emitted later.
+builder_reopen_function :: proc(builder: ^Builder, index: int) {
+	builder.open_function = index
+	builder.open_offset = len(builder.code)
+	builder.functions[index].code_offset = builder.open_offset
 }
 
 builder_end_function :: proc(builder: ^Builder) {
@@ -666,6 +679,21 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 					return .Bad_Register
 				}
 			case .Pop_Handler:
+			case .Make_Function:
+				if !valid_register(instr.a, register_count) {
+					return .Bad_Register
+				}
+				if instr.b < 0 || int(instr.b) >= len(program.functions) {
+					return .Bad_Function
+				}
+			case .Call_Value:
+				if !valid_register(instr.a, register_count) ||
+				   !valid_register(instr.b, register_count) {
+					return .Bad_Register
+				}
+				if instr.flags > 0 && !valid_register(instr.c, register_count) {
+					return .Bad_Register
+				}
 			}
 		}
 	}
@@ -792,6 +820,10 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " ->%d r%d", instr.a, instr.b)
 			case .Pop_Handler:
 				fmt.sbprintf(&builder, "")
+			case .Make_Function:
+				fmt.sbprintf(&builder, " r%d fn%d", instr.a, instr.b)
+			case .Call_Value:
+				fmt.sbprintf(&builder, " r%d r%d args@r%d", instr.a, instr.b, instr.c)
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -874,6 +906,10 @@ op_name :: proc(op: Op) -> string {
 		return "push_handler"
 	case .Pop_Handler:
 		return "pop_handler"
+	case .Make_Function:
+		return "make_function"
+	case .Call_Value:
+		return "call_value"
 	}
 	return "?"
 }

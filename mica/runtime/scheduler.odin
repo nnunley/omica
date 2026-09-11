@@ -107,7 +107,7 @@ scheduler_destroy :: proc(scheduler: ^Scheduler) {
 			vm.program_destroy(entry.task.program, scheduler.allocator)
 		}
 		if entry.arguments != nil {
-			delete(entry.arguments)
+			delete(entry.arguments, scheduler.allocator)
 		}
 		free(entry.task, scheduler.allocator)
 		free(entry, scheduler.allocator)

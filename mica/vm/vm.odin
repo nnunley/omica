@@ -497,6 +497,41 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			state.status = .Boundary
 			return .Boundary
 
+		case .Make_Function:
+			function, function_ok := v.value_function_raw(u64(instr.b))
+			if !function_ok {
+				vm_fail(state, "E_TYPE", "function index is out of range")
+				break
+			}
+			state.registers[base + int(instr.a)] = function
+
+		case .Call_Value:
+			target := state.registers[base + int(instr.b)]
+			function_id, is_function := v.value_as_function(target)
+			if !is_function {
+				vm_fail(state, "E_TYPE", "call target is not a function")
+				break
+			}
+			function_index := int(v.function_id_raw(function_id))
+			if function_index < 0 || function_index >= len(program.functions) {
+				vm_fail(state, "E_DISPATCH", "function index is invalid")
+				break
+			}
+			callee := program.functions[function_index]
+			callee_base := len(state.registers)
+			resize(&state.registers, callee_base + callee.register_count)
+			for index in 0 ..< callee.param_count {
+				state.registers[callee_base + index] =
+					state.registers[base + int(instr.c) + index]
+			}
+			append(&state.frames, Frame {
+				function      = function_index,
+				ip            = callee.code_offset,
+				register_base = callee_base,
+				caller_base   = base,
+				caller_dst    = instr.a,
+			})
+
 		case .Is_Truthy:
 			truthy := vm_value_is_truthy(state.registers[base + int(instr.b)])
 			state.registers[base + int(instr.a)] = v.value_bool(truthy)

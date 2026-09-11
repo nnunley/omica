@@ -872,3 +872,36 @@ assert TimedOut(1)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "TimedOut", 1)
 }
+
+@(test)
+test_run_fn_literals :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Result, 2)
+verb apply(f, x)
+  return f(x)
+end
+let double = fn(x) => x * 2
+let inc = fn(x)
+  return x + 1
+end
+let choosers = [fn(x) => x + 1]
+assert Result(1, apply(double, 21))
+assert Result(2, inc(41))
+assert Result(3, choosers[0](41))
+let nested = fn(x) => (fn(y) => y * 3)(x)
+assert Result(4, nested(14))
+`
+	path, path_ok := write_temp_source(t, "mica_fn_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Result", 4)
+}

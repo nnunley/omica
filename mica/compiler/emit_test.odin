@@ -591,3 +591,33 @@ test_emit_raise :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, raises, 1)
 }
+
+@(test)
+test_emit_fn_literal :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	program := compile_test_program(
+		t,
+		"let f = fn(x) => x\nf(1)",
+		&ctx,
+		allocator,
+	)
+
+	makes := 0
+	calls := 0
+	for instruction in program.code {
+		if instruction.op == .Make_Function {
+			makes += 1
+		} else if instruction.op == .Call_Value {
+			calls += 1
+		}
+	}
+	testing.expect_value(t, makes, 1)
+	testing.expect_value(t, calls, 1)
+}
