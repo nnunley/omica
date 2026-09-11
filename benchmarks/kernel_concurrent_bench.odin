@@ -7,6 +7,7 @@
 package main
 
 import "base:runtime"
+import "core:fmt"
 import "core:sync"
 import "core:thread"
 
@@ -512,6 +513,26 @@ register_kernel_concurrent_benches :: proc(runner: ^mm.Runner) {
 	mm.bench_capped(begins, "parallel_8x256", nil, bench_parallel_begins, 1)
 	mm.bench_capped(begins, "serial_2048", nil, bench_serial_begins, 1)
 
+	relations_group := mm.group(
+		runner,
+		"kernel/concurrent/relations",
+		mm.throughput_per_op(RELATION_TOTAL, "commit"),
+	)
+	mm.bench_capped(
+		relations_group,
+		"parallel_8x64",
+		nil,
+		bench_parallel_relation_commits,
+		1,
+	)
+	mm.bench_capped(
+		relations_group,
+		"serial_512",
+		nil,
+		bench_serial_relation_commits,
+		1,
+	)
+
 	read_write := mm.group(
 		runner,
 		"kernel/concurrent/read-write",
@@ -524,4 +545,120 @@ register_kernel_concurrent_benches :: proc(runner: ^mm.Runner) {
 		bench_readers_during_writer,
 		1,
 	)
+}
+
+// --- Parallel commits across relations -------------------------------------
+
+@(private)
+Relation_Bench_Worker :: struct {
+	kernel:   ^k.Kernel,
+	relation: k.Relation_ID,
+	count:    int,
+	committed: int,
+	failed:   k.Kernel_Error,
+}
+
+@(private)
+relation_bench_worker :: proc(data: rawptr) {
+	context = runtime.default_context()
+	worker := (^Relation_Bench_Worker)(data)
+	for index in 0 ..< worker.count {
+		for {
+			tx := k.kernel_begin(worker.kernel)
+			tuple := concurrent_tuple1(u64(index) + 1)
+			if err := k.transaction_assert(&tx, worker.relation, tuple); err != .None {
+				worker.failed = err
+				k.transaction_destroy(&tx)
+				return
+			}
+			committed, err := k.transaction_commit(&tx)
+			if err == .None {
+				k.snapshot_release(committed)
+				k.transaction_destroy(&tx)
+				worker.committed += 1
+				break
+			}
+			k.transaction_destroy(&tx)
+			if err != .Conflict {
+				worker.failed = err
+				return
+			}
+		}
+	}
+}
+
+RELATION_THREADS :: 8
+RELATION_COMMITS_PER_THREAD :: 256
+RELATION_TOTAL :: RELATION_THREADS * RELATION_COMMITS_PER_THREAD
+
+@(private)
+bench_parallel_relation_commits :: proc(_: rawptr, _: int, _: int) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	relations: [RELATION_THREADS]k.Relation_ID
+	workers: [RELATION_THREADS]Relation_Bench_Worker
+	threads: [RELATION_THREADS]^thread.Thread
+	for index in 0 ..< RELATION_THREADS {
+		relations[index] = concurrent_relation(
+			&kernel,
+			u32(100 + index),
+			fmt.aprintf("BenchRelation%d", index, allocator = context.temp_allocator),
+			1,
+			k.conflict_set(),
+		)
+		workers[index] = Relation_Bench_Worker {
+			kernel   = &kernel,
+			relation = relations[index],
+			count    = RELATION_COMMITS_PER_THREAD,
+		}
+		threads[index] = thread.create_and_start_with_data(
+			&workers[index],
+			relation_bench_worker,
+		)
+	}
+	for index in 0 ..< RELATION_THREADS {
+		thread.join(threads[index])
+		thread.destroy(threads[index])
+	}
+	for worker in workers {
+		assert(worker.failed == .None)
+		assert(worker.committed == RELATION_COMMITS_PER_THREAD)
+	}
+}
+
+@(private)
+bench_serial_relation_commits :: proc(_: rawptr, _: int, _: int) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	relations: [RELATION_THREADS]k.Relation_ID
+	for index in 0 ..< RELATION_THREADS {
+		relations[index] = concurrent_relation(
+			&kernel,
+			u32(100 + index),
+			fmt.aprintf("BenchRelation%d", index, allocator = context.temp_allocator),
+			1,
+			k.conflict_set(),
+		)
+	}
+
+	for index in 0 ..< RELATION_TOTAL {
+		relation := relations[index % RELATION_THREADS]
+		for {
+			tx := k.kernel_begin(&kernel)
+			tuple := concurrent_tuple1(u64(index / RELATION_THREADS) + 1)
+			assert(k.transaction_assert(&tx, relation, tuple) == .None)
+			committed, err := k.transaction_commit(&tx)
+			if err == .None {
+				k.snapshot_release(committed)
+				k.transaction_destroy(&tx)
+				break
+			}
+			k.transaction_destroy(&tx)
+			assert(err == .Conflict)
+		}
+	}
 }

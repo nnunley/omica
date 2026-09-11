@@ -479,20 +479,88 @@ optional_tuple_eq :: proc(a: v.Tuple, a_ok: bool, b: v.Tuple, b_ok: bool) -> boo
 }
 
 // Commits the transaction, publishing a new snapshot. On success the returned
-// snapshot is caller-owned. The transaction must be destroyed by the caller;
-// its arena ownership transfers to the returned snapshot.
+// snapshot is caller-owned. The transaction must be destroyed by the caller.
+//
+// Commits to the same relation are serialised by striped relation locks so a
+// candidate is prepared against a stable relation block. Publications still
+// use a compare-exchange; when it loses a race to a commit on another relation,
+// the prepared blocks are re-slotted onto the winner instead of being rebuilt
+// (the moor commit pipeline's rebase). Only pointer and array work repeats.
 transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Error) {
 	kernel := transaction.kernel
-	sync.mutex_lock(&kernel.commit_lock)
-	defer sync.mutex_unlock(&kernel.commit_lock)
 
-	current := sync.atomic_load(&kernel.current)
+	stripes := transaction_write_stripes(transaction)
+	for stripe in stripes {
+		sync.mutex_lock(&kernel.relation_locks[stripe])
+	}
+	defer {
+		for stripe in stripes {
+			sync.mutex_unlock(&kernel.relation_locks[stripe])
+		}
+	}
+
+	current := kernel_snapshot(kernel)
 	if current.version != transaction.base.version {
 		if err := transaction_validate_conflicts(transaction, current); err != .None {
+			snapshot_release(current)
 			return nil, err
 		}
 	}
 
+	candidate := transaction_build_candidate(kernel, transaction, current)
+
+	// Hand the candidate to the group committer. One publication covers every
+	// candidate that arrives together, so the per-commit publish cost is
+	// amortised across concurrent commits.
+	entry := Commit_Entry {
+		transaction = transaction,
+		base        = current,
+		candidate   = candidate,
+	}
+	if kernel_commit_enqueue(kernel, &entry) {
+		kernel_committer_drain(kernel)
+	} else {
+		kernel_commit_wait(kernel, &entry)
+	}
+
+	snapshot_release(current)
+	if entry.published == nil {
+		return nil, .Conflict
+	}
+	return entry.published, .None
+}
+
+// Returns the sorted, de-duplicated lock stripes for the transaction's writes.
+@(private)
+transaction_write_stripes :: proc(transaction: ^Transaction) -> []int {
+	if len(transaction.writes) == 0 {
+		return nil
+	}
+	stripes := make([dynamic]int, 0, len(transaction.writes), context.temp_allocator)
+	for writes in transaction.writes {
+		append(&stripes, int(writes.relation) % RELATION_LOCK_STRIPES)
+	}
+	slice.sort(stripes[:])
+	write := 0
+	previous := -1
+	for stripe in stripes {
+		if stripe != previous {
+			stripes[write] = stripe
+			write += 1
+			previous = stripe
+		}
+	}
+	return stripes[:write]
+}
+
+// Builds an unpublished candidate snapshot from `current`. The caller owns the
+// returned reference.
+@(private)
+transaction_build_candidate :: proc(
+	kernel: ^Kernel,
+	transaction: ^Transaction,
+	current: ^Snapshot,
+) -> ^Snapshot {
 	fork := snapshot_create(kernel, current.version + 1, current)
 
 	fork.catalog = make([]Relation_Metadata, len(current.catalog), fork.allocator)
@@ -535,8 +603,57 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 	}
 
 	snapshot_compute_derived(fork)
-	kernel_publish_locked(kernel, fork)
-	return fork, .None
+	return fork
+}
+
+// Adopts the winner's state into an existing candidate in place: blocks the
+// winner replaced for relations this transaction did not write are swapped in,
+// catalog and rules are refreshed, and derived facts are recomputed. Returns
+// false when the candidate's shape no longer matches the winner (for example a
+// concurrent relation creation), in which case the caller rebuilds.
+@(private)
+transaction_rebase_in_place :: proc(
+	kernel: ^Kernel,
+	transaction: ^Transaction,
+	candidate: ^Snapshot,
+	winner: ^Snapshot,
+) -> bool {
+	if len(candidate.catalog) != len(winner.catalog) ||
+	   len(candidate.rules) != len(winner.rules) ||
+	   len(candidate.blocks) != len(winner.blocks) {
+		return false
+	}
+
+	for block, index in candidate.blocks {
+		winner_block := winner.blocks[index]
+		if winner_block == block {
+			continue
+		}
+		if transaction_writes_relation(transaction, block.metadata.id) {
+			// Relation stripes prevent this; fall back if it ever happens.
+			return false
+		}
+		relation_block_retain(winner_block)
+		candidate.blocks[index] = winner_block
+		relation_block_release(block)
+	}
+
+	copy(candidate.catalog, winner.catalog)
+	copy(candidate.rules, winner.rules)
+	candidate.version = winner.version + 1
+	candidate.parent = winner
+	snapshot_compute_derived(candidate)
+	return true
+}
+
+@(private)
+transaction_writes_relation :: proc(transaction: ^Transaction, relation: Relation_ID) -> bool {
+	for writes in transaction.writes {
+		if writes.relation == relation {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)

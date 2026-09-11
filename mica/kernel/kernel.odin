@@ -20,8 +20,26 @@ import v "../var"
 // matching Rust mica's commit mutex. Loads are lock-free, so a long commit
 // never blocks transaction begins or scans.
 Kernel :: struct {
-	current:     ^Snapshot,
-	commit_lock: sync.Mutex,
+	current:      ^Snapshot,
+	catalog_lock: sync.Mutex,
+
+	// One striped lock per relation id. Commits hold the stripes for the
+	// relations they write, so candidates for the same relation are prepared
+	// in order while writes to different relations proceed in parallel.
+	relation_locks: [RELATION_LOCK_STRIPES]sync.Mutex,
+
+	// Serialises the rebase-and-publish window. Candidates are prepared in
+	// parallel; only this short window (adopt the winner's unchanged state,
+	// swap the pointer, retire the old snapshot) is exclusive.
+	publish_lock: sync.Mutex,
+
+	// Group commit. Prepared candidates queue here; the first thread to
+	// enqueue drains the batch and publishes every candidate in one snapshot,
+	// amortising publication over concurrent commits.
+	commit_queue_lock: sync.Mutex,
+	commit_queue_cond: sync.Cond,
+	pending_commits:   [dynamic]^Commit_Entry,
+	committer_active:  bool,
 	// Reader-count reclamation (RCU-style). A reader increments `readers`
 	// around load-and-retain; a publisher swaps `current`, moves the previous
 	// snapshot to `retired`, and frees retired snapshots only while no reader
@@ -46,6 +64,9 @@ Kernel :: struct {
 // relation blocks. Sharded by thread so concurrent take/return paths do not
 // convoy on a single lock.
 ARENA_POOL_SHARDS :: 16
+
+// Number of relation commit stripes.
+RELATION_LOCK_STRIPES :: 64
 
 Arena_Pool_Shard :: struct {
 	lock:   sync.Mutex,
@@ -146,6 +167,7 @@ kernel_init :: proc(kernel: ^Kernel) {
 	kernel.arena_pool = new(Arena_Pool, runtime.default_allocator())
 	arena_pool_init(kernel.arena_pool)
 	kernel.retired = make([dynamic]^Snapshot)
+	kernel.pending_commits = make([dynamic]^Commit_Entry)
 	kernel.current = snapshot_create(kernel, 0, nil)
 }
 
@@ -160,6 +182,7 @@ kernel_destroy :: proc(kernel: ^Kernel) {
 		snapshot_release(retired)
 	}
 	delete(kernel.retired)
+	delete(kernel.pending_commits)
 
 	if kernel.arena_pool != nil {
 		arena_pool_destroy(kernel.arena_pool)
@@ -216,13 +239,170 @@ kernel_next_relation_id :: proc(kernel: ^Kernel) -> Relation_ID {
 	return Relation_ID(next)
 }
 
-// Publishes `next` while the caller holds the exclusive kernel lock.
+// Publishes `next` if `expected` is still the published snapshot. The caller
+// must hold `kernel.publish_lock`, so the compare-exchange is deterministic:
+// on failure `expected` was retired by a publisher that did not hold the lock,
+// or the caller's reference is stale. On success the kernel holds a reference
+// to `next`. The previous snapshot is returned for the caller to retire after
+// releasing the publish lock, keeping the exclusive window to a pointer swap.
 @(private)
-kernel_publish_locked :: proc(kernel: ^Kernel, next: ^Snapshot) {
+kernel_publish_current :: proc(
+	kernel: ^Kernel,
+	expected, next: ^Snapshot,
+) -> (
+	previous: ^Snapshot,
+	published: bool,
+) {
 	snapshot_retain(next)
-	previous := sync.atomic_load(&kernel.current)
-	sync.atomic_store(&kernel.current, next)
-	kernel_retire(kernel, previous)
+	_, swapped := sync.atomic_compare_exchange_strong_explicit(
+		&kernel.current,
+		expected,
+		next,
+		.Acq_Rel,
+		.Acquire,
+	)
+	if swapped {
+		return expected, true
+	}
+	snapshot_release(next)
+	return nil, false
+}
+
+// A prepared commit waiting for a group publication.
+Commit_Entry :: struct {
+	transaction: ^Transaction,
+	// The snapshot the candidate was prepared against, retained by the owner.
+	base:      ^Snapshot,
+	candidate: ^Snapshot,
+	published: ^Snapshot,
+	done:      bool,
+}
+
+// Adds a prepared candidate to the commit queue. Returns true when the caller
+// should drain the queue.
+@(private)
+kernel_commit_enqueue :: proc(kernel: ^Kernel, entry: ^Commit_Entry) -> bool {
+	sync.mutex_lock(&kernel.commit_queue_lock)
+	append(&kernel.pending_commits, entry)
+	become_committer := !kernel.committer_active
+	if become_committer {
+		kernel.committer_active = true
+	}
+	sync.mutex_unlock(&kernel.commit_queue_lock)
+	return become_committer
+}
+
+// Blocks until `entry` has been published.
+@(private)
+kernel_commit_wait :: proc(kernel: ^Kernel, entry: ^Commit_Entry) {
+	sync.mutex_lock(&kernel.commit_queue_lock)
+	for !entry.done {
+		sync.cond_wait(&kernel.commit_queue_cond, &kernel.commit_queue_lock)
+	}
+	sync.mutex_unlock(&kernel.commit_queue_lock)
+}
+
+// Drains and publishes commit batches until the queue is empty.
+@(private)
+kernel_committer_drain :: proc(kernel: ^Kernel) {
+	for {
+		sync.mutex_lock(&kernel.commit_queue_lock)
+		if len(kernel.pending_commits) == 0 {
+			kernel.committer_active = false
+			sync.mutex_unlock(&kernel.commit_queue_lock)
+			return
+		}
+		batch := make([dynamic]^Commit_Entry, len(kernel.pending_commits))
+		copy(batch[:], kernel.pending_commits[:])
+		clear(&kernel.pending_commits)
+		sync.mutex_unlock(&kernel.commit_queue_lock)
+
+		kernel_publish_group(kernel, batch[:])
+
+		sync.mutex_lock(&kernel.commit_queue_lock)
+		for entry in batch {
+			entry.done = true
+		}
+		sync.cond_broadcast(&kernel.commit_queue_cond)
+		sync.mutex_unlock(&kernel.commit_queue_lock)
+		delete(batch)
+	}
+}
+
+// Merges every candidate's written blocks into one snapshot and publishes it
+// once. Candidates are stripe-protected and write disjoint relations, so the
+// merge is an adoption of prepared blocks.
+@(private)
+kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
+	sync.mutex_lock(&kernel.publish_lock)
+
+	// A lone candidate is published directly, adopting the latest snapshot's
+	// unchanged state in place. This keeps the uncontended commit path free of
+	// the merge machinery.
+	if len(batch) == 1 {
+		entry := batch[0]
+		base := kernel_snapshot(kernel)
+		if base == entry.base {
+			// The world did not move since this candidate was prepared; publish
+			// it directly.
+			previous, published := kernel_publish_current(
+				kernel,
+				base,
+				entry.candidate,
+			)
+			snapshot_release(base)
+			if published {
+				sync.mutex_unlock(&kernel.publish_lock)
+				kernel_retire(kernel, previous)
+				entry.published = entry.candidate
+				return
+			}
+		} else if transaction_rebase_in_place(kernel, entry.transaction, entry.candidate, base) {
+			previous, published := kernel_publish_current(
+				kernel,
+				base,
+				entry.candidate,
+			)
+			snapshot_release(base)
+			if published {
+				sync.mutex_unlock(&kernel.publish_lock)
+				kernel_retire(kernel, previous)
+				entry.published = entry.candidate
+				return
+			}
+		} else {
+			snapshot_release(base)
+		}
+		// Fall through to the merge path when the direct publish could not
+		// happen; the candidate is untouched by the failed compare-exchange.
+	}
+
+	for {
+		base := kernel_snapshot(kernel)
+		merged := snapshot_fork(kernel, base)
+		for entry in batch {
+			for block in entry.candidate.blocks {
+				relation_block_retain(block)
+				snapshot_set_block(merged, block)
+			}
+		}
+		snapshot_compute_derived(merged)
+
+		previous, published := kernel_publish_current(kernel, base, merged)
+		if published {
+			sync.mutex_unlock(&kernel.publish_lock)
+			kernel_retire(kernel, previous)
+			for entry in batch {
+				snapshot_retain(merged)
+				entry.published = merged
+				snapshot_release(entry.candidate)
+			}
+			snapshot_release(base)
+			return
+		}
+		snapshot_release(merged)
+		snapshot_release(base)
+	}
 }
 
 // Moves `snapshot` to the retired list and reclaims retired snapshots when no
@@ -268,25 +448,38 @@ kernel_create_relation :: proc(
 	^Snapshot,
 	Kernel_Error,
 ) {
-	sync.mutex_lock(&kernel.commit_lock)
-	defer sync.mutex_unlock(&kernel.commit_lock)
+	sync.mutex_lock(&kernel.catalog_lock)
+	defer sync.mutex_unlock(&kernel.catalog_lock)
 
-	current := sync.atomic_load(&kernel.current)
-	if _, exists := snapshot_relation_metadata_named(current, metadata.name); exists {
-		return nil, .Duplicate_Relation_Name
-	}
-	if snapshot_has_relation(current, metadata.id) {
-		return nil, .Invalid_Metadata
-	}
-	if err := validate_relation_metadata(metadata); err != .None {
-		return nil, err
-	}
+	for {
+		current := kernel_snapshot(kernel)
+		if _, exists := snapshot_relation_metadata_named(current, metadata.name); exists {
+			snapshot_release(current)
+			return nil, .Duplicate_Relation_Name
+		}
+		if snapshot_has_relation(current, metadata.id) {
+			snapshot_release(current)
+			return nil, .Invalid_Metadata
+		}
+		if err := validate_relation_metadata(metadata); err != .None {
+			snapshot_release(current)
+			return nil, err
+		}
 
-	next := snapshot_fork(kernel, current)
-	snapshot_add_relation(next, metadata_clone(kernel.world_allocator, metadata))
-	snapshot_compute_derived(next)
-	kernel_publish_locked(kernel, next)
-	return next, .None
+		next := snapshot_fork(kernel, current)
+		snapshot_add_relation(next, metadata_clone(kernel.world_allocator, metadata))
+		snapshot_compute_derived(next)
+		sync.mutex_lock(&kernel.publish_lock)
+		previous, published := kernel_publish_current(kernel, current, next)
+		sync.mutex_unlock(&kernel.publish_lock)
+		if published {
+			kernel_retire(kernel, previous)
+			snapshot_release(current)
+			return next, .None
+		}
+		snapshot_release(next)
+		snapshot_release(current)
+	}
 }
 
 // Installs a rule and publishes a new snapshot. The returned snapshot is
@@ -300,13 +493,8 @@ kernel_install_rule :: proc(
 	^Snapshot,
 	Kernel_Error,
 ) {
-	sync.mutex_lock(&kernel.commit_lock)
-	defer sync.mutex_unlock(&kernel.commit_lock)
-
-	current := sync.atomic_load(&kernel.current)
-	if err := rule_validate_arity(rule, current); err != .None {
-		return nil, err
-	}
+	sync.mutex_lock(&kernel.catalog_lock)
+	defer sync.mutex_unlock(&kernel.catalog_lock)
 
 	scratch := new(virtual.Arena)
 	if err := virtual.arena_init_growing(scratch); err != nil {
@@ -318,25 +506,42 @@ kernel_install_rule :: proc(
 	}
 	scratch_alloc := virtual.arena_allocator(scratch)
 
-	if err := rule_validate_safety(rule, scratch_alloc); err != .None {
-		return nil, err
-	}
+	for {
+		current := kernel_snapshot(kernel)
+		if err := rule_validate_arity(rule, current); err != .None {
+			snapshot_release(current)
+			return nil, err
+		}
+		if err := rule_validate_safety(rule, scratch_alloc); err != .None {
+			snapshot_release(current)
+			return nil, err
+		}
 
-	next := snapshot_fork(kernel, current)
-	snapshot_add_rule(
-		next,
-		rule_definition_clone(kernel.world_allocator, rule_definition(id, rule, source)),
-	)
+		next := snapshot_fork(kernel, current)
+		snapshot_add_rule(
+			next,
+			rule_definition_clone(kernel.world_allocator, rule_definition(id, rule, source)),
+		)
 
-	active := snapshot_active_rules(next, scratch_alloc)
-	if _, ok := rules_stratify(active, scratch_alloc); !ok {
+		active := snapshot_active_rules(next, scratch_alloc)
+		if _, ok := rules_stratify(active, scratch_alloc); !ok {
+			snapshot_release(next)
+			snapshot_release(current)
+			return nil, .Unstratified_Negation
+		}
+
+		snapshot_compute_derived(next)
+		sync.mutex_lock(&kernel.publish_lock)
+		previous, published := kernel_publish_current(kernel, current, next)
+		sync.mutex_unlock(&kernel.publish_lock)
+		if published {
+			kernel_retire(kernel, previous)
+			snapshot_release(current)
+			return next, .None
+		}
 		snapshot_release(next)
-		return nil, .Unstratified_Negation
+		snapshot_release(current)
 	}
-
-	snapshot_compute_derived(next)
-	kernel_publish_locked(kernel, next)
-	return next, .None
 }
 
 // Deactivates a rule and publishes a new snapshot. The returned snapshot is
@@ -348,30 +553,41 @@ kernel_disable_rule :: proc(
 	^Snapshot,
 	Kernel_Error,
 ) {
-	sync.mutex_lock(&kernel.commit_lock)
-	defer sync.mutex_unlock(&kernel.commit_lock)
+	sync.mutex_lock(&kernel.catalog_lock)
+	defer sync.mutex_unlock(&kernel.catalog_lock)
 
-	current := sync.atomic_load(&kernel.current)
-	found := false
-	for definition in current.rules {
-		if definition.id == rule_id {
-			found = true
-			break
+	for {
+		current := kernel_snapshot(kernel)
+		found := false
+		for definition in current.rules {
+			if definition.id == rule_id {
+				found = true
+				break
+			}
 		}
-	}
-	if !found {
-		return nil, .No_Such_Rule
-	}
+		if !found {
+			snapshot_release(current)
+			return nil, .No_Such_Rule
+		}
 
-	next := snapshot_fork(kernel, current)
-	for &definition in next.rules {
-		if definition.id == rule_id {
-			definition.active = false
+		next := snapshot_fork(kernel, current)
+		for &definition in next.rules {
+			if definition.id == rule_id {
+				definition.active = false
+			}
 		}
+		snapshot_compute_derived(next)
+		sync.mutex_lock(&kernel.publish_lock)
+		previous, published := kernel_publish_current(kernel, current, next)
+		sync.mutex_unlock(&kernel.publish_lock)
+		if published {
+			kernel_retire(kernel, previous)
+			snapshot_release(current)
+			return next, .None
+		}
+		snapshot_release(next)
+		snapshot_release(current)
 	}
-	snapshot_compute_derived(next)
-	kernel_publish_locked(kernel, next)
-	return next, .None
 }
 
 // Visits visible tuples of a relation in the current snapshot, including
