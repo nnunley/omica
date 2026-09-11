@@ -2,6 +2,7 @@ package mica_runtime
 
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
 import "core:testing"
 import c "../compiler"
 import k "../kernel"
@@ -366,4 +367,141 @@ invoke(:take, {:actor -> #alice})
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 
 	expect_relation_rows(t, &kernel, "Taken", 1)
+}
+
+@(test)
+test_run_match_expression :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Score, 1)
+make_relation(:Failed, 1)
+verb classify(text)
+  return match parse_ordinal(text)
+  case ok(value) if value >= 0
+    value
+  case ok(ignored)
+    -1
+  case err(problem)
+    -2
+  end
+end
+assert Score(classify("7"))
+assert Failed(classify("banana"))
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_match_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the match test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+
+	expect_relation_rows(t, &kernel, "Score", 1)
+	expect_relation_rows(t, &kernel, "Failed", 1)
+}
+
+@(test)
+test_run_from_literal_and_to_xml :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:Entity, 1)
+make_relation(:Markup, 1)
+verb entity_from_literal(text)
+  return match from_literal(text)
+  case ok(value)
+    value
+  case err(problem)
+    none
+  end
+end
+assert Entity(entity_from_literal("#alice"))
+assert Markup(to_xml(dom <p class="note">hi</p>))
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_literal_xml_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the literal/XML test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+
+	expect_relation_rows(t, &kernel, "Entity", 1)
+	expect_relation_rows(t, &kernel, "Markup", 1)
+}
+
+@(test)
+test_run_mud_app_world :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	core := corpus_candidate("apps/mud/core.mica")
+	if core == "" {
+		testing.expect(t, false, "mud corpus not found")
+		return
+	}
+	apps := filepath.dir(filepath.dir(core))
+	names := []string {
+		"shared/string.mica",
+		"shared/events.mica",
+		"shared/retrieval.mica",
+		"shared/sync-host.mica",
+		"shared/sync-dom.mica",
+		"mud/core.mica",
+		"mud/auth.mica",
+		"mud/command-parser.mica",
+		"mud/event-substitutions.mica",
+		"mud/ui-session.mica",
+		"mud/ui-actions.mica",
+		"mud/ui-compose.mica",
+		"mud/ui-narrative.mica",
+		"mud/ui-mica-inspect.mica",
+		"mud/ui-retrieval.mica",
+		"mud/http.mica",
+	}
+	paths := make([]string, len(names), context.temp_allocator)
+	for name, index in names {
+		joined, join_err := filepath.join(
+			[]string{apps, name},
+			context.temp_allocator,
+		)
+		if join_err != nil {
+			testing.expect(t, false, "cannot join a corpus path")
+			return
+		}
+		paths[index] = joined
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, paths, context.temp_allocator)
+	testing.expectf(t, result.ok, "mud world failed: %s", result.message)
 }

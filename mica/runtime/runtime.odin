@@ -10,6 +10,7 @@ package mica_runtime
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
 import c "../compiler"
@@ -42,6 +43,127 @@ Builtin_Env :: struct {
 	principal: v.Value,
 }
 
+// Writes `text` as a double-quoted Mica string literal with escapes.
+@(private)
+write_mica_string_literal :: proc(builder: ^strings.Builder, text: string) {
+	strings.write_byte(builder, '"')
+	for ch in text {
+		switch ch {
+		case '\\':
+			strings.write_string(builder, "\\\\")
+		case '"':
+			strings.write_string(builder, "\\\"")
+		case '\n':
+			strings.write_string(builder, "\\n")
+		case '\r':
+			strings.write_string(builder, "\\r")
+		case '\t':
+			strings.write_string(builder, "\\t")
+		case:
+			strings.write_rune(builder, ch)
+		}
+	}
+	strings.write_byte(builder, '"')
+}
+
+// Replaces `include_text("relative/path")` calls with string literals holding
+// the referenced file's contents, resolved against the including file. This
+// matches the Rust source task's load-time substitution.
+@(private)
+substitute_include_text :: proc(
+	source: string,
+	base_directory: string,
+	allocator: mem.Allocator,
+) -> (
+	string,
+	Run_Result,
+) {
+	if !strings.contains(source, "include_text") {
+		return source, Run_Result{ok = true}
+	}
+
+	builder: strings.Builder
+	strings.builder_init(&builder, allocator)
+	index := 0
+	for index < len(source) {
+		offset := strings.index(source[index:], "include_text")
+		if offset < 0 {
+			strings.write_string(&builder, source[index:])
+			break
+		}
+		start := index + offset
+		strings.write_string(&builder, source[index:start])
+
+		cursor := start + len("include_text")
+		for cursor < len(source) && (source[cursor] == ' ' || source[cursor] == '\t') {
+			cursor += 1
+		}
+		if cursor >= len(source) || source[cursor] != '(' {
+			strings.write_string(&builder, "include_text")
+			index = start + len("include_text")
+			continue
+		}
+		cursor += 1
+		for cursor < len(source) && (source[cursor] == ' ' || source[cursor] == '\t') {
+			cursor += 1
+		}
+		if cursor >= len(source) || source[cursor] != '"' {
+			strings.write_string(&builder, "include_text")
+			index = start + len("include_text")
+			continue
+		}
+		end_quote := cursor + 1
+		for end_quote < len(source) && source[end_quote] != '"' {
+			end_quote += 1
+		}
+		if end_quote >= len(source) {
+			return "", Run_Result {
+				ok      = false,
+				message = "unterminated include_text path",
+			}
+		}
+		closing := end_quote + 1
+		for closing < len(source) && (source[closing] == ' ' || source[closing] == '\t') {
+			closing += 1
+		}
+		if closing >= len(source) || source[closing] != ')' {
+			strings.write_string(&builder, "include_text")
+			index = start + len("include_text")
+			continue
+		}
+
+		relative := source[cursor + 1:end_quote]
+		full := relative
+		if !filepath.is_abs(relative) {
+			joined, join_err := filepath.join(
+				[]string{base_directory, relative},
+				allocator,
+			)
+			if join_err != nil {
+				return "", Run_Result {
+					ok      = false,
+					message = "include_text cannot join the source path",
+				}
+			}
+			full = joined
+		}
+		contents, read_err := os.read_entire_file(full, allocator)
+		if read_err != nil {
+			return "", Run_Result {
+				ok      = false,
+				message = fmt.aprintf(
+					"include_text cannot read %s",
+					full,
+					allocator = allocator,
+				),
+			}
+		}
+		write_mica_string_literal(&builder, string(contents))
+		index = closing + 1
+	}
+	return strings.to_string(builder), Run_Result{ok = true}
+}
+
 // Compiles and runs a set of fileins as one world against `kernel`. On success
 // the transaction is committed.
 run_files :: proc(
@@ -61,7 +183,15 @@ run_files :: proc(
 				allocator = allocator,
 			)}
 		}
-		ast, parse_errors := c.parse_program(string(data), allocator)
+		expanded, expand_result := substitute_include_text(
+			string(data),
+			filepath.dir(path),
+			allocator,
+		)
+		if !expand_result.ok {
+			return expand_result
+		}
+		ast, parse_errors := c.parse_program(expanded, allocator)
 		if len(parse_errors) > 0 {
 			first := parse_errors[0]
 			return Run_Result{ok = false, message = fmt.aprintf(
@@ -422,7 +552,11 @@ builtin_set_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	}
 	info, found := env.fields[name]
 	if !found || len(info.key_positions) == 0 {
-		vm.vm_set_error(state, "E_FIELD", "unknown functional field")
+		vm.vm_set_error(state, "E_FIELD", fmt.aprintf(
+			"unknown functional field: %s",
+			name,
+			allocator = context.temp_allocator,
+		))
 		return v.Value(0), false
 	}
 
@@ -488,7 +622,11 @@ builtin_get_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	}
 	info, found := env.fields[name]
 	if !found || len(info.key_positions) != 1 || info.key_positions[0] != 0 {
-		vm.vm_set_error(state, "E_FIELD", "unknown functional field")
+		vm.vm_set_error(state, "E_FIELD", fmt.aprintf(
+			"unknown functional field: %s",
+			name,
+			allocator = context.temp_allocator,
+		))
 		return v.Value(0), false
 	}
 
@@ -538,14 +676,22 @@ lower_first :: proc(name: string, allocator: mem.Allocator) -> string {
 	if len(name) == 0 {
 		return name
 	}
+	start := 0
+	if slash := strings.last_index_byte(name, '/'); slash >= 0 {
+		start = slash + 1
+	}
+	if start >= len(name) {
+		return name
+	}
 	builder: strings.Builder
 	strings.builder_init(&builder, allocator)
-	first := name[0]
+	strings.write_string(&builder, name[:start])
+	first := name[start]
 	if first >= 'A' && first <= 'Z' {
 		first += 'a' - 'A'
 	}
 	strings.write_byte(&builder, first)
-	strings.write_string(&builder, name[1:])
+	strings.write_string(&builder, name[start + 1:])
 	return strings.to_string(builder)
 }
 

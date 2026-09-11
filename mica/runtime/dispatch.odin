@@ -15,21 +15,26 @@ import v "../var"
 // binds to the system relation.
 @(private)
 install_dispatch_relations :: proc(env: ^Builtin_Env) -> Run_Result {
-	metadata := k.dispatch_relation_metadata(env.allocator)
-	for entry in metadata {
-		created, create_err := k.kernel_create_relation(env.kernel, entry)
-		if create_err != k.Kernel_Error.None {
+	groups := [2][]k.Relation_Metadata {
+		k.dispatch_relation_metadata(env.allocator),
+		k.system_relation_metadata(env.allocator),
+	}
+	for metadata in groups {
+		for entry in metadata {
+			created, create_err := k.kernel_create_relation(env.kernel, entry)
+			if create_err != k.Kernel_Error.None {
+				name, _ := v.symbol_name(entry.name)
+				return Run_Result{ok = false, message = fmt.aprintf(
+					"cannot create system relation %s: %v",
+					name,
+					create_err,
+					allocator = env.allocator,
+				)}
+			}
+			k.snapshot_release(created)
 			name, _ := v.symbol_name(entry.name)
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"cannot create dispatch relation %s: %v",
-				name,
-				create_err,
-				allocator = env.allocator,
-			)}
+			env.ctx.relations[name] = u32(entry.id)
 		}
-		k.snapshot_release(created)
-		name, _ := v.symbol_name(entry.name)
-		env.ctx.relations[name] = u32(entry.id)
 	}
 
 	env.ctx.dispatch_method_selector_relation = u32(k.DISPATCH_METHOD_SELECTOR_ID)

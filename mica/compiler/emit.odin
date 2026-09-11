@@ -415,8 +415,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return emit_relation_write(emitter, n.atom, false)
 
 	case Match:
-		push_error(emitter, "match expressions are not lowered yet")
-		return -1, false
+		return emit_match(emitter, n)
 
 	case Try:
 		push_error(emitter, "try expressions are not lowered yet")
@@ -446,7 +445,11 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return -1, false
 
 	case Query_Variable:
-		push_error(emitter, "query variables are not lowered yet")
+		push_error(emitter, fmt.aprintf(
+			"query variables are not lowered yet: ?%s",
+			n.name,
+			allocator = emitter.allocator,
+		))
 		return -1, false
 
 	case Wildcard:
@@ -523,6 +526,9 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 
 	pattern, is_binding_pattern := binding.pattern^.(Binding_Pattern)
 	if !is_binding_pattern {
+		if call_pattern, is_call_pattern := binding.pattern^.(Call_Pattern); is_call_pattern {
+			return emit_call_pattern_binding(emitter, binding, call_pattern)
+		}
 		push_error(emitter, "this binding pattern is not lowered yet")
 		return -1, false
 	}
@@ -532,6 +538,58 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 	}
 	declare_local(emitter, pattern.name, value_register, binding.is_const)
 	return value_register, true
+}
+
+// Binds `some(x)`, `ok(x)`, or `err(x)` patterns from the value's `value`
+// column. The result is whether the value is present, so this also serves as
+// the condition of `if let`.
+@(private)
+emit_call_pattern_binding :: proc(
+	emitter: ^Emitter,
+	binding: Binding,
+	pattern: Call_Pattern,
+) -> (int, bool) {
+	if len(pattern.args) > 1 {
+		push_error(emitter, "call patterns support one binding")
+		return -1, false
+	}
+	value_register, has_value := emit_expr(emitter, binding.value)
+	if !has_value {
+		return -1, false
+	}
+
+	for argument in pattern.args {
+		binding_pattern, is_binding := argument^.(Binding_Pattern)
+		if !is_binding {
+			push_error(emitter, "call pattern arguments must be names")
+			return -1, false
+		}
+		column_symbol := emit_constant(
+			emitter,
+			v.value_symbol(v.symbol_intern("value")),
+		)
+		column := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Index,
+			0,
+			i32(column),
+			i32(value_register),
+			i32(column_symbol),
+		)
+		declare_local(emitter, binding_pattern.name, column, binding.is_const)
+	}
+
+	result := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Is_Truthy,
+		0,
+		i32(result),
+		i32(value_register),
+		0,
+	)
+	return result, true
 }
 
 // Reserves a contiguous register block for `registers` and moves each value
@@ -1084,6 +1142,192 @@ emit_role_dispatch :: proc(
 		0,
 	)
 	return destination, true
+}
+
+// Lowers a match expression to an ordered chain of pattern tests. Bindings
+// declared by a case are visible in its guard and body.
+@(private)
+emit_match :: proc(emitter: ^Emitter, matched: Match) -> (int, bool) {
+	subject, subject_ok := emit_expr(emitter, matched.value)
+	if !subject_ok {
+		return -1, false
+	}
+
+	result := alloc_register(emitter)
+	end_patches: [dynamic]int
+	defer delete(end_patches)
+	next_case_patches: [dynamic]int
+	defer delete(next_case_patches)
+
+	for match_case in matched.cases {
+		scope_enter(emitter)
+		test, test_ok := emit_match_pattern(emitter, subject, match_case.pattern)
+		if !test_ok {
+			scope_leave(emitter)
+			return -1, false
+		}
+		test_branch := emit_instruction(emitter, .Branch, 0, test, 0, 0)
+		append(&next_case_patches, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
+		patch_jump(emitter, test_branch, current_offset(emitter))
+
+		if match_case.has_guard {
+			guard, guard_ok := emit_expr(emitter, match_case.guard)
+			if !guard_ok {
+				scope_leave(emitter)
+				return -1, false
+			}
+			guard_branch := emit_instruction(emitter, .Branch, 0, guard, 0, 0)
+			append(&next_case_patches, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
+			patch_jump(emitter, guard_branch, current_offset(emitter))
+		}
+
+		body_register, body_has_value := emit_block(emitter, match_case.body)
+		scope_leave(emitter)
+		if body_has_value {
+			vm.builder_emit(
+				emitter.builder,
+				.Move,
+				0,
+				i32(result),
+				i32(body_register),
+				0,
+			)
+		}
+		append(&end_patches, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
+
+		for patch in next_case_patches {
+			patch_jump(emitter, patch, current_offset(emitter))
+		}
+		clear(&next_case_patches)
+	}
+	for patch in end_patches {
+		patch_jump(emitter, patch, current_offset(emitter))
+	}
+	return result, true
+}
+
+@(private)
+emit_read_column :: proc(
+	emitter: ^Emitter,
+	subject: int,
+	name: string,
+) -> int {
+	symbol_register := emit_constant(
+		emitter,
+		v.value_symbol(v.symbol_intern(name)),
+	)
+	column := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Index,
+		0,
+		i32(column),
+		i32(subject),
+		i32(symbol_register),
+	)
+	return column
+}
+
+@(private)
+emit_match_pattern :: proc(
+	emitter: ^Emitter,
+	subject: int,
+	pattern: ^Pattern,
+) -> (int, bool) {
+	#partial switch node in pattern^ {
+	case Wildcard_Pattern:
+		return emit_constant(emitter, v.value_bool(true)), true
+
+	case Binding_Pattern:
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Move,
+			0,
+			i32(destination),
+			i32(subject),
+			0,
+		)
+		declare_local(emitter, node.name, destination, false)
+		return emit_constant(emitter, v.value_bool(true)), true
+
+	case Literal_Pattern:
+		literal, literal_ok := emit_expr(emitter, node.value)
+		if !literal_ok {
+			return -1, false
+		}
+		test := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Binary,
+			u8(vm.Bin_Op.Eq),
+			i32(test),
+			i32(subject),
+			i32(literal),
+		)
+		return test, true
+
+	case Call_Pattern:
+		return emit_match_call_pattern(emitter, subject, node)
+	}
+
+	push_error(emitter, "this match pattern is not lowered yet")
+	return -1, false
+}
+
+@(private)
+emit_match_call_pattern :: proc(
+	emitter: ^Emitter,
+	subject: int,
+	pattern: Call_Pattern,
+) -> (int, bool) {
+	test := alloc_register(emitter)
+	if pattern.name == "some" {
+		vm.builder_emit(
+			emitter.builder,
+			.Is_Truthy,
+			0,
+			i32(test),
+			i32(subject),
+			0,
+		)
+	} else if pattern.name == "ok" || pattern.name == "err" {
+		expected_name := pattern.name == "err" ? "error" : "ok"
+		actual := emit_read_column(emitter, subject, "case")
+		expected := emit_constant(
+			emitter,
+			v.value_symbol(v.symbol_intern(expected_name)),
+		)
+		vm.builder_emit(
+			emitter.builder,
+			.Binary,
+			u8(vm.Bin_Op.Eq),
+			i32(test),
+			i32(actual),
+			i32(expected),
+		)
+	} else {
+		push_error(emitter, fmt.aprintf(
+			"unknown match constructor: %s",
+			pattern.name,
+			allocator = emitter.allocator,
+		))
+		return -1, false
+	}
+
+	if len(pattern.args) == 1 {
+		binding, is_binding := pattern.args[0]^.(Binding_Pattern)
+		if !is_binding {
+			push_error(emitter, "match pattern arguments must be names")
+			return -1, false
+		}
+		column := emit_read_column(emitter, subject, "value")
+		declare_local(emitter, binding.name, column, false)
+	} else if len(pattern.args) > 1 {
+		push_error(emitter, "match constructors take at most one binding")
+		return -1, false
+	}
+	return test, true
 }
 
 // Lowers a DOM text node to the `dom_text` builtin.

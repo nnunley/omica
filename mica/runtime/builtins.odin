@@ -8,6 +8,7 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 import "core:unicode/utf8"
 import c "../compiler"
@@ -65,6 +66,11 @@ runtime_builtins := [?]Builtin_Spec {
 	{"dom_text", 1, builtin_dom_text},
 	{"dom_raw", 1, builtin_dom_raw},
 	{"dom_element", 3, builtin_dom_element},
+	{"to_xml", 1, builtin_to_xml},
+	{"sync_signature", 2, builtin_sync_signature},
+	{"dom_snapshot_payload", 3, builtin_dom_snapshot_payload},
+	{"embed_text", 2, builtin_embed_text},
+	{"from_literal", 1, builtin_from_literal},
 }
 
 @(private)
@@ -185,8 +191,379 @@ builtin_dom_element :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	}), true
 }
 
-// --- Helpers ---------------------------------------------------------------
+@(private)
+write_xml_text :: proc(builder: ^strings.Builder, text: string) {
+	for ch in text {
+		switch ch {
+		case '&':
+			strings.write_string(builder, "&amp;")
+		case '<':
+			strings.write_string(builder, "&lt;")
+		case '>':
+			strings.write_string(builder, "&gt;")
+		case:
+			strings.write_rune(builder, ch)
+		}
+	}
+}
 
+@(private)
+write_xml_attribute :: proc(builder: ^strings.Builder, text: string) {
+	for ch in text {
+		switch ch {
+		case '&':
+			strings.write_string(builder, "&amp;")
+		case '<':
+			strings.write_string(builder, "&lt;")
+		case '>':
+			strings.write_string(builder, "&gt;")
+		case '"':
+			strings.write_string(builder, "&quot;")
+		case:
+			strings.write_rune(builder, ch)
+		}
+	}
+}
+
+@(private)
+write_xml_value :: proc(builder: ^strings.Builder, value: v.Value) -> bool {
+	if text, is_string := v.value_as_string(value); is_string {
+		write_xml_text(builder, text)
+		return true
+	}
+	if boolean, is_bool := v.value_as_bool(value); is_bool {
+		strings.write_string(builder, boolean ? "true" : "false")
+		return true
+	}
+	if integer, is_int := v.value_as_int(value); is_int {
+		fmt.sbprintf(builder, "%d", integer)
+		return true
+	}
+	return false
+}
+
+@(private)
+write_xml_node :: proc(builder: ^strings.Builder, value: v.Value) -> bool {
+	if _, is_list := v.value_as_list(value); is_list {
+		nodes, _ := v.value_as_list(value)
+		for node in nodes {
+			if !write_xml_node(builder, node) {
+				return false
+			}
+		}
+		return true
+	}
+
+	entries, is_map := v.value_as_map(value)
+	if !is_map {
+		return write_xml_value(builder, value)
+	}
+
+	text: v.Value
+	has_text := false
+	raw: v.Value
+	has_raw := false
+	tag: v.Value
+	has_tag := false
+	attrs: v.Value
+	has_attrs := false
+	children: v.Value
+	has_children := false
+	for entry in entries {
+		name, _ := v.value_as_symbol(entry.key)
+		name_text, name_ok := v.symbol_name(name)
+		if !name_ok {
+			continue
+		}
+		switch name_text {
+		case "text":
+			text, has_text = entry.value, true
+		case "raw":
+			raw, has_raw = entry.value, true
+		case "tag":
+			tag, has_tag = entry.value, true
+		case "attrs":
+			attrs, has_attrs = entry.value, true
+		case "children":
+			children, has_children = entry.value, true
+		}
+	}
+
+	if has_text {
+		contents, _ := v.value_as_string(text)
+		write_xml_text(builder, contents)
+		return true
+	}
+	if has_raw {
+		contents, _ := v.value_as_string(raw)
+		strings.write_string(builder, contents)
+		return true
+	}
+	if !has_tag {
+		return false
+	}
+	tag_text, tag_ok := v.value_as_string(tag)
+	if !tag_ok {
+		return false
+	}
+	strings.write_byte(builder, '<')
+	strings.write_string(builder, tag_text)
+	if has_attrs {
+		attribute_entries, is_attrs := v.value_as_map(attrs)
+		if !is_attrs {
+			return false
+		}
+		for entry in attribute_entries {
+			name, _ := v.value_as_string(entry.key)
+			strings.write_byte(builder, ' ')
+			strings.write_string(builder, name)
+			strings.write_string(builder, "=\"")
+			if !write_xml_value(builder, entry.value) {
+				return false
+			}
+			strings.write_byte(builder, '"')
+		}
+	}
+	strings.write_byte(builder, '>')
+	if has_children {
+		if !write_xml_node(builder, children) {
+			return false
+		}
+	}
+	strings.write_string(builder, "</")
+	strings.write_string(builder, tag_text)
+	strings.write_byte(builder, '>')
+	return true
+}
+
+@(private)
+builtin_to_xml :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	builder: strings.Builder
+	strings.builder_init(&builder, state.allocator)
+	if !write_xml_node(&builder, args[0]) {
+		strings.builder_destroy(&builder)
+		return builtin_error(state, "E_TYPE", "to_xml expects DOM text, element, or node list")
+	}
+	return v.value_string(state.allocator, strings.to_string(builder)), true
+}
+
+@(private)
+builtin_sync_signature :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	revision, is_int := v.value_as_int(args[0])
+	if !is_int || revision < 0 {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			"sync_signature revision must be a non-negative integer",
+		)
+	}
+	payload, is_string := v.value_as_string(args[1])
+	if !is_string {
+		return builtin_error(state, "E_TYPE", "sync_signature payload must be a string")
+	}
+	hash := u64(0xcbf2_9ce4_8422_2325)
+	raw_revision := u64(revision)
+	for index in 0 ..< 8 {
+		byte := u8(raw_revision >> (8 * u32(index)))
+		hash = (hash ~ u64(byte)) * u64(0x0000_0100_0000_01b3)
+	}
+	for byte in transmute([]u8)payload {
+		hash = (hash ~ u64(byte)) * u64(0x0000_0100_0000_01b3)
+	}
+	hash &= 0x7fff_ffff_ffff_ffff
+	result, _ := v.value_int(i64(hash))
+	return result, true
+}
+
+@(private)
+builtin_dom_snapshot_payload :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	view, view_ok := v.value_as_int(args[0])
+	revision, revision_ok := v.value_as_int(args[1])
+	if !view_ok || !revision_ok {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			"dom_snapshot_payload expects view, revision, and a root node",
+		)
+	}
+	builder: strings.Builder
+	strings.builder_init(&builder, state.allocator)
+	fmt.sbprintf(&builder, "{\"view\":%d,\"revision\":%d,\"root\":\"", view, revision)
+	if !write_xml_node(&builder, args[2]) {
+		strings.builder_destroy(&builder)
+		return builtin_error(state, "E_TYPE", "dom_snapshot_payload root is not a DOM node")
+	}
+	strings.write_string(&builder, "\"}")
+	return v.value_string(state.allocator, strings.to_string(builder)), true
+}
+
+// A deterministic stand-in for a host embedding provider: hashes the text into
+// eight floats so retrieval plans are reproducible without a model.
+@(private)
+builtin_embed_text :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	model, model_ok := v.value_as_string(args[0])
+	if !model_ok {
+		return builtin_error(state, "E_TYPE", "embed_text model must be a string")
+	}
+	text, text_ok := v.value_as_string(args[1])
+	if !text_ok {
+		return builtin_error(state, "E_TYPE", "embed_text text must be a string")
+	}
+	values := make([]v.Value, 8, context.temp_allocator)
+	hash := u64(0xcbf2_9ce4_8422_2325)
+	input := strings.concatenate([]string{model, "\x00", text}, context.temp_allocator)
+	for byte in transmute([]u8)input {
+		hash = (hash ~ u64(byte)) * u64(0x0000_0100_0000_01b3)
+	}
+	for index in 0 ..< len(values) {
+		hash = (hash ~ u64(index)) * u64(0x0000_0100_0000_01b3)
+		scaled := f32(f64(hash & 0xffff) / 65535.0)
+		converted, converted_ok := v.value_float(scaled)
+		if !converted_ok {
+			return builtin_error(state, "E_RANGE", "embed_text produced a non-finite value")
+		}
+		values[index] = converted
+	}
+	return v.value_list(state.allocator, values), true
+}
+
+@(private)
+literal_value :: proc(env: ^Builtin_Env, expr: ^c.Expr) -> (v.Value, bool) {
+	#partial switch node in expr^ {
+	case c.Int_Literal:
+		number, parsed := strconv.parse_i64(node.text)
+		if !parsed {
+			return v.Value(0), false
+		}
+		converted, converted_ok := v.value_int(number)
+		return converted, converted_ok
+
+	case c.Float_Literal:
+		number, parsed := strconv.parse_f64(node.text)
+		if !parsed {
+			return v.Value(0), false
+		}
+		converted, converted_ok := v.value_float(f32(number))
+		return converted, converted_ok
+
+	case c.String_Literal:
+		return v.value_string(env.allocator, unquote(node.text)), true
+
+	case c.Bool_Literal:
+		return v.value_bool(node.value), true
+
+	case c.Symbol_Literal:
+		return v.value_symbol(v.symbol_intern(unquote(node.name))), true
+
+	case c.Identity_Literal:
+		if raw, parsed := strconv.parse_u64(node.name); parsed {
+			return v.value_identity_raw(raw)
+		}
+		if value, found := env.ctx.identities[node.name]; found {
+			return value, true
+		}
+		return v.Value(0), false
+
+	case c.Error_Code_Literal:
+		return v.value_error_code(v.symbol_intern(node.name)), true
+
+	case c.Name:
+		if len(node.parts) == 1 && node.parts[0] == "none" {
+			empty, _ := v.value_relation(
+				env.allocator,
+				[]v.Symbol{v.symbol_intern("value")},
+				nil,
+			)
+			return empty, true
+		}
+		return v.Value(0), false
+
+	case c.List_Literal:
+		values := make([]v.Value, len(node.elements), context.temp_allocator)
+		for element, index in node.elements {
+			value, element_ok := literal_value(env, element)
+			if !element_ok {
+				return v.Value(0), false
+			}
+			values[index] = value
+		}
+		return v.value_list(env.allocator, values), true
+
+	case c.Map_Literal:
+		entries := make([]v.Map_Entry, len(node.entries), context.temp_allocator)
+		for entry, index in node.entries {
+			key, key_ok := literal_value(env, entry.key)
+			if !key_ok {
+				return v.Value(0), false
+			}
+			value, value_ok := literal_value(env, entry.value)
+			if !value_ok {
+				return v.Value(0), false
+			}
+			entries[index] = v.Map_Entry{key = key, value = value}
+		}
+		return v.value_map(env.allocator, entries), true
+	}
+	return v.Value(0), false
+}
+
+@(private)
+builtin_from_literal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	text, is_string := string_argument(state, args, 0, "from_literal")
+	if !is_string {
+		return builtin_error(state, "E_TYPE", "from_literal expects a string")
+	}
+	ast, parse_errors := c.parse_program(text, context.temp_allocator)
+	if len(parse_errors) > 0 {
+		problem := v.value_error(
+			state.allocator,
+			v.symbol_intern("E_PARSE"),
+			parse_errors[0].message,
+			true,
+			v.value_string(state.allocator, text),
+			true,
+		)
+		return result_value(state.allocator, "error", problem), true
+	}
+	if len(ast.items) != 1 {
+		problem := v.value_error(
+			state.allocator,
+			v.symbol_intern("E_PARSE"),
+			"expected one literal expression",
+			true,
+			v.value_string(state.allocator, text),
+			true,
+		)
+		return result_value(state.allocator, "error", problem), true
+	}
+	item, is_expr := ast.items[0].(c.Expr_Item)
+	if !is_expr {
+		problem := v.value_error(
+			state.allocator,
+			v.symbol_intern("E_TYPE"),
+			"expected a literal expression",
+			true,
+			v.value_string(state.allocator, text),
+			true,
+		)
+		return result_value(state.allocator, "error", problem), true
+	}
+	value, value_ok := literal_value(builtin_env(state), item.expr)
+	if !value_ok {
+		problem := v.value_error(
+			state.allocator,
+			v.symbol_intern("E_TYPE"),
+			"unsupported literal expression",
+			true,
+			v.value_string(state.allocator, text),
+			true,
+		)
+		return result_value(state.allocator, "error", problem), true
+	}
+	return result_value(state.allocator, "ok", value), true
+}
+
+// --- Helpers ---------------------------------------------------------------
 @(private)
 builtin_error :: proc(state: ^vm.VM, code, message: string) -> (v.Value, bool) {
 	vm.vm_set_error(state, code, message)

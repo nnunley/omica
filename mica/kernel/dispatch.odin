@@ -16,8 +16,8 @@ import "core:mem"
 import "core:slice"
 import v "../var"
 
-// Reserved relation ids for the dispatch tables. These sit above the range the
-// runtime assigns to user relations.
+// Reserved relation ids for the dispatch tables. These sit in the high
+// reserved range above the ids the runtime assigns to user relations.
 DISPATCH_METHOD_SELECTOR_ID :: Relation_ID(0x7fff_ff01)
 DISPATCH_PARAM_ID :: Relation_ID(0x7fff_ff02)
 DISPATCH_DELEGATES_ID :: Relation_ID(0x7fff_ff03)
@@ -66,6 +66,66 @@ dispatch_relation_metadata :: proc(allocator := context.allocator) -> []Relation
 		v.symbol_intern("MethodProgram"),
 		2,
 	)
+	return metadata
+}
+
+// Reserved ids for the system reflection relations. Relation ids are u32 in
+// this runtime, so these use the reserved range below the dispatch tables.
+SYSTEM_RELATION_ID :: Relation_ID(0x7fff_fe01)
+SYSTEM_RELATION_NAME_ID :: Relation_ID(0x7fff_fe02)
+SYSTEM_ARITY_ID :: Relation_ID(0x7fff_fe03)
+SYSTEM_RULE_ID :: Relation_ID(0x7fff_fe04)
+SYSTEM_RULE_HEAD_ID :: Relation_ID(0x7fff_fe05)
+SYSTEM_RULE_SOURCE_ID :: Relation_ID(0x7fff_fe06)
+SYSTEM_ACTIVE_RULE_ID :: Relation_ID(0x7fff_fe07)
+SYSTEM_ARGUMENT_NAME_ID :: Relation_ID(0x7fff_fe08)
+SYSTEM_CONFLICT_POLICY_ID :: Relation_ID(0x7fff_fe09)
+SYSTEM_FUNCTIONAL_KEY_ID :: Relation_ID(0x7fff_fe0a)
+SYSTEM_INDEX_ID :: Relation_ID(0x7fff_fe0b)
+SYSTEM_INDEX_POSITION_ID :: Relation_ID(0x7fff_fe0c)
+SYSTEM_INDEX_STORAGE_KIND_ID :: Relation_ID(0x7fff_fe0d)
+SYSTEM_SUBJECT_FACT_ID :: Relation_ID(0x7fff_fe0e)
+SYSTEM_MENTIONED_FACT_ID :: Relation_ID(0x7fff_fe14)
+SYSTEM_EXTENSIONAL_MENTIONED_FACT_ID :: Relation_ID(0x7fff_fe15)
+SYSTEM_PROGRAM_BYTES_ID :: Relation_ID(0x7fff_fe0f)
+SYSTEM_METHOD_SOURCE_ID :: Relation_ID(0x7fff_fe10)
+SYSTEM_SOURCE_OWNS_FACT_ID :: Relation_ID(0x7fff_fe11)
+SYSTEM_SOURCE_OWNS_RULE_ID :: Relation_ID(0x7fff_fe12)
+SYSTEM_SOURCE_OWNS_RELATION_ID :: Relation_ID(0x7fff_fe13)
+
+// Metadata for the system reflection relations: Relation, RelationName, Arity,
+// Rule, RuleHead, RuleSource, and friends. Installed empty; the kernel and
+// runtime populate them as declarations are loaded.
+system_relation_metadata :: proc(allocator := context.allocator) -> []Relation_Metadata {
+	entries := [?]Relation_Metadata {
+		relation_metadata(SYSTEM_RELATION_ID, v.symbol_intern("Relation"), 1),
+		relation_metadata(SYSTEM_RELATION_NAME_ID, v.symbol_intern("RelationName"), 2),
+		relation_metadata(SYSTEM_ARITY_ID, v.symbol_intern("Arity"), 2),
+		relation_metadata(SYSTEM_RULE_ID, v.symbol_intern("Rule"), 1),
+		relation_metadata(SYSTEM_RULE_HEAD_ID, v.symbol_intern("RuleHead"), 2),
+		relation_metadata(SYSTEM_RULE_SOURCE_ID, v.symbol_intern("RuleSource"), 2),
+		relation_metadata(SYSTEM_ACTIVE_RULE_ID, v.symbol_intern("ActiveRule"), 2),
+		relation_metadata(SYSTEM_ARGUMENT_NAME_ID, v.symbol_intern("ArgumentName"), 3),
+		relation_metadata(SYSTEM_CONFLICT_POLICY_ID, v.symbol_intern("ConflictPolicy"), 2),
+		relation_metadata(SYSTEM_FUNCTIONAL_KEY_ID, v.symbol_intern("FunctionalKey"), 3),
+		relation_metadata(SYSTEM_INDEX_ID, v.symbol_intern("Index"), 2),
+		relation_metadata(SYSTEM_INDEX_POSITION_ID, v.symbol_intern("IndexPosition"), 3),
+		relation_metadata(SYSTEM_INDEX_STORAGE_KIND_ID, v.symbol_intern("IndexStorageKind"), 2),
+		relation_metadata(SYSTEM_SUBJECT_FACT_ID, v.symbol_intern("SubjectFact"), 3),
+		relation_metadata(SYSTEM_MENTIONED_FACT_ID, v.symbol_intern("MentionedFact"), 4),
+		relation_metadata(
+			SYSTEM_EXTENSIONAL_MENTIONED_FACT_ID,
+			v.symbol_intern("ExtensionalMentionedFact"),
+			4,
+		),
+		relation_metadata(SYSTEM_PROGRAM_BYTES_ID, v.symbol_intern("ProgramBytes"), 2),
+		relation_metadata(SYSTEM_METHOD_SOURCE_ID, v.symbol_intern("MethodSource"), 2),
+		relation_metadata(SYSTEM_SOURCE_OWNS_FACT_ID, v.symbol_intern("SourceOwnsFact"), 3),
+		relation_metadata(SYSTEM_SOURCE_OWNS_RULE_ID, v.symbol_intern("SourceOwnsRule"), 2),
+		relation_metadata(SYSTEM_SOURCE_OWNS_RELATION_ID, v.symbol_intern("SourceOwnsRelation"), 2),
+	}
+	metadata := make([]Relation_Metadata, len(entries), allocator)
+	copy(metadata, entries[:])
 	return metadata
 }
 
