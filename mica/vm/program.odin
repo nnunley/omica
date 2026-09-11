@@ -80,6 +80,10 @@ Op :: enum u8 {
 	// Dispatch: a = dst, b = dispatch spec index. Resolves a method from the
 	// selector and role arguments, then calls its program.
 	Dispatch,
+	// Yield: suspends the task and makes it runnable again.
+	Yield,
+	// Sleep: b = register holding an integer number of milliseconds.
+	Sleep,
 }
 
 // A cell in a relation scan pattern.
@@ -578,6 +582,11 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 						return .Bad_Register
 					}
 				}
+			case .Yield:
+			case .Sleep:
+				if !valid_register(instr.b, register_count) {
+					return .Bad_Register
+				}
 			}
 		}
 	}
@@ -686,6 +695,10 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d pat%d", instr.a, instr.b)
 			case .Dispatch:
 				fmt.sbprintf(&builder, " r%d spec%d", instr.a, instr.b)
+			case .Yield:
+				fmt.sbprintf(&builder, "")
+			case .Sleep:
+				fmt.sbprintf(&builder, " r%d", instr.b)
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -750,6 +763,10 @@ op_name :: proc(op: Op) -> string {
 		return "scan_one"
 	case .Dispatch:
 		return "dispatch"
+	case .Yield:
+		return "yield"
+	case .Sleep:
+		return "sleep"
 	}
 	return "?"
 }

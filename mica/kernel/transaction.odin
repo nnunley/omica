@@ -603,6 +603,11 @@ transaction_rebase_in_place :: proc(
 
 	for block, index in candidate.blocks {
 		winner_block := winner.blocks[index]
+		if winner_block.metadata.id != block.metadata.id {
+			// The two snapshots materialized different relation blocks, so
+			// positions are not comparable. Rebuild from the winner instead.
+			return false
+		}
 		if winner_block == block {
 			continue
 		}

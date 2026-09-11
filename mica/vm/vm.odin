@@ -22,7 +22,12 @@ VM_Status :: enum {
 // A request from the VM to its host.
 VM_Request :: enum {
 	None,
+	// Commit the transaction and continue.
 	Commit,
+	// Suspend the task; it is runnable again immediately.
+	Yield,
+	// Suspend the task until at least `request_millis` have passed.
+	Sleep,
 }
 
 // A builtin procedure. It returns false after recording an error with
@@ -55,6 +60,8 @@ VM :: struct {
 	transaction: ^k.Transaction,
 	builtins:    [dynamic]VM_Builtin,
 	request:     VM_Request,
+	// Sleep duration in milliseconds when `request == .Sleep`.
+	request_millis: i64,
 	// Free slot for host data, for example a builtin environment.
 	user:        rawptr,
 }
@@ -317,6 +324,22 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Commit:
 			state.request = .Commit
+			state.status = .Boundary
+			return .Boundary
+
+		case .Yield:
+			state.request = .Yield
+			state.status = .Boundary
+			return .Boundary
+
+		case .Sleep:
+			millis, is_int := v.value_as_int(state.registers[base + int(instr.b)])
+			if !is_int || millis < 0 {
+				vm_fail(state, "E_TYPE", "sleep duration must be a non-negative integer")
+				return .Failed
+			}
+			state.request = .Sleep
+			state.request_millis = millis
 			state.status = .Boundary
 			return .Boundary
 
