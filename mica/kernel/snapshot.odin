@@ -31,7 +31,7 @@ Snapshot :: struct {
 	version:   u64,
 	parent:    ^Snapshot,
 	refs:      i32,
-	arena:     ^virtual.Arena,
+	arena:     ^Frame_Arena,
 	pool:      ^Arena_Pool,
 	allocator: mem.Allocator,
 	catalog:   []Relation_Metadata,
@@ -50,7 +50,7 @@ snapshot_create :: proc(kernel: ^Kernel, version: u64, parent: ^Snapshot) -> ^Sn
 	snapshot.parent = parent
 	snapshot.arena = arena
 	snapshot.pool = kernel.arena_pool
-	snapshot.allocator = virtual.arena_allocator(arena)
+	snapshot.allocator = frame_arena_allocator(arena)
 	// Callers that fork or add entries assign these arrays; leaving them nil
 	// avoids four allocator round-trips per snapshot.
 	snapshot.catalog = nil

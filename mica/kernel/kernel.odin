@@ -70,7 +70,7 @@ RELATION_LOCK_STRIPES :: 64
 
 Arena_Pool_Shard :: struct {
 	lock:   sync.Mutex,
-	arenas: [dynamic]^virtual.Arena,
+	arenas: [dynamic]^Frame_Arena,
 }
 
 Arena_Pool :: struct {
@@ -105,11 +105,11 @@ arena_pool_shard :: proc(pool: ^Arena_Pool) -> ^Arena_Pool_Shard {
 
 arena_pool_init :: proc(pool: ^Arena_Pool) {
 	for index in 0 ..< ARENA_POOL_SHARDS {
-		pool.shards[index].arenas = make([dynamic]^virtual.Arena)
+		pool.shards[index].arenas = make([dynamic]^Frame_Arena)
 	}
 }
 
-arena_pool_take :: proc(pool: ^Arena_Pool) -> ^virtual.Arena {
+arena_pool_take :: proc(pool: ^Arena_Pool) -> ^Frame_Arena {
 	hint := arena_pool_shard_index()
 
 	// Prefer the local shard, then steal from siblings. Arenas are created and
@@ -126,18 +126,16 @@ arena_pool_take :: proc(pool: ^Arena_Pool) -> ^virtual.Arena {
 		sync.mutex_unlock(&shard.lock)
 	}
 
-	arena := new(virtual.Arena, runtime.default_allocator())
-	if err := virtual.arena_init_growing(arena); err != nil {
-		panic("failed to initialize a pooled arena")
-	}
+	arena := new(Frame_Arena, runtime.default_allocator())
+	frame_arena_init(arena)
 	return arena
 }
 
-arena_pool_return :: proc(pool: ^Arena_Pool, arena: ^virtual.Arena) {
+arena_pool_return :: proc(pool: ^Arena_Pool, arena: ^Frame_Arena) {
 	if arena == nil {
 		return
 	}
-	virtual.arena_free_all(arena)
+	frame_arena_reset(arena)
 
 	// Return to the local shard; a thread's arenas tend to be reused by it.
 	shard := arena_pool_shard(pool)
@@ -150,7 +148,7 @@ arena_pool_destroy :: proc(pool: ^Arena_Pool) {
 	for index in 0 ..< ARENA_POOL_SHARDS {
 		shard := &pool.shards[index]
 		for arena in shard.arenas {
-			virtual.arena_destroy(arena)
+			frame_arena_destroy(arena)
 			free(arena, runtime.default_allocator())
 		}
 		delete(shard.arenas)
@@ -198,12 +196,12 @@ kernel_destroy :: proc(kernel: ^Kernel) {
 }
 
 // Returns a reset staging arena, creating one on demand.
-kernel_take_arena :: proc(kernel: ^Kernel) -> ^virtual.Arena {
+kernel_take_arena :: proc(kernel: ^Kernel) -> ^Frame_Arena {
 	return arena_pool_take(kernel.arena_pool)
 }
 
 // Resets `arena` and returns it to the pool for reuse.
-kernel_return_arena :: proc(kernel: ^Kernel, arena: ^virtual.Arena) {
+kernel_return_arena :: proc(kernel: ^Kernel, arena: ^Frame_Arena) {
 	arena_pool_return(kernel.arena_pool, arena)
 }
 

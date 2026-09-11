@@ -37,7 +37,7 @@ Relation_Writes :: struct {
 Transaction :: struct {
 	kernel:        ^Kernel,
 	base:          ^Snapshot,
-	arena:         ^virtual.Arena,
+	arena:         ^Frame_Arena,
 	allocator:     mem.Allocator,
 	writes:        [dynamic]Relation_Writes,
 	derived:       []Derived_Relation,
@@ -54,7 +54,7 @@ transaction_begin :: proc(kernel: ^Kernel) -> Transaction {
 		kernel = kernel,
 		base = base,
 		arena = arena,
-		allocator = virtual.arena_allocator(arena),
+		allocator = frame_arena_allocator(arena),
 		read_only = false,
 	}
 }

@@ -26,7 +26,7 @@ CHUNK_CAPACITY :: 128
 Relation_Chunk :: struct {
 	tuples: []v.Tuple,
 	refs:   i32,
-	arena:  ^virtual.Arena,
+	arena:  ^Frame_Arena,
 	pool:   ^Arena_Pool,
 }
 
@@ -40,7 +40,7 @@ Relation_Block :: struct {
 	flat_rows:   []v.Tuple,
 	indexes:     []Secondary_Index,
 	refs:        i32,
-	arena:       ^virtual.Arena,
+	arena:       ^Frame_Arena,
 	pool:        ^Arena_Pool,
 	storage:     mem.Allocator,
 }
@@ -54,14 +54,12 @@ Secondary_Index :: struct {
 // --- Chunks ----------------------------------------------------------------
 
 @(private)
-new_arena :: proc(pool: ^Arena_Pool) -> ^virtual.Arena {
+new_arena :: proc(pool: ^Arena_Pool) -> ^Frame_Arena {
 	if pool != nil {
 		return arena_pool_take(pool)
 	}
-	arena := new(virtual.Arena, runtime.default_allocator())
-	if err := virtual.arena_init_growing(arena); err != nil {
-		panic("failed to initialize a relation chunk arena")
-	}
+	arena := new(Frame_Arena, runtime.default_allocator())
+	frame_arena_init(arena)
 	return arena
 }
 
@@ -102,7 +100,7 @@ deep_copy_rows :: proc(alloc: mem.Allocator, rows: []v.Tuple) -> []v.Tuple {
 // is pooled and recycled; without one it is owned and destroyed on release.
 relation_chunk_create :: proc(pool: ^Arena_Pool, rows: []v.Tuple) -> ^Relation_Chunk {
 	arena := new_arena(pool)
-	alloc := virtual.arena_allocator(arena)
+	alloc := frame_arena_allocator(arena)
 
 	owned := deep_copy_rows(alloc, rows)
 
@@ -135,7 +133,7 @@ relation_chunk_release :: proc(chunk: ^Relation_Chunk) {
 		arena_pool_return(chunk.pool, chunk.arena)
 		return
 	}
-	virtual.arena_destroy(chunk.arena)
+	frame_arena_destroy(chunk.arena)
 	free(chunk.arena, runtime.default_allocator())
 }
 
@@ -218,7 +216,7 @@ relation_block_build_pooled :: proc(
 	rows = sorted_unique_rows(rows)
 
 	block_arena := arena_pool_take(kernel.arena_pool)
-	block_alloc := virtual.arena_allocator(block_arena)
+	block_alloc := frame_arena_allocator(block_arena)
 
 	block := new(Relation_Block, block_alloc)
 	block.metadata = metadata
@@ -269,7 +267,7 @@ relation_block_apply :: proc(
 	new_chunks := chunks_from_rows(kernel.arena_pool, merged[:], context.temp_allocator)
 
 	block_arena := arena_pool_take(kernel.arena_pool)
-	block_alloc := virtual.arena_allocator(block_arena)
+	block_alloc := frame_arena_allocator(block_arena)
 
 	total := lo + len(new_chunks) + (len(chunks) - suffix_start)
 	spine := make([]^Relation_Chunk, total, block_alloc)
