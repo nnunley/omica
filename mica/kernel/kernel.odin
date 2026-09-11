@@ -22,11 +22,14 @@ import v "../var"
 Kernel :: struct {
 	current:     ^Snapshot,
 	commit_lock: sync.Mutex,
-	// Guards the `current` pointer swap and snapshot load-and-retain. Held
-	// only for those operations, never for a whole commit, so readers never
-	// wait on commit work. This closes the load-then-retain race that letting
-	// publishers free unreferenced snapshots would otherwise open.
-	snapshot_lock: sync.Mutex,
+	// Reader-count reclamation (RCU-style). A reader increments `readers`
+	// around load-and-retain; a publisher swaps `current`, moves the previous
+	// snapshot to `retired`, and frees retired snapshots only while no reader
+	// is active. This closes the load-then-retain race without a lock on the
+	// read path.
+	readers:     i32,
+	retire_lock: sync.Mutex,
+	retired:     [dynamic]^Snapshot,
 
 	// Relation metadata and rule definitions live here for the life of the
 	// kernel; blocks and snapshots reference their slices.
@@ -93,17 +96,21 @@ kernel_init :: proc(kernel: ^Kernel) {
 	kernel.world_allocator = virtual.arena_allocator(kernel.world)
 	kernel.arena_pool = new(Arena_Pool, runtime.default_allocator())
 	arena_pool_init(kernel.arena_pool)
+	kernel.retired = make([dynamic]^Snapshot)
 	kernel.current = snapshot_create(kernel, 0, nil)
 }
 
 // Releases the published snapshot, the committed store, and the staging pool.
 // The caller must guarantee no other thread uses the kernel.
 kernel_destroy :: proc(kernel: ^Kernel) {
-	sync.mutex_lock(&kernel.snapshot_lock)
 	current := sync.atomic_load(&kernel.current)
 	sync.atomic_store(&kernel.current, nil)
-	sync.mutex_unlock(&kernel.snapshot_lock)
 	snapshot_release(current)
+
+	for retired in kernel.retired {
+		snapshot_release(retired)
+	}
+	delete(kernel.retired)
 
 	if kernel.arena_pool != nil {
 		arena_pool_destroy(kernel.arena_pool)
@@ -129,12 +136,15 @@ kernel_return_arena :: proc(kernel: ^Kernel, arena: ^virtual.Arena) {
 }
 
 // Returns a retained reference to the current snapshot. The caller must
-// release it.
+// release it. Lock-free: the reader is announced in `readers` while it loads
+// and retains, so a publisher cannot free the snapshot underneath it.
 kernel_snapshot :: proc(kernel: ^Kernel) -> ^Snapshot {
-	sync.mutex_lock(&kernel.snapshot_lock)
+	sync.atomic_add_explicit(&kernel.readers, 1, .Acq_Rel)
 	current := sync.atomic_load(&kernel.current)
 	snapshot_retain(current)
-	sync.mutex_unlock(&kernel.snapshot_lock)
+	if sync.atomic_sub_explicit(&kernel.readers, 1, .Acq_Rel) == 1 {
+		kernel_reclaim(kernel)
+	}
 	return current
 }
 
@@ -161,15 +171,43 @@ kernel_next_relation_id :: proc(kernel: ^Kernel) -> Relation_ID {
 @(private)
 kernel_publish_locked :: proc(kernel: ^Kernel, next: ^Snapshot) {
 	snapshot_retain(next)
-
-	// Swap under the snapshot lock so a concurrent load-and-retain either sees
-	// `next` or holds a reference to `previous` before it is released below.
-	sync.mutex_lock(&kernel.snapshot_lock)
 	previous := sync.atomic_load(&kernel.current)
 	sync.atomic_store(&kernel.current, next)
-	sync.mutex_unlock(&kernel.snapshot_lock)
+	kernel_retire(kernel, previous)
+}
 
-	snapshot_release(previous)
+// Moves `snapshot` to the retired list and reclaims retired snapshots when no
+// reader is in its load-and-retain window.
+@(private)
+kernel_retire :: proc(kernel: ^Kernel, snapshot: ^Snapshot) {
+	if snapshot == nil {
+		return
+	}
+	sync.mutex_lock(&kernel.retire_lock)
+	append(&kernel.retired, snapshot)
+	has_retired := len(kernel.retired) > 0
+	sync.mutex_unlock(&kernel.retire_lock)
+
+	if has_retired && sync.atomic_load(&kernel.readers) == 0 {
+		kernel_reclaim(kernel)
+	}
+}
+
+// Releases every retired snapshot when no reader is active. Safe to call from
+// any thread; the final reader out of its window calls it.
+@(private)
+kernel_reclaim :: proc(kernel: ^Kernel) {
+	sync.mutex_lock(&kernel.retire_lock)
+	defer sync.mutex_unlock(&kernel.retire_lock)
+
+	// A reader may have entered while we waited for the lock.
+	if sync.atomic_load(&kernel.readers) != 0 {
+		return
+	}
+	for retired in kernel.retired {
+		snapshot_release(retired)
+	}
+	clear(&kernel.retired)
 }
 
 // Creates a relation and publishes a new snapshot. The returned snapshot is
