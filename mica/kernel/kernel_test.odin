@@ -1481,3 +1481,128 @@ test_snapshot_metadata_lookup_by_name :: proc(t: ^testing.T) {
 	_, missing := snapshot_relation_metadata_named(kernel.current, v.symbol_intern("NoSuchRelation"))
 	testing.expect(t, !missing)
 }
+
+@(test)
+test_metadata_defaults :: proc(t: ^testing.T) {
+	metadata := relation_metadata(Relation_ID(1), v.symbol_intern("Defaults"), 3)
+	testing.expect_value(t, metadata.id, Relation_ID(1))
+	testing.expect_value(t, metadata.arity, u16(3))
+	testing.expect_value(t, len(metadata.indexes), 0)
+	testing.expect_value(t, metadata.conflict.kind, Conflict_Kind.Set)
+	testing.expect_value(t, metadata.durability, Relation_Durability.Durable)
+	testing.expect_value(t, len(metadata.argument_names), 0)
+}
+
+@(test)
+test_dispatch_method_entries_expose_params :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	method_selector := create_relation(&kernel, 40, "MethodSelector", 2)
+	param := create_relation(&kernel, 41, "Param", 4)
+	delegates := create_relation(&kernel, 42, "Delegates", 3)
+	relations := Dispatch_Relations {
+		method_selector = method_selector,
+		param           = param,
+		delegates       = delegates,
+	}
+
+	method := must_int(100)
+	actor := must_identity(10)
+	item := must_identity(1)
+	player := must_identity(11)
+	thing := must_identity(2)
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, method_selector, tuple_of(method, sym("take")))
+	transaction_assert(&tx, param, tuple_of(method, sym("actor"), player, must_int(0)))
+	transaction_assert(&tx, param, tuple_of(method, sym("item"), thing, must_int(1)))
+	transaction_assert(&tx, delegates, tuple_of(actor, player, must_int(0)))
+	transaction_assert(&tx, delegates, tuple_of(item, thing, must_int(0)))
+
+	source := Relation_Source{transaction = &tx, use_stored_derived = true}
+	roles := []Role_Pair {
+		{role = sym("actor"), value = actor},
+		{role = sym("item"), value = item},
+	}
+	entries := applicable_method_entries(
+		&source,
+		relations,
+		sym("take"),
+		roles,
+		context.temp_allocator,
+	)
+	testing.expect_value(t, len(entries), 1)
+	if len(entries) == 1 {
+		testing.expect(t, v.value_eq(entries[0].method, method))
+		testing.expect_value(t, len(entries[0].params), 2)
+
+		actor_found := false
+		item_found := false
+		for param_row in entries[0].params {
+			values := v.tuple_values(param_row)
+			role := values[1]
+			if v.value_eq(role, sym("actor")) {
+				actor_found = true
+				testing.expect(t, v.value_eq(values[2], player))
+				testing.expect_value(t, values[3], must_int(0))
+			}
+			if v.value_eq(role, sym("item")) {
+				item_found = true
+				testing.expect(t, v.value_eq(values[2], thing))
+				testing.expect_value(t, values[3], must_int(1))
+			}
+		}
+		testing.expect(t, actor_found)
+		testing.expect(t, item_found)
+	}
+	commit_transaction(t, &tx)
+}
+
+@(test)
+test_rule_evaluation_error_path :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	base := create_relation(&kernel, 1, "Base", 1)
+	derived := create_relation(&kernel, 2, "Derived", 1)
+
+	snapshot := kernel_snapshot(&kernel)
+	defer snapshot_release(snapshot)
+	alloc := context.temp_allocator
+
+	x := v.symbol_intern("x")
+
+	// Safety validation rejects this rule at install. Evaluating it directly
+	// must report the same error.
+	unsafe := rule_definition(
+		v.Identity(1),
+		rule_new(
+			derived,
+			[]Term{term_var(x)},
+			[]Rule_Body_Item{body_atom(atom_negated(base, []Term{term_var(x)}))},
+		),
+		"unsafe",
+	)
+	_, unsafe_err := rules_evaluate(alloc, []Rule_Definition{unsafe}, snapshot)
+	testing.expect_value(t, unsafe_err, Kernel_Error.Unsafe_Negation)
+
+	// Stratification rejects this rule at install. Evaluating it directly
+	// must report the same error.
+	unstratified := rule_definition(
+		v.Identity(2),
+		rule_new(
+			derived,
+			[]Term{term_var(x)},
+			[]Rule_Body_Item {
+				body_atom(atom_positive(base, []Term{term_var(x)})),
+				body_atom(atom_negated(derived, []Term{term_var(x)})),
+			},
+		),
+		"unstratified",
+	)
+	_, unstratified_err := rules_evaluate(alloc, []Rule_Definition{unstratified}, snapshot)
+	testing.expect_value(t, unstratified_err, Kernel_Error.Unstratified_Negation)
+}

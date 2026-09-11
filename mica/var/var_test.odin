@@ -581,3 +581,156 @@ test_display_all_kinds :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, value_to_string(heap_relation, alloc), "<relation 2x1>")
 }
+
+@(test)
+test_value_float_from_bits :: proc(t: ^testing.T) {
+	valid, valid_ok := value_float_from_bits(transmute(u32)f32(1.5))
+	testing.expect(t, valid_ok)
+	round_trip, round_trip_ok := value_as_float(valid)
+	testing.expect(t, round_trip_ok)
+	testing.expect_value(t, round_trip, f32(1.5))
+
+	negative_zero, negative_zero_ok := value_float_from_bits(0x8000_0000)
+	testing.expect(t, negative_zero_ok)
+	positive_zero, _ := value_float_from_bits(0)
+	testing.expect(t, value_eq(negative_zero, positive_zero))
+
+	_, nan_ok := value_float_from_bits(0x7fc0_0000)
+	testing.expect(t, !nan_ok)
+	_, inf_ok := value_float_from_bits(0x7f80_0000)
+	testing.expect(t, !inf_ok)
+	_, negative_inf_ok := value_float_from_bits(0xff80_0000)
+	testing.expect(t, !negative_inf_ok)
+}
+
+@(test)
+test_value_is_immediate :: proc(t: ^testing.T) {
+	alloc := context.temp_allocator
+
+	relation_value, _ := value_relation(
+		alloc,
+		[]Symbol{symbol_intern("immediate-column")},
+		[]Tuple{tuple_new(alloc, []Value{must_int(1)})},
+	)
+
+	immediates := []Value {
+		value_bool(true),
+		must_int(1),
+		must_float(1.0),
+		value_identity(Identity(1)),
+		sym("immediate-symbol"),
+		value_error_code(symbol_intern("E_IMMEDIATE")),
+		value_capability(Capability_ID(1)),
+		value_function(Function_ID(1)),
+		value_empty_relation(),
+	}
+	for value in immediates {
+		testing.expect(t, value_is_immediate(value))
+	}
+
+	heap_values := []Value {
+		value_string(alloc, "text"),
+		value_bytes(alloc, []u8{1}),
+		value_list(alloc, []Value{must_int(1)}),
+		value_map(alloc, []Map_Entry{{key = must_int(1), value = must_int(2)}}),
+		value_range(alloc, must_int(0), must_int(1), true),
+		value_error(alloc, symbol_intern("E_IMMEDIATE"), "", false, Value(0), false),
+		value_frob(alloc, Identity(1), must_int(1)),
+		relation_value,
+	}
+	for value in heap_values {
+		testing.expect(t, !value_is_immediate(value))
+	}
+}
+
+@(test)
+test_division_edges :: proc(t: ^testing.T) {
+	three := must_int(3)
+	two := must_int(2)
+
+	exact_negative, exact_negative_ok := value_checked_div(must_int(-6), three)
+	testing.expect(t, exact_negative_ok)
+	testing.expect(t, value_eq(exact_negative, must_int(-2)))
+
+	inexact_negative, inexact_negative_ok := value_checked_div(must_int(-7), two)
+	testing.expect(t, inexact_negative_ok)
+	inexact_float, inexact_float_ok := value_as_float(inexact_negative)
+	testing.expect(t, inexact_float_ok)
+	testing.expect_value(t, inexact_float, f32(-3.5))
+
+	_, float_zero_ok := value_checked_div(must_float(1.0), must_float(0.0))
+	testing.expect(t, !float_zero_ok)
+
+	float_by_int, float_by_int_ok := value_checked_div(must_float(3.0), two)
+	testing.expect(t, float_by_int_ok)
+	float_by_int_value, _ := value_as_float(float_by_int)
+	testing.expect_value(t, float_by_int_value, f32(1.5))
+
+	int_by_float, int_by_float_ok := value_checked_div(three, must_float(2.0))
+	testing.expect(t, int_by_float_ok)
+	int_by_float_value, _ := value_as_float(int_by_float)
+	testing.expect_value(t, int_by_float_value, f32(1.5))
+
+	// INT_MIN / -1 leaves the 56-bit integer range.
+	_, overflow_ok := value_checked_div(must_int(INT_MIN), must_int(-1))
+	testing.expect(t, !overflow_ok)
+}
+
+@(test)
+test_primitive_prototypes :: proc(t: ^testing.T) {
+	alloc := context.temp_allocator
+
+	relation_value, _ := value_relation(
+		alloc,
+		[]Symbol{symbol_intern("prototype-column")},
+		[]Tuple{tuple_new(alloc, []Value{must_int(1)})},
+	)
+
+	values := []Value {
+		value_bool(true),
+		must_int(1),
+		must_float(1.5),
+		value_identity(Identity(1)),
+		sym("prototype-symbol"),
+		value_error_code(symbol_intern("E_PROTOTYPE")),
+		value_string(alloc, "text"),
+		value_bytes(alloc, []u8{1}),
+		value_list(alloc, []Value{must_int(1)}),
+		value_map(alloc, []Map_Entry{{key = must_int(1), value = must_int(2)}}),
+		value_range(alloc, must_int(0), must_int(1), true),
+		value_error(alloc, symbol_intern("E_PROTOTYPE"), "", false, Value(0), false),
+		value_capability(Capability_ID(1)),
+		value_frob(alloc, Identity(1), must_int(1)),
+		value_function(Function_ID(1)),
+		relation_value,
+	}
+	expected := []Identity {
+		BOOL_PROTOTYPE,
+		INTEGER_PROTOTYPE,
+		FLOAT_PROTOTYPE,
+		IDENTITY_PROTOTYPE,
+		SYMBOL_PROTOTYPE,
+		ERROR_CODE_PROTOTYPE,
+		STRING_PROTOTYPE,
+		BYTES_PROTOTYPE,
+		LIST_PROTOTYPE,
+		MAP_PROTOTYPE,
+		RANGE_PROTOTYPE,
+		ERROR_PROTOTYPE,
+		CAPABILITY_PROTOTYPE,
+		FROB_PROTOTYPE,
+		FUNCTION_PROTOTYPE,
+		RELATION_PROTOTYPE,
+	}
+
+	for value, i in values {
+		testing.expect_value(t, primitive_prototype_for_value(value), expected[i])
+		testing.expect_value(t, primitive_prototype_for_kind(value_kind(value)), expected[i])
+	}
+
+	testing.expect_value(
+		t,
+		primitive_prototype_for_value(value_empty_relation()),
+		RELATION_PROTOTYPE,
+	)
+}
