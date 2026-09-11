@@ -612,7 +612,8 @@ test_emit_fn_literal :: proc(t: ^testing.T) {
 	makes := 0
 	calls := 0
 	for instruction in program.code {
-		if instruction.op == .Make_Function {
+		if instruction.op == .Make_Function ||
+		   instruction.op == .Make_Self_Function {
 			makes += 1
 		} else if instruction.op == .Call_Value {
 			calls += 1

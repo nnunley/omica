@@ -161,7 +161,7 @@ test_vm_function_call :: proc(t: ^testing.T) {
 
 	builder_begin_function(&builder, v.symbol_intern("main"), 0, 3, true)
 	builder_emit(&builder, .Load_Const, 0, 0, twenty_one, 0)
-	builder_emit(&builder, .Call, 0, 1, i32(double), 0)
+	builder_emit(&builder, .Call, 1, 1, i32(double), 0)
 	builder_emit(&builder, .Return, 0, 1, 0, 0)
 	builder_end_function(&builder)
 
