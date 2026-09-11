@@ -62,6 +62,9 @@ runtime_builtins := [?]Builtin_Spec {
 	{"endpoint", 0, builtin_endpoint},
 	{"actor", 0, builtin_actor},
 	{"principal", 0, builtin_principal},
+	{"dom_text", 1, builtin_dom_text},
+	{"dom_raw", 1, builtin_dom_raw},
+	{"dom_element", 3, builtin_dom_element},
 }
 
 @(private)
@@ -130,6 +133,56 @@ builtin_principal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		return builtin_error(state, "E_INVARG", "principal expects no arguments")
 	}
 	return builtin_env(state).principal, true
+}
+
+@(private)
+builtin_dom_text :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	text, is_string := v.value_as_string(args[0])
+	if !is_string {
+		return builtin_error(state, "E_TYPE", "dom_text expects a string")
+	}
+	return v.value_map(state.allocator, []v.Map_Entry {
+		{
+			key   = v.value_symbol(v.symbol_intern("text")),
+			value = v.value_string(state.allocator, text),
+		},
+	}), true
+}
+
+@(private)
+builtin_dom_raw :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	text, is_string := v.value_as_string(args[0])
+	if !is_string {
+		return builtin_error(state, "E_TYPE", "dom_raw expects a string")
+	}
+	return v.value_map(state.allocator, []v.Map_Entry {
+		{
+			key   = v.value_symbol(v.symbol_intern("raw")),
+			value = v.value_string(state.allocator, text),
+		},
+	}), true
+}
+
+@(private)
+builtin_dom_element :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	tag, is_string := v.value_as_string(args[0])
+	if !is_string {
+		return builtin_error(state, "E_TYPE", "dom_element tag is not a string")
+	}
+	if _, is_map := v.value_as_map(args[1]); !is_map {
+		return builtin_error(state, "E_TYPE", "dom_element attrs are not a map")
+	}
+	if _, is_list := v.value_as_list(args[2]); !is_list {
+		return builtin_error(state, "E_TYPE", "dom_element children are not a list")
+	}
+	return v.value_map(state.allocator, []v.Map_Entry {
+		{key = v.value_symbol(v.symbol_intern("attrs")), value = args[1]},
+		{key = v.value_symbol(v.symbol_intern("children")), value = args[2]},
+		{
+			key   = v.value_symbol(v.symbol_intern("tag")),
+			value = v.value_string(state.allocator, tag),
+		},
+	}), true
 }
 
 // --- Helpers ---------------------------------------------------------------

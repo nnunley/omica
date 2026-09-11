@@ -431,9 +431,11 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 	case Structural_Literal:
 		return emit_frob(emitter, n)
 
-	case Dom_Text, Dom_Element:
-		push_error(emitter, "DOM markup is not lowered yet")
-		return -1, false
+	case Dom_Text:
+		return emit_dom_text(emitter, n)
+
+	case Dom_Element:
+		return emit_dom_element(emitter, n)
 
 	case Fn:
 		push_error(emitter, "fn literals are not lowered yet")
@@ -1080,6 +1082,87 @@ emit_role_dispatch :: proc(
 		i32(destination),
 		spec,
 		0,
+	)
+	return destination, true
+}
+
+// Lowers a DOM text node to the `dom_text` builtin.
+@(private)
+emit_dom_text :: proc(emitter: ^Emitter, text: Dom_Text) -> (int, bool) {
+	argument := emit_constant(
+		emitter,
+		v.value_string(emitter.allocator, text.text),
+	)
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("dom_text"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		1,
+		i32(destination),
+		builtin,
+		i32(argument),
+	)
+	return destination, true
+}
+
+// Lowers `dom <tag ...>children</tag>` to a `dom_element` call. Attributes
+// become a string-keyed map; valueless attributes take the value true.
+@(private)
+emit_dom_element :: proc(emitter: ^Emitter, element: Dom_Element) -> (int, bool) {
+	tag := emit_constant(
+		emitter,
+		v.value_string(emitter.allocator, element.tag),
+	)
+
+	attribute_registers := make([dynamic]int, 0, len(element.attributes) * 2, emitter.allocator)
+	defer delete(attribute_registers)
+	for attribute in element.attributes {
+		key := emit_constant(
+			emitter,
+			v.value_string(emitter.allocator, attribute.name),
+		)
+		value := 0
+		if attribute.has_value {
+			emitted, has_value := emit_expr(emitter, attribute.value)
+			if !has_value {
+				return -1, false
+			}
+			value = emitted
+		} else {
+			value = emit_constant(emitter, v.value_bool(true))
+		}
+		append(&attribute_registers, key, value)
+	}
+	first_attribute := marshal_arguments(emitter, attribute_registers[:])
+	attributes := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Build_Map,
+		0,
+		i32(attributes),
+		i32(first_attribute),
+		i32(len(element.attributes)),
+	)
+
+	children, children_ok := emit_list(
+		emitter,
+		List_Literal{elements = element.children},
+	)
+	if !children_ok {
+		return -1, false
+	}
+
+	first := marshal_arguments(emitter, []int{tag, attributes, children})
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("dom_element"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		3,
+		i32(destination),
+		builtin,
+		i32(first),
 	)
 	return destination, true
 }
