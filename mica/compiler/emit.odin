@@ -578,6 +578,52 @@ emit_assignment :: proc(emitter: ^Emitter, assignment: Assignment) -> (int, bool
 		return value, true
 	}
 
+	if index_target, is_index := assignment.target^.(Index); is_index {
+		collection_name, collection_is_name := index_target.collection^.(Name)
+		if !collection_is_name {
+			push_error(emitter, "indexed assignment requires a named collection")
+			return -1, false
+		}
+		collection_text := join_name(collection_name, emitter.allocator)
+		collection, is_const, found := resolve_local(emitter, collection_text)
+		if !found {
+			push_error(emitter, fmt.aprintf(
+				"assignment to an unknown name: %s",
+				collection_text,
+				allocator = emitter.allocator,
+			))
+			return -1, false
+		}
+		if is_const {
+			push_error(emitter, "assignment to a constant binding")
+			return -1, false
+		}
+		index_register, index_ok := emit_expr(emitter, index_target.key)
+		if !index_ok {
+			return -1, false
+		}
+		value_register, value_ok := emit_expr(emitter, assignment.value)
+		if !value_ok {
+			return -1, false
+		}
+		first_argument := marshal_arguments(
+			emitter,
+			[]int{collection, index_register, value_register},
+		)
+		destination := alloc_register(emitter)
+		builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__set_index"))
+		vm.builder_emit(
+			emitter.builder,
+			.Builtin_Call,
+			3,
+			i32(destination),
+			builtin,
+			i32(first_argument),
+		)
+		vm.builder_emit(emitter.builder, .Move, 0, i32(collection), i32(destination), 0)
+		return destination, true
+	}
+
 	target, is_name := assignment.target^.(Name)
 	if !is_name {
 		push_error(emitter, "assignment target must be a name or field")
@@ -738,7 +784,7 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		vm.builder_emit(
 			emitter.builder,
 			.Builtin_Call,
-			0,
+			u8(len(call.args)),
 			i32(destination),
 			builtin,
 			i32(first_argument),
@@ -751,35 +797,86 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 }
 
 @(private)
+emit_singleton_list :: proc(emitter: ^Emitter, register: int) -> int {
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Build_List,
+		0,
+		i32(destination),
+		i32(register),
+		1,
+	)
+	return destination
+}
+
+@(private)
+emit_list_concat :: proc(emitter: ^Emitter, lists: []int) -> (int, bool) {
+	first := marshal_arguments(emitter, lists)
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__list_concat"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		u8(len(lists)),
+		i32(destination),
+		builtin,
+		i32(first),
+	)
+	return destination, true
+}
+
+@(private)
 emit_list :: proc(emitter: ^Emitter, list: List_Literal) -> (int, bool) {
-	first := -1
-	count := 0
+	has_splice := false
 	for element in list.elements {
 		if _, is_splice := element^.(Splice); is_splice {
-			push_error(emitter, "list splices are not lowered yet")
-			return -1, false
+			has_splice = true
+			break
+		}
+	}
+
+	registers := make([dynamic]int, 0, len(list.elements), emitter.allocator)
+	defer delete(registers)
+	for element in list.elements {
+		if splice, is_splice := element^.(Splice); is_splice {
+			register, has_value := emit_expr(emitter, splice.value)
+			if !has_value {
+				return -1, false
+			}
+			append(&registers, register)
+			continue
 		}
 		register, has_value := emit_expr(emitter, element)
 		if !has_value {
 			return -1, false
 		}
-		if first < 0 {
-			first = register
+		if has_splice {
+			register = emit_singleton_list(emitter, register)
 		}
-		count += 1
+		append(&registers, register)
 	}
-	if first < 0 {
-		first = 0
+
+	if has_splice {
+		return emit_list_concat(emitter, registers[:])
 	}
+	first := marshal_arguments(emitter, registers[:])
 	destination := alloc_register(emitter)
-	vm.builder_emit(emitter.builder, .Build_List, 0, i32(destination), i32(first), i32(count))
+	vm.builder_emit(
+		emitter.builder,
+		.Build_List,
+		0,
+		i32(destination),
+		i32(first),
+		i32(len(registers)),
+	)
 	return destination, true
 }
 
 @(private)
 emit_map :: proc(emitter: ^Emitter, map_literal: Map_Literal) -> (int, bool) {
-	first := -1
-	count := 0
+	registers := make([dynamic]int, 0, len(map_literal.entries) * 2, emitter.allocator)
+	defer delete(registers)
 	for entry in map_literal.entries {
 		key_register, key_ok := emit_expr(emitter, entry.key)
 		if !key_ok {
@@ -789,16 +886,18 @@ emit_map :: proc(emitter: ^Emitter, map_literal: Map_Literal) -> (int, bool) {
 		if !value_ok {
 			return -1, false
 		}
-		if first < 0 {
-			first = key_register
-		}
-		count += 1
+		append(&registers, key_register, value_register)
 	}
-	if first < 0 {
-		first = 0
-	}
+	first := marshal_arguments(emitter, registers[:])
 	destination := alloc_register(emitter)
-	vm.builder_emit(emitter.builder, .Build_Map, 0, i32(destination), i32(first), i32(count))
+	vm.builder_emit(
+		emitter.builder,
+		.Build_Map,
+		0,
+		i32(destination),
+		i32(first),
+		i32(len(map_literal.entries)),
+	)
 	return destination, true
 }
 

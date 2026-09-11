@@ -75,12 +75,8 @@ run_files :: proc(
 		relations  = make(map[string]u32, allocator),
 		identities = make(map[string]v.Value, allocator),
 	}
-	ctx.builtins["make_identity"] = true
-	ctx.builtins["make_relation"] = true
-	ctx.builtins["make_functional_relation"] = true
-	ctx.builtins["emit"] = true
-	ctx.builtins["require"] = true
-	ctx.builtins["frob"] = true
+	install_builtin_names(&ctx)
+	install_primitive_identities(&ctx)
 
 	env := Builtin_Env {
 		kernel    = kernel,
@@ -140,7 +136,7 @@ run_files :: proc(
 	defer vm.vm_destroy(&state)
 	vm.vm_set_workspace(&state, &source, &tx)
 	state.user = &env
-	register_builtins(&state)
+	register_runtime_builtins(&state)
 
 	for {
 		status := vm.vm_run(&state)
@@ -340,25 +336,6 @@ install_rules :: proc(
 		declarations.next_rule += 1
 	}
 	return Run_Result{ok = true, message = "loaded"}
-}
-
-// --- Builtins --------------------------------------------------------------
-
-@(private)
-register_builtins :: proc(state: ^vm.VM) {
-	vm.vm_register_builtin(state, v.symbol_intern("make_identity"), 1, builtin_make_identity)
-	vm.vm_register_builtin(state, v.symbol_intern("make_relation"), 2, builtin_relation)
-	vm.vm_register_builtin(
-		state,
-		v.symbol_intern("make_functional_relation"),
-		3,
-		builtin_relation,
-	)
-	vm.vm_register_builtin(state, v.symbol_intern("__set_field"), 3, builtin_set_field)
-	vm.vm_register_builtin(state, v.symbol_intern("__get_field"), 2, builtin_get_field)
-	vm.vm_register_builtin(state, v.symbol_intern("emit"), 2, builtin_noop)
-	vm.vm_register_builtin(state, v.symbol_intern("require"), 1, builtin_require)
-	vm.vm_register_builtin(state, v.symbol_intern("frob"), 2, builtin_frob)
 }
 
 @(private)

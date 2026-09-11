@@ -438,8 +438,12 @@ vm_builtin_call :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		if builtin.name != name {
 			continue
 		}
-		args := make([]v.Value, builtin.argc, context.temp_allocator)
-		for index in 0 ..< builtin.argc {
+		argc := builtin.argc
+		if argc < 0 {
+			argc = int(instr.flags)
+		}
+		args := make([]v.Value, argc, context.temp_allocator)
+		for index in 0 ..< argc {
 			args[index] = state.registers[base + int(instr.c) + index]
 		}
 		result, ok := builtin.run(state, args)
