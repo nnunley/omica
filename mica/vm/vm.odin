@@ -68,11 +68,24 @@ Callable_Info :: struct {
 
 // A compiled exception handler: errors raised at or below `frame` jump to the
 // absolute code offset `target` with the error delivered to `error_register`
-// (-1 when the handler takes no value).
+// (-1 when the handler takes no value). A Finally handler also intercepts
+// returns so the finally body runs before the frame is popped.
+Handler_Kind :: enum {
+	Catch,
+	Finally,
+}
+
 Handler :: struct {
 	frame:          int,
 	target:         i32,
 	error_register: i32,
+	kind:           Handler_Kind,
+}
+
+// A return diverted through a finally body.
+Pending_Return :: struct {
+	frame: int,
+	value: v.Value,
 }
 
 VM :: struct {
@@ -103,6 +116,8 @@ VM :: struct {
 	handlers: [dynamic]Handler,
 	// Interned callable values, addressed by Function_ID payload.
 	callables: [dynamic]Callable_Info,
+	// Returns diverted through a finally body, innermost last.
+	pending_returns: [dynamic]Pending_Return,
 	// Free slot for host data, for example a builtin environment.
 	user:        rawptr,
 	// Values copied into the entry function's parameter registers before the
@@ -127,6 +142,7 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.entry_function = -1
 	state.handlers = make([dynamic]Handler)
 	state.callables = make([dynamic]Callable_Info)
+	state.pending_returns = make([dynamic]Pending_Return)
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
 	state.status = .Ready
@@ -139,6 +155,7 @@ vm_destroy :: proc(state: ^VM) {
 		}
 	}
 	delete(state.callables)
+	delete(state.pending_returns)
 	delete(state.handlers)
 	delete(state.registers)
 	delete(state.frames)
@@ -290,6 +307,16 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Return:
 			value := state.registers[base + int(instr.a)]
+			if handler_index := vm_finally_handler(state, top); handler_index >= 0 {
+				handler := state.handlers[handler_index]
+				ordered_remove(&state.handlers, handler_index)
+				append(&state.pending_returns, Pending_Return {
+					frame = top,
+					value = value,
+				})
+				state.frames[top].ip = int(handler.target)
+				break
+			}
 			returned := pop(&state.frames)
 			resize(&state.registers, base)
 			if len(state.frames) == 0 {
@@ -674,6 +701,36 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				caller_dst    = instr.a,
 			})
 
+		case .Push_Finally:
+			append(&state.handlers, Handler {
+				frame          = top,
+				target         = instr.a,
+				error_register = -1,
+				kind           = .Finally,
+			})
+
+		case .Resume_Return:
+			if len(state.pending_returns) > 0 &&
+			   state.pending_returns[len(state.pending_returns) - 1].frame == top {
+				pending := state.pending_returns[len(state.pending_returns) - 1]
+				if handler_index := vm_finally_handler(state, top); handler_index >= 0 {
+					handler := state.handlers[handler_index]
+					ordered_remove(&state.handlers, handler_index)
+					state.frames[top].ip = int(handler.target)
+					break
+				}
+				pop(&state.pending_returns)
+				returned := pop(&state.frames)
+				resize(&state.registers, base)
+				if len(state.frames) == 0 {
+					state.result = pending.value
+					state.status = .Halted
+					return .Halted
+				}
+				caller := state.frames[len(state.frames) - 1]
+				state.registers[caller.register_base + int(returned.caller_dst)] = pending.value
+			}
+
 		case .Is_Truthy:
 			truthy := vm_value_is_truthy(state.registers[base + int(instr.b)])
 			state.registers[base + int(instr.a)] = v.value_bool(truthy)
@@ -703,6 +760,18 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 	}
 }
 
+// Returns the index of the innermost Finally handler for `frame`, or -1.
+@(private)
+vm_finally_handler :: proc(state: ^VM, frame: int) -> int {
+	for index := len(state.handlers) - 1; index >= 0; index -= 1 {
+		handler := state.handlers[index]
+		if handler.frame == frame && handler.kind == .Finally {
+			return index
+		}
+	}
+	return -1
+}
+
 // Transfers control to the innermost handler. Returns false when no handler
 // exists and the error must escape the VM.
 @(private)
@@ -710,7 +779,22 @@ vm_unwind :: proc(state: ^VM) -> bool {
 	if len(state.handlers) == 0 {
 		return false
 	}
-	handler := pop(&state.handlers)
+	handler_index := -1
+	for index := len(state.handlers) - 1; index >= 0; index -= 1 {
+		if state.handlers[index].kind == .Catch {
+			handler_index = index
+			break
+		}
+	}
+	if handler_index < 0 {
+		return false
+	}
+	handler := state.handlers[handler_index]
+	resize(&state.handlers, handler_index)
+	for len(state.pending_returns) > 0 &&
+	    state.pending_returns[len(state.pending_returns) - 1].frame >= handler.frame {
+		pop(&state.pending_returns)
+	}
 	if handler.frame >= len(state.frames) {
 		return false
 	}

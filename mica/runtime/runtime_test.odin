@@ -1068,3 +1068,74 @@ assert Out(a)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
+
+@(test)
+test_run_finally_on_return :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Cleanup, 1)
+verb compute(mode)
+  try
+    if mode == 1
+      raise E_RANGE, "bad"
+    end
+    return 42
+  finally
+    assert Cleanup(1)
+  end
+end
+require(compute(0) == 42)
+verb nested()
+  try
+    try
+      return 7
+    finally
+      assert Cleanup(2)
+    end
+  finally
+    assert Cleanup(3)
+  end
+end
+require(nested() == 7)
+verb error_return(mode)
+  try
+    return 5
+  finally
+    if mode == 1
+      raise E_TYPE, "cleanup failed"
+    end
+  end
+end
+require(error_return(0) == 5)
+try
+  error_return(1)
+catch err
+  assert Cleanup(4)
+end
+verb loop_return()
+  for i in [1, 2, 3]
+    try
+      if i == 2
+        return i
+      end
+    finally
+      assert Cleanup(5)
+    end
+  end
+  return 0
+end
+require(loop_return() == 2)
+`
+	path, path_ok := write_temp_source(t, "mica_finally_return_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Cleanup", 5)
+}

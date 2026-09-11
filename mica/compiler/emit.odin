@@ -1710,6 +1710,10 @@ emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
 		error_register,
 		0,
 	)
+	finally_push := -1
+	if try.has_finally {
+		finally_push = emit_instruction(emitter, .Push_Finally, 0, 0, 0, 0)
+	}
 
 	scope_enter(emitter)
 	body_register, body_has_value := emit_block(emitter, try.body)
@@ -1725,6 +1729,9 @@ emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
 		)
 	}
 	emit_instruction(emitter, .Pop_Handler, 0, 0, 0, 0)
+	if try.has_finally {
+		emit_instruction(emitter, .Pop_Handler, 0, 0, 0, 0)
+	}
 	normal_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
 
 	patch_handler_target(emitter, handler_push, current_offset(emitter))
@@ -1795,19 +1802,7 @@ emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
 		patch_jump(emitter, previous_false, no_match)
 	}
 	if try.has_finally {
-		scope_enter(emitter)
-		finally_register, finally_has_value := emit_block(emitter, try.finally_body)
-		scope_leave(emitter)
-		if finally_has_value {
-			vm.builder_emit(
-				emitter.builder,
-				.Move,
-				0,
-				i32(result),
-				i32(finally_register),
-				0,
-			)
-		}
+		emit_guarded_finally(emitter, try.finally_body, result)
 	}
 	emit_instruction(emitter, .Raise, 0, error_register, -1, -1)
 
@@ -1818,21 +1813,50 @@ emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
 	}
 
 	if try.has_finally {
-		scope_enter(emitter)
-		finally_register, finally_has_value := emit_block(emitter, try.finally_body)
-		scope_leave(emitter)
-		if finally_has_value {
-			vm.builder_emit(
-				emitter.builder,
-				.Move,
-				0,
-				i32(result),
-				i32(finally_register),
-				0,
-			)
+		if finally_push >= 0 {
+			patch_handler_target(emitter, finally_push, finally_target)
 		}
+		emit_guarded_finally(emitter, try.finally_body, result)
+		emit_instruction(emitter, .Resume_Return, 0, 0, 0, 0)
 	}
 	return result, true
+}
+
+// Emits a finally body under its own handler, so an error raised inside the
+// finally propagates instead of running the finally a second time.
+@(private)
+emit_guarded_finally :: proc(
+	emitter: ^Emitter,
+	body: []^Expr,
+	result: int,
+) {
+	guard_error := alloc_register(emitter)
+	guard_push := emit_instruction(
+		emitter,
+		.Push_Handler,
+		0,
+		0,
+		guard_error,
+		0,
+	)
+	scope_enter(emitter)
+	finally_register, finally_has_value := emit_block(emitter, body)
+	scope_leave(emitter)
+	if finally_has_value {
+		vm.builder_emit(
+			emitter.builder,
+			.Move,
+			0,
+			i32(result),
+			i32(finally_register),
+			0,
+		)
+	}
+	emit_instruction(emitter, .Pop_Handler, 0, 0, 0, 0)
+	skip_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+	patch_handler_target(emitter, guard_push, current_offset(emitter))
+	emit_instruction(emitter, .Raise, 0, guard_error, -1, -1)
+	patch_jump(emitter, skip_jump, current_offset(emitter))
 }
 
 // Lowers a match expression to an ordered chain of pattern tests. Bindings
@@ -2778,7 +2802,7 @@ emit_relation_write :: proc(
 	defer delete(argument_registers)
 	for argument in call.args {
 		if argument.has_role {
-			push_error(emitter, "named-role relation atoms are not lowered yet")
+			push_error(emitter, "relation values do not accept named arguments")
 			return -1, false
 		}
 		register, has_value := emit_expr(emitter, argument.expr)

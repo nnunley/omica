@@ -104,8 +104,14 @@ Op :: enum u8 {
 	// Push_Handler: a = absolute catch target offset, b = register that
 	// receives the raised error (-1 when the handler takes no value).
 	Push_Handler,
+	// Push_Finally: a = absolute finally target offset. A `return` inside the
+	// protected region diverts through the finally before returning.
+	Push_Finally,
 	// Pop_Handler: removes the innermost handler.
 	Pop_Handler,
+	// Resume_Return: completes a diverted return once its finally has run, or
+	// continues when no return is pending.
+	Resume_Return,
 	// Make_Function: a = dst, b = function index. Wraps a program function as
 	// a first-class function value.
 	Make_Function,
@@ -685,7 +691,12 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if instr.b >= 0 && !valid_register(instr.b, register_count) {
 					return .Bad_Register
 				}
+			case .Push_Finally:
+				if instr.a < 0 {
+					return .Bad_Function
+				}
 			case .Pop_Handler:
+			case .Resume_Return:
 			case .Make_Function:
 				if !valid_register(instr.a, register_count) {
 					return .Bad_Register
@@ -852,7 +863,11 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d %d@r%d", instr.a, instr.b, instr.c)
 			case .Push_Handler:
 				fmt.sbprintf(&builder, " ->%d r%d", instr.a, instr.b)
+			case .Push_Finally:
+				fmt.sbprintf(&builder, " ->%d", instr.a)
 			case .Pop_Handler:
+				fmt.sbprintf(&builder, "")
+			case .Resume_Return:
 				fmt.sbprintf(&builder, "")
 			case .Make_Function:
 				fmt.sbprintf(&builder, " r%d fn%d", instr.a, instr.b)
@@ -946,6 +961,10 @@ op_name :: proc(op: Op) -> string {
 		return "push_handler"
 	case .Pop_Handler:
 		return "pop_handler"
+	case .Push_Finally:
+		return "push_finally"
+	case .Resume_Return:
+		return "resume_return"
 	case .Make_Function:
 		return "make_function"
 	case .Call_Value:
