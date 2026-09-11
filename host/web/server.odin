@@ -17,6 +17,11 @@ import "core:time"
 // the response is written.
 Web_Handler :: proc(user: rawptr, request: ^Http_Request, response: ^Http_Response)
 
+// Takes over a connection to write a streaming response. Returns true when the
+// request was handled; the server closes the connection when the handler
+// returns.
+Web_Stream_Handler :: proc(user: rawptr, request: ^Http_Request, socket: net.TCP_Socket) -> bool
+
 DEFAULT_BACKLOG :: 512
 RECV_BUFFER_SIZE :: 16 * 1024
 
@@ -29,9 +34,10 @@ Web_Connection :: struct {
 }
 
 Web_Server :: struct {
-	listener:    net.TCP_Socket,
-	handler:     Web_Handler,
-	user:        rawptr,
+	listener:       net.TCP_Socket,
+	handler:        Web_Handler,
+	stream_handler: Web_Stream_Handler,
+	user:           rawptr,
 	limits:      Http_Limits,
 	lock:        sync.Mutex,
 	stopping:    bool,
@@ -70,6 +76,12 @@ web_server_init :: proc(
 	_ = net.set_blocking(listener, false)
 	server.listener = listener
 	return true, ""
+}
+
+// Registers a handler that gets first chance at each request and can write a
+// streaming response.
+web_server_set_stream_handler :: proc(server: ^Web_Server, handler: Web_Stream_Handler) {
+	server.stream_handler = handler
 }
 
 // The actual bound endpoint. Useful when the bind port is zero.
@@ -167,6 +179,12 @@ web_connection_serve :: proc(connection: ^Web_Connection) {
 		request, state, parse_error := http_parser_next(&parser)
 		switch state {
 		case .Ready:
+			if server.stream_handler != nil {
+				if server.stream_handler(server.user, &request, connection.socket) {
+					http_parser_consume(&parser, parser.last_total)
+					return
+				}
+			}
 			response: Http_Response
 			response.close = request.close
 			server.handler(server.user, &request, &response)

@@ -98,6 +98,7 @@ main :: proc() {
 			os.exit(1)
 		}
 		web.documents_init(&host.documents, world)
+		web.sync_host_init(&host.sync, world)
 	}
 	// Runs at process exit, not at the end of the block above.
 	defer r.world_destroy(world)
@@ -107,6 +108,7 @@ main :: proc() {
 		fmt.eprintf("webhost: %s: %s\n", bind, message)
 		os.exit(1)
 	}
+	web.web_server_set_stream_handler(&server, webhost_stream)
 
 	if endpoint, endpoint_ok := web.web_server_endpoint(&server); endpoint_ok {
 		fmt.printf("listening on http://%s/\n", net.endpoint_to_string(endpoint))
