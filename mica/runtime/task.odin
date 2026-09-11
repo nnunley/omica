@@ -84,6 +84,7 @@ task_init :: proc(
 	}
 	vm.vm_set_workspace(&task.state, &task.source, &task.tx)
 	task.state.user = env
+	vm.vm_set_mailbox_validator(&task.state, mailbox_receivers_live, env)
 	register_runtime_builtins(&task.state)
 	if env != nil && env.enforce_authority {
 		if actor, has_actor := v.value_as_identity(env.actor); has_actor {
@@ -262,6 +263,27 @@ task_resume_with :: proc(task: ^Task, value: v.Value) -> Task_Outcome {
 	vm.vm_resume_with(&task.state, value)
 	task.outcome.suspend = .None
 	return task_run(task)
+}
+
+// Reports whether any receiver in the list is a live mailbox handle.
+@(private)
+mailbox_receivers_live :: proc(user: rawptr, receivers: []v.Value) -> bool {
+	env := (^Builtin_Env)(user)
+	if env == nil || env.scheduler == nil {
+		return true
+	}
+	for receiver in receivers {
+		if scheduler_mailbox_handle_live(env.scheduler, receiver) {
+			return true
+		}
+	}
+	return false
+}
+
+// Fails a parked task with an error code and message.
+task_fail :: proc(task: ^Task, code: string, message: string) -> Task_Outcome {
+	vm.vm_set_error(&task.state, code, message)
+	return task_abort(task, message)
 }
 
 // Requests cancellation. A parked task aborts immediately; a running task

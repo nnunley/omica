@@ -691,6 +691,9 @@ builtin_use_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool
 	if !found {
 		return builtin_error(state, "E_INVARG", "unknown capability")
 	}
+	if grant.scope == .Mailbox {
+		return builtin_error(state, "E_INVARG", "mailbox handles are not authority capabilities")
+	}
 	if !k.capability_live(grant, kernel_version(env), time.tick_now()) {
 		return builtin_error(state, "E_INVARG", "capability is revoked or expired")
 	}
@@ -704,6 +707,9 @@ builtin_restrict_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value,
 	parent, found := k.capability_store_lookup(&env.kernel.capabilities, args[0])
 	if !found {
 		return builtin_error(state, "E_INVARG", "unknown capability")
+	}
+	if parent.scope == .Mailbox {
+		return builtin_error(state, "E_INVARG", "mailbox handles cannot be restricted")
 	}
 	if !k.authority_holds_capability(state.authority, parent) &&
 	   !k.authority_can_grant(state.authority) {

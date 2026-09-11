@@ -195,3 +195,30 @@ test_authority_adopts_revocable_capability :: proc(t: ^testing.T) {
 	testing.expect(t, capability_store_revoke(&store, value))
 	testing.expect(t, !authority_can_read(&authority, secret))
 }
+
+@(test)
+test_capability_store_mailbox_handles :: proc(t: ^testing.T) {
+	store: Capability_Store
+	capability_store_init(&store, context.temp_allocator)
+	defer capability_store_destroy(&store)
+
+	receiver_value, sender_value, minted := capability_store_mint_mailbox_pair(&store, 7)
+	testing.expect(t, minted)
+	receiver, receiver_found := capability_store_lookup(&store, receiver_value)
+	testing.expect(t, receiver_found)
+	sender, sender_found := capability_store_lookup(&store, sender_value)
+	testing.expect(t, sender_found)
+
+	receiver_mailbox, receiver_ok := capability_mailbox_target(receiver, false)
+	testing.expect(t, receiver_ok)
+	testing.expect_value(t, receiver_mailbox, u64(7))
+	_, sender_as_receiver := capability_mailbox_target(sender, false)
+	testing.expect(t, !sender_as_receiver)
+	sender_mailbox, sender_ok := capability_mailbox_target(sender, true)
+	testing.expect(t, sender_ok)
+	testing.expect_value(t, sender_mailbox, u64(7))
+
+	testing.expect(t, capability_store_revoke(&store, receiver_value))
+	testing.expect(t, !capability_live(receiver, 0, time.tick_now()))
+	testing.expect(t, capability_store_revoke(&store, sender_value))
+}

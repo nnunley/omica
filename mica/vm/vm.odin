@@ -114,6 +114,10 @@ VM :: struct {
 	pending_returns: [dynamic]Pending_Return,
 	// Task authority. Nil means root access.
 	authority: ^k.Authority,
+	// Optional validator run before a Mailbox_Recv suspends, so an invalid
+	// receiver fails inside the interpreter and can be caught.
+	mailbox_validator:      proc(user: rawptr, receivers: []v.Value) -> bool,
+	mailbox_validator_user: rawptr,
 	// Free slot for host data, for example a builtin environment.
 	user:        rawptr,
 	// Values copied into the entry function's parameter registers before the
@@ -165,6 +169,17 @@ vm_resume_with :: proc(state: ^VM, value: v.Value) {
 // Sets the authority used for permission checks. Nil means root access.
 vm_set_authority :: proc(state: ^VM, authority: ^k.Authority) {
 	state.authority = authority
+}
+
+// Registers a validator for mailbox receiver lists. It returns false when no
+// receiver is a live mailbox handle.
+vm_set_mailbox_validator :: proc(
+	state: ^VM,
+	validator: proc(user: rawptr, receivers: []v.Value) -> bool,
+	user: rawptr,
+) {
+	state.mailbox_validator = validator
+	state.mailbox_validator_user = user
 }
 
 // Starts execution at `function_index` instead of the program entry.
@@ -512,8 +527,14 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Mailbox_Recv:
 			receivers := state.registers[base + int(instr.b)]
-			if _, is_list := v.value_as_list(receivers); !is_list {
+			receiver_list, is_list := v.value_as_list(receivers)
+			if !is_list {
 				vm_fail(state, "E_TYPE", "mailbox_recv expects a list of receivers")
+				break
+			}
+			if state.mailbox_validator != nil &&
+			   !state.mailbox_validator(state.mailbox_validator_user, receiver_list) {
+				vm_fail(state, "E_INVARG", "mailbox has no live receivers")
 				break
 			}
 			timeout_millis := i64(-1)

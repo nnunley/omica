@@ -31,9 +31,17 @@ Timer_Entry :: struct {
 }
 
 @(private)
+Mailbox_Waiter :: struct {
+	task_id:  Task_ID,
+	receiver: v.Value,
+}
+
+@(private)
 Mailbox :: struct {
 	messages: [dynamic]v.Value,
-	waiters:  [dynamic]Task_ID,
+	waiters:  [dynamic]Mailbox_Waiter,
+	receiver: v.Value,
+	sender:   v.Value,
 	closed:   bool,
 }
 
@@ -276,36 +284,32 @@ scheduler_run_spawns :: proc(
 }
 
 // --- Mailboxes -------------------------------------------------------------
+//
+// Mailbox endpoints are capability handles in the world capability store.
+// Revoking or closing a handle invalidates it for every holder; the queue
+// itself lives in the scheduler until shutdown.
 
+// Resolves a mailbox handle of the requested kind. Epoch limits do not apply
+// to mailbox handles, which are minted without them.
 @(private)
-mailbox_receiver_capability :: proc(mailbox: u64) -> (v.Value, bool) {
-	id, id_ok := v.capability_id_new(mailbox << 1)
-	if !id_ok {
-		return v.Value(0), false
+mailbox_target :: proc(
+	scheduler: ^Scheduler,
+	value: v.Value,
+	sender: bool,
+) -> (
+	u64,
+	^k.Capability_Grant,
+	bool,
+) {
+	grant, found := k.capability_store_lookup(&scheduler.kernel.capabilities, value)
+	if !found || !k.capability_live(grant, 0, time.tick_now()) {
+		return 0, nil, false
 	}
-	return v.value_capability(id), true
+	mailbox, target_ok := k.capability_mailbox_target(grant, sender)
+	return mailbox, grant, target_ok
 }
 
-@(private)
-mailbox_sender_capability :: proc(mailbox: u64) -> (v.Value, bool) {
-	id, id_ok := v.capability_id_new((mailbox << 1) | 1)
-	if !id_ok {
-		return v.Value(0), false
-	}
-	return v.value_capability(id), true
-}
-
-@(private)
-mailbox_from_capability :: proc(value: v.Value) -> (mailbox: u64, is_sender: bool, ok: bool) {
-	id, id_ok := v.value_as_capability(value)
-	if !id_ok {
-		return 0, false, false
-	}
-	raw := v.capability_id_raw(id)
-	return raw >> 1, raw & 1 == 1, true
-}
-
-// Creates a mailbox and returns its receiver and sender capabilities.
+// Creates a mailbox and returns its receiver and sender handles.
 scheduler_mailbox_create :: proc(
 	scheduler: ^Scheduler,
 ) -> (
@@ -318,22 +322,29 @@ scheduler_mailbox_create :: proc(
 	mailbox := scheduler.next_mailbox
 	box := new(Mailbox, scheduler.allocator)
 	box.messages = make([dynamic]v.Value, scheduler.allocator)
-	box.waiters = make([dynamic]Task_ID, scheduler.allocator)
+	box.waiters = make([dynamic]Mailbox_Waiter, scheduler.allocator)
+	receiver_value, sender_value, minted := k.capability_store_mint_mailbox_pair(
+		&scheduler.kernel.capabilities,
+		mailbox,
+	)
+	box.receiver = receiver_value
+	box.sender = sender_value
 	scheduler.mailboxes[mailbox] = box
-	receiver_value, receiver_ok := mailbox_receiver_capability(mailbox)
-	sender_value, sender_ok := mailbox_sender_capability(mailbox)
 	sync.mutex_unlock(&scheduler.lock)
-	return receiver_value, sender_value, receiver_ok && sender_ok
+	return receiver_value, sender_value, minted
 }
 
-// Delivers a value through a sender capability, waking the first waiter.
+// Delivers a value through a sender handle, waking the first waiter.
 scheduler_mailbox_send :: proc(
 	scheduler: ^Scheduler,
 	sender: v.Value,
 	value: v.Value,
 ) -> bool {
-	mailbox, is_sender, ok := mailbox_from_capability(sender)
-	if !ok || !is_sender {
+	mailbox, _, ok := mailbox_target(scheduler, sender, true)
+	if !ok {
+		return false
+	}
+	if !mailbox_handle_live(scheduler, sender, true) {
 		return false
 	}
 	sync.mutex_lock(&scheduler.lock)
@@ -342,77 +353,93 @@ scheduler_mailbox_send :: proc(
 		sync.mutex_unlock(&scheduler.lock)
 		return false
 	}
+	receiver_live := false
+	if receiver_grant, receiver_found := k.capability_store_lookup(
+		&scheduler.kernel.capabilities,
+		box.receiver,
+	); receiver_found {
+		receiver_live = k.capability_live(receiver_grant, 0, time.tick_now())
+	}
+	if !receiver_live {
+		sync.mutex_unlock(&scheduler.lock)
+		return false
+	}
 	append(&box.messages, value)
-	scheduler_wake_mailbox_locked(scheduler, mailbox, box)
+	scheduler_wake_mailbox_locked(scheduler, box)
 	sync.cond_broadcast(&scheduler.cond)
 	sync.mutex_unlock(&scheduler.lock)
 	return true
 }
 
+// Closes a mailbox from its receiver handle, revoking both endpoints.
 scheduler_mailbox_close :: proc(scheduler: ^Scheduler, receiver: v.Value) -> bool {
-	mailbox, is_sender, ok := mailbox_from_capability(receiver)
-	if !ok || is_sender {
+	mailbox, _, ok := mailbox_target(scheduler, receiver, false)
+	if !ok {
 		return false
 	}
 	sync.mutex_lock(&scheduler.lock)
 	box, found := scheduler.mailboxes[mailbox]
-	if found {
-		box.closed = true
+	if !found || box.closed {
+		sync.mutex_unlock(&scheduler.lock)
+		return found
 	}
+	box.closed = true
 	sync.mutex_unlock(&scheduler.lock)
-	return found
+	k.capability_store_revoke(&scheduler.kernel.capabilities, box.receiver)
+	k.capability_store_revoke(&scheduler.kernel.capabilities, box.sender)
+	return true
 }
 
 // Wakes the first waiter of `box` with all queued messages for that mailbox.
 @(private)
-scheduler_wake_mailbox_locked :: proc(
-	scheduler: ^Scheduler,
-	mailbox: u64,
-	box: ^Mailbox,
-) {
+scheduler_wake_mailbox_locked :: proc(scheduler: ^Scheduler, box: ^Mailbox) {
 	if len(box.messages) == 0 || len(box.waiters) == 0 {
 		return
 	}
-	task_id := box.waiters[0]
+	waiter := box.waiters[0]
 	ordered_remove(&box.waiters, 0)
-	entry, found := scheduler.entries[task_id]
+	entry, found := scheduler.entries[waiter.task_id]
 	if !found || entry.done || entry.has_pending {
-		return
-	}
-	receiver, receiver_ok := mailbox_receiver_capability(mailbox)
-	if !receiver_ok {
 		return
 	}
 	messages := v.value_list(scheduler.allocator, box.messages[:])
 	clear(&box.messages)
-	group := v.value_list(scheduler.allocator, []v.Value{receiver, messages})
+	group := v.value_list(scheduler.allocator, []v.Value{waiter.receiver, messages})
 	entry.pending_value = v.value_list(scheduler.allocator, []v.Value{group})
 	entry.has_pending = true
 	entry.generation += 1
-	append(&scheduler.ready, task_id)
+	append(&scheduler.ready, waiter.task_id)
+}
+
+// The result of draining mailbox receivers.
+Mailbox_Take_Kind :: enum {
+	Ready,
+	Empty,
+	No_Receivers,
+}
+
+Mailbox_Take :: struct {
+	kind:  Mailbox_Take_Kind,
+	value: v.Value,
 }
 
 // Drains ready messages for the receivers of a task parked on `mailbox_recv`.
-// Returns false when nothing is ready.
-scheduler_mailbox_take :: proc(
-	scheduler: ^Scheduler,
-	task: ^Task,
-) -> (
-	v.Value,
-	bool,
-) {
+// `No_Receivers` means every supplied handle is unknown, revoked, or expired.
+scheduler_mailbox_take :: proc(scheduler: ^Scheduler, task: ^Task) -> Mailbox_Take {
 	receivers, is_list := v.value_as_list(task.state.request_value)
 	if !is_list || len(receivers) == 0 {
-		return v.Value(0), false
+		return Mailbox_Take{kind = .No_Receivers}
 	}
 	groups: [dynamic]v.Value
 	defer delete(groups)
+	live_receivers := 0
 	sync.mutex_lock(&scheduler.lock)
 	for receiver in receivers {
-		mailbox, is_sender, ok := mailbox_from_capability(receiver)
-		if !ok || is_sender {
+		mailbox, _, ok := mailbox_target(scheduler, receiver, false)
+		if !ok {
 			continue
 		}
+		live_receivers += 1
 		box, found := scheduler.mailboxes[mailbox]
 		if !found || len(box.messages) == 0 {
 			continue
@@ -423,10 +450,28 @@ scheduler_mailbox_take :: proc(
 		append(&groups, group)
 	}
 	sync.mutex_unlock(&scheduler.lock)
-	if len(groups) == 0 {
-		return v.Value(0), false
+	if len(groups) > 0 {
+		return Mailbox_Take {
+			kind  = .Ready,
+			value = v.value_list(scheduler.allocator, groups[:]),
+		}
 	}
-	return v.value_list(scheduler.allocator, groups[:]), true
+	if live_receivers == 0 {
+		return Mailbox_Take{kind = .No_Receivers}
+	}
+	return Mailbox_Take{kind = .Empty}
+}
+
+// Reports whether a mailbox handle is a live endpoint of the requested kind.
+@(private)
+mailbox_handle_live :: proc(scheduler: ^Scheduler, value: v.Value, sender: bool) -> bool {
+	_, _, ok := mailbox_target(scheduler, value, sender)
+	return ok
+}
+
+// Reports whether `value` is a live receiver handle.
+scheduler_mailbox_handle_live :: proc(scheduler: ^Scheduler, value: v.Value) -> bool {
+	return mailbox_handle_live(scheduler, value, false)
 }
 
 @(private)
@@ -438,16 +483,32 @@ scheduler_park_mailbox_locked :: proc(
 ) {
 	receivers, is_list := v.value_as_list(entry.task.state.request_value)
 	if is_list {
+		seen: [dynamic]u64
+		defer delete(seen)
 		for receiver in receivers {
-			mailbox, is_sender, ok := mailbox_from_capability(receiver)
-			if !ok || is_sender {
+			mailbox, _, ok := mailbox_target(scheduler, receiver, false)
+			if !ok {
+				continue
+			}
+			duplicate := false
+			for existing in seen {
+				if existing == mailbox {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
 				continue
 			}
 			box, found := scheduler.mailboxes[mailbox]
 			if !found {
 				continue
 			}
-			append(&box.waiters, id)
+			append(&seen, mailbox)
+			append(&box.waiters, Mailbox_Waiter {
+				task_id  = id,
+				receiver = receiver,
+			})
 		}
 	}
 	if millis > 0 {
@@ -464,7 +525,7 @@ scheduler_park_mailbox_locked :: proc(
 scheduler_remove_mailbox_waiter_locked :: proc(scheduler: ^Scheduler, id: Task_ID) {
 	for _, box in scheduler.mailboxes {
 		for waiter, index in box.waiters {
-			if waiter == id {
+			if waiter.task_id == id {
 				ordered_remove(&box.waiters, index)
 				break
 			}
@@ -623,14 +684,23 @@ scheduler_worker_proc :: proc(data: rawptr) {
 
 		// Mailbox receives with queued messages resume without parking.
 		for outcome.kind == .Pending && outcome.suspend == .Mailbox_Recv {
-			if messages, ready := scheduler_mailbox_take(scheduler, entry.task); ready {
-				outcome = task_resume_with(entry.task, messages)
+			take := scheduler_mailbox_take(scheduler, entry.task)
+			switch take.kind {
+			case .Ready:
+				outcome = task_resume_with(entry.task, take.value)
 				continue
-			}
-			if outcome.millis == 0 {
-				empty := v.value_list(scheduler.allocator, nil)
-				outcome = task_resume_with(entry.task, empty)
-				continue
+			case .No_Receivers:
+				outcome = task_fail(
+					entry.task,
+					"E_INVARG",
+					"mailbox has no live receivers",
+				)
+			case .Empty:
+				if outcome.millis == 0 {
+					empty := v.value_list(scheduler.allocator, nil)
+					outcome = task_resume_with(entry.task, empty)
+					continue
+				}
 			}
 			break
 		}

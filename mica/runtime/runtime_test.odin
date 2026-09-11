@@ -1754,3 +1754,45 @@ require(len(mailbox_recv([receiver], 2000)) == 1)
 	expect_relation_rows(t, &kernel, "Vault", 1)
 	expect_relation_rows(t, &kernel, "Rw", 1)
 }
+
+@(test)
+test_run_mailbox_handle_revocation :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Out, 1)
+let [receiver, sender] = mailbox()
+revoke_capability(receiver)
+try
+  mailbox_send(sender, 1)
+  assert Out(0)
+catch err
+  assert Out(1)
+end
+try
+  mailbox_recv([receiver])
+  assert Out(2)
+catch err
+  assert Out(3)
+end
+let [receiver_two, sender_two] = mailbox()
+mailbox_close(receiver_two)
+try
+  mailbox_send(sender_two, 1)
+  assert Out(4)
+catch err
+  assert Out(5)
+end
+`
+	path, path_ok := write_temp_source(t, "mica_mailbox_revoke_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 3)
+}

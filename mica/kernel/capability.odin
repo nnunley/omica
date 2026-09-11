@@ -29,6 +29,7 @@ Capability_Scope :: enum {
 	All,
 	Relations,
 	Selectors,
+	Mailbox,
 }
 
 // Optional expiry limits. A zero deadline or epoch limit means no limit. Wall
@@ -44,7 +45,10 @@ Capability_Grant :: struct {
 	scope:       Capability_Scope,
 	relations:   []Relation_ID,
 	selectors:   []v.Symbol,
-	revoked:     i32,
+	// Mailbox handles carry the world mailbox id and which end they are.
+	mailbox:        u64,
+	mailbox_sender: bool,
+	revoked:        i32,
 	refs:        i32,
 	limits:      Capability_Limits,
 	children:    [dynamic]^Capability_Grant,
@@ -95,6 +99,9 @@ capability_store_mint :: proc(
 		return v.Value(0), false
 	}
 	if scope == .Selectors && len(selectors) == 0 {
+		return v.Value(0), false
+	}
+	if scope == .Mailbox {
 		return v.Value(0), false
 	}
 	grant := new(Capability_Grant, store.allocator)
@@ -157,6 +164,40 @@ capability_store_restrict :: proc(
 		return v.Value(0), false
 	}
 	return value, true
+}
+
+// Mints a mailbox handle: the receiver carries the read right, the sender the
+// write right.
+capability_store_mint_mailbox :: proc(
+	store: ^Capability_Store,
+	mailbox: u64,
+	sender: bool,
+) -> (
+	v.Value,
+	bool,
+) {
+	grant := new(Capability_Grant, store.allocator)
+	grant.scope = .Mailbox
+	grant.mailbox = mailbox
+	grant.mailbox_sender = sender
+	grant.rights = sender ? Rights{.Write} : Rights{.Read}
+	grant.allocator = store.allocator
+	grant.children = make([dynamic]^Capability_Grant, store.allocator)
+	return capability_store_register(store, grant)
+}
+
+// Mints the receiver and sender handles for a mailbox.
+capability_store_mint_mailbox_pair :: proc(
+	store: ^Capability_Store,
+	mailbox: u64,
+) -> (
+	receiver: v.Value,
+	sender: v.Value,
+	ok: bool,
+) {
+	receiver_value, receiver_ok := capability_store_mint_mailbox(store, mailbox, false)
+	sender_value, sender_ok := capability_store_mint_mailbox(store, mailbox, true)
+	return receiver_value, sender_value, receiver_ok && sender_ok
 }
 
 // Revokes a capability and its whole subtree. Holders observe the revocation
@@ -314,7 +355,7 @@ capability_allows_read :: proc(grant: ^Capability_Grant, relation: Relation_ID) 
 				return true
 			}
 		}
-	case .Selectors:
+	case .Selectors, .Mailbox:
 	}
 	return false
 }
@@ -332,7 +373,7 @@ capability_allows_write :: proc(grant: ^Capability_Grant, relation: Relation_ID)
 				return true
 			}
 		}
-	case .Selectors:
+	case .Selectors, .Mailbox:
 	}
 	return false
 }
@@ -350,9 +391,24 @@ capability_allows_invoke :: proc(grant: ^Capability_Grant, selector: v.Symbol) -
 				return true
 			}
 		}
-	case .Relations:
+	case .Relations, .Mailbox:
 	}
 	return false
+}
+
+// Returns the mailbox id when the grant is a live handle of the requested
+// kind.
+capability_mailbox_target :: proc(
+	grant: ^Capability_Grant,
+	sender: bool,
+) -> (
+	u64,
+	bool,
+) {
+	if grant == nil || grant.scope != .Mailbox || grant.mailbox_sender != sender {
+		return 0, false
+	}
+	return grant.mailbox, true
 }
 
 // Reports whether the grant allows invoking any method (all-scoped invoke).
