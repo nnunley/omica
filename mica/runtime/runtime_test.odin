@@ -1874,3 +1874,47 @@ end
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "CloseFailed", 1)
 }
+
+@(test)
+test_run_json_roundtrip :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Out, 1)
+let decoded = json_decode("{\"a\":[1,2.5,true,null,1e3],\"b\":\"x\"}")
+let items = index_or(decoded, :a, [])
+require(items[0] == 1)
+require(items[1] == 2.5)
+require(items[2] == true)
+require(json_is_null(items[3]))
+require(items[4] == 1000.0)
+require(index_or(decoded, :b, "") == "x")
+let encoded = json_encode({:a -> [1, 2.5, true, json_null()], :b -> "x"})
+require(encoded == "{\"a\":[1,2.5,true,null],\"b\":\"x\"}")
+require(json_decode("\"A\u0041\u00e9\ud83d\ude00\"") == "AAé😀")
+try
+  json_decode("{} junk")
+  assert Out(0)
+catch err
+  assert Out(1)
+end
+try
+  json_decode("36028797018963968")
+  assert Out(2)
+catch err
+  assert Out(3)
+end
+assert Out(decoded)
+`
+	path, path_ok := write_temp_source(t, "mica_json_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 3)
+}

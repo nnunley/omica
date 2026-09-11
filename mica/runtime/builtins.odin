@@ -81,6 +81,10 @@ runtime_builtins := [?]Builtin_Spec {
 	{"restrict_capability", 2, builtin_restrict_capability},
 	{"revoke_capability", 1, builtin_revoke_capability},
 	{"drop_capability", 1, builtin_drop_capability},
+	{"json_encode", 1, builtin_json_encode},
+	{"json_decode", 1, builtin_json_decode},
+	{"json_null", 0, builtin_json_null},
+	{"json_is_null", 1, builtin_json_is_null},
 	{"subscribe_changes", -1, builtin_subscribe_changes},
 	{"cancel_subscription", 1, builtin_cancel_subscription},
 	{"mailbox", 0, builtin_mailbox},
@@ -945,6 +949,46 @@ kernel_version :: proc(env: ^Builtin_Env) -> u64 {
 	snapshot := k.kernel_snapshot(env.kernel)
 	defer k.snapshot_release(snapshot)
 	return snapshot.version
+}
+
+@(private)
+builtin_json_encode :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	builder: strings.Builder
+	strings.builder_init(&builder, state.allocator)
+	if !json_encode_value(&builder, args[0]) {
+		strings.builder_destroy(&builder)
+		return builtin_error(state, "E_INVARG", "value cannot be encoded as JSON")
+	}
+	return v.value_string(state.allocator, strings.to_string(builder)), true
+}
+
+@(private)
+builtin_json_decode :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	text, text_ok := string_argument(state, args, 0, "json_decode")
+	if !text_ok {
+		return builtin_error(state, "E_TYPE", "json_decode expects a string")
+	}
+	value, message, decoded := json_decode_text(state.allocator, text)
+	if !decoded {
+		return builtin_error(state, "E_INVARG", message)
+	}
+	return value, true
+}
+
+@(private)
+builtin_json_null :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 0 {
+		return builtin_error(state, "E_INVARG", "json_null expects no arguments")
+	}
+	return json_null(state.allocator), true
+}
+
+@(private)
+builtin_json_is_null :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 1 {
+		return builtin_error(state, "E_INVARG", "json_is_null expects one argument")
+	}
+	return v.value_bool(json_value_is_null(args[0])), true
 }
 
 @(private)
