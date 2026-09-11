@@ -597,3 +597,180 @@ Parent(child, parent) :-
 	)
 	testing.expect(t, len(source_rows) >= 1)
 }
+
+@(test)
+test_run_try_catch_codes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Matched, 2)
+verb probe(mode)
+  try
+    if mode == 1
+      raise E_RANGE, "bad"
+    elseif mode == 2
+      raise E_TYPE, "wrong"
+    end
+    return 7
+  catch E_RANGE
+    return 1
+  catch E_TYPE as err
+    return 2
+  end
+end
+assert Matched(probe(1), 1)
+assert Matched(probe(2), 2)
+assert Matched(probe(0), 7)
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_try_codes_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the try test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Matched", 3)
+}
+
+@(test)
+test_run_try_catches_builtin_error :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Caught, 1)
+verb indexed()
+  try
+    let items = [10]
+    return items[4]
+  catch err
+    assert Caught(1)
+    return 0
+  end
+end
+assert Caught(indexed())
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_try_builtin_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the try builtin test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Caught", 2)
+}
+
+@(test)
+test_run_try_finally_paths :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Cleanup, 1)
+verb clean_normal()
+  let value = 0
+  try
+    value = 3
+  finally
+    assert Cleanup(1)
+  end
+  return value
+end
+assert Cleanup(clean_normal())
+
+verb clean_error()
+  try
+    raise E_RANGE, "bad"
+  finally
+    assert Cleanup(2)
+  end
+end
+try
+  clean_error()
+catch err
+  assert Cleanup(3)
+end
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_try_finally_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the try finally test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Cleanup", 3)
+}
+
+@(test)
+test_run_uncaught_inner_raise_propagates :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb probe()
+  try
+    raise E_RANGE, "bad"
+  catch E_TYPE
+    return 1
+  end
+  return 0
+end
+probe()
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_try_unmatched_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the try unmatched test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expect(t, !result.ok)
+}

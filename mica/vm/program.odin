@@ -95,6 +95,11 @@ Op :: enum u8 {
 	// Dynamic_Dispatch: a = dst, b = selector register, c = roles map register.
 	// Resolves a method from a runtime selector symbol and role map.
 	Dynamic_Dispatch,
+	// Push_Handler: a = absolute catch target offset, b = register that
+	// receives the raised error (-1 when the handler takes no value).
+	Push_Handler,
+	// Pop_Handler: removes the innermost handler.
+	Pop_Handler,
 }
 
 // A cell in a relation scan pattern.
@@ -633,6 +638,14 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				   !valid_register(instr.c, register_count) {
 					return .Bad_Register
 				}
+			case .Push_Handler:
+				if instr.a < 0 {
+					return .Bad_Function
+				}
+				if instr.b >= 0 && !valid_register(instr.b, register_count) {
+					return .Bad_Register
+				}
+			case .Pop_Handler:
 			}
 		}
 	}
@@ -751,6 +764,10 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d r%d r%d", instr.a, instr.b, instr.c)
 			case .Dynamic_Dispatch:
 				fmt.sbprintf(&builder, " r%d <- r%d roles@r%d", instr.a, instr.b, instr.c)
+			case .Push_Handler:
+				fmt.sbprintf(&builder, " ->%d r%d", instr.a, instr.b)
+			case .Pop_Handler:
+				fmt.sbprintf(&builder, "")
 			}
 			strings.write_byte(&builder, '\n')
 		}
@@ -825,6 +842,10 @@ op_name :: proc(op: Op) -> string {
 		return "raise"
 	case .Dynamic_Dispatch:
 		return "dynamic_dispatch"
+	case .Push_Handler:
+		return "push_handler"
+	case .Pop_Handler:
+		return "pop_handler"
 	}
 	return "?"
 }

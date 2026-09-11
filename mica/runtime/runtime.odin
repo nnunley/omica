@@ -757,6 +757,25 @@ builtin_get_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		vm.vm_set_error(state, "E_FIELD", "unknown field")
 		return v.Value(0), false
 	}
+	if error_value, is_error := v.value_as_error(args[0]); is_error {
+		switch name {
+		case "code":
+			return v.value_error_code(error_value.code), true
+		case "message":
+			if error_value.has_message {
+				return option_some_value(
+					state.allocator,
+					v.value_string(state.allocator, error_value.message),
+				), true
+			}
+			return option_none_value(state.allocator), true
+		case "value":
+			if error_value.has_value {
+				return option_some_value(state.allocator, error_value.value), true
+			}
+			return option_none_value(state.allocator), true
+		}
+	}
 	info, found := env.fields[name]
 	if !found || len(info.key_positions) != 1 || info.key_positions[0] != 0 {
 		vm.vm_set_error(state, "E_FIELD", fmt.aprintf(

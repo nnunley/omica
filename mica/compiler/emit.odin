@@ -418,8 +418,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return emit_match(emitter, n)
 
 	case Try:
-		push_error(emitter, "try expressions are not lowered yet")
-		return -1, false
+		return emit_try(emitter, n)
 
 	case Raise:
 		return emit_raise(emitter, n)
@@ -1142,6 +1141,187 @@ emit_role_dispatch :: proc(
 		0,
 	)
 	return destination, true
+}
+
+// Reads a field from an already-emitted value via `__get_field`.
+@(private)
+emit_builtin_field :: proc(
+	emitter: ^Emitter,
+	receiver: int,
+	name: string,
+) -> int {
+	symbol_register := emit_constant(
+		emitter,
+		v.value_symbol(v.symbol_intern(name)),
+	)
+	first_argument := marshal_arguments(emitter, []int{receiver, symbol_register})
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__get_field"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		0,
+		i32(destination),
+		builtin,
+		i32(first_argument),
+	)
+	return destination
+}
+
+@(private)
+patch_handler_target :: proc(emitter: ^Emitter, at: int, target: int) {
+	emitter.builder.code[at].a = i32(target)
+}
+
+// Lowers `try body catch ... end [finally ... end]` to a VM handler. The
+// handler receives the raised error; matching catch clauses bind it and
+// replace the result. A finally block runs on the normal path and before an
+// unmatched error is re-raised.
+@(private)
+emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
+	result := alloc_register(emitter)
+	error_register := alloc_register(emitter)
+	empty := emit_constant(emitter, v.value_empty_relation())
+	vm.builder_emit(
+		emitter.builder,
+		.Move,
+		0,
+		i32(error_register),
+		i32(empty),
+		0,
+	)
+
+	handler_push := emit_instruction(
+		emitter,
+		.Push_Handler,
+		0,
+		0,
+		error_register,
+		0,
+	)
+
+	scope_enter(emitter)
+	body_register, body_has_value := emit_block(emitter, try.body)
+	scope_leave(emitter)
+	if body_has_value {
+		vm.builder_emit(
+			emitter.builder,
+			.Move,
+			0,
+			i32(result),
+			i32(body_register),
+			0,
+		)
+	}
+	emit_instruction(emitter, .Pop_Handler, 0, 0, 0, 0)
+	normal_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+
+	patch_handler_target(emitter, handler_push, current_offset(emitter))
+
+	body_jumps: [dynamic]int
+	defer delete(body_jumps)
+	previous_false := -1
+	for clause in try.catches {
+		if previous_false >= 0 {
+			patch_jump(emitter, previous_false, current_offset(emitter))
+			previous_false = -1
+		}
+		scope_enter(emitter)
+		test := -1
+		if clause.has_code {
+			actual := emit_builtin_field(emitter, error_register, "code")
+			expected := emit_constant(
+				emitter,
+				v.value_error_code(v.symbol_intern(clause.code)),
+			)
+			test = alloc_register(emitter)
+			vm.builder_emit(
+				emitter.builder,
+				.Binary,
+				u8(vm.Bin_Op.Eq),
+				i32(test),
+				i32(actual),
+				i32(expected),
+			)
+		} else {
+			test = emit_constant(emitter, v.value_bool(true))
+		}
+
+		branch := emit_instruction(emitter, .Branch, 0, test, 0, 0)
+		previous_false = emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+		patch_jump(emitter, branch, current_offset(emitter))
+
+		if clause.has_name {
+			binding := alloc_register(emitter)
+			vm.builder_emit(
+				emitter.builder,
+				.Move,
+				0,
+				i32(binding),
+				i32(error_register),
+				0,
+			)
+			declare_local(emitter, clause.name, binding, false)
+		}
+		clause_register, clause_has_value := emit_block(emitter, clause.body)
+		scope_leave(emitter)
+		if clause_has_value {
+			vm.builder_emit(
+				emitter.builder,
+				.Move,
+				0,
+				i32(result),
+				i32(clause_register),
+				0,
+			)
+		}
+		append(&body_jumps, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
+	}
+
+	// No clause matched: run finally, then re-raise.
+	no_match := current_offset(emitter)
+	if previous_false >= 0 {
+		patch_jump(emitter, previous_false, no_match)
+	}
+	if try.has_finally {
+		scope_enter(emitter)
+		finally_register, finally_has_value := emit_block(emitter, try.finally_body)
+		scope_leave(emitter)
+		if finally_has_value {
+			vm.builder_emit(
+				emitter.builder,
+				.Move,
+				0,
+				i32(result),
+				i32(finally_register),
+				0,
+			)
+		}
+	}
+	emit_instruction(emitter, .Raise, 0, error_register, -1, -1)
+
+	finally_target := current_offset(emitter)
+	patch_jump(emitter, normal_jump, finally_target)
+	for jump in body_jumps {
+		patch_jump(emitter, jump, finally_target)
+	}
+
+	if try.has_finally {
+		scope_enter(emitter)
+		finally_register, finally_has_value := emit_block(emitter, try.finally_body)
+		scope_leave(emitter)
+		if finally_has_value {
+			vm.builder_emit(
+				emitter.builder,
+				.Move,
+				0,
+				i32(result),
+				i32(finally_register),
+				0,
+			)
+		}
+	}
+	return result, true
 }
 
 // Lowers a match expression to an ordered chain of pattern tests. Bindings

@@ -53,6 +53,15 @@ Frame :: struct {
 	caller_dst:    i32,
 }
 
+// A compiled exception handler: errors raised at or below `frame` jump to the
+// absolute code offset `target` with the error delivered to `error_register`
+// (-1 when the handler takes no value).
+Handler :: struct {
+	frame:          int,
+	target:         i32,
+	error_register: i32,
+}
+
 VM :: struct {
 	program:     ^Program,
 	allocator:   mem.Allocator,
@@ -72,6 +81,8 @@ VM :: struct {
 	request_spec: i32,
 	// Register (frame-relative) that receives the resume value.
 	pending_resume: i32,
+	// Active exception handlers, innermost last.
+	handlers: [dynamic]Handler,
 	// Free slot for host data, for example a builtin environment.
 	user:        rawptr,
 	// Values copied into the entry function's parameter registers before the
@@ -92,12 +103,14 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.request_spec = -1
 	state.pending_resume = -1
 	state.entry_function = -1
+	state.handlers = make([dynamic]Handler)
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
 	state.status = .Ready
 }
 
 vm_destroy :: proc(state: ^VM) {
+	delete(state.handlers)
 	delete(state.registers)
 	delete(state.frames)
 	delete(state.builtins)
@@ -207,19 +220,19 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Binary:
 			if !vm_binary(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Unary:
 			if !vm_unary(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Branch:
 			condition, is_bool := v.value_as_bool(state.registers[base + int(instr.a)])
 			if !is_bool {
 				vm_fail(state, "E_TYPE", "branch condition is not a boolean")
-				return .Failed
+				break
 			}
 			if condition {
 				state.frames[top].ip += int(instr.b)
@@ -313,68 +326,68 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 			if !length_ok {
 				vm_fail(state, "E_TYPE", "len expects a list, map, or relation")
-				return .Failed
+				break
 			}
 			length_value, length_ok_value := v.value_int(i64(length))
 			if !length_ok_value {
 				vm_fail(state, "E_RANGE", "length does not fit an integer")
-				return .Failed
+				break
 			}
 			state.registers[base + int(instr.a)] = length_value
 
 		case .Scan_Collect:
 			if !vm_scan_collect(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Scan_Exists:
 			if !vm_scan_exists(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Scan_First:
 			if !vm_scan_first(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Assert:
 			if !vm_apply_write(state, base, instr, true) {
-				return .Failed
+				break
 			}
 
 		case .Retract:
 			if !vm_apply_write(state, base, instr, false) {
-				return .Failed
+				break
 			}
 
 		case .Retract_Where:
 			if !vm_retract_where(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Build_Relation:
 			if !vm_build_relation(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Index:
 			if !vm_index(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Collection_Key_At:
 			if !vm_collection_key_at(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Collection_Value_At:
 			if !vm_collection_value_at(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Builtin_Call:
 			if !vm_builtin_call(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Commit:
@@ -392,7 +405,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			millis, is_int := v.value_as_int(state.registers[base + int(instr.b)])
 			if !is_int || millis < 0 {
 				vm_fail(state, "E_TYPE", "sleep duration must be a non-negative integer")
-				return .Failed
+				break
 			}
 			state.pending_resume = instr.a
 			state.request = .Sleep
@@ -403,7 +416,19 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 		case .Raise:
 			state.error = vm_raised_error(state, base, instr)
 			state.status = .Failed
-			return .Failed
+			break
+
+		case .Push_Handler:
+			append(&state.handlers, Handler {
+				frame          = top,
+				target         = instr.a,
+				error_register = instr.b,
+			})
+
+		case .Pop_Handler:
+			if len(state.handlers) > 0 {
+				pop(&state.handlers)
+			}
 
 		case .Spawn:
 			delay_millis := i64(0)
@@ -411,7 +436,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				millis, is_int := v.value_as_int(state.registers[base + int(instr.c)])
 				if !is_int || millis < 0 {
 					vm_fail(state, "E_TYPE", "spawn delay must be a non-negative integer")
-					return .Failed
+					break
 				}
 				delay_millis = millis
 			}
@@ -428,20 +453,48 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Scan_One:
 			if !vm_scan_one(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Dispatch:
 			if !vm_dispatch(state, base, instr) {
-				return .Failed
+				break
 			}
 
 		case .Dynamic_Dispatch:
 			if !vm_dynamic_dispatch(state, base, instr) {
-				return .Failed
+				break
 			}
 		}
+
+		if state.status == .Failed {
+			if vm_unwind(state) {
+				continue
+			}
+			return .Failed
+		}
 	}
+}
+
+// Transfers control to the innermost handler. Returns false when no handler
+// exists and the error must escape the VM.
+@(private)
+vm_unwind :: proc(state: ^VM) -> bool {
+	if len(state.handlers) == 0 {
+		return false
+	}
+	handler := pop(&state.handlers)
+	if handler.frame >= len(state.frames) {
+		return false
+	}
+	resize(&state.frames, handler.frame + 1)
+	frame := state.frames[handler.frame]
+	state.frames[handler.frame].ip = int(handler.target)
+	if handler.error_register >= 0 {
+		state.registers[frame.register_base + int(handler.error_register)] = state.error
+	}
+	state.status = .Ready
+	return true
 }
 
 @(private)
