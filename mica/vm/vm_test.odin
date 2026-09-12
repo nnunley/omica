@@ -370,7 +370,7 @@ test_vm_scan_collect_and_len :: proc(t: ^testing.T) {
 		&builder,
 		u32(relation),
 		[]v.Symbol{owner, item},
-		[]Pattern_Cell{{kind = .Wildcard}, {kind = .Wildcard}},
+		[]Pattern_Cell{{kind = .Output}, {kind = .Output}},
 	)
 
 	builder_begin_function(&builder, v.symbol_intern("main"), 0, 2, true)

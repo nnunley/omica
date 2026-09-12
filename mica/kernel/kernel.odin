@@ -663,6 +663,7 @@ kernel_advance_version :: proc(kernel: ^Kernel, minimum: u64) -> bool {
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
+			kernel_store_persist(kernel, 0, next.version, next, nil)
 			snapshot_release(current)
 			return true
 		}
@@ -729,6 +730,7 @@ kernel_install_rule :: proc(
 				relation = rule.head_relation,
 				rule     = id,
 			}})
+			kernel_store_persist(kernel, 0, next.version, next, nil)
 			return next, .None
 		}
 		snapshot_release(next)
@@ -788,6 +790,7 @@ kernel_set_rule_active :: proc(
 				relation = head_relation,
 				rule     = rule_id,
 			}})
+			kernel_store_persist(kernel, 0, next.version, next, nil)
 			return next, .None
 		}
 		snapshot_release(next)

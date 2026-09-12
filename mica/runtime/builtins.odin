@@ -2907,6 +2907,32 @@ write_source_literal :: proc(builder: ^strings.Builder, env: ^Builtin_Env, value
 		} else {
 			strings.write_string(builder, "_")
 		}
+	case .Relation:
+		relation, _ := v.value_as_relation(value)
+		strings.write_string(builder, "[")
+		for column, index in relation.heading {
+			if index > 0 {
+				strings.write_string(builder, ", ")
+			}
+			strings.write_string(builder, ":")
+			name, _ := v.symbol_name(column)
+			strings.write_string(builder, name)
+		}
+		strings.write_string(builder, "] {")
+		for row, row_index in relation.rows {
+			if row_index > 0 {
+				strings.write_string(builder, ", ")
+			}
+			strings.write_string(builder, "[")
+			for cell, cell_index in v.tuple_values(row) {
+				if cell_index > 0 {
+					strings.write_string(builder, ", ")
+				}
+				write_source_literal(builder, env, cell)
+			}
+			strings.write_string(builder, "]")
+		}
+		strings.write_string(builder, "}")
 	case:
 		strings.write_string(builder, v.value_to_string(value, context.temp_allocator))
 	}

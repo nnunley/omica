@@ -160,6 +160,12 @@ scheduler_submit :: proc(scheduler: ^Scheduler, task: ^Task) -> Task_ID {
 	return scheduler_submit_task(scheduler, task, 0, false)
 }
 
+// Submits a task that owns its program. `scheduler_release` destroys the
+// program together with the task.
+scheduler_submit_owned :: proc(scheduler: ^Scheduler, task: ^Task) -> Task_ID {
+	return scheduler_submit_task(scheduler, task, 0, true)
+}
+
 @(private)
 scheduler_submit_task :: proc(
 	scheduler: ^Scheduler,

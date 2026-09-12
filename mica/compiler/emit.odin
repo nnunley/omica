@@ -3375,9 +3375,12 @@ emit_short_circuit :: proc(emitter: ^Emitter, binary: Binary) -> (int, bool) {
 		return result, true
 	}
 
-	// Or: truthy gives true, otherwise the right operand.
+	// Or: truthy gives true, otherwise the right operand. A right operand
+	// that terminates the block (for example `return`) emits its code before
+	// reporting no value; the truthy branch must still skip that code.
 	right, right_ok := emit_expr(emitter, binary.right)
 	if !right_ok {
+		patch_jump(emitter, branch, current_offset(emitter))
 		return -1, false
 	}
 	vm.builder_emit(emitter.builder, .Move, 0, i32(result), i32(right), 0)
@@ -3448,11 +3451,20 @@ emit_relation_query :: proc(emitter: ^Emitter, relation: u32, call: Call) -> (in
 	if !cells_ok {
 		return -1, false
 	}
+	// A call with no named query variables is a predicate test and returns a
+	// boolean; otherwise it collects the matching rows as a relation value.
+	has_output := false
+	for cell in cells {
+		if cell.kind == .Output {
+			has_output = true
+			break
+		}
+	}
 	pattern := vm.builder_add_pattern(emitter.builder, relation, names, cells)
 	destination := alloc_register(emitter)
 	vm.builder_emit(
 		emitter.builder,
-		.Scan_Collect,
+		has_output ? .Scan_Collect : .Scan_Exists,
 		0,
 		i32(destination),
 		pattern,

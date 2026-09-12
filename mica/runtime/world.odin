@@ -262,6 +262,74 @@ world_release :: proc(world: ^World, id: Task_ID) {
 	scheduler_release(&world.scheduler, id)
 }
 
+// Formats a value as Mica source text, resolving identity names through the
+// world's compile context. The caller owns the result.
+world_value_literal :: proc(
+	world: ^World,
+	value: v.Value,
+	allocator := context.allocator,
+) -> string {
+	builder: strings.Builder
+	strings.builder_init(&builder, context.temp_allocator)
+	write_source_literal(&builder, &world.env, value)
+	result := strings.clone(strings.to_string(builder), allocator)
+	strings.builder_destroy(&builder)
+	return result
+}
+
+// Compiles `source` against the live world and runs it as a task. Used by the
+// CLI to evaluate expressions against a stored world without reloading its
+// sources. The stored sources are recompiled with their top-level expressions
+// removed so verb function indices match the persisted MethodProgram facts,
+// then the eval source is appended as the program's entry. The outcome borrows
+// world-allocator values.
+world_eval :: proc(
+	world: ^World,
+	source: string,
+	allocator := context.allocator,
+) -> Task_Outcome {
+	ast, parse_errors := c.parse_program(source, allocator)
+	if len(parse_errors) > 0 {
+		return Task_Outcome{kind = .Aborted, message = parse_errors[0].message}
+	}
+	items: [dynamic]c.Item
+	defer delete(items)
+	for unit_source in world.sources {
+		unit_ast, unit_errors := c.parse_program(unit_source, context.temp_allocator)
+		if len(unit_errors) > 0 {
+			return Task_Outcome{kind = .Aborted, message = unit_errors[0].message}
+		}
+		for item in unit_ast.items {
+			if _, is_expression := item.(c.Expr_Item); is_expression {
+				continue
+			}
+			append(&items, item)
+		}
+	}
+	for item in ast.items {
+		append(&items, item)
+	}
+	program_ast := c.Program_AST {
+		items = items[:],
+	}
+	compiled := c.compile_program(&program_ast, &world.ctx, allocator)
+	if len(compiled.errors) > 0 {
+		return Task_Outcome{kind = .Aborted, message = compiled.errors[0].message}
+	}
+	task := new(Task, allocator)
+	task_init(task, 0, world.kernel, compiled.program, &world.env, allocator)
+	id := scheduler_submit_owned(&world.scheduler, task)
+	if id == 0 {
+		task_destroy(task)
+		free(task, allocator)
+		vm.program_destroy(compiled.program, allocator)
+		return Task_Outcome{kind = .Aborted, message = "cannot submit eval task"}
+	}
+	outcome := scheduler_wait(&world.scheduler, id)
+	scheduler_release(&world.scheduler, id)
+	return outcome
+}
+
 // Writes a chunk-page checkpoint of the current world state. Returns false
 // when no store is attached or the checkpoint fails.
 world_checkpoint :: proc(world: ^World) -> bool {
@@ -661,8 +729,6 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	unit_rows: [dynamic]v.Tuple
 	defer delete(unit_rows)
 	k.kernel_scan_into(world.kernel, k.SYSTEM_UNIT_SOURCE_ID, []v.Binding{{}, {}, {}}, &unit_rows)
-	ordered_sources: [dynamic]string
-	defer delete(ordered_sources)
 	for row in unit_rows {
 		values := v.tuple_values(row)
 		unit, has_unit := v.value_as_symbol(values[1])
@@ -683,7 +749,8 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 		} else {
 			world.env.unit_sources[name] = strings.clone(source, allocator)
 		}
-		append(&ordered_sources, world.env.unit_sources[name])
+		// Per-file sources, in load order, for later recompilation.
+		append(&world.sources, strings.clone(source, allocator))
 	}
 
 	// Runtime context identities: allocate above every stored identity.
@@ -713,7 +780,7 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	// persisted MethodProgram facts.
 	items: [dynamic]c.Item
 	defer delete(items)
-	for source in ordered_sources {
+	for source in world.sources {
 		ast, parse_errors := c.parse_program(source, allocator)
 		if len(parse_errors) > 0 {
 			return Run_Result{ok = false, message = fmt.aprintf(

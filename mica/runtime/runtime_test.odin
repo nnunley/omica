@@ -1623,7 +1623,9 @@ grant role #reader
 end
 commit()
 verb peek()
-  assert Leak(len(Secret(1)))
+  if Secret(1)
+    assert Leak(1)
+  end
 end
 spawn :peek()
 suspend()
@@ -1734,7 +1736,9 @@ let write_cap = mint_capability(:write, :Leak)
 verb peek(read_cap, write_cap)
   use_capability(read_cap)
   use_capability(write_cap)
-  assert Leak(len(Secret(1)))
+  if Secret(1)
+    assert Leak(1)
+  end
 end
 spawn :peek(read_cap: read_cap, write_cap: write_cap)
 suspend()
@@ -2092,7 +2096,7 @@ make_relation(:Out, 1)
 Derived(x) :- Base(x)
 assert Base(1)
 commit()
-require(len(Derived(1)) == 1)
+require(Derived(1))
 let rules = Rule(?rule)
 let rule_count = 0
 for found in rules
@@ -2101,12 +2105,12 @@ for found in rules
 end
 require(rule_count == 1)
 commit()
-require(len(Derived(1)) == 0)
+require(!Derived(1))
 for found in rules
   enable_rule(found[:rule])
 end
 commit()
-require(len(Derived(1)) == 1)
+require(Derived(1))
 assert Out(1)
 `
 	path, path_ok := write_temp_source(t, "mica_rule_toggle_test.mica", source)
@@ -2139,27 +2143,27 @@ end
 let plain_names = RelationName(?rel, :Plain)
 for found in plain_names
   let plain = found[:rel]
-  require(len(ConflictPolicy(plain, :set)) == 1)
-  require(len(RelationDurability(plain, :durable)) == 1)
+  require(ConflictPolicy(plain, :set))
+  require(RelationDurability(plain, :durable))
 end
 let keyed_names = RelationName(?rel, :Keyed)
 for found in keyed_names
   let keyed = found[:rel]
-  require(len(ConflictPolicy(keyed, :functional)) == 1)
-  require(len(FunctionalKey(keyed, 0, 0)) == 1)
-  require(len(RelationDurability(keyed, :volatile)) == 1)
+  require(ConflictPolicy(keyed, :functional))
+  require(FunctionalKey(keyed, 0, 0))
+  require(RelationDurability(keyed, :volatile))
   let indexes = Index(keyed, ?idx)
   require(len(indexes) == 1)
   let idx = indexes[0][:idx]
-  require(len(IndexPosition(idx, 0, 0)) == 1)
-  require(len(IndexPosition(idx, 1, 1)) == 1)
-  require(len(IndexStorageKind(idx, :btree)) == 1)
+  require(IndexPosition(idx, 0, 0))
+  require(IndexPosition(idx, 1, 1))
+  require(IndexStorageKind(idx, :btree))
 end
 let endpoints = RelationName(?rel, :Endpoint)
 require(len(endpoints) == 1)
 for found in endpoints
   let endpoint_rel = found[:rel]
-  require(len(RelationDurability(endpoint_rel, :volatile)) == 1)
+  require(RelationDurability(endpoint_rel, :volatile))
 end
 let witness = NamedIdentity(?identity, :witness)
 require(len(witness) == 1)
@@ -2428,7 +2432,9 @@ verb work(call_cap, out_cap, denied_cap, phase_cap)
       assert Phase(4)
     end
   end
-  assert Out(len(Secret(1)))
+  if Secret(1)
+    assert Out(1)
+  end
   try
     assume_actor(#carol)
     assert Denied(0)
@@ -3237,4 +3243,42 @@ assert Kept(1)
 	defer world_destroy(world)
 	testing.expect_value(t, world.entry, Task_ID(0))
 	expect_relation_rows(t, &kernel, "Kept", 1)
+}
+
+@(test)
+test_run_guard_and_projection :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:seven)
+make_relation(:Flag, 1)
+make_relation(:Pair, 2)
+make_relation(:Out, 2)
+
+assert Flag(1)
+assert Pair(7, #seven)
+
+verb guarded()
+  Flag(1) || return :missed
+  return :guarded
+end
+
+verb projected()
+  let exactly {value} = Pair(7, ?value)
+  return value
+end
+
+assert Out(guarded(), projected())
+`
+	path, path_ok := write_temp_source(t, "mica_guard_projection_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
 }

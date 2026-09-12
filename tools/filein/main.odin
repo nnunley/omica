@@ -1,9 +1,10 @@
-// Runs Mica fileins against an in-memory kernel.
+// Runs Mica fileins against an in-memory or stored world.
 //
 // Usage:
 //
 //	odin run tools/filein -- apps/shared/capabilities.mica
 //	odin run tools/filein -- --unit equipment apps/examples/equipment-service.mica
+//	odin run tools/filein -- --store /tmp/world --eval 'return ReadyForUse(#sensor_17)'
 package main
 
 import "core:fmt"
@@ -12,6 +13,11 @@ import "core:os"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
 import s "../../mica/store"
+import v "../../mica/var"
+
+@(private)
+USAGE :: "usage: filein [--unit NAME] [--store DIR] [--durability none|group|strict] " +
+	"[--actor NAME] [--checkpoint] [--eval SOURCE]... <path>...\n"
 
 @(private)
 parse_durability :: proc(text: string) -> s.Durability {
@@ -24,50 +30,98 @@ parse_durability :: proc(text: string) -> s.Durability {
 	return .Group
 }
 
+@(private)
+print_outcome :: proc(world: ^r.World, outcome: r.Task_Outcome) -> bool {
+	switch outcome.kind {
+	case .Complete:
+		text := r.world_value_literal(world, outcome.value)
+		defer delete(text, context.allocator)
+		fmt.printf("%s\n", text)
+		return true
+	case .Aborted:
+		detail := outcome.message
+		if header, is_error := v.value_as_error(outcome.error); is_error {
+			code, _ := v.symbol_name(header.code)
+			if header.has_message && header.message != "" {
+				detail = fmt.aprintf(
+					"%s: %s",
+					code,
+					header.message,
+					allocator = context.temp_allocator,
+				)
+			} else if code != "" {
+				detail = code
+			}
+		}
+		fmt.eprintf("aborted: %s\n", detail)
+		return false
+	case .Pending:
+		fmt.eprintf("aborted: task did not finish (%s)\n", outcome.message)
+		return false
+	}
+	return false
+}
+
 main :: proc() {
 	unit := ""
 	store_path := ""
+	actor := ""
 	checkpoint := false
 	durability := s.Durability.Group
+	evals: [dynamic]string
+	defer delete(evals)
 	paths: [dynamic]string
 	defer delete(paths)
+
 	arguments := os.args[1:]
 	for index := 0; index < len(arguments); index += 1 {
-		if arguments[index] == "--unit" {
+		switch arguments[index] {
+		case "--unit":
 			if index + 1 >= len(arguments) {
-				fmt.eprintln("usage: filein [--unit NAME] [--store DIR] <path>...")
+				fmt.eprintf(USAGE)
 				os.exit(1)
 			}
-			unit = arguments[index + 1]
 			index += 1
-			continue
-		}
-		if arguments[index] == "--checkpoint" {
+			unit = arguments[index]
+		case "--store":
+			if index + 1 >= len(arguments) {
+				fmt.eprintf(USAGE)
+				os.exit(1)
+			}
+			index += 1
+			store_path = arguments[index]
+		case "--durability":
+			if index + 1 >= len(arguments) {
+				fmt.eprintf(USAGE)
+				os.exit(1)
+			}
+			index += 1
+			durability = parse_durability(arguments[index])
+		case "--actor":
+			if index + 1 >= len(arguments) {
+				fmt.eprintf(USAGE)
+				os.exit(1)
+			}
+			index += 1
+			actor = arguments[index]
+		case "--eval":
+			if index + 1 >= len(arguments) {
+				fmt.eprintf(USAGE)
+				os.exit(1)
+			}
+			index += 1
+			append(&evals, arguments[index])
+		case "--checkpoint":
 			checkpoint = true
-			continue
+		case "--help", "-h":
+			fmt.printf(USAGE)
+			return
+		case:
+			append(&paths, arguments[index])
 		}
-		if arguments[index] == "--durability" {
-			if index + 1 >= len(arguments) {
-				fmt.eprintln("usage: filein [--unit NAME] [--store DIR] [--durability none|group|strict] <path>...")
-				os.exit(1)
-			}
-			durability = parse_durability(arguments[index + 1])
-			index += 1
-			continue
-		}
-		if arguments[index] == "--store" {
-			if index + 1 >= len(arguments) {
-				fmt.eprintln("usage: filein [--unit NAME] [--store DIR] <path>...")
-				os.exit(1)
-			}
-			store_path = arguments[index + 1]
-			index += 1
-			continue
-		}
-		append(&paths, arguments[index])
 	}
-	if len(paths) == 0 && store_path == "" {
-		fmt.eprintln("usage: filein [--unit NAME] [--store DIR] <path>...")
+	if len(paths) == 0 && store_path == "" && len(evals) == 0 {
+		fmt.eprintf(USAGE)
 		os.exit(1)
 	}
 
@@ -80,6 +134,7 @@ main :: proc() {
 		paths[:],
 		context.allocator,
 		r.World_Config {
+			actor      = actor,
 			unit       = unit,
 			store_path = store_path,
 			durability = durability,
@@ -89,23 +144,28 @@ main :: proc() {
 		fmt.eprintf("failed: %s\n", start.message)
 		os.exit(1)
 	}
-	result := r.Run_Result{ok = true, message = start.message}
+	ok := true
 	if world.entry != 0 {
 		outcome := r.world_wait(world, world.entry)
 		if outcome.kind != .Complete {
-			result = r.Run_Result{ok = false, message = outcome.message}
+			ok = print_outcome(world, outcome)
+		}
+	}
+	for source in evals {
+		if !print_outcome(world, r.world_eval(world, source)) {
+			ok = false
 		}
 	}
 	if checkpoint && !r.world_checkpoint(world) {
-		result = r.Run_Result{ok = false, message = "checkpoint failed"}
+		fmt.eprintf("failed: checkpoint failed\n")
+		ok = false
 	}
 	r.world_destroy(world)
-	if result.ok {
+	if ok {
 		for path in paths {
 			fmt.printf("loaded %s\n", path)
 		}
 	} else {
-		fmt.eprintf("failed: %s\n", result.message)
 		os.exit(1)
 	}
 }

@@ -1222,10 +1222,43 @@ vm_scan_collect :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	if !vm_scan_rows(state, base, pattern, &rows) {
 		return false
 	}
-	result, err := v.value_relation(state.allocator, pattern.column_names, rows[:])
-	if err != .None {
-		vm_fail(state, "E_RELATION", "scan result columns are invalid")
-		return false
+	// Only named query variables are result columns; bound values and
+	// wildcards participate in matching but do not appear in the heading.
+	output_count := 0
+	for cell in pattern.cells {
+		if cell.kind == .Output {
+			output_count += 1
+		}
+	}
+	result: v.Value
+	if output_count == len(pattern.cells) {
+		converted, err := v.value_relation(state.allocator, pattern.column_names, rows[:])
+		if err != .None {
+			vm_fail(state, "E_RELATION", "scan result columns are invalid")
+			return false
+		}
+		result = converted
+	} else {
+		heading := make([]v.Symbol, output_count, context.temp_allocator)
+		positions := make([]u16, output_count, context.temp_allocator)
+		write := 0
+		for cell, index in pattern.cells {
+			if cell.kind == .Output {
+				heading[write] = pattern.column_names[index]
+				positions[write] = u16(index)
+				write += 1
+			}
+		}
+		projected := make([]v.Tuple, len(rows), context.temp_allocator)
+		for row, index in rows {
+			projected[index] = v.tuple_select(row, state.allocator, positions)
+		}
+		converted, err := v.value_relation(state.allocator, heading, projected)
+		if err != .None {
+			vm_fail(state, "E_RELATION", "scan result columns are invalid")
+			return false
+		}
+		result = converted
 	}
 	state.registers[base + int(instr.a)] = result
 	return true
