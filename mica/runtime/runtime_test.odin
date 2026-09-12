@@ -2995,3 +2995,82 @@ assert Caught(probe())
 	testing.expect(t, is_string)
 	testing.expectf(t, text == source, "fileout text: %q", text)
 }
+
+@(test)
+test_run_read_waits_for_input :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb ask()
+  return read()
+end
+
+verb answer()
+  return read(:line)
+end
+`
+	path, path_ok := write_temp_source(t, "mica_read_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "world start failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	answer_id := world_submit_call(world, "answer", nil)
+	testing.expect(t, answer_id != 0)
+	metadata := v.Value(0)
+	has_request := false
+	deadline := time.tick_now()
+	for time.tick_since(deadline) < 2 * time.Second {
+		metadata, has_request = world_task_request(world, answer_id)
+		if has_request {
+			break
+		}
+		time.sleep(1 * time.Millisecond)
+	}
+	testing.expect(t, has_request)
+	symbol, is_symbol := v.value_as_symbol(metadata)
+	testing.expect(t, is_symbol)
+	name, has_name := v.symbol_name(symbol)
+	testing.expect(t, has_name)
+	testing.expect_value(t, name, "line")
+
+	input := v.value_string(context.temp_allocator, "look")
+	testing.expect(t, world_resume(world, answer_id, input))
+	answer := world_wait(world, answer_id)
+	testing.expect_value(t, answer.kind, Task_Outcome_Kind.Complete)
+	text, is_text := v.value_as_string(answer.value)
+	testing.expect(t, is_text)
+	testing.expect_value(t, text, "look")
+	world_release(world, answer_id)
+
+	// A read with no metadata waits without a request value.
+	ask_id := world_submit_call(world, "ask", nil)
+	testing.expect(t, ask_id != 0)
+	ask_parked := false
+	deadline = time.tick_now()
+	for time.tick_since(deadline) < 2 * time.Second {
+		_, ask_parked = world_task_request(world, ask_id)
+		if ask_parked {
+			break
+		}
+		time.sleep(1 * time.Millisecond)
+	}
+	testing.expect(t, ask_parked)
+	done := v.value_symbol(v.symbol_intern("done"))
+	testing.expect(t, world_resume(world, ask_id, done))
+	ask_answer := world_wait(world, ask_id)
+	testing.expect_value(t, ask_answer.kind, Task_Outcome_Kind.Complete)
+	testing.expect(t, v.value_eq(ask_answer.value, done))
+	world_release(world, ask_id)
+}

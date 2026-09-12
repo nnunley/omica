@@ -188,6 +188,17 @@ world_wait :: proc(world: ^World, id: Task_ID) -> Task_Outcome {
 	return scheduler_wait(&world.scheduler, id)
 }
 
+// Resumes a task parked on `read` (or another host request) with `value`.
+world_resume :: proc(world: ^World, id: Task_ID, value: v.Value) -> bool {
+	return scheduler_resume(&world.scheduler, id, value)
+}
+
+// Returns the `read` metadata for a parked task. The boolean reports whether
+// the task is currently waiting for host input.
+world_task_request :: proc(world: ^World, id: Task_ID) -> (v.Value, bool) {
+	return scheduler_task_request(&world.scheduler, id)
+}
+
 // Frees a terminal task entry after its outcome is read.
 world_release :: proc(world: ^World, id: Task_ID) {
 	scheduler_release(&world.scheduler, id)

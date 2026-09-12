@@ -615,6 +615,18 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			state.status = .Boundary
 			return .Boundary
 
+		case .Read:
+			state.pending_resume = instr.a
+			state.request = .Host_Request
+			if instr.b >= 0 {
+				state.request_value = state.registers[base + int(instr.b)]
+			} else {
+				state.request_value = v.Value(0)
+			}
+			state.request_millis = 0
+			state.status = .Boundary
+			return .Boundary
+
 		case .Make_Self_Function:
 			capture_count := int(instr.flags)
 			if capture_count == 0 {

@@ -38,6 +38,8 @@ Task_Outcome :: struct {
 	message: string,
 	suspend: Task_Suspend,
 	millis:  i64,
+	// The metadata supplied to a `read` suspension, zero when absent.
+	request: v.Value,
 }
 
 Task :: struct {
@@ -225,6 +227,10 @@ task_run :: proc(task: ^Task) -> Task_Outcome {
 					suspend = .None
 				}
 				millis := task.state.request_millis
+				request := v.Value(0)
+				if suspend == .Host_Request {
+					request = task.state.request_value
+				}
 				task_end_tx(task)
 				task.state.request = .None
 				task.state.request_millis = 0
@@ -232,6 +238,7 @@ task_run :: proc(task: ^Task) -> Task_Outcome {
 					kind    = .Pending,
 					suspend = suspend,
 					millis  = millis,
+					request = request,
 				}
 				return task.outcome
 

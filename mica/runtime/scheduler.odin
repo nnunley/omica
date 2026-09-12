@@ -727,6 +727,21 @@ scheduler_task_values :: proc(scheduler: ^Scheduler, allocator: mem.Allocator) -
 	return values
 }
 
+// Returns the metadata of a task parked on `read`. The boolean reports
+// whether the task is currently waiting for host input.
+scheduler_task_request :: proc(scheduler: ^Scheduler, id: Task_ID) -> (v.Value, bool) {
+	sync.mutex_lock(&scheduler.lock)
+	defer sync.mutex_unlock(&scheduler.lock)
+	entry, found := scheduler.entries[id]
+	if !found || entry.done || entry.running {
+		return v.Value(0), false
+	}
+	if entry.result.kind != .Pending || entry.result.suspend != .Host_Request {
+		return v.Value(0), false
+	}
+	return entry.result.request, true
+}
+
 // Frees a terminal task entry. Call after reading the outcome. The outcome's
 // value stays valid because owner values live in the world allocator.
 scheduler_release :: proc(scheduler: ^Scheduler, id: Task_ID) {

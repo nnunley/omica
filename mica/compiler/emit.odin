@@ -1275,6 +1275,31 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		return destination, true
 	}
 
+	if text == "read" {
+		if len(call.args) > 1 {
+			push_error(emitter, "read expects zero or one argument")
+			return -1, false
+		}
+		metadata := -1
+		if len(call.args) == 1 {
+			register, has_value := emit_expr(emitter, call.args[0].expr)
+			if !has_value {
+				return -1, false
+			}
+			metadata = register
+		}
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Read,
+			0,
+			i32(destination),
+			i32(metadata),
+			0,
+		)
+		return destination, true
+	}
+
 	// A relation query.
 	if emitter.ctx != nil {
 		if relation, found := emitter.ctx.relations[text]; found {

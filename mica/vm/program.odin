@@ -105,6 +105,9 @@ Op :: enum u8 {
 	// External_Request: a = dst, b = service symbol register, c = payload
 	// register. Suspends until the host resolves the request.
 	External_Request,
+	// Read: a = destination register for the input value, b = metadata
+	// register (-1 when absent). Suspends until the host supplies input.
+	Read,
 	// Push_Handler: a = absolute catch target offset, b = register that
 	// receives the raised error (-1 when the handler takes no value).
 	Push_Handler,
@@ -740,6 +743,13 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				   !valid_register(instr.c, register_count) {
 					return .Bad_Register
 				}
+			case .Read:
+				if !valid_register(instr.a, register_count) {
+					return .Bad_Register
+				}
+				if instr.b >= 0 && !valid_register(instr.b, register_count) {
+					return .Bad_Register
+				}
 			case .Push_Handler:
 				if instr.a < 0 {
 					return .Bad_Function
@@ -934,6 +944,8 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d receivers@r%d", instr.a, instr.b)
 			case .External_Request:
 				fmt.sbprintf(&builder, " r%d %d@r%d", instr.a, instr.b, instr.c)
+			case .Read:
+				fmt.sbprintf(&builder, " r%d meta@r%d", instr.a, instr.b)
 			case .Push_Handler:
 				fmt.sbprintf(&builder, " ->%d r%d", instr.a, instr.b)
 			case .Push_Finally:
@@ -1034,6 +1046,8 @@ op_name :: proc(op: Op) -> string {
 		return "mailbox_recv"
 	case .External_Request:
 		return "external_request"
+	case .Read:
+		return "read"
 	case .Push_Handler:
 		return "push_handler"
 	case .Pop_Handler:
