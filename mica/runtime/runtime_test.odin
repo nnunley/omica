@@ -3884,3 +3884,85 @@ suspend()
 	expect_relation_rows(t, &kernel, "Cleared", 0)
 	expect_relation_rows(t, &kernel, "Secret", 3)
 }
+
+// A per-call actor override must be checked with that actor's authority, not
+// the world default's.
+@(test)
+test_run_per_call_actor_authority :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_identity(:bob)
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+make_relation(:SecretA, 1)
+make_relation(:SecretB, 1)
+make_relation(:Allowed, 1)
+make_relation(:Denied, 1)
+assert SecretA(1)
+assert SecretB(1)
+grant #alice
+  read:
+    :SecretA
+  write:
+    :Denied
+end
+grant #bob
+  read:
+    :SecretB
+  write:
+    :Allowed
+    :Denied
+end
+commit()
+verb peek_b()
+  try
+    let rows = SecretB(1)
+    assert Allowed(1)
+  catch err
+    assert Denied(1)
+  end
+end
+`
+	path, path_ok := write_temp_source(t, "mica_per_call_actor.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		World_Config{actor = "alice"},
+	)
+	testing.expectf(t, start.ok, "world start failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	bob, bob_found := world.ctx.identities["bob"]
+	testing.expect(t, bob_found)
+
+	result := world_submit_call_with_options(
+		world,
+		"peek_b",
+		nil,
+		nil,
+		0,
+		World_Call_Options{actor = bob},
+	)
+	testing.expect(t, result.id != 0)
+	if result.id != 0 {
+		outcome := world_wait(world, result.id)
+		testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+		world_release(world, result.id)
+	}
+	expect_relation_rows(t, &kernel, "Allowed", 1)
+	expect_relation_rows(t, &kernel, "Denied", 0)
+}

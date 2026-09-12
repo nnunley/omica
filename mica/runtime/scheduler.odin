@@ -905,6 +905,13 @@ scheduler_submit_dispatch :: proc(
 			principal = options.actor
 		}
 		vm.vm_set_identities(&task.state, endpoint, options.actor, principal)
+		// The task authority was minted from the world default in `task_init`;
+		// remint it from the effective per-call actor.
+		if env != nil && env.enforce_authority {
+			if _, has_actor := v.value_as_identity(options.actor); has_actor {
+				task_set_actor_authority(task, options.actor, scheduler.allocator)
+			}
+		}
 	}
 	vm.vm_set_entry_function(&task.state, i32(function_index))
 	vm.vm_set_entry_arguments(&task.state, arguments)

@@ -92,18 +92,26 @@ task_init :: proc(
 	vm.vm_set_mailbox_validator(&task.state, mailbox_receivers_live, env)
 	register_runtime_builtins(&task.state)
 	if env != nil && env.enforce_authority {
-		if actor, has_actor := v.value_as_identity(env.actor); has_actor {
-			snapshot := k.kernel_snapshot(kernel)
-			source := k.Relation_Source {
-				snapshot = snapshot,
-			}
-			task.authority = k.authority_from_actor(&source, actor, allocator)
-			k.snapshot_release(snapshot)
-			task.has_authority = true
-			vm.vm_set_authority(&task.state, &task.authority)
-		}
+		task_set_actor_authority(task, env.actor, allocator)
 	}
 	task_begin_tx(task)
+}
+
+// Mints the task's authority for `actor`, replacing any existing authority and
+// updating the VM. Used at init and when a per-call actor overrides the world
+// default.
+task_set_actor_authority :: proc(task: ^Task, actor: v.Value, allocator: mem.Allocator) {
+	identity, has_identity := v.value_as_identity(actor)
+	if !has_identity {
+		return
+	}
+	snapshot := k.kernel_snapshot(task.kernel)
+	source := k.Relation_Source {
+		snapshot = snapshot,
+	}
+	authority := k.authority_from_actor(&source, identity, allocator)
+	k.snapshot_release(snapshot)
+	task_set_authority(task, authority)
 }
 
 // Replaces the task's authority, taking ownership of `authority`.
