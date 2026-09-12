@@ -51,7 +51,12 @@ sync_handle_request :: proc(
 	}
 	envelope, decoded := sync_decode_envelope(request.body)
 	if !decoded {
-		return sync_handle_dom_event(host, actor, request, response)
+		return sync_handle_dom_event(host, actor, request.body, response)
+	}
+	// The SSE client wraps DOM events in a HaveView envelope whose payload is
+	// the event JSON. Decode that payload before the view-refresh path.
+	if event, is_event := dom_event_decode(envelope.payload, host.world.allocator); is_event {
+		return sync_dispatch_dom_event(host, actor, event, response)
 	}
 	switch envelope.kind {
 	case .Need_View:
@@ -110,16 +115,26 @@ sync_handle_request :: proc(
 sync_handle_dom_event :: proc(
 	host: ^Sync_Host,
 	actor: v.Value,
-	request: ^Http_Request,
+	body: []u8,
 	response: ^Http_Response,
 ) -> bool {
 	// Role values must outlive the connection thread's temp arena, so they are
 	// allocated from the world allocator.
-	event, parsed := dom_event_decode(request.body, host.world.allocator)
+	event, parsed := dom_event_decode(body, host.world.allocator)
 	if !parsed {
 		http_response_text(response, 400, "text/plain; charset=utf-8", "invalid sync envelope")
 		return true
 	}
+	return sync_dispatch_dom_event(host, actor, event, response)
+}
+
+@(private)
+sync_dispatch_dom_event :: proc(
+	host: ^Sync_Host,
+	actor: v.Value,
+	event: Dom_Event,
+	response: ^Http_Response,
+) -> bool {
 	session := sync_host_ensure_session(host, event.session_id, actor)
 	session_value, _ := v.value_int(i64(event.session_id))
 	view_value, _ := v.value_int(i64(event.view_id))

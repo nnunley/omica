@@ -314,3 +314,134 @@ end
 	thread.join(run_thread)
 	thread.destroy(run_thread)
 }
+
+@(test)
+test_sync_dom_event_envelope :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Clicked, 1)
+
+verb sync_event(endpoint, session, view, event, target, action, fields)
+  assert Clicked(action)
+end
+
+verb sync_view_tree(view)
+  let clicks = Clicked(?c)
+  let rows = []
+  for row in clicks
+    rows = [@rows, dom <li>{to_literal(row[:c])}</li>]
+  end
+  return dom <ul id="items">{rows}</ul>
+end
+`
+	path, path_ok := write_document_source(t, "mica_sync_dom_event_fixture.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "world start failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer r.world_destroy(world)
+	entry := r.world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
+
+	host: Sync_Fixture_Host
+	sync_host_init(&host.sync, world)
+	defer sync_host_destroy(&host.sync)
+
+	server: Web_Server
+	ok, message := web_server_init(&server, "127.0.0.1:0", sync_fixture_handler, &host)
+	testing.expectf(t, ok, "server init failed: %s", message)
+	if !ok {
+		return
+	}
+	web_server_set_stream_handler(&server, sync_fixture_stream)
+	run_thread := thread.create_and_start_with_data(&server, server_run_worker)
+	if run_thread == nil {
+		return
+	}
+
+	sse_client := dial_server(t, &server)
+	send_text(sse_client, "GET /sync/events?session=5 HTTP/1.1\r\nHost: a\r\n\r\n")
+	connected := read_until(sse_client, ": connected", 3 * time.Second)
+	defer delete(connected)
+
+	need := Sync_Envelope {
+		kind       = .Need_View,
+		session_id = 5,
+		view_id    = 1,
+	}
+	need_bytes: [dynamic]u8
+	defer delete(need_bytes)
+	sync_encode_envelope(&need, &need_bytes)
+	input_client := dial_server(t, &server)
+	request_line := fmt.aprintf(
+		"POST /sync/input HTTP/1.1\r\nHost: a\r\nContent-Length: %d\r\n\r\n",
+		len(need_bytes),
+		allocator = context.temp_allocator,
+	)
+	send_text(input_client, request_line)
+	_, _ = net.send_tcp(input_client, need_bytes[:])
+	need_response := read_response(input_client)
+	defer delete(need_response)
+	testing.expectf(
+		t,
+		strings.contains(string(need_response), "202 Accepted"),
+		"need view: %q",
+		string(need_response),
+	)
+	snapshot := read_until(sse_client, "\"kind\":\"ViewSnapshot\"", 3 * time.Second)
+	defer delete(snapshot)
+
+	payload := `{"type":"dom_event","session":"5","view":"1","revision":"0","signature":"0","refresh":true,"event":"submit","target":"t","action":"punch","fields":{}}`
+	event_envelope := Sync_Envelope {
+		kind             = .Have_View,
+		session_id       = 5,
+		view_id          = 1,
+		client_revision  = 0,
+		client_signature = 0,
+		payload          = transmute([]u8)payload,
+	}
+	event_bytes: [dynamic]u8
+	defer delete(event_bytes)
+	sync_encode_envelope(&event_envelope, &event_bytes)
+	event_line := fmt.aprintf(
+		"POST /sync/input HTTP/1.1\r\nHost: a\r\nContent-Length: %d\r\n\r\n",
+		len(event_bytes),
+		allocator = context.temp_allocator,
+	)
+	event_client := dial_server(t, &server)
+	send_text(event_client, event_line)
+	_, _ = net.send_tcp(event_client, event_bytes[:])
+	event_response := read_response(event_client)
+	defer delete(event_response)
+	testing.expectf(
+		t,
+		strings.contains(string(event_response), "202 Accepted"),
+		"dom event: %q",
+		string(event_response),
+	)
+
+	event := read_until(sse_client, "punch", 5 * time.Second)
+	defer delete(event)
+	testing.expectf(
+		t,
+		strings.contains(string(event), "punch"),
+		"dom event response: %q",
+		string(event),
+	)
+
+	net.close(event_client)
+	net.close(input_client)
+	net.close(sse_client)
+	web_server_stop(&server)
+	thread.join(run_thread)
+	thread.destroy(run_thread)
+}
