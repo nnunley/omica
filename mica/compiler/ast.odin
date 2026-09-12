@@ -444,8 +444,10 @@ Verb_Item :: struct {
 }
 
 Rule_Item :: struct {
-	head: ^Expr,
-	body: []^Expr,
+	head:   ^Expr,
+	body:   []^Expr,
+	// The rule's own source text, a slice into the parsed program text.
+	source: string,
 }
 
 Item :: union {

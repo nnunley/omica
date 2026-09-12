@@ -91,6 +91,8 @@ runtime_builtins := [?]Builtin_Spec {
 	{"disable_rule", 1, builtin_disable_rule},
 	{"rules", 1, builtin_rules},
 	{"describe_rule", 1, builtin_describe_rule},
+	{"fileout", 1, builtin_fileout},
+	{"fileout_rules", -1, builtin_fileout_rules},
 	{"tasks", 0, builtin_tasks},
 	{"log", -1, builtin_log},
 	{"project", -1, builtin_project},
@@ -1437,6 +1439,87 @@ builtin_describe_rule :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 		return v.value_string(state.allocator, definition.source), true
 	}
 	return builtin_error(state, "E_INVARG", "rule does not exist")
+}
+
+// `fileout(:unit)`: the source text loaded for a filein unit.
+@(private)
+builtin_fileout :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 1 {
+		return builtin_error(state, "E_INVARG", "fileout expects fileout(:unit)")
+	}
+	name_symbol, is_symbol := v.value_as_symbol(args[0])
+	if !is_symbol {
+		return builtin_error(state, "E_TYPE", "fileout expects a unit symbol")
+	}
+	name, has_name := v.symbol_name(name_symbol)
+	if !has_name {
+		return builtin_error(state, "E_INVARG", "fileout expects a named unit symbol")
+	}
+	env := builtin_env(state)
+	source, found := env.unit_sources[name]
+	if !found {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			fmt.aprintf("unknown filein unit :%s", name, allocator = state.allocator),
+		)
+	}
+	return v.value_string(state.allocator, source), true
+}
+
+// `fileout_rules([:Relation])`: active rule source, optionally filtered to one
+// head relation. Rules are separated by a blank line.
+@(private)
+builtin_fileout_rules :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) > 1 {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			"fileout_rules expects fileout_rules() or fileout_rules(:Relation)",
+		)
+	}
+	env := builtin_env(state)
+	relation_id := k.Relation_ID(0)
+	filter := false
+	if len(args) == 1 {
+		name_symbol, is_symbol := v.value_as_symbol(args[0])
+		if !is_symbol {
+			return builtin_error(state, "E_TYPE", "fileout_rules expects a relation name symbol")
+		}
+		name, has_name := v.symbol_name(name_symbol)
+		if !has_name {
+			return builtin_error(state, "E_INVARG", "fileout_rules expects a named relation symbol")
+		}
+		known_id, known := env.ctx.relations[name]
+		if !known {
+			return builtin_error(
+				state,
+				"E_INVARG",
+				fmt.aprintf("unknown relation :%s", name, allocator = state.allocator),
+			)
+		}
+		relation_id = k.Relation_ID(known_id)
+		filter = true
+	}
+	snapshot := k.kernel_snapshot(env.kernel)
+	defer k.snapshot_release(snapshot)
+	builder: strings.Builder
+	strings.builder_init(&builder, state.allocator)
+	first := true
+	for definition in snapshot.rules {
+		if !definition.active {
+			continue
+		}
+		if filter && definition.rule.head_relation != relation_id {
+			continue
+		}
+		if !first {
+			strings.write_string(&builder, "\n\n")
+		}
+		first = false
+		strings.write_string(&builder, definition.source)
+	}
+	return v.value_string(state.allocator, strings.to_string(builder)), true
 }
 
 // `tasks()`: snapshots of managed tasks as `[:id, :state]` maps.

@@ -198,11 +198,20 @@ parse_item :: proc(parser: ^Parser) -> Item {
 			return parse_grant(parser)
 		}
 
+		start := peek(parser).offset
 		head := parse_expression(parser)
 		if at(parser, .Colon_Dash) {
 			advance(parser)
 			body := parse_rule_body(parser)
-			return Rule_Item{head = head, body = body}
+			end := len(parser.source)
+			if parser.pos < len(parser.tokens) {
+				end = parser.tokens[parser.pos].offset
+			}
+			rule_source := ""
+			if start >= 0 && end <= len(parser.source) && start < end {
+				rule_source = strings.trim_space(parser.source[start:end])
+			}
+			return Rule_Item{head = head, body = body, source = rule_source}
 		}
 		return Expr_Item{expr = head}
 	}

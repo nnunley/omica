@@ -43,6 +43,9 @@ Builtin_Env :: struct {
 	// Change subscriptions registered by this world.
 	subscriptions:     Subscription_Store,
 
+	// Source text per filein unit, keyed by unit name.
+	unit_sources: map[string]string,
+
 	// Runtime context identities returned by `endpoint()`, `actor()`, and
 	// `principal()`.
 	endpoint:  v.Value,
@@ -357,6 +360,8 @@ Run_Options :: struct {
 	// Name of the declared identity that spawned tasks run as. Empty keeps
 	// every task at root.
 	actor: string,
+	// Filein unit name for `fileout`. Empty derives one unit per file.
+	unit: string,
 }
 
 // Compiles and runs a set of fileins as one world against `kernel`. On success
@@ -372,7 +377,7 @@ run_files :: proc(
 		kernel,
 		paths,
 		allocator,
-		World_Config{actor = options.actor, workers = 1},
+		World_Config{actor = options.actor, unit = options.unit, workers = 1},
 	)
 	if !start_result.ok {
 		return start_result
@@ -822,6 +827,10 @@ install_rules :: proc(
 		if !is_rule {
 			continue
 		}
+		rule_source := rule_item.source
+		if rule_source == "" {
+			rule_source = source
+		}
 		rule, rule_ok := convert_rule(rule_item, env.ctx)
 		if !rule_ok {
 			return Run_Result{ok = false, message = fmt.aprintf(
@@ -834,7 +843,7 @@ install_rules :: proc(
 			kernel,
 			v.Identity(declarations.next_rule),
 			rule,
-			source,
+			rule_source,
 		)
 		if install_err != k.Kernel_Error.None {
 			return Run_Result{ok = false, message = fmt.aprintf(
@@ -848,7 +857,7 @@ install_rules :: proc(
 		append(&facts, Rule_Fact {
 			id     = v.Identity(declarations.next_rule),
 			head   = rule.head_relation,
-			source = source,
+			source = rule_source,
 			active = true,
 		})
 		declarations.next_rule += 1

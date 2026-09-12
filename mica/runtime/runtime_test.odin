@@ -2909,3 +2909,89 @@ require !LocatedIn(#thing, #room)
 		delete(rows)
 	}
 }
+
+@(test)
+test_run_fileout_rules :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:DirectDependency, 2)
+make_relation(:DependsOn, 2)
+
+DependsOn(component, dependency) :-
+  DirectDependency(component, dependency)
+
+require fileout_rules(:DependsOn) == "DependsOn(component, dependency) :-\n  DirectDependency(component, dependency)"
+require fileout_rules(:DirectDependency) == ""
+require string_contains(fileout_rules(), "DirectDependency")
+
+let rule = rules(:DependsOn)
+disable_rule(rule[0])
+require fileout_rules(:DependsOn) == ""
+`
+	path, path_ok := write_temp_source(t, "mica_fileout_rules_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}
+
+@(test)
+test_run_fileout_unit :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Source, 1)
+make_relation(:Caught, 1)
+
+assert Source(fileout(:example))
+
+verb probe()
+  try
+    return fileout(:missing)
+  catch E_INVARG
+    return :caught
+  end
+end
+assert Caught(probe())
+`
+	path, path_ok := write_temp_source(t, "mica_fileout_unit_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{unit = "example"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Caught", 1)
+
+	snapshot := k.kernel_snapshot(&kernel)
+	metadata, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("Source"))
+	k.snapshot_release(snapshot)
+	testing.expect(t, found)
+	if !found {
+		return
+	}
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(&kernel, metadata.id, []v.Binding{{}}, &rows)
+	if len(rows) != 1 {
+		testing.expectf(t, false, "Source has %d rows", len(rows))
+		return
+	}
+	text, is_string := v.value_as_string(v.tuple_values(rows[0])[0])
+	testing.expect(t, is_string)
+	testing.expectf(t, text == source, "fileout text: %q", text)
+}

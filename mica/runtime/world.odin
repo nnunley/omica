@@ -10,6 +10,7 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import c "../compiler"
 import k "../kernel"
 import vm "../vm"
@@ -21,6 +22,9 @@ World_Config :: struct {
 	actor:   string,
 	// Worker threads. Clamped to at least one.
 	workers: int,
+	// Filein unit name for `fileout`. Empty derives one unit per file from
+	// the file's base name without its extension.
+	unit:    string,
 }
 
 // A relation write applied to a task transaction before it starts.
@@ -89,6 +93,10 @@ world_destroy :: proc(world: ^World) {
 		delete(source, world.allocator)
 	}
 	delete(world.sources)
+	for _, &source in world.env.unit_sources {
+		delete(source, world.allocator)
+	}
+	delete(world.env.unit_sources)
 	for key, info in world.env.fields {
 		if info.key_positions != nil {
 			delete(info.key_positions, world.allocator)
@@ -258,11 +266,32 @@ world_call :: proc(world: ^World, selector: string, roles: []k.Role_Pair) -> Tas
 
 // --- Loading ---------------------------------------------------------------
 
+// Derives a filein unit name from a path: the base name without its extension.
+@(private)
+source_unit_name :: proc(path: string) -> string {
+	base := path
+	if slash := strings.last_index_byte(path, '/'); slash >= 0 {
+		base = path[slash + 1:]
+	}
+	if dot := strings.last_index_byte(base, '.'); dot > 0 {
+		base = base[:dot]
+	}
+	return base
+}
+
 @(private)
 world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_Result {
 	allocator := world.allocator
 	asts := make([dynamic]^c.Program_AST, allocator)
 	defer delete(asts)
+
+	Unit_Entry :: struct {
+		name:   string,
+		source: string,
+	}
+	unit_entries: [dynamic]Unit_Entry
+	unit_entries = make([dynamic]Unit_Entry, allocator)
+	defer delete(unit_entries)
 
 	for path in paths {
 		data, read_err := os.read_entire_file(path, allocator)
@@ -306,6 +335,13 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 		}
 		append(&asts, ast)
 		append(&world.sources, granted)
+		unit_name := config.unit
+		if unit_name == "" {
+			unit_name = source_unit_name(path)
+		}
+		if unit_name != "" {
+			append(&unit_entries, Unit_Entry{name = unit_name, source = granted})
+		}
 	}
 
 	world.ctx = c.Compile_Context {
@@ -317,10 +353,23 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	install_primitive_identities(&world.ctx)
 
 	world.env = Builtin_Env {
-		kernel    = world.kernel,
-		ctx       = &world.ctx,
-		fields    = make(map[string]Field_Info, allocator),
-		allocator = allocator,
+		kernel       = world.kernel,
+		ctx          = &world.ctx,
+		fields       = make(map[string]Field_Info, allocator),
+		unit_sources = make(map[string]string, allocator),
+		allocator    = allocator,
+	}
+	for entry in unit_entries {
+		if existing, found := world.env.unit_sources[entry.name]; found {
+			combined := strings.concatenate(
+				[]string{existing, "\n\n", entry.source},
+				allocator,
+			)
+			delete(existing, allocator)
+			world.env.unit_sources[entry.name] = combined
+		} else {
+			world.env.unit_sources[entry.name] = strings.clone(entry.source, allocator)
+		}
 	}
 	subscriptions_init(&world.env.subscriptions, allocator)
 
