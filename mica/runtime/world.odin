@@ -29,6 +29,10 @@ World_Config :: struct {
 	// Durable store directory. When set and non-empty, the world boots from
 	// the store; otherwise the given sources load and persist into it.
 	store_path: string,
+	// Store fsync policy. Defaults to group commit.
+	durability: s.Durability,
+	// WAL bytes before an automatic checkpoint. Zero uses the store default.
+	checkpoint_bytes: i64,
 }
 
 // A relation write applied to a task transaction before it starts.
@@ -78,14 +82,21 @@ world_start :: proc(
 	if config.store_path != "" {
 		durable := new(s.Store, allocator)
 		if !s.store_open(durable, s.Store_Options {
-			mode = .File,
-			path = config.store_path,
+			mode             = .File,
+			path             = config.store_path,
+			durability       = config.durability,
+			checkpoint_bytes = config.checkpoint_bytes,
 		}) {
+			detail := s.store_last_error(durable)
+			if detail == "" {
+				detail = "unknown error"
+			}
 			free(durable, allocator)
 			world_destroy(world)
 			return nil, Run_Result{ok = false, message = fmt.aprintf(
-				"cannot open the store at %s",
+				"cannot open the store at %s: %s",
 				config.store_path,
+				detail,
 				allocator = allocator,
 			)}
 		}
@@ -123,6 +134,11 @@ world_destroy :: proc(world: ^World) {
 	}
 	if world.store != nil {
 		k.kernel_detach_store(world.kernel)
+		// A clean shutdown checkpoints, so the next boot starts from a fresh
+		// manifest instead of replaying a long log.
+		if world.started {
+			_ = s.store_checkpoint(world.store, world.kernel)
+		}
 		s.store_destroy(world.store)
 		free(world.store, world.allocator)
 		world.store = nil

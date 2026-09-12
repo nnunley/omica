@@ -11,11 +11,24 @@ import "core:os"
 
 import k "../../mica/kernel"
 import r "../../mica/runtime"
+import s "../../mica/store"
+
+@(private)
+parse_durability :: proc(text: string) -> s.Durability {
+	switch text {
+	case "none":
+		return .None
+	case "strict":
+		return .Strict
+	}
+	return .Group
+}
 
 main :: proc() {
 	unit := ""
 	store_path := ""
 	checkpoint := false
+	durability := s.Durability.Group
 	paths: [dynamic]string
 	defer delete(paths)
 	arguments := os.args[1:]
@@ -31,6 +44,15 @@ main :: proc() {
 		}
 		if arguments[index] == "--checkpoint" {
 			checkpoint = true
+			continue
+		}
+		if arguments[index] == "--durability" {
+			if index + 1 >= len(arguments) {
+				fmt.eprintln("usage: filein [--unit NAME] [--store DIR] [--durability none|group|strict] <path>...")
+				os.exit(1)
+			}
+			durability = parse_durability(arguments[index + 1])
+			index += 1
 			continue
 		}
 		if arguments[index] == "--store" {
@@ -57,7 +79,11 @@ main :: proc() {
 		&kernel,
 		paths[:],
 		context.allocator,
-		r.World_Config{unit = unit, store_path = store_path},
+		r.World_Config {
+			unit       = unit,
+			store_path = store_path,
+			durability = durability,
+		},
 	)
 	if !start.ok {
 		fmt.eprintf("failed: %s\n", start.message)

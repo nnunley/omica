@@ -3174,3 +3174,67 @@ assert Marker(#alice, :seed)
 	testing.expectf(t, outcome.kind == .Complete, "call failed: %s", outcome.message)
 	expect_relation_rows(t, &kernel, "Marker", 3)
 }
+
+@(test)
+test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Kept, 1)
+assert Kept(1)
+`
+	path, path_ok := write_temp_source(t, "mica_shutdown_checkpoint_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	directory, directory_error := os.temp_dir(context.temp_allocator)
+	if directory_error != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	store_path, join_error := filepath.join(
+		[]string{directory, "mica_shutdown_checkpoint"},
+		context.temp_allocator,
+	)
+	if join_error != nil {
+		return
+	}
+	os.remove_all(store_path)
+	defer os.remove_all(store_path)
+
+	// The first world checkpoints only at clean shutdown.
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		world, start := world_start(
+			&kernel,
+			[]string{path},
+			context.temp_allocator,
+			World_Config{store_path = store_path},
+		)
+		testing.expectf(t, start.ok, "load failed: %s", start.message)
+		if start.ok {
+			entry := world_wait(world, world.entry)
+			testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+			world_destroy(world)
+		}
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		nil,
+		context.temp_allocator,
+		World_Config{store_path = store_path},
+	)
+	testing.expectf(t, start.ok, "boot failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	testing.expect_value(t, world.entry, Task_ID(0))
+	expect_relation_rows(t, &kernel, "Kept", 1)
+}

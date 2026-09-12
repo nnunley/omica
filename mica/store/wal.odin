@@ -330,6 +330,7 @@ store_wal_open :: proc(store: ^Store, path: string) -> bool {
 		}
 		last_good = cursor
 	}
+	store.covered = store.durable
 	if last_good < len(data) {
 		// Drop the torn tail so later appends start at a record boundary.
 		if truncate_error := os.truncate(file, i64(last_good)); truncate_error != nil {
@@ -365,6 +366,7 @@ store_wal_append_batch :: proc(store: ^Store, entries: []Queue_Entry) -> bool {
 			return false
 		}
 		store.wal_end += i64(written)
+		sync.atomic_add(&store.wal_bytes_since_checkpoint, i64(written))
 		if store.durability == .Strict {
 			if sync_error := os.sync(store.file); sync_error != nil {
 				return false
@@ -379,6 +381,20 @@ store_wal_append_batch :: proc(store: ^Store, entries: []Queue_Entry) -> bool {
 		sync.atomic_add(&store.syncs, 1)
 	}
 	return true
+}
+
+// Raises the store's durable version, used after restoring a checkpoint.
+@(private)
+store_mark_durable :: proc(store: ^Store, version: u64) {
+	sync.mutex_lock(&store.lock)
+	if version > store.durable {
+		store.durable = version
+	}
+	if version > store.covered {
+		store.covered = version
+	}
+	sync.cond_broadcast(&store.cond)
+	sync.mutex_unlock(&store.lock)
 }
 
 // Rewrites the WAL with only the records after `version`. The checkpoint
@@ -469,6 +485,7 @@ store_wal_rotate :: proc(store: ^Store, version: u64) -> bool {
 	}
 	store.file = reopened
 	store.wal_end = position
+	sync.atomic_store(&store.wal_bytes_since_checkpoint, 0)
 	clear(&store.records)
 	append(&store.records, ..tail[:])
 	sync.mutex_unlock(&store.lock)
@@ -494,6 +511,7 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 		// only covers later checkpoints and is not replayed.
 		if store.checkpoint_version > 0 {
 			_ = k.kernel_advance_version(kernel, store.checkpoint_version)
+			store_mark_durable(store, store.checkpoint_version)
 		}
 		return true
 	}
@@ -557,10 +575,12 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	}
 
 	// New commits must resume above the durable log's and checkpoint's
-	// versions.
+	// versions. Restored state is durable by definition, so the store's
+	// durable version catches up before any further checkpoint waits on it.
 	target := max(durable, store.checkpoint_version)
 	if target > 0 {
 		_ = k.kernel_advance_version(kernel, target)
+		store_mark_durable(store, target)
 	}
 	return true
 }

@@ -62,6 +62,7 @@ done
 args+=(--bind "${bind}" --sync-client host/web/sync-client.js)
 if [[ -n "${MICA_STORE:-}" ]]; then
   args+=(--store "${MICA_STORE}")
+  args+=(--durability "${MICA_DURABILITY:-group}")
 fi
 
 port="${bind##*:}"

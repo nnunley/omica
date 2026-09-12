@@ -8,13 +8,18 @@
 //	odin run tools/webhost -- --filein apps/... --bind 127.0.0.1:8080
 package main
 
+import "core:c/libc"
 import "core:fmt"
 import "core:net"
 import "core:os"
+import "core:sync"
+import "core:thread"
+import "core:time"
 
 import web "../../host/web"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
+import s "../../mica/store"
 import v "../../mica/var"
 
 DEFAULT_BIND :: "127.0.0.1:8080"
@@ -25,6 +30,7 @@ main :: proc() {
 	sync_client := ""
 	actor := ""
 	store_path := ""
+	durability_text := "group"
 	fileins: [dynamic]string
 	defer delete(fileins)
 
@@ -66,6 +72,13 @@ main :: proc() {
 			}
 			index += 1
 			store_path = args[index]
+		case "--durability":
+			if index + 1 >= len(args) {
+				usage()
+				os.exit(1)
+			}
+			index += 1
+			durability_text = args[index]
 		case "--help", "-h":
 			usage()
 			return
@@ -96,9 +109,10 @@ main :: proc() {
 			fileins[:],
 			context.allocator,
 			r.World_Config {
-				actor = actor,
-				workers = DEFAULT_WORKERS,
+				actor      = actor,
+				workers    = DEFAULT_WORKERS,
 				store_path = store_path,
+				durability = parse_durability(durability_text),
 			},
 		)
 		if !result.ok {
@@ -141,7 +155,16 @@ main :: proc() {
 	} else {
 		fmt.printf("listening on %s\n", bind)
 	}
+	// A clean SIGINT/SIGTERM runs the deferred world_destroy, which
+	// checkpoints the store and releases its lock.
+	libc.signal(libc.SIGINT, webhost_signal_handler)
+	libc.signal(libc.SIGTERM, webhost_signal_handler)
+	watcher := thread.create_and_start_with_data(&server, webhost_shutdown_watcher)
 	web.web_server_run(&server)
+	if watcher != nil {
+		thread.join(watcher)
+		thread.destroy(watcher)
+	}
 }
 
 // Publishes the mud RuntimeConfig sign-in flags when the world declares the
@@ -217,9 +240,37 @@ webhost_seed_person :: proc(world: ^r.World, login, display_name: string) {
 }
 
 @(private)
+shutdown_requested: i32
+
+@(private)
+webhost_signal_handler :: proc "c" (signal: i32) {
+	sync.atomic_store(&shutdown_requested, 1)
+}
+
+@(private)
+webhost_shutdown_watcher :: proc(data: rawptr) {
+	server := (^web.Web_Server)(data)
+	for sync.atomic_load(&shutdown_requested) == 0 {
+		time.sleep(20 * time.Millisecond)
+	}
+	web.web_server_stop(server)
+}
+
+@(private)
+parse_durability :: proc(text: string) -> s.Durability {
+	switch text {
+	case "none":
+		return .None
+	case "strict":
+		return .Strict
+	}
+	return .Group
+}
+
 usage :: proc() {
 	fmt.eprintln(
 		"usage: webhost [--bind address:port] [--filein path]... " +
-		"[--sync-client path.js] [--actor name] [--store dir]",
+		"[--sync-client path.js] [--actor name] [--store dir] " +
+		"[--durability none|group|strict]",
 	)
 }

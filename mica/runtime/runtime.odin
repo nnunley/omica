@@ -15,6 +15,7 @@ import "core:strconv"
 import "core:strings"
 import c "../compiler"
 import k "../kernel"
+import s "../store"
 import vm "../vm"
 import v "../var"
 
@@ -362,6 +363,10 @@ Run_Options :: struct {
 	actor: string,
 	// Filein unit name for `fileout`. Empty derives one unit per file.
 	unit: string,
+	// Durable store directory; empty runs in memory.
+	store_path: string,
+	// Store fsync policy. Defaults to group commit.
+	durability: s.Durability,
 }
 
 // Compiles and runs a set of fileins as one world against `kernel`. On success
@@ -377,7 +382,13 @@ run_files :: proc(
 		kernel,
 		paths,
 		allocator,
-		World_Config{actor = options.actor, unit = options.unit, workers = 1},
+		World_Config {
+			actor      = options.actor,
+			unit       = options.unit,
+			workers    = 1,
+			store_path = options.store_path,
+			durability = options.durability,
+		},
 	)
 	if !start_result.ok {
 		return start_result

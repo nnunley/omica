@@ -22,10 +22,10 @@ Store_Mode :: enum {
 
 // Controls when WAL appends are flushed to stable storage.
 Durability :: enum {
+	// One fsync per writer drain batch. The default.
+	Group,
 	// Never fsync; the OS decides.
 	None,
-	// One fsync per writer drain batch.
-	Group,
 	// One fsync per record.
 	Strict,
 }
@@ -41,11 +41,16 @@ Store_Options :: struct {
 	budget_bytes: i64,
 	warn_after:   time.Duration,
 	timeout:      time.Duration,
+	// Write a checkpoint once this many WAL bytes accumulate. Zero uses
+	// `DEFAULT_CHECKPOINT_BYTES`; negative disables automatic checkpoints.
+	checkpoint_bytes: i64,
 }
 
 DEFAULT_STORE_BUDGET_BYTES :: i64(128) << 20
 DEFAULT_STORE_WARN_AFTER :: 2 * time.Second
 DEFAULT_STORE_TIMEOUT :: 10 * time.Second
+// Bytes of WAL allowed before a checkpoint is written automatically.
+DEFAULT_CHECKPOINT_BYTES :: i64(64) << 20
 
 // One persisted fact change.
 Wal_Write :: struct {
@@ -91,6 +96,9 @@ Store :: struct {
 	records: [dynamic]Wal_Record,
 	known:   map[k.Relation_ID]bool,
 	durable: u64,
+	// Highest version known to be fully persisted or to have had nothing to
+	// persist. Empty publishes advance it; `wait_durable` accepts either.
+	covered: u64,
 
 	warn_after: time.Duration,
 	timeout:    time.Duration,
@@ -102,6 +110,9 @@ Store :: struct {
 	// File mode state.
 	path:       string,
 	wal_path:   string,
+	lock_path:  string,
+	lock_acquired: bool,
+	last_error: string,
 	file:       ^os.File,
 	wal_end:    i64,
 	durability: Durability,
@@ -110,6 +121,12 @@ Store :: struct {
 
 	// Serializes WAL appends with checkpoint rotation.
 	wal_lock: sync.Mutex,
+
+	// The kernel this store persists, set by `store_attach`; automatic
+	// checkpoints read it.
+	kernel:        ^k.Kernel,
+	checkpoint_bytes: i64,
+	wal_bytes_since_checkpoint: i64,
 
 	// Chunk shadow pages and checkpoint manifest.
 	pages_generation:   u32,
@@ -140,6 +157,10 @@ store_init :: proc(store: ^Store, options := Store_Options{}) {
 store_open :: proc(store: ^Store, options: Store_Options) -> bool {
 	store_setup(store, options)
 	if options.mode == .File {
+		if !store_lock_acquire(store, options.path) {
+			store_release(store)
+			return false
+		}
 		if !store_wal_open(store, options.path) {
 			store_release(store)
 			return false
@@ -200,6 +221,10 @@ store_setup :: proc(store: ^Store, options: Store_Options) {
 	if store.timeout <= 0 {
 		store.timeout = DEFAULT_STORE_TIMEOUT
 	}
+	store.checkpoint_bytes = options.checkpoint_bytes
+	if store.checkpoint_bytes == 0 {
+		store.checkpoint_bytes = DEFAULT_CHECKPOINT_BYTES
+	}
 	store.tickets = make(map[k.Persist_Ticket]i64, store.allocator)
 	store.known = make(map[k.Relation_ID]bool, store.allocator)
 	store.persisted = make(map[rawptr]u32, store.allocator)
@@ -237,6 +262,7 @@ store_destroy :: proc(store: ^Store) {
 		os.close(store.pages_file)
 		store.pages_file = nil
 	}
+	store_lock_release(store)
 	if store.path != "" {
 		delete(store.path, store.allocator)
 		store.path = ""
@@ -269,6 +295,7 @@ store_release :: proc(store: ^Store) {
 		os.close(store.pages_file)
 		store.pages_file = nil
 	}
+	store_lock_release(store)
 	if store.path != "" {
 		delete(store.path, store.allocator)
 		store.path = ""
@@ -290,9 +317,69 @@ store_release :: proc(store: ^Store) {
 	}
 }
 
+// Creates the exclusive `LOCK` file. A second process on the same store fails
+// with a clear message; a stale lock after a crash must be removed by hand.
+@(private)
+store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
+	if directory_error := os.make_directory_all(path, os.Permissions_Default); directory_error != nil {
+		if directory_error != .Exist {
+			store.last_error = fmt.aprintf(
+				"cannot create store directory: %v",
+				directory_error,
+				allocator = store.allocator,
+			)
+			return false
+		}
+	}
+	lock_path, join_error := filepath.join(
+		[]string{path, "LOCK"},
+		store.allocator,
+	)
+	if join_error != nil {
+		return false
+	}
+	file, open_error := os.open(lock_path, os.O_RDWR | os.O_CREATE | os.O_EXCL)
+	if open_error == .Exist {
+		store.last_error = "store is locked by another process"
+		delete(lock_path, store.allocator)
+		return false
+	}
+	if open_error != nil {
+		store.last_error = fmt.aprintf(
+			"cannot create store lock: %v",
+			open_error,
+			allocator = store.allocator,
+		)
+		delete(lock_path, store.allocator)
+		return false
+	}
+	os.close(file)
+	store.lock_path = lock_path
+	store.lock_acquired = true
+	return true
+}
+
+@(private)
+store_lock_release :: proc(store: ^Store) {
+	if store.lock_acquired && store.lock_path != "" {
+		os.remove(store.lock_path)
+		store.lock_acquired = false
+	}
+	if store.lock_path != "" {
+		delete(store.lock_path, store.allocator)
+		store.lock_path = ""
+	}
+}
+
 // Attaches the store to a kernel so commits admit and publish into it.
 store_attach :: proc(store: ^Store, kernel: ^k.Kernel) {
+	store.kernel = kernel
 	k.kernel_attach_store(kernel, store_hooks(store))
+}
+
+// Human-readable reason the last open failed, or "".
+store_last_error :: proc(store: ^Store) -> string {
+	return store.last_error
 }
 
 store_hooks :: proc(store: ^Store) -> k.Store_Hooks {
@@ -306,10 +393,11 @@ store_hooks :: proc(store: ^Store) -> k.Store_Hooks {
 	}
 }
 
-// Blocks until `version` is durable.
+// Blocks until `version` is durable. A version with no persistable writes is
+// covered as soon as everything published before it is written.
 store_wait_durable :: proc(store: ^Store, version: u64) {
 	sync.mutex_lock(&store.lock)
-	for store.durable < version && !store.closed {
+	for store.durable < version && store.covered < version && !store.closed {
 		sync.cond_wait(&store.cond, &store.lock)
 	}
 	sync.mutex_unlock(&store.lock)
@@ -448,11 +536,15 @@ store_publish_hook :: proc(
 
 	if len(entry.writes) == 0 && len(entry.catalog) == 0 {
 		// Nothing durable in this publish (for example a read-only commit or
-		// a volatile-only write set); return the reservation untouched.
+		// a volatile-only write set); return the reservation untouched. When
+		// no earlier write is in flight, this version is covered.
 		sync.mutex_lock(&store.lock)
 		if bytes, found := store.tickets[ticket]; found {
 			delete_key(&store.tickets, ticket)
 			store.reserved_bytes -= bytes
+		}
+		if len(store.queue) == 0 && store.reserved_bytes == 0 && version > store.covered {
+			store.covered = version
 		}
 		sync.cond_broadcast(&store.cond)
 		sync.mutex_unlock(&store.lock)
@@ -534,6 +626,9 @@ store_writer_proc :: proc(data: rawptr) {
 					store.durable = entry.version
 				}
 			}
+			if len(store.queue) == 0 && store.durable > store.covered {
+				store.covered = store.durable
+			}
 		}
 		for entry in batch {
 			store.reserved_bytes -= entry.bytes
@@ -541,6 +636,12 @@ store_writer_proc :: proc(data: rawptr) {
 		sync.cond_broadcast(&store.cond)
 		sync.mutex_unlock(&store.lock)
 		clear(&batch)
+
+		if durable && store.mode == .File && store.kernel != nil &&
+		   store.checkpoint_bytes > 0 &&
+		   sync.atomic_load(&store.wal_bytes_since_checkpoint) >= store.checkpoint_bytes {
+			_ = store_checkpoint_internal(store, store.kernel, false)
+		}
 	}
 }
 

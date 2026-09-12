@@ -374,10 +374,23 @@ store_manifest_open :: proc(store: ^Store, path: string) -> bool {
 store_checkpoint :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	sync.mutex_lock(&store.checkpoint_lock)
 	defer sync.mutex_unlock(&store.checkpoint_lock)
+	return store_checkpoint_internal(store, kernel, true)
+}
 
+// Checkpoint body. The caller holds `checkpoint_lock`. `wait` blocks for the
+// snapshot version to be durable; the writer passes false because it has just
+// advanced durability itself.
+@(private)
+store_checkpoint_internal :: proc(store: ^Store, kernel: ^k.Kernel, wait: bool) -> bool {
 	snapshot := k.kernel_snapshot(kernel)
 	defer k.snapshot_release(snapshot)
-	store_wait_durable(store, snapshot.version)
+	if snapshot.version <= store.checkpoint_version {
+		// The current checkpoint already covers this state.
+		return true
+	}
+	if wait {
+		store_wait_durable(store, snapshot.version)
+	}
 
 	relations: [dynamic]Checkpoint_Relation
 	relations = make([dynamic]Checkpoint_Relation, context.temp_allocator)

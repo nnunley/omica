@@ -2,6 +2,7 @@ package store
 
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:time"
@@ -692,4 +693,71 @@ test_page_compaction :: proc(t: ^testing.T) {
 		free(store, context.allocator)
 		k.kernel_destroy(&kernel)
 	}
+}
+
+@(test)
+test_store_lock :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_lock")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	first: Store
+	testing.expect(t, store_open(&first, Store_Options{mode = .File, path = path}))
+
+	second: Store
+	testing.expect(t, !store_open(&second, Store_Options{mode = .File, path = path}))
+	testing.expect(
+		t,
+		strings.contains(store_last_error(&second), "locked"),
+	)
+	store_destroy(&first)
+
+	third: Store
+	testing.expect(t, store_open(&third, Store_Options{mode = .File, path = path}))
+	store_destroy(&third)
+}
+
+@(test)
+test_auto_checkpoint_on_wal_bytes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_auto_checkpoint")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options {
+			mode             = .File,
+			path             = path,
+			durability       = .Group,
+			checkpoint_bytes = 1024,
+		}),
+	)
+	defer store_destroy(&store)
+	store_attach(&store, &kernel)
+	create_named_relation(t, &kernel, 1, "Auto", 1, .Durable)
+
+	for index in 0 ..< 60 {
+		commit_single(t, &kernel, 1, i64(index))
+	}
+	deadline := time.tick_now()
+	for time.tick_since(deadline) < 5 * time.Second {
+		if store_checkpoint_version(&store) > 0 {
+			break
+		}
+		time.sleep(2 * time.Millisecond)
+	}
+	testing.expect(t, store_checkpoint_version(&store) > 0)
+	k.kernel_detach_store(&kernel)
 }
