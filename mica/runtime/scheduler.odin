@@ -9,7 +9,9 @@
 // generation so a task that is resumed by other means ignores its stale timer.
 package mica_runtime
 
+import "core:fmt"
 import "core:mem"
+import "core:slice"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -682,6 +684,47 @@ scheduler_wait :: proc(scheduler: ^Scheduler, id: Task_ID) -> Task_Outcome {
 		}
 		sync.cond_wait(&scheduler.cond, &scheduler.lock)
 	}
+}
+
+// Returns one map per managed task, sorted by id: `:id` is the task id and
+// `:state` is `:running` or `:suspended`. Terminal tasks are omitted.
+scheduler_task_values :: proc(scheduler: ^Scheduler, allocator: mem.Allocator) -> []v.Value {
+	sync.mutex_lock(&scheduler.lock)
+	defer sync.mutex_unlock(&scheduler.lock)
+
+	ids: [dynamic]Task_ID
+	ids = make([dynamic]Task_ID, 0, len(scheduler.entries), context.temp_allocator)
+	for id, entry in scheduler.entries {
+		if entry.done {
+			continue
+		}
+		append(&ids, id)
+	}
+	slice.sort(ids[:])
+
+	values := make([]v.Value, len(ids), allocator)
+	for id, index in ids {
+		entry := scheduler.entries[id]
+		state := "suspended"
+		if entry.running {
+			state = "running"
+		}
+		id_value, id_ok := v.value_int(i64(id))
+		if !id_ok {
+			id_value = v.value_string(allocator, fmt.aprintf("%d", id, allocator = context.temp_allocator))
+		}
+		values[index] = v.value_map(allocator, []v.Map_Entry {
+			{
+				key   = v.value_symbol(v.symbol_intern("id")),
+				value = id_value,
+			},
+			{
+				key   = v.value_symbol(v.symbol_intern("state")),
+				value = v.value_symbol(v.symbol_intern(state)),
+			},
+		})
+	}
+	return values
 }
 
 // Frees a terminal task entry. Call after reading the outcome. The outcome's

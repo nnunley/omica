@@ -891,6 +891,82 @@ builtin_relation :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	return v.value_empty_relation(), true
 }
 
+// Retracts every stored fact whose first column is the identity. This mirrors
+// the Rust `destroy_identity` subject scan. The read-only catalogue relations
+// are never touched.
+@(private)
+builtin_destroy_identity :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 1 {
+		vm.vm_set_error(state, "E_INVARG", "destroy_identity expects destroy_identity(#identity)")
+		return v.Value(0), false
+	}
+	if !k.authority_can_grant(state.authority) {
+		vm.vm_set_error(state, "E_PERMISSION", "destroy_identity is not permitted")
+		return v.Value(0), false
+	}
+	identity_value := args[0]
+	if _, is_identity := v.value_as_identity(identity_value); !is_identity {
+		vm.vm_set_error(state, "E_TYPE", "destroy_identity expects an identity")
+		return v.Value(0), false
+	}
+	if state.transaction == nil {
+		vm.vm_set_error(state, "E_INVARG", "destroy_identity requires a task transaction")
+		return v.Value(0), false
+	}
+
+	env := builtin_env(state)
+	snapshot := k.kernel_snapshot(env.kernel)
+	defer k.snapshot_release(snapshot)
+	source := k.Relation_Source{transaction = state.transaction}
+	count := i64(0)
+	for metadata in snapshot.catalog {
+		if metadata.arity == 0 || read_only_system_relation(metadata.id) {
+			continue
+		}
+		bindings := make([]v.Binding, int(metadata.arity), context.temp_allocator)
+		bindings[0] = v.binding_of(identity_value)
+		rows: [dynamic]v.Tuple
+		rows = make([dynamic]v.Tuple, 0, 8, context.temp_allocator)
+		k.relation_source_scan_into(&source, metadata.id, bindings, &rows)
+		for row in rows {
+			if err := k.transaction_retract(state.transaction, metadata.id, row); err != k.Kernel_Error.None {
+				vm.vm_set_error(state, "E_KERNEL", "destroy_identity could not retract a fact")
+				return v.Value(0), false
+			}
+			count += 1
+		}
+	}
+	result, _ := v.value_int(count)
+	return result, true
+}
+
+// Relations owned by the catalogue and reflection surface. Retracting them
+// directly is never allowed.
+@(private)
+read_only_system_relation :: proc(id: k.Relation_ID) -> bool {
+	switch id {
+	case k.SYSTEM_RELATION_ID,
+	     k.SYSTEM_RELATION_NAME_ID,
+	     k.SYSTEM_ARITY_ID,
+	     k.SYSTEM_RELATION_DURABILITY_ID,
+	     k.SYSTEM_RULE_ID,
+	     k.SYSTEM_RULE_HEAD_ID,
+	     k.SYSTEM_RULE_SOURCE_ID,
+	     k.SYSTEM_ACTIVE_RULE_ID,
+	     k.SYSTEM_ARGUMENT_NAME_ID,
+	     k.SYSTEM_CONFLICT_POLICY_ID,
+	     k.SYSTEM_FUNCTIONAL_KEY_ID,
+	     k.SYSTEM_INDEX_ID,
+	     k.SYSTEM_INDEX_POSITION_ID,
+	     k.SYSTEM_INDEX_STORAGE_KIND_ID,
+	     k.SYSTEM_SUBJECT_FACT_ID,
+	     k.SYSTEM_MENTIONED_FACT_ID,
+	     k.SYSTEM_EXTENSIONAL_MENTIONED_FACT_ID:
+		return true
+	}
+	return false
+}
+
 @(private)
 builtin_frob :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	delegate, is_identity := v.value_as_identity(args[0])

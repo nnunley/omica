@@ -30,6 +30,7 @@ Builtin_Spec :: struct {
 @(private)
 runtime_builtins := [?]Builtin_Spec {
 	{"make_identity", 1, builtin_make_identity},
+	{"destroy_identity", 1, builtin_destroy_identity},
 	{"make_relation", 2, builtin_relation},
 	{"make_functional_relation", 3, builtin_relation},
 	{"__set_field", 3, builtin_set_field},
@@ -73,6 +74,8 @@ runtime_builtins := [?]Builtin_Spec {
 	{"dom_raw", 1, builtin_dom_raw},
 	{"dom_element", 3, builtin_dom_element},
 	{"dom_diff", 2, builtin_dom_diff},
+	{"dom_html", 1, builtin_dom_html},
+	{"from_xml", 1, builtin_from_xml},
 	{"to_xml", 1, builtin_to_xml},
 	{"sync_signature", 2, builtin_sync_signature},
 	{"dom_snapshot_payload", 3, builtin_dom_snapshot_payload},
@@ -88,6 +91,7 @@ runtime_builtins := [?]Builtin_Spec {
 	{"disable_rule", 1, builtin_disable_rule},
 	{"rules", 1, builtin_rules},
 	{"describe_rule", 1, builtin_describe_rule},
+	{"tasks", 0, builtin_tasks},
 	{"log", -1, builtin_log},
 	{"project", -1, builtin_project},
 	{"union", 2, builtin_union},
@@ -369,12 +373,15 @@ write_xml_value :: proc(builder: ^strings.Builder, value: v.Value) -> bool {
 	return false
 }
 
+// Writes a DOM value as XML or HTML. In HTML mode, tags and attributes are
+// restricted to the supported DOM surface, matching `dom_html` in the Rust
+// runtime. Attribute names may be strings or named symbols.
 @(private)
-write_xml_node :: proc(builder: ^strings.Builder, value: v.Value) -> bool {
+write_markup_node :: proc(builder: ^strings.Builder, value: v.Value, html: bool) -> bool {
 	if _, is_list := v.value_as_list(value); is_list {
 		nodes, _ := v.value_as_list(value)
 		for node in nodes {
-			if !write_xml_node(builder, node) {
+			if !write_markup_node(builder, node, html) {
 				return false
 			}
 		}
@@ -433,6 +440,9 @@ write_xml_node :: proc(builder: ^strings.Builder, value: v.Value) -> bool {
 	if !tag_ok {
 		return false
 	}
+	if html && !dom.is_supported_dom_tag(tag_text) {
+		return false
+	}
 	strings.write_byte(builder, '<')
 	strings.write_string(builder, tag_text)
 	if has_attrs {
@@ -441,11 +451,19 @@ write_xml_node :: proc(builder: ^strings.Builder, value: v.Value) -> bool {
 			return false
 		}
 		for entry in attribute_entries {
-			name, _ := v.value_as_string(entry.key)
+			name_text, name_ok := markup_attribute_name(entry.key)
+			if !name_ok {
+				return false
+			}
+			if html && !dom.is_supported_dom_attribute(name_text) {
+				return false
+			}
 			strings.write_byte(builder, ' ')
-			strings.write_string(builder, name)
+			strings.write_string(builder, name_text)
 			strings.write_string(builder, "=\"")
-			if !write_xml_value(builder, entry.value) {
+			if contents, is_string := v.value_as_string(entry.value); is_string {
+				write_xml_attribute(builder, contents)
+			} else if !write_xml_value(builder, entry.value) {
 				return false
 			}
 			strings.write_byte(builder, '"')
@@ -453,7 +471,7 @@ write_xml_node :: proc(builder: ^strings.Builder, value: v.Value) -> bool {
 	}
 	strings.write_byte(builder, '>')
 	if has_children {
-		if !write_xml_node(builder, children) {
+		if !write_markup_node(builder, children, html) {
 			return false
 		}
 	}
@@ -463,11 +481,51 @@ write_xml_node :: proc(builder: ^strings.Builder, value: v.Value) -> bool {
 	return true
 }
 
+// Attribute names are strings or named symbols, matching the Rust host.
+@(private)
+markup_attribute_name :: proc(value: v.Value) -> (string, bool) {
+	if text, is_string := v.value_as_string(value); is_string {
+		return text, true
+	}
+	if symbol, is_symbol := v.value_as_symbol(value); is_symbol {
+		return v.symbol_name(symbol)
+	}
+	return "", false
+}
+
+@(private)
+builtin_dom_html :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	builder: strings.Builder
+	strings.builder_init(&builder, state.allocator)
+	if !write_markup_node(&builder, args[0], true) {
+		strings.builder_destroy(&builder)
+		return builtin_error(
+			state,
+			"E_TYPE",
+			"dom_html expects DOM text, element, or node list with supported tags and attributes",
+		)
+	}
+	return v.value_string(state.allocator, strings.to_string(builder)), true
+}
+
+@(private)
+builtin_from_xml :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	text, is_string := v.value_as_string(args[0])
+	if !is_string {
+		return builtin_error(state, "E_TYPE", "from_xml expects XML text")
+	}
+	value, parse_error := dom.dom_parse_xml_value(text, state.allocator)
+	if parse_error != "" {
+		return builtin_error(state, "E_INVARG", parse_error)
+	}
+	return value, true
+}
+
 @(private)
 builtin_to_xml :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	builder: strings.Builder
 	strings.builder_init(&builder, state.allocator)
-	if !write_xml_node(&builder, args[0]) {
+	if !write_markup_node(&builder, args[0], false) {
 		strings.builder_destroy(&builder)
 		return builtin_error(state, "E_TYPE", "to_xml expects DOM text, element, or node list")
 	}
@@ -1379,6 +1437,22 @@ builtin_describe_rule :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 		return v.value_string(state.allocator, definition.source), true
 	}
 	return builtin_error(state, "E_INVARG", "rule does not exist")
+}
+
+// `tasks()`: snapshots of managed tasks as `[:id, :state]` maps.
+@(private)
+builtin_tasks :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 0 {
+		return builtin_error(state, "E_INVARG", "tasks expects tasks()")
+	}
+	env := builtin_env(state)
+	if env.scheduler == nil {
+		return v.value_list(state.allocator, nil), true
+	}
+	return v.value_list(
+		state.allocator,
+		scheduler_task_values(env.scheduler, state.allocator),
+	), true
 }
 
 @(private)

@@ -5,6 +5,7 @@ import "core:strings"
 import "core:os"
 import "core:path/filepath"
 import "core:testing"
+import "core:time"
 import c "../compiler"
 import k "../kernel"
 import vm "../vm"
@@ -2685,4 +2686,226 @@ require len(rules(:DependsOn)) == 1
 
 	result := run_files(&kernel, []string{path}, context.temp_allocator)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}
+
+@(test)
+test_run_dom_html_builtin :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Caught, 1)
+
+require dom_html(dom_element("button", {:id -> "send", :type -> "submit"}, [dom_text("Send & go")])) == "<button id=\"send\" type=\"submit\">Send &amp; go</button>"
+require dom_html(dom_element("h4", {}, [dom_text("References")])) == "<h4>References</h4>"
+
+let label = "Send & go"
+let extra = [dom <span class="note">!</span>]
+let composed = dom_html(dom <button id="send" type="submit">{label}{@extra}</button>)
+require string_contains(composed, "Send &amp; go")
+require string_contains(composed, "<span class=\"note\">!</span>")
+
+let expanded = dom_html(dom_element("img", {:alt -> "Logo", "aria-describedby" -> "caption", "data-route" -> "home", :loading -> "lazy", :src -> "/logo.png"}, []))
+require string_starts_with(expanded, "<img ")
+require string_contains(expanded, "alt=\"Logo\"")
+require string_contains(expanded, "aria-describedby=\"caption\"")
+require string_contains(expanded, "data-route=\"home\"")
+require string_contains(expanded, "loading=\"lazy\"")
+require string_contains(expanded, "src=\"/logo.png\"")
+
+verb probe()
+  try
+    return dom_html(dom_element("widget", {}, []))
+  catch E_TYPE
+    return :caught
+  end
+end
+assert Caught(probe())
+`
+	path, path_ok := write_temp_source(t, "mica_dom_html_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Caught", 1)
+}
+
+@(test)
+test_run_from_xml_builtin :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Caught, 1)
+
+require to_xml(from_xml("<p>a &amp; b</p>")) == "<p>a &amp; b</p>"
+require to_xml(from_xml("<a></a><b></b>")) == "<a></a><b></b>"
+require to_xml(from_xml("<ul><!-- note --><li>one</li><li>two</li></ul>")) == "<ul><li>one</li><li>two</li></ul>"
+require to_xml(from_xml("<input id='actor'/>")) == "<input id=\"actor\"></input>"
+
+let composer = from_xml("<form id='chat-composer' data-sync-event='submit' data-sync-action='chat_post'><input id='actor' name='actor' autocomplete='name' value='browser' aria-label='Actor'/><input id='message' name='text' autocomplete='off' placeholder='Message' aria-label='Message'/><button id='send' type='submit'>Send</button></form>")
+require composer[:tag] == "form"
+let rendered = to_xml(composer)
+require string_contains(rendered, "<form ")
+require string_contains(rendered, "id=\"chat-composer\"")
+require string_contains(rendered, "data-sync-event=\"submit\"")
+require string_contains(rendered, "data-sync-action=\"chat_post\"")
+require string_contains(rendered, "<input ")
+require string_contains(rendered, "aria-label=\"Actor\"")
+require string_contains(rendered, "<button ")
+require string_contains(rendered, ">Send</button>")
+
+verb probe()
+  try
+    return from_xml("<a><b></a>")
+  catch E_INVARG
+    return :caught
+  end
+end
+assert Caught(probe())
+`
+	path, path_ok := write_temp_source(t, "mica_from_xml_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Caught", 1)
+}
+
+@(test)
+test_run_tasks_builtin :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Slept, 1)
+make_relation(:ObservedRunning, 1)
+make_relation(:ObservedSuspended, 1)
+
+verb sleeper()
+  assert Slept(1)
+  suspend(10000)
+end
+
+verb observer()
+  let snapshot = tasks()
+  for entry in snapshot
+    if entry[:state] == :running
+      assert ObservedRunning(1)
+    end
+    if entry[:state] == :suspended
+      assert ObservedSuspended(1)
+    end
+  end
+end
+`
+	path, path_ok := write_temp_source(t, "mica_tasks_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "world start failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	sleeper_id := world_submit_call(world, "sleeper", nil)
+	testing.expect(t, sleeper_id != 0)
+
+	// Wait until the sleeper has asserted its fact and parked.
+	slept := false
+	deadline := time.tick_now()
+	for time.tick_since(deadline) < 2 * time.Second {
+		snapshot := k.kernel_snapshot(&kernel)
+		metadata, found := k.snapshot_relation_metadata_named(
+			snapshot,
+			v.symbol_intern("Slept"),
+		)
+		k.snapshot_release(snapshot)
+		if found {
+			one, _ := v.value_int(1)
+			if k.kernel_contains(
+				&kernel,
+				metadata.id,
+				v.tuple_new(context.temp_allocator, []v.Value{one}),
+			) {
+				slept = true
+				break
+			}
+		}
+		time.sleep(1 * time.Millisecond)
+	}
+	testing.expect(t, slept, "sleeper did not park")
+
+	observer := world_call(world, "observer", nil)
+	testing.expectf(t, observer.kind == .Complete, "observer failed: %s", observer.message)
+	expect_relation_rows(t, &kernel, "ObservedRunning", 1)
+	expect_relation_rows(t, &kernel, "ObservedSuspended", 1)
+}
+
+@(test)
+test_run_destroy_identity :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:thing)
+make_identity(:room)
+make_relation(:Object, 1)
+make_relation(:LocatedIn, 2)
+make_relation(:Destroyed, 1)
+
+assert Object(#thing)
+assert Object(#room)
+assert LocatedIn(#thing, #room)
+assert LocatedIn(#room, #thing)
+assert Destroyed(destroy_identity(#thing))
+
+require Object(#room)
+require LocatedIn(#room, #thing)
+require !Object(#thing)
+require !LocatedIn(#thing, #room)
+`
+	path, path_ok := write_temp_source(t, "mica_destroy_identity_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Destroyed", 1)
+	expect_relation_rows(t, &kernel, "Object", 1)
+	expect_relation_rows(t, &kernel, "LocatedIn", 1)
+
+	// The two subject facts of #thing were retracted.
+	metadata, found := k.snapshot_relation_metadata_named(
+		k.kernel_snapshot(&kernel),
+		v.symbol_intern("Destroyed"),
+	)
+	testing.expect(t, found)
+	if found {
+		rows: [dynamic]v.Tuple
+		k.kernel_scan_into(&kernel, metadata.id, []v.Binding{{}}, &rows)
+		if len(rows) == 1 {
+			count, is_int := v.value_as_int(v.tuple_values(rows[0])[0])
+			testing.expectf(t, is_int && count == 2, "destroyed count %d", count)
+		}
+		delete(rows)
+	}
 }
