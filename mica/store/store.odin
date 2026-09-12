@@ -519,15 +519,17 @@ store_publish_hook :: proc(
 	// Catalogue entries persist for volatile relations too: their schema is
 	// durable while their facts are not.
 	catalog_list: [dynamic]Wal_Catalog
+	sync.mutex_lock(&store.lock)
 	for metadata in snapshot.catalog {
-		sync.mutex_lock(&store.lock)
-		known := store.known[metadata.id]
-		sync.mutex_unlock(&store.lock)
-		if known {
+		if store.known[metadata.id] {
 			continue
 		}
+		// Claim the entry while holding the lock so two concurrent writers
+		// cannot both decide it is new.
+		store.known[metadata.id] = true
 		append(&catalog_list, Wal_Catalog{metadata = clone_metadata(store.copy_allocator, metadata)})
 	}
+	sync.mutex_unlock(&store.lock)
 	if len(catalog_list) > 0 {
 		entry.catalog = make([]Wal_Catalog, len(catalog_list), store.copy_allocator)
 		copy(entry.catalog, catalog_list[:])
@@ -556,9 +558,7 @@ store_publish_hook :: proc(
 		entry.bytes = bytes
 		delete_key(&store.tickets, ticket)
 	}
-	for catalog in entry.catalog {
-		store.known[catalog.metadata.id] = true
-	}
+	// `store.known` was claimed for these entries during the scan above.
 	append(&store.queue, entry)
 	sync.cond_broadcast(&store.cond)
 	sync.mutex_unlock(&store.lock)
