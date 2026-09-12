@@ -215,6 +215,12 @@ run_unit() {
     capture "${log}" "${test_timeout}" "${odin_bin}" test "${pkg}" || rc=$?
     inspect "unit:${pkg}" "${log}" "${rc}"
   done
+  if command -v node >/dev/null 2>&1 && [[ -f "${repo_root}/host/web/sync-client.test.mjs" ]]; then
+    log="${log_dir}/unit-sync-client.log"
+    rc=0
+    capture "${log}" "${test_timeout}" node --test host/web/sync-client.test.mjs || rc=$?
+    inspect "unit:sync-client.js" "${log}" "${rc}"
+  fi
 }
 
 run_tsan() {

@@ -1489,21 +1489,42 @@ async function readAllStreamBytes(stream) {
     return bytes;
 }
 
-export function bootstrapServerRenderedSync(mount, status) {
-    const params = new URLSearchParams(location.search);
-    const transport = params.get("transport")
-        ?? mount.dataset.syncTransport
-        ?? (params.get("url") ? "webtransport" : "sse");
-    const state = {
+// Resolves the sync endpoints from host-rendered dataset configuration. Query
+// overrides are honored only when the host explicitly opts into development
+// mode, so a crafted link cannot point the UI (and the form input it sends) at
+// another origin.
+export function resolveSyncEndpoints(dataset, params, development) {
+    const query = (name) => (development ? params.get(name) : null);
+    const transport = query("transport")
+        ?? dataset.syncTransport
+        ?? ((query("url") || dataset.syncTransportUrl) ? "webtransport" : "sse");
+    return {
         transport,
-        syncUrl: params.get("syncUrl") ?? mount.dataset.syncUrl ?? "/sync",
-        url: params.get("url") ?? mount.dataset.syncTransportUrl ?? "",
-        certificateHash: params.get("certHash") ?? "",
+        syncUrl: query("syncUrl") ?? dataset.syncUrl ?? "/sync",
+        url: query("url") ?? dataset.syncTransportUrl ?? "",
+        certificateHash: query("certHash") ?? "",
+        pollMs: parseInt(query("pollMs") ?? dataset.syncPollMs ?? "0", 10),
+    };
+}
+
+export function bootstrapServerRenderedSync(mount, status) {
+    const dataset = mount.dataset ?? {};
+    const params = new URLSearchParams(location.search);
+    const endpoints = resolveSyncEndpoints(
+        dataset,
+        params,
+        dataset.syncDevelopment === "true",
+    );
+    const state = {
+        transport: endpoints.transport,
+        syncUrl: endpoints.syncUrl,
+        url: endpoints.url,
+        certificateHash: endpoints.certificateHash,
         session: BigInt(params.get("session") ?? randomSessionId()),
-        view: BigInt(mount.dataset.view),
-        revision: BigInt(mount.dataset.revision),
-        signature: BigInt(mount.dataset.signature),
-        pollMs: parseInt(params.get("pollMs") ?? mount.dataset.syncPollMs ?? "0", 10),
+        view: BigInt(dataset.view),
+        revision: BigInt(dataset.revision),
+        signature: BigInt(dataset.signature),
+        pollMs: endpoints.pollMs,
     };
     let connected = false;
     let client;
