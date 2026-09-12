@@ -1,7 +1,9 @@
 package compiler
 
+import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
+import "core:strings"
 import "core:testing"
 import k "../kernel"
 import vm "../vm"
@@ -707,4 +709,35 @@ end
 		testing.expect(t, function.defaults == nil)
 	}
 	testing.expect(t, found)
+}
+
+// A call with more than 255 arguments must be rejected rather than narrowing
+// the count to a byte and losing arguments.
+@(test)
+test_call_arity_limit_is_diagnosed :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer {
+		delete(ctx.builtins)
+		delete(ctx.relations)
+		delete(ctx.identities)
+	}
+
+	source_builder := strings.builder_make(allocator)
+	defer strings.builder_destroy(&source_builder)
+	strings.write_string(&source_builder, "probe(")
+	for index in 0 ..< 256 {
+		if index > 0 {
+			strings.write_string(&source_builder, ", ")
+		}
+		fmt.sbprintf(&source_builder, "%d", index)
+	}
+	strings.write_string(&source_builder, ")")
+
+	ast, parse_errors := parse_program(strings.to_string(source_builder), allocator)
+	testing.expectf(t, len(parse_errors) == 0, "parse errors: %v", parse_errors)
+	compiled := compile_program(ast, &ctx, allocator)
+	testing.expectf(t, len(compiled.errors) > 0, "expected an arity diagnostic")
 }

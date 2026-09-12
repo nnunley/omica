@@ -1052,6 +1052,10 @@ binary_op :: proc(op: Binary_Op) -> vm.Bin_Op {
 
 @(private)
 emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
+	if len(call.args) > 255 {
+		push_error(emitter, "a call may take at most 255 arguments")
+		return -1, false
+	}
 	callee, is_name := call.callee^.(Name)
 	if !is_name {
 		if symbol, is_symbol := call.callee^.(Symbol_Literal); is_symbol {
@@ -2079,6 +2083,11 @@ emit_self_binding :: proc(
 	_ = set_param_metadata(emitter, index, fn.params)
 
 	captures := make([]Local, len(emitter.locals) + 1, emitter.allocator)
+	if len(captures) > 255 {
+		push_error(emitter, "a closure may capture at most 255 values")
+		delete(captures, emitter.allocator)
+		return -1, false
+	}
 	copy(captures, emitter.locals[:])
 	scratch := alloc_register(emitter)
 	captures[len(emitter.locals)] = Local{name = name, register = scratch}
@@ -2131,6 +2140,11 @@ emit_fn_literal :: proc(emitter: ^Emitter, fn: Fn) -> (int, bool) {
 	// Capture every visible local by value. Captures land in the callee's
 	// first registers, before the parameters.
 	captures := make([]Local, len(emitter.locals), emitter.allocator)
+	if len(captures) > 255 {
+		push_error(emitter, "a closure may capture at most 255 values")
+		delete(captures, emitter.allocator)
+		return -1, false
+	}
 	copy(captures, emitter.locals[:])
 	capture_registers := make([]int, len(captures), emitter.allocator)
 	defer delete(capture_registers, emitter.allocator)
