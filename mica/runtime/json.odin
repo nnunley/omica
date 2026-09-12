@@ -232,7 +232,9 @@ json_parse_value :: proc(
 		if !ok {
 			return v.Value(0), message, false
 		}
-		return v.value_string(allocator, text), "", true
+		value := v.value_string(allocator, text)
+		delete(text, allocator)
+		return value, "", true
 	case '[':
 		return json_parse_array(parser, allocator)
 	case '{':
@@ -301,6 +303,8 @@ json_parse_object :: proc(
 		if !key_ok {
 			return v.Value(0), message, false
 		}
+		key_symbol := v.value_symbol(v.symbol_intern(key))
+		delete(key, allocator)
 		json_skip_whitespace(parser)
 		if !json_expect(parser, ":") {
 			return v.Value(0), "expected ':' after JSON object key", false
@@ -310,7 +314,7 @@ json_parse_object :: proc(
 			return v.Value(0), value_message, false
 		}
 		append(&entries, v.Map_Entry {
-			key   = v.value_symbol(v.symbol_intern(key)),
+			key   = key_symbol,
 			value = value,
 		})
 		json_skip_whitespace(parser)
@@ -419,7 +423,9 @@ json_parse_string :: proc(
 		switch ch {
 		case '"':
 			parser.pos += 1
-			return strings.to_string(builder), "", true
+			result := strings.clone(strings.to_string(builder), allocator)
+			strings.builder_destroy(&builder)
+			return result, "", true
 		case '\\':
 			parser.pos += 1
 			if parser.pos >= len(parser.text) {

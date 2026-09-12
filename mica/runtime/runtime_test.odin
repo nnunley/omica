@@ -3,6 +3,7 @@ package mica_runtime
 import "core:fmt"
 import "core:strings"
 import "core:os"
+import "core:mem"
 import "core:path/filepath"
 import "core:testing"
 import "core:time"
@@ -3640,5 +3641,27 @@ test_llm_bridge_reports_not_implemented :: proc(t: ^testing.T) {
 		&ctx,
 		`llm_chat_stream_to("model", [], {:stream -> true}, [], none)`,
 		"E_NOT_IMPLEMENTED",
+	)
+}
+
+// Decoding a JSON string allocates a copy; the decode must not also leak the
+// temporary builder buffer used to unescape it.
+@(test)
+test_json_decode_string_no_leak :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	alloc := mem.tracking_allocator(&track)
+
+	value, message, ok := json_decode_text(alloc, `{"greeting":"hello \"world\""}`)
+	testing.expectf(t, ok, "decode failed: %s", message)
+	if ok {
+		v.value_deep_free(alloc, value)
+	}
+	testing.expectf(
+		t,
+		len(track.allocation_map) == 0,
+		"json_decode_text leaked %d allocation(s)",
+		len(track.allocation_map),
 	)
 }
