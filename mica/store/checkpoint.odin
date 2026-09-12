@@ -417,6 +417,9 @@ store_checkpoint :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	if !store_manifest_write(store, snapshot.version, relations[:]) {
 		return false
 	}
+	if !store_wal_rotate(store, snapshot.version) {
+		return false
+	}
 
 	owned := make([]Checkpoint_Relation, len(relations), store.copy_allocator)
 	copy(owned, relations[:])

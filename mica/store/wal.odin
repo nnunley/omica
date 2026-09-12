@@ -381,6 +381,101 @@ store_wal_append_batch :: proc(store: ^Store, entries: []Queue_Entry) -> bool {
 	return true
 }
 
+// Rewrites the WAL with only the records after `version`. The checkpoint
+// covers everything at or below it. Runs at the end of a checkpoint while
+// holding the WAL lock, so no writer I/O interleaves.
+@(private)
+store_wal_rotate :: proc(store: ^Store, version: u64) -> bool {
+	sync.mutex_lock(&store.wal_lock)
+	defer sync.mutex_unlock(&store.wal_lock)
+
+	sync.mutex_lock(&store.lock)
+	tail: [dynamic]Wal_Record
+	tail = make([dynamic]Wal_Record, context.temp_allocator)
+	for record in store.records {
+		if record.version > version {
+			append(&tail, record)
+		}
+	}
+	sync.mutex_unlock(&store.lock)
+
+	temp_path, temp_error := filepath.join([]string{store.path, "wal.tmp"}, context.temp_allocator)
+	if temp_error != nil {
+		delete(tail)
+		return false
+	}
+	file, open_error := os.open(temp_path, os.O_RDWR | os.O_CREATE | os.O_TRUNC)
+	if open_error != nil {
+		delete(tail)
+		return false
+	}
+	header: [WAL_HEADER_SIZE]u8
+	copy(header[:8], WAL_MAGIC)
+	version_bytes := WAL_VERSION
+	header[8] = u8(version_bytes)
+	header[9] = u8(version_bytes >> 8)
+	header[10] = u8(version_bytes >> 16)
+	header[11] = u8(version_bytes >> 24)
+	written, write_error := os.write(file, header[:])
+	if write_error != nil || written != WAL_HEADER_SIZE {
+		os.close(file)
+		delete(tail)
+		return false
+	}
+	position := i64(WAL_HEADER_SIZE)
+	buffer: [dynamic]u8
+	buffer = make([dynamic]u8, context.temp_allocator)
+	defer delete(buffer)
+	for &record in tail {
+		clear(&buffer)
+		if encode_error := wal_encode_record(&buffer, &record); encode_error != .None {
+			os.close(file)
+			delete(tail)
+			return false
+		}
+		count, append_error := os.write_at(file, buffer[:], position)
+		if append_error != nil || count != len(buffer) {
+			os.close(file)
+			delete(tail)
+			return false
+		}
+		position += i64(count)
+	}
+	if sync_error := os.sync(file); sync_error != nil {
+		os.close(file)
+		delete(tail)
+		return false
+	}
+	os.close(file)
+
+	wal_path, wal_error := filepath.join([]string{store.path, "wal"}, context.temp_allocator)
+	if wal_error != nil {
+		delete(tail)
+		return false
+	}
+	if rename_error := os.rename(temp_path, wal_path); rename_error != nil {
+		delete(tail)
+		return false
+	}
+	reopened, reopen_error := os.open(wal_path, os.O_RDWR)
+	if reopen_error != nil {
+		delete(tail)
+		return false
+	}
+
+	sync.mutex_lock(&store.lock)
+	if store.file != nil {
+		os.close(store.file)
+	}
+	store.file = reopened
+	store.wal_end = position
+	clear(&store.records)
+	append(&store.records, ..tail[:])
+	sync.mutex_unlock(&store.lock)
+	delete(tail)
+	return true
+}
+
 // Replays every recovered record into a fresh kernel. The store must not be
 // attached to the kernel during restore.
 store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {

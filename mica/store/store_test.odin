@@ -487,6 +487,8 @@ test_checkpoint_round_trip :: proc(t: ^testing.T) {
 		// A second checkpoint persists only the chunks the tail touched.
 		testing.expect(t, store_checkpoint(&store, &kernel))
 		checkpoint_version = store_checkpoint_version(&store)
+		// The checkpoint truncates the log; nothing was committed after it.
+		testing.expect_value(t, store_record_count(&store), 0)
 		pages_after_tail := store_page_count(&store)
 		testing.expectf(
 			t,

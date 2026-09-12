@@ -104,6 +104,9 @@ Store :: struct {
 	syncs:      u64,
 	failed:     bool,
 
+	// Serializes WAL appends with checkpoint rotation.
+	wal_lock: sync.Mutex,
+
 	// Chunk shadow pages and checkpoint manifest.
 	pages_file:         ^os.File,
 	pages_end:          i64,
@@ -485,7 +488,9 @@ store_writer_proc :: proc(data: rawptr) {
 			failed := store.failed
 			sync.mutex_unlock(&store.lock)
 			if !failed {
+				sync.mutex_lock(&store.wal_lock)
 				durable = store_wal_append_batch(store, batch[:])
+				sync.mutex_unlock(&store.wal_lock)
 			}
 		}
 
