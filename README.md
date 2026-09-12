@@ -462,10 +462,6 @@ The [guide](mdbook/src/SUMMARY.md) walks through the examples, the language, and
 - [`benchmarks`](benchmarks): microbenchmarks for the value, kernel, and runtime layers.
 - [`scripts/mud.sh`](scripts/mud.sh): builds and runs the web host with the MUD fileins.
 - [`mdbook`](mdbook): The Mica Guide, a tutorial and language/runtime reference.
-- [`docs/persistence-design.md`](docs/persistence-design.md),
-  [`docs/http-host-design.md`](docs/http-host-design.md),
-  [`docs/builtins-gap.md`](docs/builtins-gap.md), and
-  [`docs/testing-gaps.md`](docs/testing-gaps.md): design and status notes for this port.
 
 ## Contributing
 
