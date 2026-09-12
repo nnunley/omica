@@ -2,9 +2,10 @@
 # Builds and starts the MUD world over the in-process web host.
 #
 #   scripts/mud.sh
-#   MICA_WEB_BIND=127.0.0.1:9000 scripts/mud.sh
+#   MICA_WEB_BIND=127.0.0.1:9000 scripts/mud.sh    # loopback only
 #
-# Open http://<bind>/mud and sign in with one of the seeded users:
+# Binds all interfaces by default. Open http://<host>:8080/mud and sign in
+# with one of the seeded users:
 #   alice / alice-pass
 #   bob / bob-pass
 set -euo pipefail
@@ -22,7 +23,7 @@ if [[ -z "${odin_bin}" || ! -x "${odin_bin}" ]]; then
 fi
 
 webhost_bin="${WEBHOST_BIN:-${repo_root}/.cache/bin/webhost}"
-bind="${MICA_WEB_BIND:-127.0.0.1:8080}"
+bind="${MICA_WEB_BIND:-0.0.0.0:8080}"
 
 fileins=(
   apps/shared/string.mica
@@ -54,6 +55,18 @@ for file in "${fileins[@]}"; do
 done
 args+=(--bind "${bind}" --sync-client host/web/sync-client.js)
 
-echo "MUD: http://${bind}/mud"
+port="${bind##*:}"
+host="${bind%:*}"
+if [[ "${host}" == "0.0.0.0" || "${host}" == "::" || "${host}" == "" ]]; then
+  lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [[ -n "${lan_ip}" ]]; then
+    echo "MUD: http://${lan_ip}:${port}/mud"
+  else
+    echo "MUD: http://<this-host>:${port}/mud"
+  fi
+else
+  echo "MUD: http://${host}:${port}/mud"
+fi
 echo "users: alice/alice-pass, bob/bob-pass"
+echo "note: demo auth over plain HTTP; do not expose beyond a trusted network"
 exec "${webhost_bin}" "${args[@]}"
