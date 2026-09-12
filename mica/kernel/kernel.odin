@@ -74,8 +74,10 @@ Kernel :: struct {
 // convoy on a single lock.
 ARENA_POOL_SHARDS :: 16
 
-// Padded reader counters. Each thread touches its own slot, so snapshot
-// acquisition under parallel load does not ping-pong one cache line.
+// Padded reader counters. Threads spread load-and-retain announcements
+// across slots so snapshot acquisition under parallel load does not ping-pong
+// one cache line. Sharing a slot is harmless for counters (increments
+// compose); hazard pins below are claimed exclusively instead.
 READER_SLOTS :: 16
 
 // Number of relation commit stripes.
@@ -86,7 +88,12 @@ Reader_Slot :: struct {
 	count:  i32,
 	// Hazard pointer for borrowed (non-retained) snapshot reads.
 	hazard: ^Snapshot,
-	_pad:   [14]i32,
+	// Set while a thread holds this slot as its exclusive hazard pin. The
+	// count field needs no exclusivity (concurrent increments compose), but
+	// a hazard pin must never be shared: two borrowers on one slot would
+	// overwrite each other's pin and let reclamation free a live snapshot.
+	claimed: u32,
+	_pad:    [12]i32,
 }
 
 @(private)
@@ -107,6 +114,48 @@ reader_slot_index :: proc() -> u32 {
 	}
 	return reader_slot_hint
 }
+
+// Claims an unused hazard slot from `kernel` for the calling thread. At most
+// READER_SLOTS threads can hold a hazard pin on one kernel at a time; when
+// all slots are claimed the caller must retain instead (see
+// kernel_snapshot_borrow). Lock-free: a single CAS per candidate slot.
+@(private)
+reader_slot_claim :: proc(kernel: ^Kernel) -> (^Reader_Slot, bool) {
+	for &slot in kernel.readers {
+		_, claimed := sync.atomic_compare_exchange_strong_explicit(
+			&slot.claimed,
+			u32(0),
+			u32(1),
+			.Acquire,
+			.Acquire,
+		)
+		if claimed {
+			return &slot, true
+		}
+	}
+	return nil, false
+}
+
+// Releases a claimed hazard slot. Clears the pin before unclaiming so a
+// concurrent claim can never observe a stale pin.
+@(private)
+reader_slot_release :: proc(slot: ^Reader_Slot) {
+	sync.atomic_store_explicit(&slot.hazard, nil, .Release)
+	sync.atomic_store_explicit(&slot.claimed, u32(0), .Release)
+}
+
+// The calling thread's outstanding hazard borrow, if any. Borrows are not
+// nestable: at most one snapshot is borrowed per thread at a time.
+@(thread_local)
+hazard_borrow_slot: ^Reader_Slot
+
+@(thread_local)
+hazard_borrow_kernel: ^Kernel
+
+// Non-nil when the borrow fell back to retain/release because every hazard
+// slot was claimed. Cleared by releasing the snapshot.
+@(thread_local)
+hazard_borrow_retained: ^Snapshot
 
 // Reports whether any hazard slot pins `snapshot`.
 @(private)
@@ -310,25 +359,51 @@ kernel_snapshot :: proc(kernel: ^Kernel) -> ^Snapshot {
 }
 
 // Borrows the current snapshot without retaining it. The caller must use it
-// only until `kernel_hazard_clear`, and must not release it. Reclamation keeps
-// a hazard-pinned snapshot alive.
+// only until `kernel_hazard_clear`, must not release it, and must not borrow
+// again before clearing. Reclamation keeps a hazard-pinned snapshot alive.
+//
+// The pin lives in a hazard slot claimed exclusively by the calling thread,
+// so concurrent borrowers can never overwrite each other's pin. When every
+// slot is already claimed the borrow transparently retains instead, and the
+// clear releases it; the caller cannot tell the difference.
 kernel_snapshot_borrow :: proc(kernel: ^Kernel) -> ^Snapshot {
-	slot := &kernel.readers[reader_slot_index()]
+	slot, claimed := reader_slot_claim(kernel)
+	if !claimed {
+		snapshot := kernel_snapshot(kernel)
+		hazard_borrow_slot = nil
+		hazard_borrow_kernel = kernel
+		hazard_borrow_retained = snapshot
+		return snapshot
+	}
 	for {
 		current := sync.atomic_load(&kernel.current)
 		sync.atomic_store_explicit(&slot.hazard, current, .Release)
 		// If a publisher swapped between the load and the hazard store, pin
 		// the newer snapshot instead.
 		if sync.atomic_load(&kernel.current) == current {
+			hazard_borrow_slot = slot
+			hazard_borrow_kernel = kernel
+			hazard_borrow_retained = nil
 			return current
 		}
 	}
 }
 
-// Clears the calling thread's hazard pointer.
+// Clears the calling thread's hazard borrow. Releases the claimed slot, or
+// the retained snapshot when the borrow fell back. Only acts on a borrow
+// from `kernel`; clearing any other kernel is a no-op.
 kernel_hazard_clear :: proc(kernel: ^Kernel) {
-	slot := &kernel.readers[reader_slot_index()]
-	sync.atomic_store_explicit(&slot.hazard, nil, .Release)
+	if hazard_borrow_kernel != kernel {
+		return
+	}
+	if hazard_borrow_slot != nil {
+		reader_slot_release(hazard_borrow_slot)
+	} else if hazard_borrow_retained != nil {
+		snapshot_release(hazard_borrow_retained)
+	}
+	hazard_borrow_kernel = nil
+	hazard_borrow_slot = nil
+	hazard_borrow_retained = nil
 }
 
 // Begins a transaction over the current snapshot.

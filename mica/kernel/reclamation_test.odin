@@ -291,8 +291,7 @@ hazard_reader :: proc(data: rawptr) {
 }
 
 @(test)
-test_snapshot_hazard_borrow_scales :: proc(t: ^testing.T) {
-	kernel: Kernel
+test_snapshot_hazard_borrow_scales :: proc(t: ^testing.T) {	kernel: Kernel
 	kernel_init(&kernel)
 	defer kernel_destroy(&kernel)
 
@@ -319,5 +318,209 @@ test_snapshot_hazard_borrow_scales :: proc(t: ^testing.T) {
 	testing.expect(t, reader.monotonic)
 	testing.expect(t, reader.last >= 1)
 	testing.expect(t, kernel.current.version >= u64(writer.count))
+	testing.expect_value(t, len(kernel.retired), 0)
+}
+
+// Hazard slots are claimed exclusively: at most READER_SLOTS claims on one
+// kernel succeed, and a released slot is claimable again.
+@(test)
+test_reader_slot_claim_exclusive :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	claimed: [READER_SLOTS]^Reader_Slot
+	for index in 0 ..< READER_SLOTS {
+		slot, ok := reader_slot_claim(&kernel)
+		testing.expect(t, ok)
+		if !ok {
+			break
+		}
+		claimed[index] = slot
+		for prior in 0 ..< index {
+			testing.expect(t, claimed[prior] != slot)
+		}
+	}
+
+	// Every slot is held; the next claim must fall back.
+	_, exhausted := reader_slot_claim(&kernel)
+	testing.expect(t, !exhausted)
+
+	for slot in claimed {
+		reader_slot_release(slot)
+	}
+
+	// Released slots are claimable again.
+	slot, ok := reader_slot_claim(&kernel)
+	testing.expect(t, ok)
+	if ok {
+		reader_slot_release(slot)
+	}
+}
+
+@(private)
+Storm_Reader :: struct {
+	kernel:    ^Kernel,
+	relation:  Relation_ID,
+	ready:     ^i32,
+	start:     ^i32,
+	entered:   ^i32,
+	readers:   i32,
+	done:      ^i32,
+	iterations: int,
+	last:      u64,
+	monotonic: bool,
+	found:     bool,
+}
+
+@(private)
+Storm_Writer :: struct {
+	kernel:        ^Kernel,
+	relation:      Relation_ID,
+	max_commits:   int,
+	readers_done:  ^i32,
+	readers_total: i32,
+	committed:     int,
+	failed:        Kernel_Error,
+}
+
+@(private)
+storm_writer :: proc(data: rawptr) {
+	context = runtime.default_context()
+	worker := (^Storm_Writer)(data)
+	for index in 0 ..< worker.max_commits {
+		// Outlast the readers so reclamation runs for their whole test.
+		if sync.atomic_load(worker.readers_done) >= worker.readers_total {
+			break
+		}
+		tx := kernel_begin(worker.kernel)
+		if err := transaction_assert(
+			&tx,
+			worker.relation,
+			tuple_of(must_identity(u64(index) + 1)),
+		); err != .None {
+			worker.failed = err
+			transaction_destroy(&tx)
+			return
+		}
+		published, err := transaction_commit(&tx)
+		if err != .None {
+			worker.failed = err
+			transaction_destroy(&tx)
+			return
+		}
+		worker.committed += 1
+		snapshot_release(published)
+		transaction_destroy(&tx)
+	}
+}
+
+@(private)
+storm_reader :: proc(data: rawptr) {
+	context = runtime.default_context()
+	worker := (^Storm_Reader)(data)
+	sync.atomic_add(worker.ready, 1)
+	for sync.atomic_load(worker.start) == 0 {
+		sync.cpu_relax()
+	}
+	worker.monotonic = true
+	worker.found = true
+	for iteration in 0 ..< worker.iterations {
+		snapshot := kernel_snapshot_borrow(worker.kernel)
+		if iteration == 0 {
+			// First lap: hold the borrow until every reader is inside, so
+			// all hazard slots (and the retain fallback) are engaged at
+			// once while the writer publishes and reclaims.
+			sync.atomic_add(worker.entered, 1)
+			for sync.atomic_load(worker.entered) < worker.readers {
+				sync.cpu_relax()
+			}
+		}
+		version := snapshot.version
+		// Dereference the borrowed snapshot: if reclamation freed it early
+		// this crashes or reads garbage instead of the seeded block.
+		block, block_found := snapshot_relation_block(snapshot, worker.relation)
+		if !block_found || relation_block_len(block) < 1 {
+			worker.found = false
+		}
+		kernel_hazard_clear(worker.kernel)
+		if version < worker.last {
+			worker.monotonic = false
+		}
+		worker.last = version
+	}
+	sync.atomic_add(worker.done, 1)
+}
+
+// Borrowing from more threads than hazard slots must stay sound: only
+// READER_SLOTS pins exist, so the rest transparently retain. A writer
+// publishing throughout reclaims aggressively; every borrowed snapshot must
+// stay readable and versions must stay monotonic. Regression: slots were
+// assigned modulo READER_SLOTS, so borrowers overwrote each other's pins and
+// reclamation freed live snapshots.
+@(test)
+test_snapshot_hazard_borrow_many_threads :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 92, "Storm", 1)
+
+	// Seed one row before spawning threads: the block is never empty, so a
+	// missing block always means a bad read, never a too-early borrow. The
+	// seed identity sits outside the writer's range.
+	commit_chain_row(t, &kernel, relation, 999_999)
+
+	READERS :: 40
+	ITERATIONS :: 300
+	ready: i32 = 0
+	start: i32 = 0
+	entered: i32 = 0
+	readers_done: i32 = 0
+	writer := Storm_Writer {
+		kernel        = &kernel,
+		relation      = relation,
+		max_commits   = 20_000,
+		readers_done  = &readers_done,
+		readers_total = READERS,
+	}
+	readers: [READERS]Storm_Reader
+	threads: [READERS]^thread.Thread
+	for index in 0 ..< READERS {
+		readers[index] = Storm_Reader {
+			kernel     = &kernel,
+			relation   = relation,
+			ready      = &ready,
+			start      = &start,
+			entered    = &entered,
+			readers    = READERS,
+			done       = &readers_done,
+			iterations = ITERATIONS,
+		}
+		threads[index] = thread.create_and_start_with_data(&readers[index], storm_reader)
+	}
+	writer_thread := thread.create_and_start_with_data(&writer, storm_writer)
+
+	// Let every reader arrive so the borrows overlap, then release them.
+	for sync.atomic_load(&ready) < READERS {
+		sync.cpu_relax()
+	}
+	sync.atomic_store(&start, 1)
+
+	thread.join(writer_thread)
+	thread.destroy(writer_thread)
+	for index in 0 ..< READERS {
+		thread.join(threads[index])
+		thread.destroy(threads[index])
+	}
+
+	testing.expect_value(t, writer.failed, Kernel_Error.None)
+	testing.expect(t, writer.committed >= ITERATIONS)
+	for index in 0 ..< READERS {
+		testing.expectf(t, readers[index].monotonic, "reader %d saw versions go backwards", index)
+		testing.expectf(t, readers[index].found, "reader %d missed the seeded block", index)
+		testing.expect(t, readers[index].last >= 1)
+	}
+	testing.expect(t, kernel.current.version >= u64(writer.committed))
 	testing.expect_value(t, len(kernel.retired), 0)
 }
