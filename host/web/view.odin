@@ -104,6 +104,24 @@ sync_render_view :: proc(
 	sync.mutex_lock(&view.render_lock)
 	defer sync.mutex_unlock(&view.render_lock)
 
+	// Consume the invalidation flags now. An invalidation that arrives during
+	// the render re-sets them and triggers another render. Clearing them at the
+	// end could instead wipe a newer invalidation (a lost update).
+	force := force_snapshot || sync.atomic_load(&view.force_snapshot) || !view.has_tree
+	sync.atomic_store(&view.force_snapshot, false)
+	sync.atomic_store(&view.dirty, false)
+	render_ok := false
+	defer {
+		if !render_ok {
+			// The render did not complete; keep the invalidation so the pump
+			// retries.
+			sync.atomic_store(&view.dirty, true)
+			if force {
+				sync.atomic_store(&view.force_snapshot, true)
+			}
+		}
+	}
+
 	view_value, view_ok := v.value_int(i64(view_id))
 	if !view_ok {
 		return false
@@ -127,7 +145,7 @@ sync_render_view :: proc(
 	if !view.has_tree {
 		revision = 1
 	}
-	full := force_snapshot || sync.atomic_load(&view.force_snapshot) || !view.has_tree
+	full := force
 
 	kind: Sync_Kind
 	payload: string
@@ -144,8 +162,7 @@ sync_render_view :: proc(
 		dom.dom_diff_nodes(view.tree, node, &path, &patches, view.allocator)
 		if len(patches) == 0 {
 			dom.dom_node_release(node, view.allocator)
-			sync.atomic_store(&view.dirty, false)
-			sync.atomic_store(&view.force_snapshot, false)
+			render_ok = true
 			return true
 		}
 		kind = .View_Delta
@@ -179,8 +196,7 @@ sync_render_view :: proc(
 	view.has_tree = true
 	view.revision = revision
 	view.signature = envelope.server_signature
-	sync.atomic_store(&view.dirty, false)
-	sync.atomic_store(&view.force_snapshot, false)
+	render_ok = true
 	return true
 }
 
