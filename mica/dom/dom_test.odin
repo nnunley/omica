@@ -165,6 +165,56 @@ test_dom_rejects_invalid_nodes :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(text_error, "text"))
 }
 
+// URL-valued attributes must not carry an executable scheme.
+@(test)
+test_dom_rejects_unsafe_url_attributes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	testing.expect(t, is_safe_dom_url("/mud"))
+	testing.expect(t, is_safe_dom_url("mud/page.html"))
+	testing.expect(t, is_safe_dom_url("#section"))
+	testing.expect(t, is_safe_dom_url("?q=1"))
+	testing.expect(t, is_safe_dom_url("https://example.com"))
+	testing.expect(t, is_safe_dom_url("HTTP://example.com"))
+	testing.expect(t, is_safe_dom_url("mailto:a@b.c"))
+	testing.expect(t, !is_safe_dom_url("javascript:alert(1)"))
+	testing.expect(t, !is_safe_dom_url("JavaScript:alert(1)"))
+	testing.expect(t, !is_safe_dom_url("java\tscript:alert(1)"))
+	testing.expect(t, !is_safe_dom_url("  javascript:alert(1)"))
+	testing.expect(t, !is_safe_dom_url("data:text/html,<script>"))
+	testing.expect(t, !is_safe_dom_url("vbscript:msgbox(1)"))
+
+	allocator := context.temp_allocator
+	_, url_error := dom_node_from_value(
+		v.value_map(allocator, []v.Map_Entry {
+			{key = symbol("tag"), value = string_value("a")},
+			{
+				key = symbol("attrs"),
+				value = v.value_map(allocator, []v.Map_Entry {
+					{key = string_value("href"), value = string_value("javascript:alert(1)")},
+				}),
+			},
+			{key = symbol("children"), value = v.value_list(allocator, nil)},
+		}),
+		allocator,
+	)
+	testing.expect(t, strings.contains(url_error, "unsafe DOM URL attribute"))
+
+	_, ok_error := dom_node_from_value(
+		v.value_map(allocator, []v.Map_Entry {
+			{key = symbol("tag"), value = string_value("a")},
+			{
+				key = symbol("attrs"),
+				value = v.value_map(allocator, []v.Map_Entry {
+					{key = string_value("href"), value = string_value("/mud/page")},
+				}),
+			},
+			{key = symbol("children"), value = v.value_list(allocator, nil)},
+		}),
+		allocator,
+	)
+	testing.expect_value(t, ok_error, "")
+}
+
 @(test)
 test_dom_support_predicates :: proc(t: ^testing.T) {
 	testing.expect(t, is_supported_dom_tag("div"))

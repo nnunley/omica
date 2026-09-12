@@ -259,6 +259,77 @@ is_supported_dom_attribute :: proc(name: string) -> bool {
 	return false
 }
 
+// Attributes whose value is a URL and so must not carry an executable scheme
+// such as `javascript:`.
+@(private)
+DOM_URL_ATTRIBUTES := []string{"action", "href", "src"}
+
+@(private)
+DOM_URL_SCHEMES := []string{"http", "https", "mailto", "tel"}
+
+// Reports whether a URL-valued attribute is safe: a relative URL, or an
+// absolute URL with an allowed scheme. Browsers ignore ASCII whitespace and
+// control characters inside a scheme, so they are skipped before the scheme
+// is compared (for example "java\tscript:" is still javascript:).
+is_safe_dom_url :: proc(value: string) -> bool {
+	index := 0
+	for index < len(value) {
+		c := value[index]
+		if c > 0x20 && c != 0x7f {
+			break
+		}
+		index += 1
+	}
+	scheme: [16]u8
+	scheme_len := 0
+	for index < len(value) {
+		c := value[index]
+		switch {
+		case c == ':':
+			if scheme_len == 0 {
+				return true
+			}
+			return dom_scheme_allowed(scheme[:scheme_len])
+		case c == '/' || c == '?' || c == '#':
+			return true
+		case c == '\t' || c == '\n' || c == '\r' || c < 0x20 || c == 0x7f:
+			index += 1
+		case:
+			if scheme_len >= len(scheme) {
+				return false
+			}
+			scheme[scheme_len] = c
+			scheme_len += 1
+			index += 1
+		}
+	}
+	return true
+}
+
+@(private)
+dom_scheme_allowed :: proc(scheme: []u8) -> bool {
+	for allowed in DOM_URL_SCHEMES {
+		if len(allowed) != len(scheme) {
+			continue
+		}
+		match := true
+		for i in 0 ..< len(scheme) {
+			c := scheme[i]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != allowed[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 @(private)
 is_custom_attr_suffix :: proc(suffix: string) -> bool {
 	if len(suffix) == 0 {
@@ -400,6 +471,13 @@ dom_attrs_from_value :: proc(
 			attribute_value = fmt.aprintf("%d", integer, allocator = allocator)
 		} else {
 			return nil, "DOM attribute values must be strings, booleans, or integers"
+		}
+		if slice.contains(DOM_URL_ATTRIBUTES, name) && !is_safe_dom_url(attribute_value) {
+			return nil, fmt.aprintf(
+				"unsafe DOM URL attribute value for %s",
+				name,
+				allocator = allocator,
+			)
 		}
 		append(&attrs, Dom_Attr{name = name, value = attribute_value})
 	}
