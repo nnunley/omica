@@ -116,6 +116,9 @@ VM :: struct {
 	// Execution limits. Zero means unlimited.
 	max_call_depth:     int,
 	instruction_budget: u64,
+	// Set once the budget reaches zero, so a caught E_BUDGET cannot silently
+	// turn the exhausted budget (0) into "unlimited".
+	instruction_budget_exhausted: bool,
 	// Runtime context identities: endpoint, actor, and principal.
 	endpoint:  v.Value,
 	actor:     v.Value,
@@ -184,9 +187,11 @@ vm_set_max_call_depth :: proc(state: ^VM, depth: int) {
 }
 
 // Limits how many instructions the VM may execute before failing. The budget
-// is not reset by boundaries. Zero means unlimited.
+// is not reset by boundaries. Zero means unlimited; exceeding a positive budget
+// fails even if the task catches `E_BUDGET`.
 vm_set_instruction_budget :: proc(state: ^VM, budget: u64) {
 	state.instruction_budget = budget
+	state.instruction_budget_exhausted = false
 }
 
 // Sets the authority used for permission checks. Nil means root access.
@@ -307,9 +312,17 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			return .Failed
 		}
 
+		if state.instruction_budget_exhausted {
+			vm_fail(state, "E_BUDGET", "instruction budget exhausted")
+			if vm_unwind(state) {
+				continue
+			}
+			return .Failed
+		}
 		if state.instruction_budget > 0 {
 			state.instruction_budget -= 1
 			if state.instruction_budget == 0 {
+				state.instruction_budget_exhausted = true
 				vm_fail(state, "E_BUDGET", "instruction budget exhausted")
 				if vm_unwind(state) {
 					continue

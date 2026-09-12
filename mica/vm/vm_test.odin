@@ -1017,6 +1017,46 @@ test_vm_instruction_budget :: proc(t: ^testing.T) {
 	testing.expect_value(t, code, "E_BUDGET")
 }
 
+// Catching E_BUDGET must not turn the exhausted budget (0) into unlimited.
+@(test)
+test_vm_caught_budget_stays_exhausted :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	one := i32(builder_add_constant(&builder, must_int(1)))
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 3, true)
+	handler_index := len(builder.code)
+	builder_emit(&builder, .Push_Handler, 0, 0, 1, 0)
+	builder_emit(&builder, .Load_Const, 0, 0, one, 0)
+	builder_emit(&builder, .Load_Const, 0, 1, one, 0)
+	builder_emit(&builder, .Binary, u8(Bin_Op.Add), 0, 0, 1)
+	builder_emit(&builder, .Jump, 0, 0, -4, 0)
+	catch_offset := len(builder.code)
+	builder.code[handler_index].a = i32(catch_offset)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	vm_set_instruction_budget(&state, 8)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Failed)
+	error, error_ok := v.value_as_error(state.error)
+	testing.expect(t, error_ok)
+	code, code_ok := v.symbol_name(error.code)
+	testing.expect(t, code_ok)
+	testing.expect_value(t, code, "E_BUDGET")
+}
+
 @(test)
 test_vm_dispatch_opcode :: proc(t: ^testing.T) {
 	arena := test_arena()
