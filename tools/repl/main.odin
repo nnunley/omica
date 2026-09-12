@@ -10,6 +10,7 @@ import "core:bufio"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:time"
 
 import k "../../mica/kernel"
 import r "../../mica/runtime"
@@ -54,6 +55,59 @@ print_outcome :: proc(world: ^r.World, outcome: r.Task_Outcome) {
 		fmt.eprintf("aborted: %s\n", detail)
 	case .Pending:
 		fmt.eprintf("aborted: task did not finish (%s)\n", outcome.message)
+	}
+}
+
+// Runs a submitted eval to completion, supplying lines typed at the prompt
+// when the task parks on `read`.
+@(private)
+drive_task :: proc(world: ^r.World, id: r.Task_ID, reader: ^bufio.Reader) {
+	for {
+		outcome, observed := r.world_task_outcome(world, id)
+		if !observed {
+			time.sleep(2 * time.Millisecond)
+			continue
+		}
+		switch outcome.kind {
+		case .Complete, .Aborted:
+			print_outcome(world, outcome)
+			r.world_release(world, id)
+			return
+		case .Pending:
+			if outcome.suspend != r.Task_Suspend.Host_Request {
+				time.sleep(5 * time.Millisecond)
+				continue
+			}
+			metadata, has_request := r.world_task_request(world, id)
+			label := ""
+			if has_request {
+				if symbol, is_symbol := v.value_as_symbol(metadata); is_symbol {
+					if name, has_name := v.symbol_name(symbol); has_name {
+						label = name
+					}
+				}
+			}
+			if label != "" {
+				fmt.printf("read(%s)> ", label)
+			} else {
+				fmt.printf("read> ")
+			}
+			line, read_error := bufio.reader_read_string(
+				reader,
+				'\n',
+				context.temp_allocator,
+			)
+			if read_error != nil {
+				fmt.println()
+				fmt.println("input closed; task left suspended")
+				return
+			}
+			input := strings.trim_right(line, "\r\n")
+			if !r.world_resume(world, id, v.value_string(world.allocator, input)) {
+				fmt.eprintln("could not deliver input")
+				return
+			}
+		}
 	}
 }
 
@@ -174,7 +228,12 @@ main :: proc() {
 			}
 			continue
 		}
-		print_outcome(world, r.world_eval(world, source))
+		id, failure, submitted := r.world_eval_submit(world, source)
+		if !submitted {
+			print_outcome(world, failure)
+			continue
+		}
+		drive_task(world, id, &reader)
 	}
 
 	r.world_destroy(world)

@@ -733,6 +733,18 @@ scheduler_task_values :: proc(scheduler: ^Scheduler, allocator: mem.Allocator) -
 	return values
 }
 
+// Returns the latest outcome without blocking. Reports false while the task is
+// running, queued but not started, or unknown.
+scheduler_task_outcome :: proc(scheduler: ^Scheduler, id: Task_ID) -> (Task_Outcome, bool) {
+	sync.mutex_lock(&scheduler.lock)
+	defer sync.mutex_unlock(&scheduler.lock)
+	entry, found := scheduler.entries[id]
+	if !found || entry.running || entry.has_pending || !entry.started {
+		return Task_Outcome{}, false
+	}
+	return entry.result, true
+}
+
 // Returns the metadata of a task parked on `read`. The boolean reports
 // whether the task is currently waiting for host input.
 scheduler_task_request :: proc(scheduler: ^Scheduler, id: Task_ID) -> (v.Value, bool) {

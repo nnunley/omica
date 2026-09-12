@@ -3353,3 +3353,73 @@ assert Loaded(1)
 	outcome := world_call(world, "probe", nil)
 	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Aborted)
 }
+
+@(test)
+test_run_eval_submit_suspend_resume :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb probe()
+  return read(:line)
+end
+`
+	path, path_ok := write_temp_source(t, "mica_eval_submit_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "world start failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	id, failure, submitted := world_eval_submit(world, "return read(:line)")
+	testing.expectf(t, submitted, "eval failed: %s", failure.message)
+	if !submitted {
+		return
+	}
+
+	parked := false
+	deadline := time.tick_now()
+	for time.tick_since(deadline) < 2 * time.Second {
+		if _, has_request := world_task_request(world, id); has_request {
+			parked = true
+			break
+		}
+		time.sleep(1 * time.Millisecond)
+	}
+	testing.expect(t, parked)
+
+	suspended, observed := world_task_outcome(world, id)
+	testing.expect(t, observed)
+	testing.expect_value(t, suspended.kind, Task_Outcome_Kind.Pending)
+	testing.expect_value(t, suspended.suspend, Task_Suspend.Host_Request)
+
+	testing.expect(
+		t,
+		world_resume(world, id, v.value_string(context.temp_allocator, "look")),
+	)
+
+	finished := Task_Outcome{}
+	deadline = time.tick_now()
+	for time.tick_since(deadline) < 2 * time.Second {
+		outcome, has_outcome := world_task_outcome(world, id)
+		if has_outcome && outcome.kind != .Pending {
+			finished = outcome
+			break
+		}
+		time.sleep(1 * time.Millisecond)
+	}
+	testing.expect_value(t, finished.kind, Task_Outcome_Kind.Complete)
+	text, is_text := v.value_as_string(finished.value)
+	testing.expect(t, is_text)
+	testing.expect_value(t, text, "look")
+	world_release(world, id)
+}

@@ -288,16 +288,37 @@ world_eval :: proc(
 	source: string,
 	allocator := context.allocator,
 ) -> Task_Outcome {
+	id, failure, submitted := world_eval_submit(world, source, allocator)
+	if !submitted {
+		return failure
+	}
+	outcome := scheduler_wait(&world.scheduler, id)
+	scheduler_release(&world.scheduler, id)
+	return outcome
+}
+
+// Compiles `source` and submits it without waiting. The bool reports whether a
+// task was submitted; when false, the returned outcome is an abort describing
+// the compile or submission failure.
+world_eval_submit :: proc(
+	world: ^World,
+	source: string,
+	allocator := context.allocator,
+) -> (
+	Task_ID,
+	Task_Outcome,
+	bool,
+) {
 	ast, parse_errors := c.parse_program(source, allocator)
 	if len(parse_errors) > 0 {
-		return Task_Outcome{kind = .Aborted, message = parse_errors[0].message}
+		return 0, Task_Outcome{kind = .Aborted, message = parse_errors[0].message}, false
 	}
 	items: [dynamic]c.Item
 	defer delete(items)
 	for unit_source in world.sources {
 		unit_ast, unit_errors := c.parse_program(unit_source, context.temp_allocator)
 		if len(unit_errors) > 0 {
-			return Task_Outcome{kind = .Aborted, message = unit_errors[0].message}
+			return 0, Task_Outcome{kind = .Aborted, message = unit_errors[0].message}, false
 		}
 		for item in unit_ast.items {
 			if _, is_expression := item.(c.Expr_Item); is_expression {
@@ -314,7 +335,7 @@ world_eval :: proc(
 	}
 	compiled := c.compile_program(&program_ast, &world.ctx, allocator)
 	if len(compiled.errors) > 0 {
-		return Task_Outcome{kind = .Aborted, message = compiled.errors[0].message}
+		return 0, Task_Outcome{kind = .Aborted, message = compiled.errors[0].message}, false
 	}
 	task := new(Task, allocator)
 	task_init(task, 0, world.kernel, compiled.program, &world.env, allocator)
@@ -323,11 +344,15 @@ world_eval :: proc(
 		task_destroy(task)
 		free(task, allocator)
 		vm.program_destroy(compiled.program, allocator)
-		return Task_Outcome{kind = .Aborted, message = "cannot submit eval task"}
+		return 0, Task_Outcome{kind = .Aborted, message = "cannot submit eval task"}, false
 	}
-	outcome := scheduler_wait(&world.scheduler, id)
-	scheduler_release(&world.scheduler, id)
-	return outcome
+	return id, {}, true
+}
+
+// Returns the latest outcome of a task without blocking. Reports false while
+// the task is running or unknown.
+world_task_outcome :: proc(world: ^World, id: Task_ID) -> (Task_Outcome, bool) {
+	return scheduler_task_outcome(&world.scheduler, id)
 }
 
 // Writes a chunk-page checkpoint of the current world state. Returns false
