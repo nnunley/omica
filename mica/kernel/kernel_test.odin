@@ -1,5 +1,6 @@
 package kernel
 
+import "core:mem"
 import "core:testing"
 import v "../var"
 
@@ -2216,4 +2217,30 @@ test_rule_planner_prefers_selective_atom :: proc(t: ^testing.T) {
 	index, err = pick_body_item(rule, used, bindings, &slots, &source)
 	testing.expect_value(t, err, Kernel_Error.None)
 	testing.expect_value(t, index, 0)
+}
+
+// slot_map_init must not leak the scratch symbol list it builds.
+@(test)
+test_slot_map_init_no_leak :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	alloc := mem.tracking_allocator(&track)
+
+	rule := rule_new(Relation_ID(1), []Term{term_var(v.symbol_intern("x"))}, nil)
+	mapping: Slot_Map
+
+	previous := context.allocator
+	context.allocator = alloc
+	slot_map_init(&mapping, rule, alloc)
+	context.allocator = previous
+
+	// `mapping.symbols` is caller-owned; free it before checking for leaks.
+	delete(mapping.symbols, alloc)
+	testing.expectf(
+		t,
+		len(track.allocation_map) == 0,
+		"slot_map_init leaked %d allocation(s)",
+		len(track.allocation_map),
+	)
 }

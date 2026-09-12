@@ -532,6 +532,7 @@ Slot_Map :: struct {
 
 slot_map_init :: proc(mapping: ^Slot_Map, rule: Rule, alloc: mem.Allocator) {
 	symbols: [dynamic]v.Symbol
+	defer delete(symbols)
 	for term in rule.head_terms {
 		if term.kind != .Var {
 			continue
