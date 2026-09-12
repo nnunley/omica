@@ -1,13 +1,13 @@
 # Task Control
 
-Task-control forms let a computation publish its work and cooperate with the runtime driver. Each
-suspending form commits the current transaction before waiting. The driver determines when to resume
-the continuation and supplies its result value. See
+Task-control forms let a computation publish its work and cooperate with the runtime scheduler. Each
+suspending form commits the current transaction before waiting. The scheduler or host determines
+when to resume the continuation and supplies its result value. See
 [Tasks and Transactions](./tasks-and-transactions.md) for commit, replay, and authority rules.
 
 ## Publishing and Waiting
 
-`commit()` publishes the current transaction and yields to the driver. Execution continues in a
+`commit()` publishes the current transaction and yields to the scheduler. Execution continues in a
 fresh transaction when scheduled:
 
 ```mica
@@ -22,10 +22,11 @@ duration:
 suspend(1.5)
 ```
 
-A zero-duration suspension still crosses a transaction boundary. `suspend()` without a duration
-keeps the continuation available for an explicit host resumption; it does not arrange a timer. These
-forms cooperate with the scheduler. They do not block the worker thread for the duration of the
-wait.
+A zero-duration suspension still crosses a transaction boundary. In this implementation
+`suspend()` without a duration is a cooperative yield: the task crosses the boundary and is
+rescheduled immediately, so the continuation continues rather than parking. Use `read()` when a
+task must wait for host input. Suspending forms cooperate with the scheduler; they do not block the
+worker thread for the duration of the wait.
 
 `read(metadata)` waits for input addressed to the task's endpoint:
 
@@ -35,8 +36,9 @@ let line = read(:line)
 
 The metadata describes the request to the host. `:line` is a value passed to that host protocol; the
 VM itself does not read a terminal or assume every input is a string. The value supplied by the host
-becomes the value of the `read` expression. Multiple suspended readers on an endpoint can receive
-the same input, so use one reader when a protocol requires a single consumer.
+becomes the value of the `read` expression. A host inspects `world_task_request` for the metadata
+and delivers input with `world_resume`. Multiple suspended readers on an endpoint can receive the
+same input, so use one reader when a protocol requires a single consumer.
 
 ## Starting a Child
 
@@ -147,9 +149,9 @@ transaction restores. Close a mailbox when its consumer is finished. Its capabil
 through local values, call arguments, and other mailboxes, while durable facts store progress such
 as `ToolResult`, `Observation`, or `Completed`.
 
-A host may cancel a suspended task or close the endpoint that owns it. Cancellation discards the
-continuation; it does not resume the VM to run a `finally` block. Hosts should therefore close the
-resources they own as part of cancellation, and application protocols should make abandoned work
+Destroying a world stops its scheduler, which cancels suspended tasks; a cancelled continuation is
+discarded and does not resume the VM to run a `finally` block. Hosts should therefore close the
+resources they own as part of shutdown, and application protocols should make abandoned work
 recognizable in durable state. A task that reaches its own `finally` block through ordinary return,
 break, or error unwinding can perform language-level cleanup there.
 

@@ -16,9 +16,7 @@ The complete source is
 ```sh
 export MICA_EXAMPLE_STORE="$(mktemp -d)"
 
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" \
-  filein --unit approvals --replace \
+filein --store "$MICA_EXAMPLE_STORE" --unit approvals \
   apps/examples/approval-workflow.mica
 ```
 
@@ -63,13 +61,9 @@ CanApprove(approver, request) :-
 Query Alice's eligibility:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor alice \
-  eval 'return CanApprove(#alice, #office_supplies_request)'
+filein --store "$MICA_EXAMPLE_STORE" --actor alice --eval 'return CanApprove(#alice, #office_supplies_request)'
 
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor alice \
-  eval 'return CanApprove(#alice, #lab_upgrade_request)'
+filein --store "$MICA_EXAMPLE_STORE" --actor alice --eval 'return CanApprove(#alice, #lab_upgrade_request)'
 ```
 
 The first command returns `true`; the second returns `false`.
@@ -80,9 +74,7 @@ Alice has runtime invoke and write authority in this teaching fixture, but the d
 is not eligible for the large request:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor alice \
-  eval 'return :approve(actor: #alice, request: #lab_upgrade_request, note: "approved")'
+filein --store "$MICA_EXAMPLE_STORE" --actor alice --eval 'return :approve(actor: #alice, request: #lab_upgrade_request, note: "approved")'
 ```
 
 The verb returns:
@@ -102,17 +94,13 @@ current business rules.
 Sam satisfies the senior rule:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor sam \
-  eval 'return :approve(actor: #sam, request: #lab_upgrade_request, note: "budget confirmed")'
+filein --store "$MICA_EXAMPLE_STORE" --actor sam --eval 'return :approve(actor: #sam, request: #lab_upgrade_request, note: "budget confirmed")'
 ```
 
 The result is `:approved`. Inspect the committed facts as Alice:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor alice \
-  eval 'return [#lab_upgrade_request.requestState, #lab_upgrade_request.approvedBy, #lab_upgrade_request.decisionNote]'
+filein --store "$MICA_EXAMPLE_STORE" --actor alice --eval 'return [#lab_upgrade_request.requestState, #lab_upgrade_request.approvedBy, #lab_upgrade_request.decisionNote]'
 ```
 
 The returned list is:

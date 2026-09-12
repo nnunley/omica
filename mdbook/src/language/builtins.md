@@ -173,12 +173,13 @@ See [Relations](./relations.md#relation-value-algebra) for heading and duplicate
 | `rules(:Relation)`                                           | active rule identities for a head relation |
 | `describe_rule(#rule)`                                       | installed rule source                      |
 | `disable_rule(#rule)`                                        | `()`                                       |
-| `fileout(:unit)`                                             | source owned by a filein unit              |
+| `fileout(:unit)`                                             | loaded source for a filein unit            |
 | `fileout_rules([:Relation])`                                 | active rule source                         |
 | `tasks()`                                                    | current task snapshots                     |
 
 The optional durability symbol is `:durable` or `:volatile`. Definition, destruction, and
-rule-disabling operations require administrative authority.
+rule-disabling operations require administrative authority. `destroy_identity` also removes the
+identity's `NamedIdentity` name binding.
 
 ## Runtime Context, Effects, and Coordination
 
@@ -215,8 +216,9 @@ published at commit. Subscriptions are specified in [Subscriptions](../runtime/s
 | `sync_signature(revision, payload)`          | synchronization signature   |
 | `embed_text(model, text)`                    | embedding vector            |
 
-The DOM helpers underlie [DOM Markup](./dom-markup.md). Embedding availability depends on the
-configured provider; see [Retrieval and Embeddings](../runtime/retrieval-and-embeddings.md).
+The DOM helpers underlie [DOM Markup](./dom-markup.md). Where a host has no embedding provider,
+`embed_text` returns a deterministic hash-based vector so retrieval plans stay reproducible; see
+[Retrieval and Embeddings](../runtime/retrieval-and-embeddings.md).
 
 ## Compiler-Recognized Runtime Forms
 
@@ -230,6 +232,9 @@ These calls resemble built-ins but compile directly to task operations:
 | `mailbox_recv(receivers[, timeout])`            | publish and wait for mailboxes                     |
 | `external_request(service, payload[, timeout])` | request a host service                             |
 | `invoke(selector, roles)`                       | dynamic named-role dispatch                        |
+
+`read` suspends the task until the host supplies input; the value delivered on resume becomes the
+form's value. See [Task Control](../runtime/task-control.md).
 
 `spawn` is a language form rather than a function. See [Task Control](../runtime/task-control.md).
 Hosts may register additional request functions. Those are deployment APIs, not part of this core

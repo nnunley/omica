@@ -137,7 +137,7 @@ Organize fileins around cohesive ownership:
 - host-specific routes or views;
 - initial or example data.
 
-Named filein units make replacement and fileout understandable. Avoid one enormous bootstrap file
+Group definitions into named filein units so `fileout` can recover each unit's source. Avoid one enormous bootstrap file
 whose definitions cannot evolve independently, but also avoid fragmenting every relation into a
 separate unit.
 

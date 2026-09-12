@@ -51,6 +51,7 @@
 # Runtime Reference
 
 - [Runtime Overview](./runtime/index.md)
+- [Implementation Notes](./runtime/implementation-notes.md)
 - [Tasks and Transactions](./runtime/tasks-and-transactions.md)
 - [Task Control](./runtime/task-control.md)
 - [Subscriptions](./runtime/subscriptions.md)

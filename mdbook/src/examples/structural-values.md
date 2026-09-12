@@ -4,7 +4,7 @@
 filein focused on value boundaries rather than durable domain state. Load it with:
 
 ```sh
-cargo run --bin mica -- filein apps/examples/structural-values.mica
+filein --store "$MICA_EXAMPLE_STORE" apps/examples/structural-values.mica
 ```
 
 The `example/describe_optional` verb distinguishes an absent outer option, a present outer option

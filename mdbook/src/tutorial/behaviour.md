@@ -124,7 +124,7 @@ Do not collapse all four into a single boolean policy relation.
 
 Installed methods have durable identities and catalogue facts describing their selector, roles,
 restrictions, source, and compiled program. Fileout and inspection tooling can therefore treat
-behaviour as part of the world rather than as an invisible Rust-side callback registry.
+behaviour as part of the world rather than as an invisible host-side callback registry.
 
 Filein unit ownership allows a maintained source unit to replace the definitions it owns. This is
 how a continuing world can receive updated behaviour without pretending old and new implementations

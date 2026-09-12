@@ -87,7 +87,7 @@ After the task that installs it commits, later tasks can invoke `:describe`.
 
 ## Installed Definitions
 
-An installed definition is not a separate Rust-side registry entry or a hidden compiler artefact. It
+An installed definition is not a separate host-side registry entry or a hidden compiler artefact. It
 is part of the live world model. The implementation may cache compiled programs, dispatch tables, or
 authority contexts, but those caches are derived from installed definitions and committed facts.
 

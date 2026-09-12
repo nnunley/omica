@@ -18,9 +18,7 @@ The complete source is
 ```sh
 export MICA_EXAMPLE_STORE="$(mktemp -d)"
 
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" \
-  filein --unit dependencies --replace \
+filein --store "$MICA_EXAMPLE_STORE" --unit dependencies \
   apps/examples/dependency-planner.mica
 ```
 
@@ -47,9 +45,7 @@ DependsOn(component, dependency) :-
 Ask what the web frontend depends on:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor olivia \
-  eval 'return DependsOn(#web_frontend, ?dependency)'
+filein --store "$MICA_EXAMPLE_STORE" --actor olivia --eval 'return DependsOn(#web_frontend, ?dependency)'
 ```
 
 The result contains both the direct API dependency and the indirect database dependency:
@@ -66,9 +62,7 @@ path means, and Mica evaluates it to a fixpoint.
 Invoke the operator action:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor olivia \
-  eval 'return :mark_unavailable(actor: #olivia, component: #database)'
+filein --store "$MICA_EXAMPLE_STORE" --actor olivia --eval 'return :mark_unavailable(actor: #olivia, component: #database)'
 ```
 
 It returns `:marked_unavailable` and asserts one stored fact:
@@ -91,9 +85,7 @@ Affected(component) :-
 Query the result:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor olivia \
-  eval 'return Affected(?component)'
+filein --store "$MICA_EXAMPLE_STORE" --actor olivia --eval 'return Affected(?component)'
 ```
 
 The returned set is:
@@ -108,9 +100,7 @@ affected through the API's transitive dependency.
 ## Restore the Component
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor olivia \
-  eval 'return :restore(actor: #olivia, component: #database)'
+filein --store "$MICA_EXAMPLE_STORE" --actor olivia --eval 'return :restore(actor: #olivia, component: #database)'
 ```
 
 The verb retracts `Unavailable(#database)` and returns `:restored`. Querying `Affected(?component)`

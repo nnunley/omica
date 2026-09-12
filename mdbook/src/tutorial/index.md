@@ -66,7 +66,7 @@ collection, a simulation, an agent workspace, or an operational service.
 
 The word is useful because the environment is more than a database. Code can be installed into it,
 people and processes can act on it concurrently, and its definitions can change without rebuilding
-the runtime around a new set of Rust structures.
+the runtime around a new set of host structures.
 
 ## A Note About Datalog
 

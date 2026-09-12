@@ -143,8 +143,7 @@ This distinction avoids stale caches while keeping important historical decision
 ## Rules Are Installed World Definitions
 
 A rule is not merely a local function in the file that mentions it. Installing the source changes
-the live world's catalogue. The definition can be inspected, filed out, replaced through filein unit
-ownership, and used by later tasks.
+the live world's catalogue. The definition can be inspected, filed out, and used by later tasks.
 
 Because rules are live definitions, changes deserve the same review and testing discipline as schema
 and application code. Replacing a rule can change many visible conclusions at once.

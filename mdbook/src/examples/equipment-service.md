@@ -9,14 +9,12 @@ The complete source is
 
 ## Load the World
 
-Create a temporary store and load the owned filein unit:
+Create a temporary store and load the example as a unit:
 
 ```sh
 export MICA_EXAMPLE_STORE="$(mktemp -d)"
 
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" \
-  filein --unit equipment --replace \
+filein --store "$MICA_EXAMPLE_STORE" --unit equipment \
   apps/examples/equipment-service.mica
 ```
 
@@ -28,9 +26,7 @@ rules, two verbs, and enough authority policy for Alice and Bob to run the walkt
 Bob works at the north office, where Spectrometer 2 is ready for use:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor bob \
-  eval 'return CanCollect(#bob, #spectrometer_2)'
+filein --store "$MICA_EXAMPLE_STORE" --actor bob --eval 'return CanCollect(#bob, #spectrometer_2)'
 ```
 
 The stable returned value is:
@@ -43,9 +39,7 @@ Sensor 17 is assigned to the air-quality project but requires calibration. Ask w
 blocked:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor alice \
-  eval 'return BlockedProject(?project, ?instrument)'
+filein --store "$MICA_EXAMPLE_STORE" --actor alice --eval 'return BlockedProject(?project, ?instrument)'
 ```
 
 The result has two named columns:
@@ -97,9 +91,7 @@ No `BlockedProject` fact is asserted by hand.
 Alice delegates to the `#technician` prototype, so the calibration verb applies to her:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor alice \
-  eval 'return :record_calibration(actor: #alice, instrument: #sensor_17)'
+filein --store "$MICA_EXAMPLE_STORE" --actor alice --eval 'return :record_calibration(actor: #alice, instrument: #sensor_17)'
 ```
 
 It returns:
@@ -121,9 +113,7 @@ end
 The derived conclusions change without direct updates:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor alice \
-  eval 'return ReadyForUse(#sensor_17)'
+filein --store "$MICA_EXAMPLE_STORE" --actor alice --eval 'return ReadyForUse(#sensor_17)'
 ```
 
 This now returns `true`. `BlockedProject(#air_quality_project, #sensor_17)` now returns `false`.
@@ -133,9 +123,7 @@ This now returns `true`. `BlockedProject(#air_quality_project, #sensor_17)` now 
 Move Sensor 17 to Bob's site:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor alice \
-  eval 'return :transfer(actor: #alice, instrument: #sensor_17, destination: #north_office)'
+filein --store "$MICA_EXAMPLE_STORE" --actor alice --eval 'return :transfer(actor: #alice, instrument: #sensor_17, destination: #north_office)'
 ```
 
 It returns `:transferred`. The verb uses functional-relation assignment:
@@ -151,9 +139,7 @@ neighbourhood change.
 Bob can now collect the calibrated sensor:
 
 ```sh
-cargo run --bin mica -- \
-  --storage fjall --store "$MICA_EXAMPLE_STORE" --actor bob \
-  eval 'return CanCollect(#bob, #sensor_17)'
+filein --store "$MICA_EXAMPLE_STORE" --actor bob --eval 'return CanCollect(#bob, #sensor_17)'
 ```
 
 The result is `true`. This conclusion follows from the new location, Bob's work site, and the
@@ -168,7 +154,7 @@ earlier calibration transition.
 - delegation makes concrete actors and instruments match verb roles;
 - verbs group domain writes into checked transactional actions;
 - actor-scoped CLI tasks receive explicit read, write, and invoke authority;
-- the Fjall store carries the installed world across runner processes.
+- the store carries the installed world across runner processes.
 
 Continue with the [Approval Workflow](./approval-workflow.md) for comparison guards and multiple
 rule branches.

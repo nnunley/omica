@@ -72,32 +72,33 @@ record the acknowledged result in a subsequent transaction.
 ## Publication and Persistence
 
 Publication makes a committed snapshot visible to other tasks in the current process. Persistence
-determines when the host can recover those facts after a restart. The in-memory provider keeps the
-world for the life of that process. The Fjall provider stores durable relation metadata, rules, and
-facts, then reconstructs the in-memory world when opened again.
+determines when the host can recover those facts after a restart. A world can run entirely in
+memory, or attach a store directory that keeps durable relation metadata, rules, source units, and
+facts, then reconstructs the world when it is opened again.
 
-With Fjall, the host chooses a durability mode. The runner exposes it through `--durability`:
+The store chooses a durability mode. The runner exposes it through `--durability`:
 
 ```sh
-cargo run --bin mica -- --storage fjall --store world-db --durability strict eval 'return ()'
+filein --store world-db --durability group path/to/example.mica
 ```
 
-| Mode      | When a durable commit returns                                         |
-| --------- | --------------------------------------------------------------------- |
-| `relaxed` | after the ordered background writer accepts the commit into its queue |
-| `strict`  | after the writer applies the commit and syncs the journal             |
+| Mode     | When writes are durable                       |
+| -------- | --------------------------------------------- |
+| `none`   | the host decides when to flush; no fsync      |
+| `group`  | one fsync per writer drain batch; the default |
+| `strict` | one fsync per record                          |
 
-The default is `relaxed`. In that mode, another task can observe published facts while their write
-is still queued. Strict mode puts the journal sync before publication and release of buffered
-effects. An embedding host can call `flush_persistence()` to wait for earlier queued writes and sync
-the journal in either mode. A task's `commit()` ends its transaction; it uses the configured
-provider mode rather than changing that mode.
+Commits publish as soon as the store's byte budget admits them; the writer thread appends records
+and advances the durable version without blocking the commit path. A host can wait for a specific
+durable version. Checkpoints write the changed chunks of the current snapshot as immutable pages
+plus a manifest, then truncate the log. Stores checkpoint automatically once the log passes a byte
+threshold and on clean shutdown.
 
-Relation durability is a separate choice. A `:volatile` relation retains its definition across a
-Fjall restart but starts with no stored rows. Use it for process-lifetime facts such as open
-endpoints. Durable relations recover their stored rows. Derived answers are recomputed from the
-recovered facts and active rules; execution caches and live capabilities are not recovered as
-durable authority.
+Relation durability is a separate choice. A `:volatile` relation keeps its definition across a
+restart but starts with no stored rows. Use it for process-lifetime facts such as open endpoints.
+Durable relations recover their stored rows. Derived answers are recomputed from the recovered
+facts and active rules; execution caches and live capabilities are not recovered as durable
+authority.
 
 ## Continuing After a Boundary
 

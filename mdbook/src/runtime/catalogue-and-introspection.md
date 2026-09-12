@@ -134,12 +134,12 @@ relation for references that inspectors need to follow directly.
 
 ## Installed Behaviour and Source Ownership
 
-Installed methods are described by `MethodSelector`, `Param`, `Delegates`, `MethodProgram`,
-`ProgramBytes`, and `MethodSource`. Filein ownership is recorded by `SourceOwnsFact`,
-`SourceOwnsRule`, and `SourceOwnsRelation`. These are primarily tooling surfaces; author-facing
-definitions should normally use `verb`, relation rules, and filein units.
+Installed methods are described by `MethodSelector`, `Param`, `Delegates`, `MethodProgram`, and
+`MethodSource`. Declared identity names are recorded by `NamedIdentity`, and each loaded file is
+recorded by `UnitSource(ordinal, unit, source)`. These are primarily tooling surfaces;
+author-facing definitions should normally use `verb`, relation rules, and fileins.
 
-Use `fileout(:unit)` to recover one unit's owned source, or `fileout_rules()` to render active rule
+Use `fileout(:unit)` to recover a unit's loaded source, or `fileout_rules()` to render active rule
 source. See [Filein and Fileout](./filein-fileout.md).
 
 ## Runtime Context and Tasks
