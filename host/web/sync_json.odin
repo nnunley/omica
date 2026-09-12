@@ -155,8 +155,11 @@ sync_host_ensure_session :: proc(
 ) -> ^Sync_Session {
 	sync.mutex_lock(&host.lock)
 	if existing, found := host.sessions[session_id]; found {
-		if !v.value_is_empty_relation(actor) {
-			existing.actor = actor
+		// A session is bound to the actor that created it. A different actor
+		// presenting the id must be rejected, not rebound.
+		if existing.actor != actor {
+			sync.mutex_unlock(&host.lock)
+			return nil
 		}
 		sync.mutex_unlock(&host.lock)
 		return existing

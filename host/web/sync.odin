@@ -63,6 +63,7 @@ sync_handle_request :: proc(
 		if !sync_render_view(
 			host,
 			envelope.session_id,
+			actor,
 			envelope.view_id,
 			envelope.client_revision,
 			envelope.client_signature,
@@ -78,6 +79,15 @@ sync_handle_request :: proc(
 		}
 	case .Have_View:
 		session := sync_host_ensure_session(host, envelope.session_id, actor)
+		if session == nil {
+			http_response_text(
+				response,
+				403,
+				"text/plain; charset=utf-8",
+				"session actor mismatch",
+			)
+			return true
+		}
 		view := sync_view_state(session, envelope.view_id)
 		sync.mutex_lock(&view.render_lock)
 		up_to_date := view.has_tree &&
@@ -88,6 +98,7 @@ sync_handle_request :: proc(
 			if !sync_render_view(
 				host,
 				envelope.session_id,
+				actor,
 				envelope.view_id,
 				envelope.client_revision,
 				envelope.client_signature,
@@ -136,6 +147,15 @@ sync_dispatch_dom_event :: proc(
 	response: ^Http_Response,
 ) -> bool {
 	session := sync_host_ensure_session(host, event.session_id, actor)
+	if session == nil {
+		http_response_text(
+			response,
+			403,
+			"text/plain; charset=utf-8",
+			"session actor mismatch",
+		)
+		return true
+	}
 	session_value, _ := v.value_int(i64(event.session_id))
 	view_value, _ := v.value_int(i64(event.view_id))
 	field_entries := make([]v.Map_Entry, len(event.fields), host.world.allocator)
@@ -178,6 +198,7 @@ sync_dispatch_dom_event :: proc(
 	_ = sync_render_view(
 		host,
 		event.session_id,
+		actor,
 		event.view_id,
 		event.revision,
 		event.signature,
@@ -214,6 +235,10 @@ sync_events_stream :: proc(
 	}
 
 	session := sync_host_ensure_session(host, session_id, actor)
+	if session == nil {
+		sync_write_error(socket, 403, "session actor mismatch")
+		return true
+	}
 	generation := sync_session_claim_writer(session)
 	defer sync_session_release_writer(session, generation)
 

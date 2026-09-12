@@ -135,14 +135,53 @@ end
 	testing.expect(t, found)
 
 	session := sync_host_ensure_session(&host, 1, alice)
-	testing.expect(t, sync_render_view(&host, 1, 1, 0, 0, true))
+	testing.expect(t, sync_render_view(&host, 1, alice, 1, 0, 0, true))
 	payload := session_payload(t, session)
 	testing.expectf(t, strings.contains(payload, "signed-in"), "payload: %q", payload)
 
+	// Another actor cannot render Alice's session.
+	bob, bob_ok := v.value_identity_raw(0x2002)
+	testing.expect(t, bob_ok)
+	testing.expect(t, !sync_render_view(&host, 1, bob, 1, 0, 0, true))
+
 	guest_session := sync_host_ensure_session(&host, 2, v.Value(0))
-	testing.expect(t, sync_render_view(&host, 2, 1, 0, 0, true))
+	testing.expect(t, sync_render_view(&host, 2, v.Value(0), 1, 0, 0, true))
 	guest_payload := session_payload(t, guest_session)
 	testing.expectf(t, strings.contains(guest_payload, "guest"), "payload: %q", guest_payload)
+}
+
+// Regression test: a session id is bound to the actor that created it. A
+// different authenticated actor presenting the same id must not be able to
+// attach to (and rebind) that session.
+@(test)
+test_sync_session_actor_binding :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	host: Sync_Host
+	sync_host_init(&host, nil)
+	defer sync_host_destroy(&host)
+
+	alice, alice_ok := v.value_identity_raw(0x2001)
+	bob, bob_ok := v.value_identity_raw(0x2002)
+	testing.expect(t, alice_ok && bob_ok)
+	testing.expect(t, alice != bob)
+
+	alice_session := sync_host_ensure_session(&host, 42, alice)
+	testing.expect(t, alice_session != nil)
+	if alice_session == nil {
+		return
+	}
+	testing.expect(t, alice_session.actor == alice)
+
+	// Bob presents Alice's session id: rejected, not rebound.
+	testing.expect(t, sync_host_ensure_session(&host, 42, bob) == nil)
+
+	// The original actor can still reach the same session.
+	again := sync_host_ensure_session(&host, 42, alice)
+	testing.expect(t, again == alice_session)
+	if again != nil {
+		testing.expect(t, again.actor == alice)
+	}
 }
 
 @(private)

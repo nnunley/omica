@@ -73,6 +73,7 @@ sync_view_destroy :: proc(host: ^Sync_Host, view: ^View_State) {
 sync_render_view :: proc(
 	host: ^Sync_Host,
 	session_id: u64,
+	actor: v.Value,
 	view_id: u64,
 	client_revision: u64,
 	client_signature: u64,
@@ -83,8 +84,9 @@ sync_render_view :: proc(
 	}
 	sync.mutex_lock(&host.lock)
 	session, session_found := host.sessions[session_id]
+	actor_matches := session_found && session.actor == actor
 	sync.mutex_unlock(&host.lock)
-	if !session_found || session.closed {
+	if !actor_matches || session.closed {
 		return false
 	}
 	view := sync_view_state(session, view_id)
@@ -436,6 +438,7 @@ sync_pump_session :: proc(host: ^Sync_Host, session: ^Sync_Session) {
 		_ = sync_render_view(
 			host,
 			session.session_id,
+			session.actor,
 			view_id,
 			client_revision,
 			client_signature,
