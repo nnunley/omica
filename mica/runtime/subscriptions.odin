@@ -166,10 +166,11 @@ subscriptions_register :: proc(
 // Cancels a subscription by its capability handle.
 @(private)
 subscriptions_cancel :: proc(env: ^Builtin_Env, capability: v.Value) -> bool {
-	grant, found := k.capability_store_lookup(&env.kernel.capabilities, capability)
+	grant, found := k.capability_store_lookup_retained(&env.kernel.capabilities, capability)
 	if !found {
 		return false
 	}
+	defer k.capability_release(grant)
 	subscription_id, is_subscription := k.capability_subscription_target(grant)
 	if !is_subscription {
 		return false
@@ -184,10 +185,11 @@ subscriptions_cancel :: proc(env: ^Builtin_Env, capability: v.Value) -> bool {
 // Cancels every subscription that delivers to `receiver`'s mailbox.
 @(private)
 subscriptions_cancel_for_mailbox :: proc(env: ^Builtin_Env, receiver: v.Value) -> int {
-	grant, found := k.capability_store_lookup(&env.kernel.capabilities, receiver)
+	grant, found := k.capability_store_lookup_retained(&env.kernel.capabilities, receiver)
 	if !found {
 		return 0
 	}
+	defer k.capability_release(grant)
 	mailbox, is_receiver := k.capability_mailbox_target(grant, false)
 	if !is_receiver {
 		return 0
@@ -197,7 +199,7 @@ subscriptions_cancel_for_mailbox :: proc(env: ^Builtin_Env, receiver: v.Value) -
 	to_cancel: [dynamic]v.Value
 	defer delete(to_cancel)
 	for _, subscription in env.subscriptions.entries {
-		sender_grant, sender_found := k.capability_store_lookup(
+		sender_grant, sender_found := k.capability_store_lookup_retained(
 			&env.kernel.capabilities,
 			subscription.sender,
 		)
@@ -205,19 +207,22 @@ subscriptions_cancel_for_mailbox :: proc(env: ^Builtin_Env, receiver: v.Value) -
 			continue
 		}
 		sender_mailbox, is_sender := k.capability_mailbox_target(sender_grant, true)
+		k.capability_release(sender_grant)
 		if !is_sender || sender_mailbox != mailbox {
 			continue
 		}
 		append(&to_cancel, subscription.capability)
 	}
 	for capability in to_cancel {
-		if grant_value, grant_found := k.capability_store_lookup(
+		if grant_value, grant_found := k.capability_store_lookup_retained(
 			&env.kernel.capabilities,
 			capability,
 		); grant_found {
-			if subscription_id, is_subscription := k.capability_subscription_target(
+			subscription_id, is_subscription := k.capability_subscription_target(
 				grant_value,
-			); is_subscription {
+			)
+			k.capability_release(grant_value)
+			if is_subscription {
 				subscriptions_release_locked(&env.subscriptions, subscription_id)
 				removed += 1
 			}
@@ -284,13 +289,14 @@ subscriptions_dispatch :: proc(env: ^Builtin_Env) {
 
 @(private)
 subscription_is_live :: proc(env: ^Builtin_Env, subscription: ^Subscription) -> bool {
-	grant, found := k.capability_store_lookup(
+	grant, found := k.capability_store_lookup_retained(
 		&env.kernel.capabilities,
 		subscription.capability,
 	)
 	if !found {
 		return false
 	}
+	defer k.capability_release(grant)
 	if _, is_subscription := k.capability_subscription_target(grant); !is_subscription {
 		return false
 	}

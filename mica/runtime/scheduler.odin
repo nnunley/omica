@@ -306,15 +306,20 @@ mailbox_target :: proc(
 	sender: bool,
 ) -> (
 	u64,
-	^k.Capability_Grant,
 	bool,
 ) {
-	grant, found := k.capability_store_lookup(&scheduler.kernel.capabilities, value)
-	if !found || !k.capability_live(grant, 0, time.tick_now()) {
-		return 0, nil, false
+	grant, found := k.capability_store_lookup_retained(
+		&scheduler.kernel.capabilities,
+		value,
+	)
+	if !found {
+		return 0, false
 	}
-	mailbox, target_ok := k.capability_mailbox_target(grant, sender)
-	return mailbox, grant, target_ok
+	defer k.capability_release(grant)
+	if !k.capability_live(grant, 0, time.tick_now()) {
+		return 0, false
+	}
+	return k.capability_mailbox_target(grant, sender)
 }
 
 // Creates a mailbox and returns its receiver and sender handles.
@@ -348,7 +353,7 @@ scheduler_mailbox_send :: proc(
 	sender: v.Value,
 	value: v.Value,
 ) -> bool {
-	mailbox, _, ok := mailbox_target(scheduler, sender, true)
+	mailbox, ok := mailbox_target(scheduler, sender, true)
 	if !ok {
 		return false
 	}
@@ -362,11 +367,12 @@ scheduler_mailbox_send :: proc(
 		return false
 	}
 	receiver_live := false
-	if receiver_grant, receiver_found := k.capability_store_lookup(
+	if receiver_grant, receiver_found := k.capability_store_lookup_retained(
 		&scheduler.kernel.capabilities,
 		box.receiver,
 	); receiver_found {
 		receiver_live = k.capability_live(receiver_grant, 0, time.tick_now())
+		k.capability_release(receiver_grant)
 	}
 	if !receiver_live {
 		sync.mutex_unlock(&scheduler.lock)
@@ -393,7 +399,7 @@ scheduler_mailbox_deliver_subscription :: proc(
 	ok: bool,
 	overflow: bool,
 ) {
-	mailbox, _, target_ok := mailbox_target(scheduler, sender, true)
+	mailbox, target_ok := mailbox_target(scheduler, sender, true)
 	if !target_ok {
 		return false, false
 	}
@@ -426,7 +432,7 @@ scheduler_mailbox_replace_subscription :: proc(
 	capability: v.Value,
 	value: v.Value,
 ) -> bool {
-	mailbox, _, target_ok := mailbox_target(scheduler, sender, true)
+	mailbox, target_ok := mailbox_target(scheduler, sender, true)
 	if !target_ok {
 		return false
 	}
@@ -445,11 +451,15 @@ scheduler_mailbox_replace_subscription :: proc(
 
 @(private)
 mailbox_receiver_live_locked :: proc(scheduler: ^Scheduler, box: ^Mailbox) -> bool {
-	receiver_grant, receiver_found := k.capability_store_lookup(
+	receiver_grant, receiver_found := k.capability_store_lookup_retained(
 		&scheduler.kernel.capabilities,
 		box.receiver,
 	)
-	return receiver_found && k.capability_live(receiver_grant, 0, time.tick_now())
+	if !receiver_found {
+		return false
+	}
+	defer k.capability_release(receiver_grant)
+	return k.capability_live(receiver_grant, 0, time.tick_now())
 }
 
 // Removes queued subscription messages for `capability`. The caller holds the
@@ -485,7 +495,7 @@ subscription_message_capability :: proc(value: v.Value) -> v.Value {
 
 // Closes a mailbox from its receiver handle, revoking both endpoints.
 scheduler_mailbox_close :: proc(scheduler: ^Scheduler, receiver: v.Value) -> bool {
-	mailbox, _, ok := mailbox_target(scheduler, receiver, false)
+	mailbox, ok := mailbox_target(scheduler, receiver, false)
 	if !ok {
 		return false
 	}
@@ -552,7 +562,7 @@ scheduler_collect_messages_locked :: proc(
 	}
 	live := 0
 	for receiver in receivers {
-		mailbox, _, ok := mailbox_target(scheduler, receiver, false)
+		mailbox, ok := mailbox_target(scheduler, receiver, false)
 		if !ok {
 			continue
 		}
@@ -604,7 +614,7 @@ scheduler_mailbox_drain :: proc(
 	[dynamic]v.Value,
 	bool,
 ) {
-	mailbox, _, ok := mailbox_target(scheduler, receiver, false)
+	mailbox, ok := mailbox_target(scheduler, receiver, false)
 	if !ok {
 		return nil, false
 	}
@@ -623,7 +633,7 @@ scheduler_mailbox_drain :: proc(
 // Reports whether a mailbox handle is a live endpoint of the requested kind.
 @(private)
 mailbox_handle_live :: proc(scheduler: ^Scheduler, value: v.Value, sender: bool) -> bool {
-	_, _, ok := mailbox_target(scheduler, value, sender)
+	_, ok := mailbox_target(scheduler, value, sender)
 	return ok
 }
 
@@ -663,7 +673,7 @@ scheduler_park_mailbox_locked :: proc(
 		seen: [dynamic]u64
 		defer delete(seen)
 		for receiver in receivers {
-			mailbox, _, ok := mailbox_target(scheduler, receiver, false)
+			mailbox, ok := mailbox_target(scheduler, receiver, false)
 			if !ok {
 				continue
 			}

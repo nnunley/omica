@@ -1098,10 +1098,11 @@ builtin_mint_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, boo
 @(private)
 builtin_use_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	env := builtin_env(state)
-	grant, found := k.capability_store_lookup(&env.kernel.capabilities, args[0])
+	grant, found := k.capability_store_lookup_retained(&env.kernel.capabilities, args[0])
 	if !found {
 		return builtin_error(state, "E_INVARG", "unknown capability")
 	}
+	defer k.capability_release(grant)
 	if grant.scope == .Mailbox || grant.scope == .Subscription {
 		return builtin_error(state, "E_INVARG", "handle is not an authority capability")
 	}
@@ -1115,10 +1116,11 @@ builtin_use_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool
 @(private)
 builtin_restrict_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	env := builtin_env(state)
-	parent, found := k.capability_store_lookup(&env.kernel.capabilities, args[0])
+	parent, found := k.capability_store_lookup_retained(&env.kernel.capabilities, args[0])
 	if !found {
 		return builtin_error(state, "E_INVARG", "unknown capability")
 	}
+	defer k.capability_release(parent)
 	if parent.scope == .Mailbox || parent.scope == .Subscription {
 		return builtin_error(state, "E_INVARG", "handles cannot be restricted")
 	}
@@ -1144,10 +1146,11 @@ builtin_restrict_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value,
 @(private)
 builtin_revoke_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	env := builtin_env(state)
-	grant, found := k.capability_store_lookup(&env.kernel.capabilities, args[0])
+	grant, found := k.capability_store_lookup_retained(&env.kernel.capabilities, args[0])
 	if !found {
 		return builtin_error(state, "E_INVARG", "unknown capability")
 	}
+	defer k.capability_release(grant)
 	if !k.authority_holds_capability(state.authority, grant) &&
 	   !k.authority_can_grant(state.authority) {
 		return builtin_error(state, "E_PERMISSION", "capability revocation denied")
@@ -1161,10 +1164,11 @@ builtin_revoke_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 @(private)
 builtin_drop_capability :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	env := builtin_env(state)
-	grant, found := k.capability_store_lookup(&env.kernel.capabilities, args[0])
+	grant, found := k.capability_store_lookup_retained(&env.kernel.capabilities, args[0])
 	if !found {
 		return builtin_error(state, "E_INVARG", "unknown capability")
 	}
+	defer k.capability_release(grant)
 	return v.value_bool(k.authority_drop_capability(state.authority, grant)), true
 }
 

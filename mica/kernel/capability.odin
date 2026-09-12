@@ -274,6 +274,25 @@ capability_store_lookup :: proc(
 	return grant, grant != nil
 }
 
+// Looks up a capability by value and retains it under the store lock, so a
+// concurrent `capability_store_revoke` cannot free it while the caller uses
+// it. The caller owns the reference and must call `capability_release`.
+capability_store_lookup_retained :: proc(
+	store: ^Capability_Store,
+	value: v.Value,
+) -> (
+	^Capability_Grant,
+	bool,
+) {
+	sync.mutex_lock(&store.lock)
+	defer sync.mutex_unlock(&store.lock)
+	grant := capability_store_lookup_locked(store, value)
+	if grant != nil {
+		capability_retain(grant)
+	}
+	return grant, grant != nil
+}
+
 @(private)
 capability_store_lookup_locked :: proc(
 	store: ^Capability_Store,
