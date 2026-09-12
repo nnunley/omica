@@ -4042,3 +4042,49 @@ return n`,
 		1,
 	)
 }
+
+// `break` and `continue` must run the finalizers of the protected regions they
+// exit.
+@(test)
+test_run_break_and_continue_run_finally :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	ctx := c.Compile_Context {
+		builtins   = make(map[string]bool),
+		relations  = make(map[string]u32),
+		identities = make(map[string]v.Value),
+	}
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	install_builtin_names(&ctx)
+
+	expect_int_builtin(
+		t,
+		&ctx,
+		`let n = 0
+while true
+  try
+    break
+  finally
+    n = n + 1
+  end
+end
+return n`,
+		1,
+	)
+
+	expect_int_builtin(
+		t,
+		&ctx,
+		`let n = 0
+for x in [1, 2]
+  try
+    continue
+  finally
+    n = n + 1
+  end
+end
+return n`,
+		2,
+	)
+}

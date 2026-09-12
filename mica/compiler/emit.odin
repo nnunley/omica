@@ -59,6 +59,14 @@ Pending_Function :: struct {
 	captures: []Local,
 }
 
+// A `try ... finally` region active while emitting a loop body, tracked so a
+// `break`/`continue` can run the finalizers of the regions it exits.
+@(private)
+Finally_Scope :: struct {
+	loop_depth: int,
+	body:       []^Expr,
+}
+
 @(private)
 Emitter :: struct {
 	builder:       ^vm.Builder,
@@ -81,6 +89,7 @@ Emitter :: struct {
 	// `continue_patches` where each active loop's continues begin.
 	continue_patches: [dynamic]int,
 	continue_marks:   [dynamic]int,
+	active_finallys:  [dynamic]Finally_Scope,
 	loop_depth: int,
 	empty_constant: int,
 	pending_functions: [dynamic]Pending_Function,
@@ -117,6 +126,7 @@ compile_program :: proc(
 		break_patches = make([dynamic]int),
 		continue_patches = make([dynamic]int),
 		continue_marks = make([dynamic]int),
+		active_finallys = make([dynamic]Finally_Scope),
 		pending_functions = make([dynamic]Pending_Function),
 	}
 	defer {
@@ -130,6 +140,7 @@ compile_program :: proc(
 		delete(emitter.break_patches)
 		delete(emitter.continue_patches)
 		delete(emitter.continue_marks)
+		delete(emitter.active_finallys)
 		delete(emitter.pending_functions)
 	}
 
@@ -506,6 +517,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 			push_error(emitter, "break outside a loop")
 			return -1, false
 		}
+		emit_exited_finallys(emitter)
 		append(&emitter.break_patches, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
 		return -1, false
 
@@ -514,6 +526,7 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 			push_error(emitter, "continue outside a loop")
 			return -1, false
 		}
+		emit_exited_finallys(emitter)
 		append(&emitter.continue_patches, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
 		return -1, false
 
@@ -2206,6 +2219,19 @@ patch_handler_target :: proc(emitter: ^Emitter, at: int, target: int) {
 // unmatched error is re-raised.
 @(private)
 emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
+	// Track this finalizer while its body and catch clauses are emitted, so a
+	// `break`/`continue` that exits the region runs it.
+	if try.has_finally {
+		append(&emitter.active_finallys, Finally_Scope {
+			loop_depth = emitter.loop_depth,
+			body       = try.finally_body,
+		})
+	}
+	defer {
+		if try.has_finally {
+			pop(&emitter.active_finallys)
+		}
+	}
 	result := alloc_register(emitter)
 	error_register := alloc_register(emitter)
 	empty := emit_constant(emitter, v.value_empty_relation())
@@ -3132,6 +3158,19 @@ patch_loop_continues :: proc(emitter: ^Emitter, target: int) {
 	}
 	resize(&emitter.continue_patches, mark)
 	pop(&emitter.continue_marks)
+}
+
+// Emits the finalizers of the protected regions a `break`/`continue` exits
+// (the ones inside the current loop), innermost first.
+@(private)
+emit_exited_finallys :: proc(emitter: ^Emitter) {
+	for index := len(emitter.active_finallys) - 1; index >= 0; index -= 1 {
+		scope := emitter.active_finallys[index]
+		if scope.loop_depth < emitter.loop_depth {
+			break
+		}
+		_, _ = emit_block(emitter, scope.body)
+	}
 }
 
 @(private)
