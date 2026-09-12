@@ -399,19 +399,8 @@ float_is_finite :: proc(f: f32) -> bool {
 	return exponent != 0xff
 }
 
-@(private)
-numeric_as_f32 :: proc(v: Value) -> (f32, bool) {
-	if n, ok := value_as_int(v); ok {
-		return f32(n), true
-	}
-	if f, ok := value_as_float(v); ok {
-		return f, true
-	}
-	return 0, false
-}
-
 // Adds two numeric values with checked overflow. Integer operands produce an
-// integer when the result fits; mixed operands produce a float.
+// integer; float operands produce a float. Mixed kinds fail.
 value_checked_add :: proc(a, b: Value) -> (Value, bool) {
 	if left, lok := value_as_int(a); lok {
 		if right, rok := value_as_int(b); rok {
@@ -420,9 +409,10 @@ value_checked_add :: proc(a, b: Value) -> (Value, bool) {
 			}
 			return Value(0), false
 		}
+		return Value(0), false
 	}
-	l, lok := numeric_as_f32(a)
-	r, rok := numeric_as_f32(b)
+	l, lok := value_as_float(a)
+	r, rok := value_as_float(b)
 	if !lok || !rok {
 		return Value(0), false
 	}
@@ -438,9 +428,10 @@ value_checked_sub :: proc(a, b: Value) -> (Value, bool) {
 			}
 			return Value(0), false
 		}
+		return Value(0), false
 	}
-	l, lok := numeric_as_f32(a)
-	r, rok := numeric_as_f32(b)
+	l, lok := value_as_float(a)
+	r, rok := value_as_float(b)
 	if !lok || !rok {
 		return Value(0), false
 	}
@@ -456,9 +447,10 @@ value_checked_mul :: proc(a, b: Value) -> (Value, bool) {
 			}
 			return Value(0), false
 		}
+		return Value(0), false
 	}
-	l, lok := numeric_as_f32(a)
-	r, rok := numeric_as_f32(b)
+	l, lok := value_as_float(a)
+	r, rok := value_as_float(b)
 	if !lok || !rok {
 		return Value(0), false
 	}
@@ -466,31 +458,31 @@ value_checked_mul :: proc(a, b: Value) -> (Value, bool) {
 }
 
 // Divides two numeric values. Integer division that is exact produces an
-// integer; all other divisions produce a float. Division by zero or overflow
-// fails.
+// integer; all other divisions fail, including mixing an integer and a float.
+// Division by zero or overflow fails.
 value_checked_div :: proc(a, b: Value) -> (Value, bool) {
 	if left, lok := value_as_int(a); lok {
 		if right, rok := value_as_int(b); rok {
-			if right == 0 {
+			if right == 0 || left % right != 0 {
 				return Value(0), false
 			}
-			if left % right == 0 {
-				if quotient, ok := value_int(left / right); ok {
-					return quotient, true
-				}
-				return Value(0), false
+			if quotient, ok := value_int(left / right); ok {
+				return quotient, true
 			}
+			return Value(0), false
 		}
+		return Value(0), false
 	}
-	l, lok := numeric_as_f32(a)
-	r, rok := numeric_as_f32(b)
+	l, lok := value_as_float(a)
+	r, rok := value_as_float(b)
 	if !lok || !rok || r == 0 {
 		return Value(0), false
 	}
 	return value_float(l / r)
 }
 
-// Computes the remainder of two numeric values. Division by zero fails.
+// Computes the remainder of two numeric values. Division by zero or mixed
+// kinds fail.
 value_checked_rem :: proc(a, b: Value) -> (Value, bool) {
 	if left, lok := value_as_int(a); lok {
 		if right, rok := value_as_int(b); rok {
@@ -502,13 +494,43 @@ value_checked_rem :: proc(a, b: Value) -> (Value, bool) {
 			}
 			return Value(0), false
 		}
+		return Value(0), false
 	}
-	l, lok := numeric_as_f32(a)
-	r, rok := numeric_as_f32(b)
+	l, lok := value_as_float(a)
+	r, rok := value_as_float(b)
 	if !lok || !rok || r == 0 {
 		return Value(0), false
 	}
 	return value_float(float_rem(l, r))
+}
+
+// Explicitly converts a numeric value to a float. Integers round to the
+// nearest binary32 value; floats are returned unchanged. Non-numeric values
+// fail.
+value_to_float :: proc(v: Value) -> (Value, bool) {
+	if n, ok := value_as_int(v); ok {
+		return value_float(f32(n))
+	}
+	if _, ok := value_as_float(v); ok {
+		return v, true
+	}
+	return Value(0), false
+}
+
+// Explicitly converts a numeric value to an integer. A float converts only
+// when it is exactly integral and within the Mica integer range; integers are
+// returned unchanged. Other values fail.
+value_to_int :: proc(v: Value) -> (Value, bool) {
+	if f, ok := value_as_float(v); ok {
+		if f != math.trunc(f) {
+			return Value(0), false
+		}
+		return value_int(i64(f))
+	}
+	if _, ok := value_as_int(v); ok {
+		return v, true
+	}
+	return Value(0), false
 }
 
 @(private)

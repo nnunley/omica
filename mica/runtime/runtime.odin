@@ -1125,7 +1125,7 @@ builtin_noop :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 
 @(private)
 builtin_require :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
-	if !vm.vm_value_is_truthy(args[0]) {
+	if !vm.vm_truthy(args[0]) {
 		vm.vm_set_error(state, "E_REQUIRE", "required condition is not satisfied")
 		return v.Value(0), false
 	}

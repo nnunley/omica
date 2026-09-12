@@ -111,17 +111,46 @@ test_checked_arithmetic :: proc(t: ^testing.T) {
 	testing.expect(t, exact_ok)
 	testing.expect(t, value_eq(exact, two))
 
-	inexact, inexact_ok := value_checked_div(three, four)
-	testing.expect(t, inexact_ok)
-	f, float_ok := value_as_float(inexact)
-	testing.expect(t, float_ok)
-	testing.expect_value(t, f, f32(0.75))
+	// Inexact integer division fails rather than widening.
+	_, inexact_ok := value_checked_div(three, four)
+	testing.expect(t, !inexact_ok)
+
+	// Mixed kinds fail rather than widening.
+	_, mixed_ok := value_checked_add(three, must_float(0.5))
+	testing.expect(t, !mixed_ok)
 
 	_, div_zero_ok := value_checked_div(three, must_int(0))
 	testing.expect(t, !div_zero_ok)
 
 	_, overflow_ok := value_checked_mul(must_int(INT_MAX), two)
 	testing.expect(t, !overflow_ok)
+}
+
+@(test)
+test_explicit_numeric_conversions :: proc(t: ^testing.T) {
+	converted_float, float_ok := value_to_float(must_int(7))
+	testing.expect(t, float_ok)
+	f, f_ok := value_as_float(converted_float)
+	testing.expect(t, f_ok)
+	testing.expect_value(t, f, f32(7))
+
+	converted_int, int_ok := value_to_int(must_float(7))
+	testing.expect(t, int_ok)
+	testing.expect(t, value_eq(converted_int, must_int(7)))
+
+	// A fractional float does not convert.
+	_, fractional_ok := value_to_int(must_float(7.5))
+	testing.expect(t, !fractional_ok)
+
+	// Non-numeric values do not convert.
+	_, string_float_ok := value_to_float(value_string(context.temp_allocator, "7"))
+	testing.expect(t, !string_float_ok)
+	_, string_int_ok := value_to_int(value_string(context.temp_allocator, "7"))
+	testing.expect(t, !string_int_ok)
+
+	// A float outside the integer range does not convert.
+	_, max_float_ok := value_to_int(must_float(3.4028235e38))
+	testing.expect(t, !max_float_ok)
 }
 
 @(test)
@@ -660,24 +689,27 @@ test_division_edges :: proc(t: ^testing.T) {
 	testing.expect(t, exact_negative_ok)
 	testing.expect(t, value_eq(exact_negative, must_int(-2)))
 
-	inexact_negative, inexact_negative_ok := value_checked_div(must_int(-7), two)
-	testing.expect(t, inexact_negative_ok)
-	inexact_float, inexact_float_ok := value_as_float(inexact_negative)
-	testing.expect(t, inexact_float_ok)
-	testing.expect_value(t, inexact_float, f32(-3.5))
+	// Inexact negative integer division fails rather than widening.
+	_, inexact_negative_ok := value_checked_div(must_int(-7), two)
+	testing.expect(t, !inexact_negative_ok)
 
 	_, float_zero_ok := value_checked_div(must_float(1.0), must_float(0.0))
 	testing.expect(t, !float_zero_ok)
 
-	float_by_int, float_by_int_ok := value_checked_div(must_float(3.0), two)
-	testing.expect(t, float_by_int_ok)
-	float_by_int_value, _ := value_as_float(float_by_int)
-	testing.expect_value(t, float_by_int_value, f32(1.5))
+	// Mixed kinds fail rather than widening.
+	_, float_by_int_ok := value_checked_div(must_float(3.0), two)
+	testing.expect(t, !float_by_int_ok)
 
-	int_by_float, int_by_float_ok := value_checked_div(three, must_float(2.0))
-	testing.expect(t, int_by_float_ok)
-	int_by_float_value, _ := value_as_float(int_by_float)
-	testing.expect_value(t, int_by_float_value, f32(1.5))
+	_, int_by_float_ok := value_checked_div(three, must_float(2.0))
+	testing.expect(t, !int_by_float_ok)
+
+	// Explicit conversion restores float division.
+	converted, converted_ok := value_to_float(three)
+	testing.expect(t, converted_ok)
+	float_by_float, float_by_float_ok := value_checked_div(converted, must_float(2.0))
+	testing.expect(t, float_by_float_ok)
+	float_by_float_value, _ := value_as_float(float_by_float)
+	testing.expect_value(t, float_by_float_value, f32(1.5))
 
 	// INT_MIN / -1 leaves the 56-bit integer range.
 	_, overflow_ok := value_checked_div(must_int(INT_MIN), must_int(-1))

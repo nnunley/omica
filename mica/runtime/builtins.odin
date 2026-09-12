@@ -61,6 +61,8 @@ runtime_builtins := [?]Builtin_Spec {
 	{"__len_option", 1, builtin_len_option},
 	{"__set_index", 3, builtin_set_index},
 	{"to_symbol", 1, builtin_to_symbol},
+	{"to_float", 1, builtin_to_float},
+	{"to_int", 1, builtin_to_int},
 	{"map_pairs", 1, builtin_map_pairs},
 	{"index_or", 3, builtin_index_or},
 	{"url_encode_component", 1, builtin_url_encode_component},
@@ -2756,6 +2758,29 @@ builtin_to_symbol :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		return builtin_error(state, "E_TYPE", "to_symbol expects a string")
 	}
 	return v.value_symbol(v.symbol_intern(text)), true
+}
+
+// Converts a numeric value to a float. Integers round to the nearest binary32
+// value; floats pass through. Non-numeric values raise E_TYPE.
+@(private)
+builtin_to_float :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	converted, ok := v.value_to_float(args[0])
+	if !ok {
+		return builtin_error(state, "E_TYPE", "to_float expects a numeric value")
+	}
+	return converted, true
+}
+
+// Converts a numeric value to an integer. A float converts only when it is
+// exactly integral and within the Mica integer range. Other values raise
+// E_TYPE.
+@(private)
+builtin_to_int :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	converted, ok := v.value_to_int(args[0])
+	if !ok {
+		return builtin_error(state, "E_TYPE", "to_int expects an exactly integral numeric value")
+	}
+	return converted, true
 }
 
 // --- URL components --------------------------------------------------------

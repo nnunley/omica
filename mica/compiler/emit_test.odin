@@ -76,7 +76,7 @@ double_builtin :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	two, _ := v.value_int(2)
 	result, ok := v.value_checked_mul(args[0], two)
 	if !ok {
-		vm.vm_set_error(state, "E_ARITHMETIC", "double failed")
+		vm.vm_set_error(state, "E_ARITH", "double failed")
 		return v.Value(0), false
 	}
 	return result, true

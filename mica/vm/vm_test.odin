@@ -30,8 +30,20 @@ must_int :: proc(n: i64) -> v.Value {
 }
 
 @(private)
+must_float :: proc(f: f32) -> v.Value {
+	value, ok := v.value_float(f)
+	assert(ok)
+	return value
+}
+
+@(private)
 constant :: proc(builder: ^Builder, n: i64) -> i32 {
 	return i32(builder_add_constant(builder, must_int(n)))
+}
+
+@(private)
+float_constant :: proc(builder: ^Builder, f: f32) -> i32 {
+	return i32(builder_add_constant(builder, must_float(f)))
 }
 
 @(test)
@@ -99,6 +111,65 @@ test_vm_branch_selects_value :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
 	testing.expect_value(t, state.result, must_int(10))
+}
+
+@(test)
+test_vm_truthiness_matches_for_all_paths :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	empty_list := i32(builder_add_constant(&builder, v.value_list(alloc, []v.Value{})))
+	one_list := i32(builder_add_constant(&builder, v.value_list(alloc, []v.Value{must_int(1)})))
+	empty_relation := i32(builder_add_constant(&builder, v.value_empty_relation()))
+	false_const := i32(builder_add_constant(&builder, v.value_bool(false)))
+
+	// Each Is_Truthy and Unary Not writes into the contiguous registers 8..12
+	// so the final Build_List can collect them.
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 16, true)
+
+	builder_emit(&builder, .Load_Const, 0, 0, empty_list, 0)
+	builder_emit(&builder, .Is_Truthy, 0, 8, 0, 0)
+	builder_emit(&builder, .Load_Const, 0, 1, empty_relation, 0)
+	builder_emit(&builder, .Is_Truthy, 0, 9, 1, 0)
+	builder_emit(&builder, .Load_Const, 0, 2, one_list, 0)
+	builder_emit(&builder, .Is_Truthy, 0, 10, 2, 0)
+	builder_emit(&builder, .Load_Const, 0, 3, false_const, 0)
+	builder_emit(&builder, .Unary, u8(Un_Op.Not), 11, 3, 0)
+	builder_emit(&builder, .Unary, u8(Un_Op.Not), 12, 0, 0)
+
+	builder_emit(&builder, .Build_List, 0, 13, 8, 5)
+	builder_emit(&builder, .Return, 0, 13, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	observed, observed_ok := v.value_as_list(state.result)
+	testing.expect(t, observed_ok)
+	if !observed_ok {
+		return
+	}
+	expect_bool := proc(t: ^testing.T, value: v.Value, expected: bool) {
+		actual, ok := v.value_as_bool(value)
+		testing.expect(t, ok)
+		testing.expect_value(t, actual, expected)
+	}
+	// empty list false; empty relation false; non-empty list true;
+	// !false true; !empty-list true.
+	expect_bool(t, observed[0], false)
+	expect_bool(t, observed[1], false)
+	expect_bool(t, observed[2], true)
+	expect_bool(t, observed[3], true)
+	expect_bool(t, observed[4], true)
 }
 
 @(test)
@@ -268,7 +339,49 @@ test_vm_division_by_zero_fails :: proc(t: ^testing.T) {
 	testing.expect(t, error_ok)
 	code_name, code_ok := v.symbol_name(error.code)
 	testing.expect(t, code_ok)
-	testing.expect_value(t, code_name, "E_ARITHMETIC")
+	testing.expect_value(t, code_name, "E_DIV")
+	// The error carries the operands as its payload.
+	testing.expect(t, error.has_value)
+	payload, payload_ok := v.value_as_list(error.value)
+	testing.expect(t, payload_ok)
+	testing.expect_value(t, len(payload), 2)
+	testing.expect(t, v.value_eq(payload[0], must_int(1)))
+	testing.expect(t, v.value_eq(payload[1], must_int(0)))
+}
+
+@(test)
+test_vm_mixed_numeric_operands_fail_with_e_type :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	one := constant(&builder, 1)
+	half := float_constant(&builder, 0.5)
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 3, true)
+	builder_emit(&builder, .Load_Const, 0, 0, one, 0)
+	builder_emit(&builder, .Load_Const, 0, 1, half, 0)
+	builder_emit(&builder, .Binary, u8(Bin_Op.Add), 2, 0, 1)
+	builder_emit(&builder, .Return, 0, 2, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Failed)
+	error, error_ok := v.value_as_error(state.error)
+	testing.expect(t, error_ok)
+	code_name, code_ok := v.symbol_name(error.code)
+	testing.expect(t, code_ok)
+	testing.expect_value(t, code_name, "E_TYPE")
 }
 
 @(test)
@@ -621,7 +734,7 @@ double_builtin :: proc(state: ^VM, args: []v.Value) -> (v.Value, bool) {
 	two, _ := v.value_int(2)
 	result, ok := v.value_checked_mul(args[0], two)
 	if !ok {
-		vm_set_error(state, "E_ARITHMETIC", "double failed")
+		vm_set_error(state, "E_ARITH", "double failed")
 		return v.Value(0), false
 	}
 	return result, true

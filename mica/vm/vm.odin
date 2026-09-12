@@ -859,7 +859,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 
 		case .Is_Truthy:
-			truthy := vm_value_is_truthy(state.registers[base + int(instr.b)])
+			truthy := vm_truthy(state.registers[base + int(instr.b)])
 			state.registers[base + int(instr.a)] = v.value_bool(truthy)
 
 		case .Scan_One:
@@ -1335,21 +1335,6 @@ vm_scan_one :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	return true
 }
 
-// Truthiness used by `if`, `&&`, and `||`: false and the empty option and
-// relation values are falsy; everything else is truthy.
-vm_value_is_truthy :: proc(value: v.Value) -> bool {
-	if boolean, ok := v.value_as_bool(value); ok {
-		return boolean
-	}
-	if v.value_is_empty_relation(value) {
-		return false
-	}
-	if relation, ok := v.value_as_relation(value); ok {
-		return len(relation.rows) > 0
-	}
-	return true
-}
-
 @(private)
 vm_apply_write :: proc(
 	state: ^VM,
@@ -1696,16 +1681,58 @@ vm_binary :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	}
 
 	if !ok {
-		vm_fail(state, "E_ARITHMETIC", "arithmetic operation failed")
+		vm_arithmetic_fail(state, op, left, right)
 		return false
 	}
 	state.registers[base + int(instr.a)] = result
 	return true
 }
 
-// Truthiness mirrors the Rust VM: booleans use their value, lists and
-// relations are true when non-empty, and every other kind is true.
+// Records an arithmetic failure with the error code the language documents.
+// A zero divisor in division or remainder raises E_DIV carrying the operands;
+// mixing an integer and a float raises E_TYPE; every other failure, such as
+// overflow or a non-finite float result, raises E_ARITH.
 @(private)
+vm_arithmetic_fail :: proc(state: ^VM, op: Bin_Op, left, right: v.Value) {
+	code := "E_ARITH"
+	message := "invalid arithmetic"
+	#partial switch op {
+	case .Div, .Rem:
+		divisor_is_zero := false
+		if divisor, ok := v.value_as_int(right); ok && divisor == 0 {
+			divisor_is_zero = true
+		}
+		if divisor, ok := v.value_as_float(right); ok && divisor == 0 {
+			divisor_is_zero = true
+		}
+		if divisor_is_zero {
+			code = "E_DIV"
+			message = op == .Div ? "division by zero" : "remainder by zero"
+		}
+	}
+	left_is_int := v.value_kind(left) == .Int
+	right_is_int := v.value_kind(right) == .Int
+	left_is_numeric := left_is_int || v.value_kind(left) == .Float
+	right_is_numeric := right_is_int || v.value_kind(right) == .Float
+	if left_is_numeric && right_is_numeric && left_is_int != right_is_int {
+		code = "E_TYPE"
+		message = "numeric operands must have the same kind"
+	}
+
+	payload := v.value_list(state.allocator, []v.Value{left, right})
+	state.error = v.value_error(
+		state.allocator,
+		v.symbol_intern(code),
+		message,
+		true,
+		payload,
+		true,
+	)
+	state.status = .Failed
+}
+
+// Truthiness used by conditions, `&&`, `||`, `!`, and `require`: false, an
+// empty list, and an empty relation are falsy; everything else is truthy.
 vm_truthy :: proc(value: v.Value) -> bool {
 	#partial switch v.value_kind(value) {
 	case .Bool:
@@ -1730,7 +1757,7 @@ vm_unary :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	case .Neg:
 		result, ok := v.value_checked_neg(source)
 		if !ok {
-			vm_fail(state, "E_ARITHMETIC", "negation failed")
+			vm_fail(state, "E_ARITH", "invalid unary arithmetic")
 			return false
 		}
 		state.registers[base + int(instr.a)] = result

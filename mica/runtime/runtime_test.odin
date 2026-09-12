@@ -803,6 +803,173 @@ assert Caught(indexed())
 }
 
 @(test)
+test_run_arithmetic_error_codes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb classify(which)
+  try
+    if which == 1
+      return 1 / 0
+    elseif which == 2
+      return 1.0 / 0.0
+    elseif which == 3
+      let big = 36028797018963967
+      return big + 1
+    elseif which == 4
+      return 4 / 2.0
+    elseif which == 5
+      return 5 / 2
+    elseif which == 6
+      return 1 % 0
+    elseif which == 7
+      let most_negative = -36028797018963967 - 1
+      return -most_negative
+    elseif which == 8
+      return 3.4028235e38 * 3.4028235e38
+    end
+    return 0
+  catch E_DIV
+    return 10
+  catch E_TYPE
+    return 20
+  catch E_ARITH
+    return 30
+  end
+end
+require classify(1) == 10
+require classify(2) == 10
+require classify(3) == 30
+require classify(4) == 20
+require classify(5) == 30
+require classify(6) == 10
+require classify(7) == 30
+require classify(8) == 30
+require classify(0) == 0
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_arithmetic_codes_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the arithmetic codes test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	// No E_ARITHMETIC arm exists, so a stray E_ARITHMETIC aborts the filein.
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}
+
+@(test)
+test_run_explicit_numeric_conversions :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb convert(which)
+  try
+    if which == 1
+      return to_float(5) / to_float(2)
+    elseif which == 2
+      return to_int(4.0 / 2.0)
+    elseif which == 3
+      return to_int(7.5)
+    end
+    return 0
+  catch E_TYPE
+    return -1
+  end
+end
+require convert(1) == 2.5
+require convert(2) == 2
+require convert(3) == -1
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_numeric_conversion_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the numeric conversion test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}
+
+@(test)
+test_run_require_rejects_empty_list :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb probe(which)
+  try
+    if which == 1
+      require []
+    elseif which == 2
+      require [1]
+      return 2
+    elseif which == 3
+      require []
+      return 3
+    elseif which == 4
+      require none
+    elseif which == 5
+      require [] {}
+    end
+    return 0
+  catch E_REQUIRE
+    return 42
+  end
+end
+require probe(1) == 42
+require probe(2) == 2
+require probe(3) == 42
+require probe(4) == 42
+require probe(5) == 42
+require probe(0) == 0
+`
+	directory, directory_err := os.temp_dir(context.temp_allocator)
+	if directory_err != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	path := fmt.aprintf(
+		"%s/mica_require_truthiness_test.mica",
+		directory,
+		allocator = context.temp_allocator,
+	)
+	if write_err := os.write_entire_file(path, source); write_err != nil {
+		testing.expect(t, false, "cannot write the require truthiness test file")
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}
+
+@(test)
 test_run_try_finally_paths :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:Cleanup, 1)
