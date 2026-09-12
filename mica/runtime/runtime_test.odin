@@ -1422,6 +1422,53 @@ assert Taken(#alice, #coin)
 }
 
 @(test)
+test_run_positional_dispatch_restrictions :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:template/name)
+make_identity(:template/conjugation)
+make_identity(:alice)
+
+verb render_part(part @ #string, bindings, viewer)
+  return :text
+end
+
+verb render_part(part @ #template/name<_>, bindings, viewer)
+  return :name
+end
+
+verb render_part(part @ #template/conjugation<_>, bindings, viewer)
+  return :conjugation
+end
+
+verb pick(part, x)
+  return :any
+end
+
+verb pick(part @ #template/name<_>, x)
+  return :name
+end
+
+require(render_part(frob(#template/name, {:binding -> #alice}), {}, #alice) == :name)
+require(render_part(frob(#template/conjugation, {:binding -> #alice}), {}, #alice) == :conjugation)
+require(render_part("plain", {}, #alice) == :text)
+require(pick(frob(#template/name, {:binding -> #alice}), #alice) == :name)
+require(pick("plain", #alice) == :any)
+`
+	path, path_ok := write_temp_source(t, "mica_positional_dispatch_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}
+
+@(test)
 test_run_return_in_finally :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:Ran, 1)

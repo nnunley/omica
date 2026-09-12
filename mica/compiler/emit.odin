@@ -70,6 +70,8 @@ Emitter :: struct {
 	next_register: int,
 	max_register:  int,
 	functions:     map[string]int,
+	verb_declarations: map[string]int,
+	verb_restricted:   map[string]bool,
 	break_patches: [dynamic]int,
 	continue_targets: [dynamic]int,
 	loop_depth: int,
@@ -102,6 +104,8 @@ compile_program :: proc(
 		scopes    = make([dynamic]Scope),
 		locals    = make([dynamic]Local),
 		functions = make(map[string]int),
+		verb_declarations = make(map[string]int),
+		verb_restricted = make(map[string]bool),
 		break_patches = make([dynamic]int),
 		continue_targets = make([dynamic]int),
 		pending_functions = make([dynamic]Pending_Function),
@@ -110,6 +114,8 @@ compile_program :: proc(
 		delete(emitter.scopes)
 		delete(emitter.locals)
 		delete(emitter.functions)
+		delete(emitter.verb_declarations)
+		delete(emitter.verb_restricted)
 		delete(emitter.break_patches)
 		delete(emitter.continue_targets)
 		delete(emitter.pending_functions)
@@ -137,6 +143,12 @@ compile_program :: proc(
 		vm.builder_end_function(&builder)
 		_ = set_param_metadata(&emitter, index, verb.params)
 		emitter.functions[verb.name] = index
+		emitter.verb_declarations[verb.name] = emitter.verb_declarations[verb.name] + 1
+		for param in verb.params {
+			if param.has_restriction && param.restriction != nil {
+				emitter.verb_restricted[verb.name] = true
+			}
+		}
 		append(&verb_slots, index)
 	}
 
@@ -1281,8 +1293,22 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 	}
 	first_argument := marshal_arguments(emitter, argument_registers[:])
 
-	// A directly callable verb.
+	// A directly callable verb. Overloaded or restricted names must go through
+	// dispatch so every declaration is considered and restrictions are checked.
 	if function_index, found := emitter.functions[text]; found {
+		if emitter.verb_declarations[text] > 1 || emitter.verb_restricted[text] {
+			selector := emit_constant(emitter, v.value_symbol(v.symbol_intern(text)))
+			destination := alloc_register(emitter)
+			vm.builder_emit(
+				emitter.builder,
+				.Positional_Dispatch,
+				u8(len(call.args)),
+				i32(destination),
+				i32(selector),
+				i32(first_argument),
+			)
+			return destination, true
+		}
 		destination := alloc_register(emitter)
 		vm.builder_emit(
 			emitter.builder,
