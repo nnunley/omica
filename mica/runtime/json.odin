@@ -176,7 +176,7 @@ JSON_Parser :: struct {
 	pos:  int,
 }
 
-@(private)
+// Decodes a JSON document into a Mica value. Exported for host use.
 json_decode_text :: proc(
 	allocator: mem.Allocator,
 	text: string,

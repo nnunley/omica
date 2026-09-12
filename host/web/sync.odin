@@ -4,6 +4,7 @@
 // queues a snapshot. The stream writes SSE chunks from the session queue.
 package web
 
+import "core:fmt"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -50,8 +51,7 @@ sync_handle_request :: proc(
 	}
 	envelope, decoded := sync_decode_envelope(request.body)
 	if !decoded {
-		http_response_text(response, 400, "text/plain; charset=utf-8", "invalid sync envelope")
-		return true
+		return sync_handle_dom_event(host, actor, request, response)
 	}
 	switch envelope.kind {
 	case .Need_View:
@@ -100,6 +100,73 @@ sync_handle_request :: proc(
 	case .View_Snapshot, .View_Delta:
 		// Client view state is not forwarded into the world yet.
 	}
+	response.status = 202
+	return true
+}
+
+// Handles a JSON DOM event from the client: dispatch `sync_event` as the
+// session actor, then render the view so the delta comes back down the stream.
+@(private)
+sync_handle_dom_event :: proc(
+	host: ^Sync_Host,
+	actor: v.Value,
+	request: ^Http_Request,
+	response: ^Http_Response,
+) -> bool {
+	event, parsed := dom_event_decode(request.body, context.temp_allocator)
+	if !parsed {
+		http_response_text(response, 400, "text/plain; charset=utf-8", "invalid sync envelope")
+		return true
+	}
+	session := sync_host_ensure_session(host, event.session_id, actor)
+	session_value, _ := v.value_int(i64(event.session_id))
+	view_value, _ := v.value_int(i64(event.view_id))
+	field_entries := make([]v.Map_Entry, len(event.fields), context.temp_allocator)
+	for field, index in event.fields {
+		field_entries[index] = v.Map_Entry {
+			key   = v.value_symbol(v.symbol_intern(field.name)),
+			value = v.value_string(context.temp_allocator, field.value),
+		}
+	}
+	roles := []k.Role_Pair {
+		{role = v.value_symbol(v.symbol_intern("endpoint")), value = r.world_endpoint(host.world)},
+		{role = v.value_symbol(v.symbol_intern("session")), value = session_value},
+		{role = v.value_symbol(v.symbol_intern("view")), value = view_value},
+		{
+			role = v.value_symbol(v.symbol_intern("event")),
+			value = v.value_string(context.temp_allocator, event.event),
+		},
+		{
+			role = v.value_symbol(v.symbol_intern("target")),
+			value = v.value_string(context.temp_allocator, event.target),
+		},
+		{
+			role = v.value_symbol(v.symbol_intern("action")),
+			value = v.value_string(context.temp_allocator, event.action),
+		},
+		{
+			role = v.value_symbol(v.symbol_intern("fields")),
+			value = v.value_map(context.temp_allocator, field_entries),
+		},
+	}
+	event_outcome := sync_world_call(host, session, "sync_event", roles)
+
+	// Send the resulting view. A client behind the current revision gets a
+	// full snapshot; otherwise a delta.
+	view := sync_view_state(session, event.view_id)
+	sync.mutex_lock(&view.render_lock)
+	stale := view.has_tree &&
+		(event.revision != view.revision || event.signature != view.signature)
+	sync.mutex_unlock(&view.render_lock)
+	_ = sync_render_view(
+		host,
+		event.session_id,
+		event.view_id,
+		event.revision,
+		event.signature,
+		stale,
+	)
+	_ = event_outcome
 	response.status = 202
 	return true
 }

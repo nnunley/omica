@@ -231,6 +231,11 @@ world_cancel_subscription :: proc(world: ^World, capability: v.Value) -> bool {
 	return subscriptions_cancel(&world.env, capability)
 }
 
+// The world's default endpoint identity.
+world_endpoint :: proc(world: ^World) -> v.Value {
+	return world.env.endpoint
+}
+
 // The world's default principal and actor identities.
 world_principal :: proc(world: ^World) -> v.Value {
 	return world.env.principal
