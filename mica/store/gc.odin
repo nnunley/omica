@@ -143,6 +143,13 @@ store_pages_compact_locked :: proc(store: ^Store) -> bool {
 		if !read_ok {
 			return false
 		}
+		// A manifest from a different generation is a leftover from a
+		// compaction that crashed mid-rewrite. Its page ids are unusable;
+		// drop it so it cannot wedge compaction forever.
+		if data.generation != store.pages_generation {
+			os.remove(versioned_manifest_path(store, version))
+			continue
+		}
 		append(&manifests, data)
 		for relation in data.relations {
 			for page_id in relation.page_ids {
@@ -205,6 +212,7 @@ store_pages_compact_locked :: proc(store: ^Store) -> bool {
 	if rename_error := os.rename(temp_path, new_path); rename_error != nil {
 		return false
 	}
+	store_sync_dir(store.path)
 
 	// Rewrite retained manifests with remapped ids and the new generation.
 	for &data in manifests {
@@ -286,6 +294,12 @@ store_gc_if_needed :: proc(store: ^Store) {
 		data, read_ok := store_manifest_read(store, versioned_manifest_path(store, version))
 		if !read_ok {
 			return
+		}
+		// See store_pages_compact_locked: an interrupted compaction can leave
+		// a manifest from the old generation behind. Drop it.
+		if data.generation != store.pages_generation {
+			os.remove(versioned_manifest_path(store, version))
+			continue
 		}
 		for relation in data.relations {
 			for page_id in relation.page_ids {

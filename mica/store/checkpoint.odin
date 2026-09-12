@@ -350,6 +350,7 @@ store_manifest_write_to :: proc(store: ^Store, path: string, data: ^Manifest_Dat
 	if rename_error := os.rename(temp_path, path); rename_error != nil {
 		return false
 	}
+	store_sync_dir(store.path)
 	return true
 }
 
@@ -470,6 +471,7 @@ store_checkpoint_internal :: proc(store: ^Store, kernel: ^k.Kernel, wait: bool) 
 	store.manifest_relations = owned
 	sync.atomic_store(&store.checkpoint_version, snapshot.version)
 	store_gc_if_needed(store)
+	store_rebase_copy_arena(store)
 	return true
 }
 

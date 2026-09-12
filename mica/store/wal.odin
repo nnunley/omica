@@ -482,6 +482,7 @@ store_wal_rotate :: proc(store: ^Store, version: u64) -> bool {
 		delete(tail)
 		return false
 	}
+	store_sync_dir(store.path)
 	reopened, reopen_error := os.open(wal_path, os.O_RDWR)
 	if reopen_error != nil {
 		delete(tail)

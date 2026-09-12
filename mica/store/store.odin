@@ -94,6 +94,9 @@ Store :: struct {
 
 	queue:   [dynamic]Queue_Entry,
 	records: [dynamic]Wal_Record,
+	// True while the writer holds a batch whose payloads live in the copy
+	// arena; arena rebasing must not free them.
+	writer_busy: bool,
 	known:   map[k.Relation_ID]bool,
 	durable: u64,
 	// Highest version known to be fully persisted or to have had nothing to
@@ -243,6 +246,121 @@ store_setup :: proc(store: ^Store, options: Store_Options) {
 		panic("failed to initialize store arena")
 	}
 	store.copy_allocator = virtual.arena_allocator(store.arena)
+}
+
+// Deep-copies a write record's arena-owned payloads into `allocator`.
+@(private)
+wal_record_copy :: proc(record: Wal_Record, allocator: mem.Allocator) -> Wal_Record {
+	copied := record
+	if len(record.writes) > 0 {
+		writes := make([]Wal_Write, len(record.writes), allocator)
+		for write, index in record.writes {
+			writes[index] = Wal_Write {
+				relation = write.relation,
+				assert   = write.assert,
+				tuple    = v.tuple_deep_copy(allocator, write.tuple),
+			}
+		}
+		copied.writes = writes
+	}
+	if len(record.catalog) > 0 {
+		catalog := make([]Wal_Catalog, len(record.catalog), allocator)
+		for entry, index in record.catalog {
+			catalog[index] = Wal_Catalog {
+				metadata = clone_metadata(allocator, entry.metadata),
+			}
+		}
+		copied.catalog = catalog
+	}
+	return copied
+}
+
+// Deep-copies one manifest relation's arena-owned payloads into `allocator`.
+@(private)
+checkpoint_relation_copy :: proc(
+	relation: Checkpoint_Relation,
+	allocator: mem.Allocator,
+) -> Checkpoint_Relation {
+	copied := relation
+	copied.metadata = clone_metadata(allocator, relation.metadata)
+	if len(relation.page_ids) > 0 {
+		ids := make([]u32, len(relation.page_ids), allocator)
+		copy(ids, relation.page_ids)
+		copied.page_ids = ids
+	}
+	if len(relation.row_counts) > 0 {
+		counts := make([]u32, len(relation.row_counts), allocator)
+		copy(counts, relation.row_counts)
+		copied.row_counts = counts
+	}
+	return copied
+}
+
+// Replaces the copy arena with a fresh one, migrating the live records and
+// manifests, then destroys the old arena. The arena is otherwise reclaimed
+// only at destroy, so without this every checkpoint leaks the payloads of the
+// records and manifests it supersedes. Skipped while the writer or the queue
+// still references the old arena; a later checkpoint will rebase instead.
+@(private)
+store_rebase_copy_arena :: proc(store: ^Store) {
+	old_arena: ^virtual.Arena
+	old_records: [dynamic]Wal_Record
+	migrated := false
+
+	sync.mutex_lock(&store.lock)
+	if !store.writer_busy && len(store.queue) == 0 && store.reserved_bytes == 0 {
+		new_arena := new(virtual.Arena, store.allocator)
+		if init_error := virtual.arena_init_growing(new_arena); init_error != nil {
+			panic("failed to initialize store arena")
+		}
+		new_allocator := virtual.arena_allocator(new_arena)
+
+		// The record array itself lives on the heap so it can be freed
+		// explicitly; its payloads live in the arena.
+		records := make([dynamic]Wal_Record, store.allocator)
+		for record in store.records {
+			append(&records, wal_record_copy(record, new_allocator))
+		}
+		relations := make(
+			[]Checkpoint_Relation,
+			len(store.manifest_relations),
+			new_allocator,
+		)
+		for relation, index in store.manifest_relations {
+			relations[index] = checkpoint_relation_copy(relation, new_allocator)
+		}
+
+		old_arena = store.arena
+		old_records = store.records
+		store.arena = new_arena
+		store.copy_allocator = new_allocator
+		store.records = records
+		store.manifest_relations = relations
+		migrated = true
+	}
+	sync.mutex_unlock(&store.lock)
+
+	if !migrated {
+		return
+	}
+	delete(old_records)
+	if old_arena != nil {
+		virtual.arena_destroy(old_arena)
+		free(old_arena, store.allocator)
+	}
+}
+
+// Flushes a directory entry so a rename survives a crash. Best effort: some
+// platforms cannot open a directory for sync, and the file contents were
+// already synced before the rename.
+@(private)
+store_sync_dir :: proc(path: string) {
+	dir, open_error := os.open(path, os.O_RDONLY)
+	if open_error != nil {
+		return
+	}
+	os.sync(dir)
+	os.close(dir)
 }
 
 store_destroy :: proc(store: ^Store) {
@@ -621,6 +739,7 @@ store_writer_proc :: proc(data: rawptr) {
 		}
 		append(&batch, ..store.queue[:])
 		clear(&store.queue)
+		store.writer_busy = true
 		sync.mutex_unlock(&store.lock)
 
 		// I/O runs outside the store lock: commits hand off, they do not wait.
@@ -658,6 +777,7 @@ store_writer_proc :: proc(data: rawptr) {
 		if durable {
 			store_update_covered_locked(store)
 		}
+		store.writer_busy = false
 		sync.cond_broadcast(&store.cond)
 		sync.mutex_unlock(&store.lock)
 		clear(&batch)

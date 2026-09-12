@@ -145,6 +145,43 @@ test_store_empty_publish_covered_after_drain :: proc(t: ^testing.T) {
 	store_wait_durable(&store, 2)
 }
 
+// The copy arena must be reclaimed across checkpoints; without rebasing, the
+// payloads of superseded records and manifests accumulate for the process
+// lifetime (long-run OOM).
+@(test)
+test_store_arena_rebase_reclaims :: proc(t: ^testing.T) {
+	store: Store
+	store_init(&store, Store_Options{})
+	defer store_destroy(&store)
+
+	sync.mutex_lock(&store.lock)
+	// Dead payloads, as superseded records and manifests would leave behind.
+	for _ in 0 ..< 256 {
+		_ = make([]u8, 4096, store.copy_allocator)
+	}
+	// One live record whose payload must survive the migration.
+	one, _ := v.value_int(42)
+	writes := make([]Wal_Write, 1, store.copy_allocator)
+	writes[0] = Wal_Write {
+		relation = 1,
+		assert   = true,
+		tuple    = v.tuple_new(store.copy_allocator, []v.Value{one}),
+	}
+	append(&store.records, Wal_Record{version = 1, writes = writes})
+	before := store.arena.total_used
+	sync.mutex_unlock(&store.lock)
+
+	store_rebase_copy_arena(&store)
+
+	testing.expect(t, store.arena.total_used < before)
+	testing.expect(t, len(store.records) == 1)
+	values := v.tuple_values(store.records[0].writes[0].tuple)
+	testing.expect(t, len(values) == 1)
+	migrated, is_int := v.value_as_int(values[0])
+	testing.expect(t, is_int)
+	testing.expect_value(t, migrated, i64(42))
+}
+
 @(private)
 create_named_relation :: proc(t: ^testing.T, kernel: ^k.Kernel, id: u32, name: string, arity: u16, durability: k.Relation_Durability) {
 	metadata := k.relation_metadata(k.Relation_ID(id), v.symbol_intern(name), arity)
