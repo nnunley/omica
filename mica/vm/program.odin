@@ -773,12 +773,18 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if instr.a < 0 {
 					return .Bad_Function
 				}
+				if int(instr.a) < function.code_offset || int(instr.a) >= code_end {
+					return .Bad_Jump
+				}
 				if instr.b >= 0 && !valid_register(instr.b, register_count) {
 					return .Bad_Register
 				}
 			case .Push_Finally:
 				if instr.a < 0 {
 					return .Bad_Function
+				}
+				if int(instr.a) < function.code_offset || int(instr.a) >= code_end {
+					return .Bad_Jump
 				}
 			case .Pop_Handler:
 			case .Resume_Return:

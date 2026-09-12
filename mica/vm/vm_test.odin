@@ -1176,3 +1176,31 @@ test_vm_dispatch_opcode :: proc(t: ^testing.T) {
 	testing.expect_value(t, code, "E_DISPATCH")
 	testing.expect_value(t, error.message, "ambiguous method dispatch")
 }
+
+// Handler targets must point inside the function's code range.
+@(test)
+test_program_validation_rejects_bad_handler_target :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 1, true)
+	builder_emit(&builder, .Push_Handler, 0, 9999, -1, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.Bad_Jump)
+
+	builder2: Builder
+	builder_init(&builder2)
+	defer builder_destroy(&builder2)
+	builder_begin_function(&builder2, v.symbol_intern("main"), 0, 1, true)
+	builder_emit(&builder2, .Push_Finally, 0, 9999, 0, 0)
+	builder_emit(&builder2, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder2)
+	program2 := builder_build(&builder2, alloc)
+	testing.expect_value(t, program_validate(program2), Program_Error.Bad_Jump)
+}
