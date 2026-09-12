@@ -129,6 +129,12 @@ subscriptions_register :: proc(
 	subscription.cursor = cursor_value
 	subscription.queue_budget = queue_budget
 	subscription.baseline = baseline
+	// A relation subscription resumed from an older cursor cannot be given a
+	// baseline as of that cursor, so its first delivery is a replacement
+	// snapshot rather than a silent gap in the reported changes.
+	if subject == .Relation && has_cursor {
+		subscription.needs_resynchronization = true
+	}
 	env.subscriptions.entries[subscription_id] = subscription
 	sync.mutex_unlock(&env.subscriptions.lock)
 

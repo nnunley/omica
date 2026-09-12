@@ -3966,3 +3966,45 @@ end
 	expect_relation_rows(t, &kernel, "Allowed", 1)
 	expect_relation_rows(t, &kernel, "Denied", 0)
 }
+
+// Resuming a relation subscription from an older cursor cannot reconstruct the
+// baseline at that cursor, so it must resynchronize rather than silently skip
+// the changes made while disconnected.
+@(test)
+test_run_subscription_relation_resume_resyncs :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Base, 1)
+make_relation(:Derived, 1)
+make_relation(:Out, 1)
+Derived(x) :- Base(x)
+let [receiver, sender] = mailbox()
+assert Base(1)
+commit()
+let sub_one = subscribe_changes(sender, :relation, some(:Derived), [none], :changes)
+assert Base(2)
+commit()
+let ready_one = mailbox_recv([receiver])
+let cursor = index_or(ready_one[0][1][0], :cursor, 0)
+cancel_subscription(sub_one)
+assert Base(3)
+commit()
+let sub_two = subscribe_changes(sender, :relation, some(:Derived), [none], :changes, some(cursor))
+assert Out(1)
+commit()
+let ready_two = mailbox_recv([receiver], 500)
+require(len(ready_two) > 0)
+`
+	path, path_ok := write_temp_source(t, "mica_subscription_resume_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}
