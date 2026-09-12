@@ -99,6 +99,10 @@ Store :: struct {
 	// Highest version known to be fully persisted or to have had nothing to
 	// persist. Empty publishes advance it; `wait_durable` accepts either.
 	covered: u64,
+	// Highest version published with nothing to persist that is still waiting
+	// for earlier queued writes to drain. Once the queue and all in-flight
+	// reservations are empty, `covered` advances to at least this version.
+	covered_target: u64,
 
 	warn_after: time.Duration,
 	timeout:    time.Duration,
@@ -393,6 +397,23 @@ store_hooks :: proc(store: ^Store) -> k.Store_Hooks {
 	}
 }
 
+// Advances `covered` to the highest version whose persistence is settled. A
+// version with nothing to persist (an empty publish) is covered once every
+// earlier queued write and reservation has drained. Caller holds `store.lock`.
+@(private)
+store_update_covered_locked :: proc(store: ^Store) {
+	if len(store.queue) != 0 || store.reserved_bytes != 0 {
+		return
+	}
+	target := store.durable
+	if store.covered_target > target {
+		target = store.covered_target
+	}
+	if target > store.covered {
+		store.covered = target
+	}
+}
+
 // Blocks until `version` is durable. A version with no persistable writes is
 // covered as soon as everything published before it is written.
 store_wait_durable :: proc(store: ^Store, version: u64) {
@@ -545,9 +566,13 @@ store_publish_hook :: proc(
 			delete_key(&store.tickets, ticket)
 			store.reserved_bytes -= bytes
 		}
-		if len(store.queue) == 0 && store.reserved_bytes == 0 && version > store.covered {
-			store.covered = version
+		if version > store.covered_target {
+			store.covered_target = version
 		}
+		if version > store.covered_target {
+			store.covered_target = version
+		}
+		store_update_covered_locked(store)
 		sync.cond_broadcast(&store.cond)
 		sync.mutex_unlock(&store.lock)
 		return
@@ -626,12 +651,12 @@ store_writer_proc :: proc(data: rawptr) {
 					store.durable = entry.version
 				}
 			}
-			if len(store.queue) == 0 && store.durable > store.covered {
-				store.covered = store.durable
-			}
 		}
 		for entry in batch {
 			store.reserved_bytes -= entry.bytes
+		}
+		if durable {
+			store_update_covered_locked(store)
 		}
 		sync.cond_broadcast(&store.cond)
 		sync.mutex_unlock(&store.lock)

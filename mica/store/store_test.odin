@@ -106,6 +106,45 @@ test_store_admission_budget :: proc(t: ^testing.T) {
 	testing.expect_value(t, store_reserved_bytes(&store), i64(0))
 }
 
+// A version that published nothing durable must still be covered once the
+// writes queued ahead of it drain. Regression: `covered` was only advanced
+// when the queue was already empty, so `wait_durable` on the empty version
+// blocked forever.
+@(test)
+test_store_empty_publish_covered_after_drain :: proc(t: ^testing.T) {
+	store: Store
+	store_init(&store, Store_Options{})
+	defer store_destroy(&store)
+
+	// A durable write at version 1 is queued and still in flight.
+	sync.mutex_lock(&store.lock)
+	append(&store.queue, Queue_Entry{version = 1, bytes = 4})
+	store.reserved_bytes = 4
+	sync.mutex_unlock(&store.lock)
+
+	// Version 2 publishes with nothing to persist while version 1 is queued:
+	// it must not be reported covered yet.
+	sync.mutex_lock(&store.lock)
+	store.covered_target = 2
+	store_update_covered_locked(&store)
+	testing.expect(t, store.covered < 2)
+	sync.mutex_unlock(&store.lock)
+
+	// The writer drains version 1 and releases the reservation.
+	sync.mutex_lock(&store.lock)
+	clear(&store.queue)
+	store.reserved_bytes = 0
+	if store.durable < 1 {
+		store.durable = 1
+	}
+	store_update_covered_locked(&store)
+	testing.expect(t, store.covered >= 2)
+	sync.mutex_unlock(&store.lock)
+
+	// wait_durable(2) returns instead of blocking.
+	store_wait_durable(&store, 2)
+}
+
 @(private)
 create_named_relation :: proc(t: ^testing.T, kernel: ^k.Kernel, id: u32, name: string, arity: u16, durability: k.Relation_Durability) {
 	metadata := k.relation_metadata(k.Relation_ID(id), v.symbol_intern(name), arity)
