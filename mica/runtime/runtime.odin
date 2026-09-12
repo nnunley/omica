@@ -460,6 +460,9 @@ assert_relation_facts :: proc(
 	env: ^Builtin_Env,
 	relations: []k.Relation_Metadata,
 ) -> Run_Result {
+	// NOTE: the transient tuple arrays below use the temp allocator.
+	// transaction_assert deep-copies synchronously, so nothing outlives the
+	// call; allocating them in env.allocator would leak one array per fact.
 	if len(relations) == 0 {
 		return Run_Result{ok = true, message = "loaded"}
 	}
@@ -477,21 +480,21 @@ assert_relation_facts :: proc(
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_RELATION_ID,
-			v.tuple_new(env.allocator, []v.Value{identity}),
+			v.tuple_new(context.temp_allocator, []v.Value{identity}),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "Relation", err)
 		}
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_RELATION_NAME_ID,
-			v.tuple_new(env.allocator, []v.Value{identity, v.value_symbol(metadata.name)}),
+			v.tuple_new(context.temp_allocator, []v.Value{identity, v.value_symbol(metadata.name)}),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "RelationName", err)
 		}
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_ARITY_ID,
-			v.tuple_new(env.allocator, []v.Value{identity, arity_value}),
+			v.tuple_new(context.temp_allocator, []v.Value{identity, arity_value}),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "Arity", err)
 		}
@@ -502,7 +505,7 @@ assert_relation_facts :: proc(
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_RELATION_DURABILITY_ID,
-			v.tuple_new(env.allocator, []v.Value {
+			v.tuple_new(context.temp_allocator, []v.Value {
 				identity,
 				v.value_symbol(v.symbol_intern(durability_name)),
 			}),
@@ -517,7 +520,7 @@ assert_relation_facts :: proc(
 			if err := k.transaction_assert(
 				&tx,
 				k.SYSTEM_ARGUMENT_NAME_ID,
-				v.tuple_new(env.allocator, []v.Value {
+				v.tuple_new(context.temp_allocator, []v.Value {
 					identity,
 					value_int_must(i64(position)),
 					v.value_symbol(name),
@@ -537,7 +540,7 @@ assert_relation_facts :: proc(
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_CONFLICT_POLICY_ID,
-			v.tuple_new(env.allocator, []v.Value {
+			v.tuple_new(context.temp_allocator, []v.Value {
 				identity,
 				v.value_symbol(v.symbol_intern(policy_name)),
 			}),
@@ -549,7 +552,7 @@ assert_relation_facts :: proc(
 				if err := k.transaction_assert(
 					&tx,
 					k.SYSTEM_FUNCTIONAL_KEY_ID,
-					v.tuple_new(env.allocator, []v.Value {
+					v.tuple_new(context.temp_allocator, []v.Value {
 						identity,
 						value_int_must(i64(slot)),
 						value_int_must(i64(position)),
@@ -569,7 +572,7 @@ assert_relation_facts :: proc(
 			if err := k.transaction_assert(
 				&tx,
 				k.SYSTEM_INDEX_ID,
-				v.tuple_new(env.allocator, []v.Value{identity, index_value}),
+				v.tuple_new(context.temp_allocator, []v.Value{identity, index_value}),
 			); err != k.Kernel_Error.None {
 				return catalog_error(env, "Index", err)
 			}
@@ -589,7 +592,7 @@ assert_relation_facts :: proc(
 				if err := k.transaction_assert(
 					&tx,
 					k.SYSTEM_INDEX_POSITION_ID,
-					v.tuple_new(env.allocator, []v.Value {
+					v.tuple_new(context.temp_allocator, []v.Value {
 						index_value,
 						value_int_must(i64(slot)),
 						value_int_must(i64(position)),
@@ -601,7 +604,7 @@ assert_relation_facts :: proc(
 			if err := k.transaction_assert(
 				&tx,
 				k.SYSTEM_INDEX_STORAGE_KIND_ID,
-				v.tuple_new(env.allocator, []v.Value {
+				v.tuple_new(context.temp_allocator, []v.Value {
 					index_value,
 					v.value_symbol(v.symbol_intern(storage)),
 				}),
@@ -647,7 +650,7 @@ assert_named_identities :: proc(env: ^Builtin_Env, entries: []Named_Identity) ->
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_NAMED_IDENTITY_ID,
-			v.tuple_new(env.allocator, []v.Value{entry.identity, v.value_symbol(entry.name)}),
+			v.tuple_new(context.temp_allocator, []v.Value{entry.identity, v.value_symbol(entry.name)}),
 		); err != k.Kernel_Error.None {
 			return Run_Result{ok = false, message = fmt.aprintf(
 				"cannot record named identity: %v",
@@ -685,10 +688,10 @@ assert_unit_sources :: proc(env: ^Builtin_Env, entries: []Unit_Source_Fact) -> R
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_UNIT_SOURCE_ID,
-			v.tuple_new(env.allocator, []v.Value{
+			v.tuple_new(context.temp_allocator, []v.Value{
 				ordinal,
 				v.value_symbol(entry.unit),
-				v.value_string(env.allocator, entry.source),
+				v.value_string(context.temp_allocator, entry.source),
 			}),
 		); err != k.Kernel_Error.None {
 			return Run_Result{ok = false, message = fmt.aprintf(
@@ -737,23 +740,23 @@ assert_rule_facts :: proc(env: ^Builtin_Env, rules: []Rule_Fact) -> Run_Result {
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_RULE_ID,
-			v.tuple_new(env.allocator, []v.Value{identity}),
+			v.tuple_new(context.temp_allocator, []v.Value{identity}),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "Rule", err)
 		}
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_RULE_HEAD_ID,
-			v.tuple_new(env.allocator, []v.Value{identity, head}),
+			v.tuple_new(context.temp_allocator, []v.Value{identity, head}),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "RuleHead", err)
 		}
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_RULE_SOURCE_ID,
-			v.tuple_new(env.allocator, []v.Value {
+			v.tuple_new(context.temp_allocator, []v.Value {
 				identity,
-				v.value_string(env.allocator, rule_fact.source),
+				v.value_string(context.temp_allocator, rule_fact.source),
 			}),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "RuleSource", err)
@@ -761,7 +764,7 @@ assert_rule_facts :: proc(env: ^Builtin_Env, rules: []Rule_Fact) -> Run_Result {
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_ACTIVE_RULE_ID,
-			v.tuple_new(env.allocator, []v.Value {
+			v.tuple_new(context.temp_allocator, []v.Value {
 				identity,
 				v.value_bool(rule_fact.active),
 			}),
@@ -1195,7 +1198,7 @@ builtin_set_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		return v.Value(0), false
 	}
 
-	new_tuple := v.tuple_new(env.allocator, []v.Value{receiver, value})
+	new_tuple := v.tuple_new(context.temp_allocator, []v.Value{receiver, value})
 	if has_existing {
 		if v.tuple_eq(existing, new_tuple) {
 			return value, true

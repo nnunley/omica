@@ -89,7 +89,7 @@ install_methods :: proc(
 			if err := k.transaction_assert(
 				&tx,
 				k.DISPATCH_METHOD_SELECTOR_ID,
-				v.tuple_new(env.allocator, []v.Value{method_value, selector}),
+				v.tuple_new(context.temp_allocator, []v.Value{method_value, selector}),
 			); err != k.Kernel_Error.None {
 				return method_install_error(env, verb.name, err)
 			}
@@ -98,7 +98,7 @@ install_methods :: proc(
 			if err := k.transaction_assert(
 				&tx,
 				k.DISPATCH_METHOD_PROGRAM_ID,
-				v.tuple_new(env.allocator, []v.Value{method_value, program_value}),
+				v.tuple_new(context.temp_allocator, []v.Value{method_value, program_value}),
 			); err != k.Kernel_Error.None {
 				return method_install_error(env, verb.name, err)
 			}
@@ -107,9 +107,9 @@ install_methods :: proc(
 				if err := k.transaction_assert(
 					&tx,
 					k.SYSTEM_METHOD_SOURCE_ID,
-					v.tuple_new(env.allocator, []v.Value {
+					v.tuple_new(context.temp_allocator, []v.Value {
 						method_value,
-						v.value_string(env.allocator, source_text),
+						v.value_string(context.temp_allocator, source_text),
 					}),
 				); err != k.Kernel_Error.None {
 					return method_install_error(env, verb.name, err)
@@ -129,7 +129,7 @@ install_methods :: proc(
 				if err := k.transaction_assert(
 					&tx,
 					k.DISPATCH_PARAM_ID,
-					v.tuple_new(env.allocator, []v.Value {
+					v.tuple_new(context.temp_allocator, []v.Value {
 						method_value,
 						v.value_symbol(v.symbol_intern(param.name)),
 						restriction,

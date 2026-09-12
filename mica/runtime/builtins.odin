@@ -247,7 +247,7 @@ builtin_assume_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 		if err := k.transaction_retract(
 			state.transaction,
 			k.SYSTEM_ENDPOINT_ACTOR_ID,
-			v.tuple_new(env.allocator, []v.Value{state.endpoint, previous_actor}),
+			v.tuple_new(context.temp_allocator, []v.Value{state.endpoint, previous_actor}),
 		); err != .None {
 			return builtin_error(
 				state,
@@ -258,7 +258,7 @@ builtin_assume_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 		if err := k.transaction_assert(
 			state.transaction,
 			k.SYSTEM_ENDPOINT_ACTOR_ID,
-			v.tuple_new(env.allocator, []v.Value{state.endpoint, args[0]}),
+			v.tuple_new(context.temp_allocator, []v.Value{state.endpoint, args[0]}),
 		); err != .None {
 			return builtin_error(
 				state,
@@ -1413,7 +1413,7 @@ rule_active_builtin :: proc(
 		if err := k.transaction_retract(
 			state.transaction,
 			k.SYSTEM_ACTIVE_RULE_ID,
-			v.tuple_new(env.allocator, []v.Value{rule_value, v.value_bool(!active)}),
+			v.tuple_new(context.temp_allocator, []v.Value{rule_value, v.value_bool(!active)}),
 		); err != .None {
 			return builtin_error(
 				state,
@@ -1424,7 +1424,7 @@ rule_active_builtin :: proc(
 		if err := k.transaction_assert(
 			state.transaction,
 			k.SYSTEM_ACTIVE_RULE_ID,
-			v.tuple_new(env.allocator, []v.Value{rule_value, v.value_bool(active)}),
+			v.tuple_new(context.temp_allocator, []v.Value{rule_value, v.value_bool(active)}),
 		); err != .None {
 			return builtin_error(
 				state,
