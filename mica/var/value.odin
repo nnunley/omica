@@ -530,6 +530,13 @@ value_to_int :: proc(v: Value) -> (Value, bool) {
 		if f != math.trunc(f) {
 			return Value(0), false
 		}
+		// i64(f) is undefined for out-of-range floats, so bound the float
+		// before converting; value_int then enforces the 56-bit range.
+		// f32(INT_MAX) rounds up to 2^55, so f above it is out of range
+		// while f equal to it still converts safely and fails below.
+		if f < f32(INT_MIN) || f > f32(INT_MAX) {
+			return Value(0), false
+		}
 		return value_int(i64(f))
 	}
 	if _, ok := value_as_int(v); ok {

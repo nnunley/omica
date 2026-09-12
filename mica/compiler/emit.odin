@@ -1724,6 +1724,12 @@ emit_receiver_dispatch :: proc(
 	emitter: ^Emitter,
 	call: Receiver_Call,
 ) -> (int, bool) {
+	// Receiver calls bypass emit_call, so enforce the argument limit here:
+	// the count below is a u8 and includes the receiver.
+	if len(call.args) > 254 {
+		push_error(emitter, "a call may take at most 255 arguments")
+		return -1, false
+	}
 	receiver, receiver_ok := emit_expr(emitter, call.receiver)
 	if !receiver_ok {
 		return -1, false
@@ -3532,6 +3538,9 @@ emit_short_circuit :: proc(emitter: ^Emitter, binary: Binary) -> (int, bool) {
 
 		right, right_ok := emit_expr(emitter, binary.right)
 		if !right_ok {
+			// The right side diverges (for example `return`): the falsy
+			// path already holds false, so skip the dead code it emitted.
+			patch_jump(emitter, end_jump, current_offset(emitter))
 			return -1, false
 		}
 		vm.builder_emit(emitter.builder, .Move, 0, i32(result), i32(right), 0)

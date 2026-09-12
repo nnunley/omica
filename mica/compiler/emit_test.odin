@@ -310,6 +310,61 @@ test_emit_short_circuit :: proc(t: ^testing.T) {
 	state_or := run_test_program(t, program_or, allocator)
 	defer vm.vm_destroy(&state_or)
 	expect_int_result(t, &state_or, 7)
+
+	// A diverging right side (`return`) must not execute for a falsy left
+	// side. Regression: the falsy path fell through into the return.
+	diverge := "return false && return 1"
+	program_diverge := compile_test_program(t, diverge, &ctx, allocator)
+	state_diverge := run_test_program(t, program_diverge, allocator)
+	defer vm.vm_destroy(&state_diverge)
+	if one, is_int := v.value_as_int(state_diverge.result); is_int {
+		testing.expectf(t, one != 1, "falsy && executed its return: %d", one)
+	}
+
+	// A truthy left side still runs the diverging right side.
+	converge := "return true && return 1"
+	program_converge := compile_test_program(t, converge, &ctx, allocator)
+	state_converge := run_test_program(t, program_converge, allocator)
+	defer vm.vm_destroy(&state_converge)
+	expect_int_result(t, &state_converge, 1)
+}
+
+// Receiver calls carry the receiver in the u8 argument count, so more than
+// 254 arguments would wrap it. They are rejected like over-long plain calls.
+@(test)
+test_emit_receiver_call_argument_limit :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	build_call :: proc(arg_count: int, allocator: mem.Allocator) -> string {
+		builder: strings.Builder
+		strings.builder_init(&builder, allocator)
+		defer strings.builder_destroy(&builder)
+		strings.write_string(&builder, "let x = 1\nlet r = x:foo(")
+		for index in 0 ..< arg_count {
+			if index > 0 {
+				strings.write_string(&builder, ", ")
+			}
+			strings.write_string(&builder, "1")
+		}
+		strings.write_string(&builder, ")")
+		return strings.to_string(builder)
+	}
+
+	ok_ast, ok_parse := parse_program(build_call(254, allocator), allocator)
+	testing.expect_value(t, len(ok_parse), 0)
+	ok_compiled := compile_program(ok_ast, &ctx, allocator)
+	testing.expect_value(t, len(ok_compiled.errors), 0)
+
+	bad_ast, bad_parse := parse_program(build_call(255, allocator), allocator)
+	testing.expect_value(t, len(bad_parse), 0)
+	bad_compiled := compile_program(bad_ast, &ctx, allocator)
+	testing.expect(t, len(bad_compiled.errors) > 0)
 }
 
 @(test)

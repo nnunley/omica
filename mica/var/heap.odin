@@ -393,7 +393,7 @@ value_ephemeral_ok :: proc(v: Value, allow_capabilities: bool) -> bool {
 			return false
 		}
 		for item in values {
-			if !value_is_persistable(item) {
+			if !value_ephemeral_ok(item, allow_capabilities) {
 				return false
 			}
 		}
@@ -404,7 +404,8 @@ value_ephemeral_ok :: proc(v: Value, allow_capabilities: bool) -> bool {
 			return false
 		}
 		for entry in entries {
-			if !value_is_persistable(entry.key) || !value_is_persistable(entry.value) {
+			if !value_ephemeral_ok(entry.key, allow_capabilities) ||
+			   !value_ephemeral_ok(entry.value, allow_capabilities) {
 				return false
 			}
 		}
@@ -414,19 +415,20 @@ value_ephemeral_ok :: proc(v: Value, allow_capabilities: bool) -> bool {
 		if !ok {
 			return false
 		}
-		return value_is_persistable(start) && (!has_end || value_is_persistable(end))
+		return value_ephemeral_ok(start, allow_capabilities) &&
+			(!has_end || value_ephemeral_ok(end, allow_capabilities))
 	case .Error:
 		header, ok := value_as_error(v)
 		if !ok {
 			return false
 		}
-		return !header.has_value || value_is_persistable(header.value)
+		return !header.has_value || value_ephemeral_ok(header.value, allow_capabilities)
 	case .Frob:
 		header, ok := value_as_frob(v)
 		if !ok {
 			return false
 		}
-		return value_is_persistable(header.value)
+		return value_ephemeral_ok(header.value, allow_capabilities)
 	case .Relation:
 		relation, ok := value_as_relation(v)
 		if !ok {
@@ -434,7 +436,7 @@ value_ephemeral_ok :: proc(v: Value, allow_capabilities: bool) -> bool {
 		}
 		for row in relation.rows {
 			for cell in tuple_values(row) {
-				if !value_is_persistable(cell) {
+				if !value_ephemeral_ok(cell, allow_capabilities) {
 					return false
 				}
 			}

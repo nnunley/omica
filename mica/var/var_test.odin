@@ -156,6 +156,20 @@ test_explicit_numeric_conversions :: proc(t: ^testing.T) {
 	// A float outside the integer range does not convert.
 	_, max_float_ok := value_to_int(must_float(3.4028235e38))
 	testing.expect(t, !max_float_ok)
+
+	// Boundary floats around the 56-bit range convert if and only if they
+	// fit. 2^55 itself is just above the maximum and must fail; the largest
+	// integral float below it converts exactly.
+	_, above_max_ok := value_to_int(must_float(f32(i64(1) << 55)))
+	testing.expect(t, !above_max_ok)
+	low_edge, low_edge_ok := value_to_int(must_float(f32(-(i64(1) << 55))))
+	testing.expect(t, low_edge_ok)
+	testing.expect(t, value_eq(low_edge, must_int(INT_MIN)))
+	high_edge, high_edge_ok := value_to_int(
+		must_float(f32((i64(1) << 55) - (i64(1) << 32))),
+	)
+	testing.expect(t, high_edge_ok)
+	testing.expect(t, value_eq(high_edge, must_int((i64(1) << 55) - (i64(1) << 32))))
 }
 
 @(test)
@@ -463,6 +477,16 @@ test_value_is_persistable :: proc(t: ^testing.T) {
 	bad_relation, _ := value_relation(alloc, heading, []Tuple{tuple_new(alloc, []Value{capability})})
 	testing.expect(t, value_is_persistable(good_relation))
 	testing.expect(t, !value_is_persistable(bad_relation))
+
+	// Capabilities nested in collections are storable in a live world even
+	// though the collection cannot be persisted.
+	testing.expect(t, value_is_storable(bad_list))
+	testing.expect(t, value_is_storable(bad_map))
+	testing.expect(t, value_is_storable(bad_range))
+	testing.expect(t, value_is_storable(bad_error))
+	testing.expect(t, value_is_storable(bad_frob))
+	testing.expect(t, value_is_storable(bad_relation))
+	testing.expect(t, !value_is_storable(function))
 }
 
 @(test)
