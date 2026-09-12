@@ -41,3 +41,6 @@ desktop.ini
 
 # Local web host build cache
 .cache/
+
+# mdBook build output
+mdbook/book/

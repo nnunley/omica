@@ -1,0 +1,11 @@
+[book]
+title = "The Mica Guide"
+description = "Learn, build, and operate persistent relational systems with Mica."
+authors = ["Ryan Daum"]
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/rdaum/omica"
+edit-url-template = "https://github.com/rdaum/omica/edit/main/mdbook/{path}"

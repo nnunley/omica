@@ -1,0 +1,218 @@
+# Value-Kind Annotations
+
+Mica code is dynamically typed unless an author adds an exact value-kind annotation at a supported
+boundary. An annotation names one runtime kind and keeps that boundary invariant without changing
+the value:
+
+```mica
+let total: int = 0
+
+fn add(left: int, right: int) -> int
+  return left + right
+end
+```
+
+Annotations are optional. Leaving them out preserves ordinary dynamic Mica behaviour.
+
+## Exact Kinds
+
+The supported source names are:
+
+| Source name  | Runtime value kind           |
+| ------------ | ---------------------------- |
+| `bool`       | Boolean                      |
+| `int`        | 56-bit signed integer        |
+| `float`      | finite binary32 float        |
+| `identity`   | identity                     |
+| `string`     | string                       |
+| `bytes`      | byte string                  |
+| `symbol`     | symbol                       |
+| `error_code` | error code                   |
+| `error`      | raised or caught error value |
+| `capability` | ephemeral capability         |
+| `frob`       | frob                         |
+| `function`   | function value               |
+| `list`       | list                         |
+| `map`        | map                          |
+| `range`      | range                        |
+| `relation`   | immutable relation value     |
+
+These names are contextual rather than reserved words. A local may still be named `int` or
+`relation` when the name is not in an annotation position.
+
+Each value-kind annotation is exact. `int` does not accept `float`, even when the values compare as
+numerically equal. Structural relation types and aliases refine the `relation` kind with headings,
+cell types, alternatives, and cardinality; see
+[Structural Relation Types](./structural-relation-types.md).
+
+## Supported Boundaries
+
+Ordinary `let` and `const` bindings may be annotated. An annotated ordinary binding requires an
+initializer, and every later assignment to a mutable annotated binding must preserve its kind:
+
+```mica
+let count: int = 0
+const label: string = "ready"
+count = count + 1
+```
+
+The invariant also applies to assignments made by a closure that captures the binding.
+
+Required and optional `fn` parameters may be annotated. An optional parameter must have an explicit
+default. A rest parameter is always constructed as a list, so `list` is its only valid annotation:
+
+```mica
+fn describe(item: identity, ?style: symbol = :brief, @details: list) -> string
+  return to_literal([item, style, details])
+end
+
+let render = fn(value: string) -> string => value
+```
+
+One- and two-name `for` bindings may be annotated:
+
+```mica
+for index: int, row: map in rows
+  emit(actor, [index, row])
+end
+```
+
+Scatter bindings support annotations on required, optional, and rest names:
+
+```mica
+let [head: int, ?middle: int = 0, @tail: list] = values
+```
+
+Installed `verb` parameters and results may be annotated:
+
+```mica
+verb echo(value @ #string: string) -> string
+  return value
+end
+```
+
+Brace lambdas, catch bindings, query variables, explicit `method` fileout envelopes, and relation
+rule variables do not currently accept annotations.
+
+## Checks, Proofs, and Errors
+
+Annotations never convert values. The compiler handles an annotated value in one of three ways:
+
+- when it can prove an exact match, it emits no runtime kind check;
+- when it can prove a mismatch, compilation fails at the annotated boundary;
+- when the value is dynamic, it emits one check at that boundary.
+
+A failed dynamic check raises the catchable error code `E_TYPE`. The error identifies the binding or
+parameter, names the expected and actual kinds, and retains the unchanged offending value in
+`err.value`:
+
+```mica,eval
+try
+  match from_literal("\"not an integer\"")
+  case ok(value)
+    let count: int = value
+  case err(problem)
+    raise problem
+  end
+catch E_TYPE as err
+  require err.value == some("not an integer")
+  return [err.message, err.value]
+end
+raise E_TEST, "The annotation should have rejected the string."
+```
+
+Checks occur when a value enters an annotated binding or parameter and before an assignment changes
+an annotated binding. Reading an already checked binding does not check it again.
+
+Function and verb result annotations are different: they are proof-only. Every reachable normal exit
+must have the declared kind, and the compiler emits no check or conversion at `return`. A dynamic
+result must first cross an annotated local boundary:
+
+```mica,eval
+fn decode_count(source: string) -> int
+  return match from_literal(source)
+  case ok(value)
+    let count: int = value
+    count
+  case err(problem)
+    raise problem
+  end
+end
+
+require decode_count("12") == 12
+```
+
+`from_literal` reports parsing success as `ok(value)` and failure as `err(problem)`. The `int`
+annotation checks the successful payload. Unwrapping the result and checking the payload are
+separate boundaries: a well-formed literal can still have the wrong kind for the application.
+
+A body that reaches its end returns its last expression. An empty body and a bare `return` produce
+`()`, whose structural type is `unit` and whose outer kind is `relation`. A scalar result annotation
+rejects those unit-producing paths. The compiler considers each branch, so every normally returning
+branch of `decode_count` must prove an integer; its raising branch has no normal result to check.
+
+## Outer Kinds
+
+An exact outer kind does not imply a structural or behavioural contract:
+
+- `identity` says only that the value is an identity. It says nothing about the identity's facts,
+  prototypes, or relation membership.
+- `frob` says only that the value is a frob. It does not constrain its delegate or payload.
+- `capability` says only that the value is a live capability. It grants no authority, does not make
+  the capability persistable, and does not change serialization rules.
+- `function` says only that the value is a function value. It does not describe parameter or result
+  kinds and does not prove that an arbitrary function call has a particular result.
+- `error` says only that the value is a structured error value. It does not restrict the error code,
+  message, or payload.
+- `relation` accepts every relation value. Use a structural relation type when heading, row shape,
+  discriminator, cell types, or cardinality are part of the contract.
+
+## Dispatch Is Independent
+
+Dispatch restrictions and value-kind annotations serve different phases. In this header:
+
+```mica
+verb inspect(value @ #string: string) -> string
+  return value
+end
+```
+
+`@ #string` helps select the applicable verb through the dispatch system. After selection,
+`: string` constrains the parameter value. An annotation does not affect applicability, specificity,
+fallback selection, or persisted dispatch restriction facts. Two methods cannot be overloaded by
+differing only in value-kind annotations.
+
+## Performance
+
+Declared and inferred exact kinds feed the same compiler facts. Adding an annotation where the
+compiler already proves the kind does not request a different representation and emits no check.
+
+A union establishes an exact outer kind only when all its possible values have that kind. For
+example, `:ready | :waiting` contains only symbols, and two structural relation alternatives both
+have the outer kind `relation`. `int | string` does not establish either kind, and adding `dynamic`
+admits values of every kind. A check against such a union must accept any of its alternatives.
+
+Row counts also describe the resulting value. A relation literal containing two expressions may
+produce one row when both expressions yield equal values. Known constant rows let the compiler count
+distinct values; dynamic rows require bounds that allow duplicates to collapse:
+
+```mica,eval
+fn pair(left, right) -> relation<{:value -> dynamic}> where rows in 1..2
+  return [:value] { [left], [right] }
+end
+
+require pair(7, 7) == [:value] { [7] }
+require pair(7, 8) == [:value] { [7], [8] }
+```
+
+Dynamic boundaries have real cost. An assignment from a dynamic call checks each time it executes,
+and an annotated binding over dynamically typed collection cells checks every yielded element:
+
+```mica
+for value: int in values
+  total = total + value
+end
+```
+
+Use annotations to state an invariant that matters to the program. Do not mechanically annotate
+locals whose exact kinds are already obvious.
