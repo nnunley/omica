@@ -5,8 +5,15 @@ import "core:encoding/base64"
 import "core:fmt"
 import "core:strings"
 
+// Maximum recursion depth used when rendering nested values.
+VALUE_DISPLAY_MAX_DEPTH :: 64
+
 // Writes a value in its display form to `builder`.
-write_value :: proc(builder: ^strings.Builder, v: Value) {
+write_value :: proc(builder: ^strings.Builder, v: Value, depth := 0) {
+	if depth > VALUE_DISPLAY_MAX_DEPTH {
+		strings.write_string(builder, "...")
+		return
+	}
 	switch value_kind(v) {
 	case .Bool:
 		b, _ := value_as_bool(v)
@@ -52,7 +59,7 @@ write_value :: proc(builder: ^strings.Builder, v: Value) {
 			if i != 0 {
 				strings.write_string(builder, ", ")
 			}
-			write_value(builder, value)
+			write_value(builder, value, depth + 1)
 		}
 		strings.write_byte(builder, '}')
 	case .Map:
@@ -62,17 +69,17 @@ write_value :: proc(builder: ^strings.Builder, v: Value) {
 			if i != 0 {
 				strings.write_string(builder, ", ")
 			}
-			write_value(builder, entry.key)
+			write_value(builder, entry.key, depth + 1)
 			strings.write_string(builder, ": ")
-			write_value(builder, entry.value)
+			write_value(builder, entry.value, depth + 1)
 		}
 		strings.write_byte(builder, ']')
 	case .Range:
 		start, end, has_end, _ := value_as_range(v)
-		write_value(builder, start)
+		write_value(builder, start, depth + 1)
 		strings.write_string(builder, "..")
 		if has_end {
-			write_value(builder, end)
+			write_value(builder, end, depth + 1)
 		} else {
 			strings.write_string(builder, "_")
 		}
@@ -92,13 +99,13 @@ write_value :: proc(builder: ^strings.Builder, v: Value) {
 				strings.write_string(builder, ", none")
 			}
 			strings.write_string(builder, ", ")
-			write_value(builder, error.value)
+			write_value(builder, error.value, depth + 1)
 		}
 		strings.write_byte(builder, ')')
 	case .Frob:
 		frob, _ := value_as_frob(v)
 		fmt.sbprintf(builder, "#%d<", identity_raw(frob.delegate))
-		write_value(builder, frob.value)
+		write_value(builder, frob.value, depth + 1)
 		strings.write_byte(builder, '>')
 	case .Relation:
 		switch {
@@ -133,7 +140,11 @@ value_to_debug_string :: proc(v: Value, alloc := context.allocator) -> string {
 }
 
 // Writes a value in its debug form to `builder`.
-write_value_debug :: proc(builder: ^strings.Builder, v: Value) {
+write_value_debug :: proc(builder: ^strings.Builder, v: Value, depth := 0) {
+	if depth > VALUE_DISPLAY_MAX_DEPTH {
+		strings.write_string(builder, "...")
+		return
+	}
 	#partial switch value_kind(v) {
 	case .String:
 		s, _ := value_as_string(v)
@@ -145,7 +156,7 @@ write_value_debug :: proc(builder: ^strings.Builder, v: Value) {
 			if i != 0 {
 				strings.write_string(builder, ", ")
 			}
-			write_value_debug(builder, value)
+			write_value_debug(builder, value, depth + 1)
 		}
 		strings.write_byte(builder, '}')
 	case .Map:
@@ -155,12 +166,12 @@ write_value_debug :: proc(builder: ^strings.Builder, v: Value) {
 			if i != 0 {
 				strings.write_string(builder, ", ")
 			}
-			write_value_debug(builder, entry.key)
+			write_value_debug(builder, entry.key, depth + 1)
 			strings.write_string(builder, ": ")
-			write_value_debug(builder, entry.value)
+			write_value_debug(builder, entry.value, depth + 1)
 		}
 		strings.write_byte(builder, ']')
 	case:
-		write_value(builder, v)
+		write_value(builder, v, depth)
 	}
 }

@@ -619,6 +619,24 @@ test_display_all_kinds :: proc(t: ^testing.T) {
 	testing.expect_value(t, value_to_string(heap_relation, alloc), "<relation 2x1>")
 }
 
+// Deeply nested values must not recurse without bound; display elides past a
+// depth limit instead of overflowing the stack.
+@(test)
+test_display_depth_limit :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	alloc := context.temp_allocator
+
+	value := must_int(1)
+	for _ in 0 ..< 100 {
+		value = value_list(alloc, []Value{value})
+	}
+	text := value_to_string(value, alloc)
+	testing.expectf(t, strings.contains(text, "..."), "deep value was not elided: %s", text)
+
+	debug := value_to_debug_string(value, alloc)
+	testing.expectf(t, strings.contains(debug, "..."), "deep debug value was not elided: %s", debug)
+}
+
 @(test)
 test_value_float_from_bits :: proc(t: ^testing.T) {
 	valid, valid_ok := value_float_from_bits(transmute(u32)f32(1.5))
