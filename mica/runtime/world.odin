@@ -12,6 +12,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import c "../compiler"
+import s "../store"
 import k "../kernel"
 import vm "../vm"
 import v "../var"
@@ -25,6 +26,9 @@ World_Config :: struct {
 	// Filein unit name for `fileout`. Empty derives one unit per file from
 	// the file's base name without its extension.
 	unit:    string,
+	// Durable store directory. When set and non-empty, the world boots from
+	// the store; otherwise the given sources load and persist into it.
+	store_path: string,
 }
 
 // A relation write applied to a task transaction before it starts.
@@ -49,6 +53,8 @@ World :: struct {
 	program:   ^vm.Program,
 	// Final expanded source text. Compile-context keys are views into it.
 	sources:   [dynamic]string,
+	// Attached durable store. Owned by the world.
+	store:     ^s.Store,
 	entry:     Task_ID,
 	started:   bool,
 }
@@ -68,6 +74,34 @@ world_start :: proc(
 	world.allocator = allocator
 	world.kernel = kernel
 	world.sources = make([dynamic]string, allocator)
+
+	if config.store_path != "" {
+		durable := new(s.Store, allocator)
+		if !s.store_open(durable, s.Store_Options {
+			mode = .File,
+			path = config.store_path,
+		}) {
+			free(durable, allocator)
+			world_destroy(world)
+			return nil, Run_Result{ok = false, message = fmt.aprintf(
+				"cannot open the store at %s",
+				config.store_path,
+				allocator = allocator,
+			)}
+		}
+		world.store = durable
+		s.store_attach(durable, kernel)
+	}
+
+	if world.store != nil && s.store_durable_version(world.store) > 0 {
+		result := world_boot(world, world.store, config)
+		if !result.ok {
+			world_destroy(world)
+			return nil, result
+		}
+		return world, result
+	}
+
 	result := world_load(world, paths, config)
 	if !result.ok {
 		world_destroy(world)
@@ -84,6 +118,12 @@ world_destroy :: proc(world: ^World) {
 	}
 	if world.started {
 		scheduler_destroy(&world.scheduler)
+	}
+	if world.store != nil {
+		k.kernel_detach_store(world.kernel)
+		s.store_destroy(world.store)
+		free(world.store, world.allocator)
+		world.store = nil
 	}
 	subscriptions_destroy(&world.env.subscriptions)
 	if world.program != nil {
@@ -297,8 +337,9 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	defer delete(asts)
 
 	Unit_Entry :: struct {
-		name:   string,
-		source: string,
+		name:    string,
+		source:  string,
+		ordinal: i64,
 	}
 	unit_entries: [dynamic]Unit_Entry
 	unit_entries = make([dynamic]Unit_Entry, allocator)
@@ -351,7 +392,11 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 			unit_name = source_unit_name(path)
 		}
 		if unit_name != "" {
-			append(&unit_entries, Unit_Entry{name = unit_name, source = granted})
+			append(&unit_entries, Unit_Entry {
+				name    = unit_name,
+				source  = granted,
+				ordinal = i64(len(unit_entries)),
+			})
 		}
 	}
 
@@ -370,6 +415,8 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 		unit_sources = make(map[string]string, allocator),
 		allocator    = allocator,
 	}
+	unit_facts: [dynamic]Unit_Source_Fact
+	defer delete(unit_facts)
 	for entry in unit_entries {
 		if existing, found := world.env.unit_sources[entry.name]; found {
 			combined := strings.concatenate(
@@ -381,6 +428,11 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 		} else {
 			world.env.unit_sources[entry.name] = strings.clone(entry.source, allocator)
 		}
+		append(&unit_facts, Unit_Source_Fact {
+			ordinal = entry.ordinal,
+			unit    = v.symbol_intern(entry.name),
+			source  = entry.source,
+		})
 	}
 	subscriptions_init(&world.env.subscriptions, allocator)
 
@@ -409,6 +461,15 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 		if !result.ok {
 			return result
 		}
+	}
+	identity_result := assert_named_identities(&world.env, declarations.named_identities[:])
+	if !identity_result.ok {
+		return identity_result
+	}
+	delete(declarations.named_identities)
+	unit_result := assert_unit_sources(&world.env, unit_facts[:])
+	if !unit_result.ok {
+		return unit_result
 	}
 	if config.actor != "" {
 		actor_value, actor_found := world.ctx.identities[config.actor]
@@ -494,4 +555,299 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	}
 	world.entry = scheduler_submit(&world.scheduler, entry)
 	return Run_Result{ok = true, message = "loaded"}
+}
+
+// Boots a world from an attached store: replay the kernel, rebuild the compile
+// context from durable reflection facts, recompile the persisted unit sources,
+// restore rules, and start the scheduler. The entry task is not submitted
+// because every top-level expression already ran in the original world.
+@(private)
+world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_Result {
+	allocator := world.allocator
+	// Replay without persistence hooks so restored commits do not append to
+	// the log they were read from.
+	k.kernel_detach_store(world.kernel)
+	if !s.store_restore(store, world.kernel) {
+		s.store_attach(store, world.kernel)
+		return Run_Result{ok = false, message = "cannot restore the stored world"}
+	}
+	s.store_attach(store, world.kernel)
+
+	world.ctx = c.Compile_Context {
+		builtins                            = make(map[string]bool, allocator),
+		relations                           = make(map[string]u32, allocator),
+		identities                          = make(map[string]v.Value, allocator),
+		dispatch_method_selector_relation   = u32(k.DISPATCH_METHOD_SELECTOR_ID),
+		dispatch_param_relation             = u32(k.DISPATCH_PARAM_ID),
+		dispatch_delegates_relation         = u32(k.DISPATCH_DELEGATES_ID),
+		dispatch_method_program_relation    = u32(k.DISPATCH_METHOD_PROGRAM_ID),
+	}
+	install_builtin_names(&world.ctx)
+	install_primitive_identities(&world.ctx)
+	world.env = Builtin_Env {
+		kernel       = world.kernel,
+		ctx          = &world.ctx,
+		fields       = make(map[string]Field_Info, allocator),
+		unit_sources = make(map[string]string, allocator),
+		allocator    = allocator,
+	}
+	subscriptions_init(&world.env.subscriptions, allocator)
+
+	// The catalogue supplies the relation name -> id map plus the functional
+	// field metadata used by `record.field` access.
+	catalog := k.kernel_snapshot(world.kernel)
+	for metadata in catalog.catalog {
+		name, has_name := v.symbol_name(metadata.name)
+		if !has_name {
+			continue
+		}
+		world.ctx.relations[name] = u32(metadata.id)
+		if metadata.conflict.kind != .Functional {
+			continue
+		}
+		key_positions := make([]u16, len(metadata.conflict.key_positions), allocator)
+		copy(key_positions, metadata.conflict.key_positions)
+		world.env.fields[lower_first(name, allocator)] = Field_Info {
+			relation      = metadata.id,
+			key_positions = key_positions,
+		}
+	}
+	k.snapshot_release(catalog)
+
+	// NamedIdentity facts supply `#name` resolution.
+	name_rows: [dynamic]v.Tuple
+	defer delete(name_rows)
+	k.kernel_scan_into(world.kernel, k.SYSTEM_NAMED_IDENTITY_ID, []v.Binding{{}, {}}, &name_rows)
+	for row in name_rows {
+		values := v.tuple_values(row)
+		name, has_name := v.value_as_symbol(values[1])
+		if !has_name {
+			continue
+		}
+		name_text, has_text := v.symbol_name(name)
+		if has_text {
+			world.ctx.identities[name_text] = values[0]
+		}
+	}
+
+	// UnitSource facts supply fileout text and the recompilation order.
+	unit_rows: [dynamic]v.Tuple
+	defer delete(unit_rows)
+	k.kernel_scan_into(world.kernel, k.SYSTEM_UNIT_SOURCE_ID, []v.Binding{{}, {}, {}}, &unit_rows)
+	ordered_sources: [dynamic]string
+	defer delete(ordered_sources)
+	for row in unit_rows {
+		values := v.tuple_values(row)
+		unit, has_unit := v.value_as_symbol(values[1])
+		source, has_source := v.value_as_string(values[2])
+		has_name := false
+		name := ""
+		if has_unit {
+			name, has_name = v.symbol_name(unit)
+		}
+		if !has_source || !has_name {
+			continue
+		}
+		if existing, found := world.env.unit_sources[name]; found {
+			world.env.unit_sources[name] = strings.concatenate(
+				[]string{existing, "\n\n", source},
+				allocator,
+			)
+		} else {
+			world.env.unit_sources[name] = strings.clone(source, allocator)
+		}
+		append(&ordered_sources, world.env.unit_sources[name])
+	}
+
+	// Runtime context identities: allocate above every stored identity.
+	next_identity := max_stored_identity(world.kernel) + 1
+	endpoint_identity, endpoint_ok := v.value_identity_raw(next_identity)
+	next_identity += 1
+	actor_identity, actor_ok := v.value_identity_raw(next_identity)
+	if endpoint_ok && actor_ok {
+		world.env.endpoint = endpoint_identity
+		world.env.actor = actor_identity
+		world.env.principal = actor_identity
+	}
+	if config.actor != "" {
+		actor_value, actor_found := world.ctx.identities[config.actor]
+		if !actor_found {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"unknown authority actor: %s",
+				config.actor,
+				allocator = allocator,
+			)}
+		}
+		world.env.actor = actor_value
+		world.env.principal = actor_value
+	}
+
+	// Recompile the same concatenated sources; function indices must match the
+	// persisted MethodProgram facts.
+	items: [dynamic]c.Item
+	defer delete(items)
+	for source in ordered_sources {
+		ast, parse_errors := c.parse_program(source, allocator)
+		if len(parse_errors) > 0 {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"cannot reparse stored source: %s",
+				parse_errors[0].message,
+				allocator = allocator,
+			)}
+		}
+		for item in ast.items {
+			append(&items, item)
+		}
+	}
+	program_ast := c.Program_AST {
+		items = items[:],
+	}
+	compiled := c.compile_program(&program_ast, &world.ctx, allocator)
+	if len(compiled.errors) > 0 {
+		return Run_Result{ok = false, message = compiled.errors[0].message}
+	}
+	world.program = compiled.program
+
+	rule_result := restore_rules(world)
+	if !rule_result.ok {
+		return rule_result
+	}
+
+	workers := config.workers
+	if workers < 1 {
+		workers = 1
+	}
+	scheduler_init(
+		&world.scheduler,
+		world.kernel,
+		Scheduler_Config{workers = workers},
+		allocator,
+	)
+	world.started = true
+	world.env.scheduler = &world.scheduler
+	if config.actor != "" {
+		world.env.enforce_authority = true
+	}
+	return Run_Result{ok = true, message = "loaded"}
+}
+
+// Reinstalls rule definitions from the durable Rule/RuleSource/ActiveRule
+// reflection facts. The lowered bodies are not persisted, so they are parsed
+// and converted again here.
+@(private)
+restore_rules :: proc(world: ^World) -> Run_Result {
+	rule_rows: [dynamic]v.Tuple
+	defer delete(rule_rows)
+	k.kernel_scan_into(world.kernel, k.SYSTEM_RULE_ID, []v.Binding{{}}, &rule_rows)
+
+	inactive: [dynamic]v.Value
+	defer delete(inactive)
+	for row in rule_rows {
+		rule_id := v.tuple_values(row)[0]
+		source_rows: [dynamic]v.Tuple
+		k.kernel_scan_into(
+			world.kernel,
+			k.SYSTEM_RULE_SOURCE_ID,
+			[]v.Binding{v.binding_of(rule_id), {}},
+			&source_rows,
+		)
+		if len(source_rows) == 0 {
+			delete(source_rows)
+			continue
+		}
+		source_values := v.tuple_values(source_rows[0])
+		source, has_source := v.value_as_string(source_values[1])
+		delete(source_rows)
+		if !has_source {
+			continue
+		}
+		ast, parse_errors := c.parse_program(source, world.allocator)
+		if len(parse_errors) > 0 {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"cannot reparse stored rule: %s",
+				parse_errors[0].message,
+				allocator = world.allocator,
+			)}
+		}
+		rule_item: c.Rule_Item
+		found_rule := false
+		for item in ast.items {
+			if candidate, is_rule := item.(c.Rule_Item); is_rule {
+				rule_item = candidate
+				found_rule = true
+				break
+			}
+		}
+		if !found_rule {
+			continue
+		}
+		rule, rule_ok := convert_rule(rule_item, &world.ctx)
+		if !rule_ok {
+			return Run_Result{ok = false, message = "cannot lower stored rule"}
+		}
+		identity, identity_ok := v.value_as_identity(rule_id)
+		if !identity_ok {
+			continue
+		}
+		installed, install_error := k.kernel_install_rule(
+			world.kernel,
+			identity,
+			rule,
+			source,
+		)
+		if install_error != k.Kernel_Error.None {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"cannot restore rule: %v",
+				install_error,
+				allocator = world.allocator,
+			)}
+		}
+		k.snapshot_release(installed)
+
+		active_rows: [dynamic]v.Tuple
+		k.kernel_scan_into(
+			world.kernel,
+			k.SYSTEM_ACTIVE_RULE_ID,
+			[]v.Binding{v.binding_of(rule_id), v.binding_of(v.value_bool(false))},
+			&active_rows,
+		)
+		if len(active_rows) > 0 {
+			append(&inactive, rule_id)
+		}
+		delete(active_rows)
+	}
+	for rule_id in inactive {
+		identity, identity_ok := v.value_as_identity(rule_id)
+		if !identity_ok {
+			continue
+		}
+		disabled, disable_error := k.kernel_set_rule_active(world.kernel, identity, false)
+		if disable_error == k.Kernel_Error.None {
+			k.snapshot_release(disabled)
+		}
+	}
+	return Run_Result{ok = true, message = "loaded"}
+}
+
+// Highest raw identity stored in NamedIdentity or MethodSelector facts.
+@(private)
+max_stored_identity :: proc(kernel: ^k.Kernel) -> u64 {
+	maximum := u64(0)
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(kernel, k.SYSTEM_NAMED_IDENTITY_ID, []v.Binding{{}, {}}, &rows)
+	for row in rows {
+		if identity, is_identity := v.value_as_identity(v.tuple_values(row)[0]); is_identity {
+			maximum = max(maximum, v.identity_raw(identity))
+		}
+	}
+	delete(rows)
+	rows = make([dynamic]v.Tuple, context.temp_allocator)
+	k.kernel_scan_into(kernel, k.DISPATCH_METHOD_SELECTOR_ID, []v.Binding{{}, {}}, &rows)
+	for row in rows {
+		if identity, is_identity := v.value_as_identity(v.tuple_values(row)[0]); is_identity {
+			maximum = max(maximum, v.identity_raw(identity))
+		}
+	}
+	return maximum
 }

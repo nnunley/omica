@@ -421,6 +421,15 @@ Declarations :: struct {
 	next_relation: u32,
 	next_identity: u64,
 	next_rule:     u64,
+	// Named identities declared by the loaded files, recorded as NamedIdentity
+	// facts once every file is prescanned.
+	named_identities: [dynamic]Named_Identity,
+}
+
+// A declared identity and its source name.
+Named_Identity :: struct {
+	identity: v.Value,
+	name:     v.Symbol,
 }
 
 // Assert the catalog facts that describe relations: Relation, RelationName, and
@@ -605,6 +614,89 @@ Rule_Fact :: struct {
 	active: bool,
 }
 
+// Records declared identity names as NamedIdentity facts so a later boot can
+// resolve `#name` without the source files.
+@(private)
+assert_named_identities :: proc(env: ^Builtin_Env, entries: []Named_Identity) -> Run_Result {
+	if len(entries) == 0 {
+		return Run_Result{ok = true, message = "loaded"}
+	}
+	tx := k.kernel_begin(env.kernel)
+	defer k.transaction_destroy(&tx)
+	for entry in entries {
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_NAMED_IDENTITY_ID,
+			v.tuple_new(env.allocator, []v.Value{entry.identity, v.value_symbol(entry.name)}),
+		); err != k.Kernel_Error.None {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"cannot record named identity: %v",
+				err,
+				allocator = env.allocator,
+			)}
+		}
+	}
+	committed, commit_err := k.transaction_commit(&tx)
+	if commit_err != k.Kernel_Error.None {
+		return Run_Result{ok = false, message = fmt.aprintf(
+			"cannot record named identities: %v",
+			commit_err,
+			allocator = env.allocator,
+		)}
+	}
+	k.snapshot_release(committed)
+	return Run_Result{ok = true, message = "loaded"}
+}
+
+// Records the loaded unit sources so a later boot can recompile code and serve
+// `fileout` without the source files.
+@(private)
+assert_unit_sources :: proc(env: ^Builtin_Env, entries: []Unit_Source_Fact) -> Run_Result {
+	if len(entries) == 0 {
+		return Run_Result{ok = true, message = "loaded"}
+	}
+	tx := k.kernel_begin(env.kernel)
+	defer k.transaction_destroy(&tx)
+	for entry in entries {
+		ordinal, ordinal_ok := v.value_int(entry.ordinal)
+		if !ordinal_ok {
+			return Run_Result{ok = false, message = "unit ordinal is out of range"}
+		}
+		if err := k.transaction_assert(
+			&tx,
+			k.SYSTEM_UNIT_SOURCE_ID,
+			v.tuple_new(env.allocator, []v.Value{
+				ordinal,
+				v.value_symbol(entry.unit),
+				v.value_string(env.allocator, entry.source),
+			}),
+		); err != k.Kernel_Error.None {
+			return Run_Result{ok = false, message = fmt.aprintf(
+				"cannot record unit source: %v",
+				err,
+				allocator = env.allocator,
+			)}
+		}
+	}
+	committed, commit_err := k.transaction_commit(&tx)
+	if commit_err != k.Kernel_Error.None {
+		return Run_Result{ok = false, message = fmt.aprintf(
+			"cannot record unit sources: %v",
+			commit_err,
+			allocator = env.allocator,
+		)}
+	}
+	k.snapshot_release(committed)
+	return Run_Result{ok = true, message = "loaded"}
+}
+
+@(private)
+Unit_Source_Fact :: struct {
+	ordinal: i64,
+	unit:    v.Symbol,
+	source:  string,
+}
+
 // Assert the catalog facts that describe rules: Rule, RuleHead, and RuleSource.
 @(private)
 assert_rule_facts :: proc(env: ^Builtin_Env, rules: []Rule_Fact) -> Run_Result {
@@ -732,6 +824,10 @@ prescan_file :: proc(
 			if identity_ok {
 				ctx.identities[symbol_name] = identity_value
 				declarations.next_identity += 1
+				append(&declarations.named_identities, Named_Identity {
+					identity = identity_value,
+					name     = v.symbol_intern(symbol_name),
+				})
 			}
 
 		case "make_relation", "make_functional_relation":
@@ -945,6 +1041,28 @@ builtin_destroy_identity :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bo
 			count += 1
 		}
 	}
+
+	// The identity's name binding lives in NamedIdentity and is removed too,
+	// so the reflection surface no longer reports the name.
+	name_rows: [dynamic]v.Tuple
+	name_rows = make([dynamic]v.Tuple, 0, 4, context.temp_allocator)
+	k.relation_source_scan_into(
+		&source,
+		k.SYSTEM_NAMED_IDENTITY_ID,
+		[]v.Binding{v.binding_of(identity_value), {}},
+		&name_rows,
+	)
+	for row in name_rows {
+		if err := k.transaction_retract(
+			state.transaction,
+			k.SYSTEM_NAMED_IDENTITY_ID,
+			row,
+		); err != k.Kernel_Error.None {
+			vm.vm_set_error(state, "E_KERNEL", "destroy_identity could not retract a name")
+			return v.Value(0), false
+		}
+		count += 1
+	}
 	result, _ := v.value_int(count)
 	return result, true
 }
@@ -970,7 +1088,9 @@ read_only_system_relation :: proc(id: k.Relation_ID) -> bool {
 	     k.SYSTEM_INDEX_STORAGE_KIND_ID,
 	     k.SYSTEM_SUBJECT_FACT_ID,
 	     k.SYSTEM_MENTIONED_FACT_ID,
-	     k.SYSTEM_EXTENSIONAL_MENTIONED_FACT_ID:
+	     k.SYSTEM_EXTENSIONAL_MENTIONED_FACT_ID,
+	     k.SYSTEM_NAMED_IDENTITY_ID,
+	     k.SYSTEM_UNIT_SOURCE_ID:
 		return true
 	}
 	return false

@@ -2127,7 +2127,8 @@ assert Out(1)
 @(test)
 test_run_relation_reflection_facts :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	source := `make_relation(:Plain, 2)
+	source := `make_identity(:witness)
+make_relation(:Plain, 2)
 make_functional_relation(:Keyed, 2, [0], :volatile)
 make_relation(:Out, 1)
 
@@ -2160,6 +2161,11 @@ for found in endpoints
   let endpoint_rel = found[:rel]
   require(len(RelationDurability(endpoint_rel, :volatile)) == 1)
 end
+let witness = NamedIdentity(?identity, :witness)
+require(len(witness) == 1)
+let units = UnitSource(0, ?unit, ?text)
+require(len(units) == 1)
+require(units[0][:unit] == :mica_reflection_facts_test)
 let methods = MethodSelector(?mm, :greet)
 require(len(methods) == 1)
 let m = methods[0][:mm]
@@ -2899,7 +2905,7 @@ require !LocatedIn(#thing, #room)
 	expect_relation_rows(t, &kernel, "Object", 1)
 	expect_relation_rows(t, &kernel, "LocatedIn", 1)
 
-	// The two subject facts of #thing were retracted.
+	// Two subject facts and the NamedIdentity name binding were retracted.
 	metadata, found := k.snapshot_relation_metadata_named(
 		k.kernel_snapshot(&kernel),
 		v.symbol_intern("Destroyed"),
@@ -2910,7 +2916,7 @@ require !LocatedIn(#thing, #room)
 		k.kernel_scan_into(&kernel, metadata.id, []v.Binding{{}}, &rows)
 		if len(rows) == 1 {
 			count, is_int := v.value_as_int(v.tuple_values(rows[0])[0])
-			testing.expectf(t, is_int && count == 2, "destroyed count %d", count)
+			testing.expectf(t, is_int && count == 3, "destroyed count %d", count)
 		}
 		delete(rows)
 	}
@@ -3079,4 +3085,91 @@ end
 	testing.expect_value(t, ask_answer.kind, Task_Outcome_Kind.Complete)
 	testing.expect(t, v.value_eq(ask_answer.value, done))
 	world_release(world, ask_id)
+}
+
+@(test)
+test_run_store_boot :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:Marker, 2)
+
+verb mark(who)
+  assert Marker(who, :marked)
+end
+assert Marker(#alice, :seed)
+`
+	path, path_ok := write_temp_source(t, "mica_store_boot_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	directory, directory_error := os.temp_dir(context.temp_allocator)
+	if directory_error != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	store_path, join_error := filepath.join(
+		[]string{directory, "mica_store_boot"},
+		context.temp_allocator,
+	)
+	if join_error != nil {
+		return
+	}
+	os.remove_all(store_path)
+	defer os.remove_all(store_path)
+
+	// First world: load from source and persist.
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		world, start := world_start(
+			&kernel,
+			[]string{path},
+			context.temp_allocator,
+			World_Config{store_path = store_path},
+		)
+		testing.expectf(t, start.ok, "load failed: %s", start.message)
+		if start.ok {
+			entry := world_wait(world, world.entry)
+			testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+			who := v.value_symbol(v.symbol_intern("alice"))
+			outcome := world_call(world, "mark", []k.Role_Pair{{
+				role  = v.value_symbol(v.symbol_intern("who")),
+				value = who,
+			}})
+			testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+			world_destroy(world)
+		}
+		k.kernel_destroy(&kernel)
+	}
+
+	// Second world: boot from the store with no source paths.
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		nil,
+		context.temp_allocator,
+		World_Config{store_path = store_path},
+	)
+	testing.expectf(t, start.ok, "boot failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	testing.expect_value(t, world.entry, Task_ID(0))
+	testing.expect(t, len(world.env.unit_sources) >= 1)
+	expect_relation_rows(t, &kernel, "Marker", 2)
+
+	// Code and identity names are restored; the verb runs against them.
+	alice, has_alice := world.ctx.identities["alice"]
+	testing.expect(t, has_alice)
+	outcome := world_call(world, "mark", []k.Role_Pair{{
+		role  = v.value_symbol(v.symbol_intern("who")),
+		value = alice,
+	}})
+	testing.expectf(t, outcome.kind == .Complete, "call failed: %s", outcome.message)
+	expect_relation_rows(t, &kernel, "Marker", 3)
 }

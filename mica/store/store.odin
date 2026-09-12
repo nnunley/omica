@@ -337,9 +337,21 @@ store_publish_hook :: proc(
 	for relation_writes in writes {
 		metadata, found := k.snapshot_relation_metadata(snapshot, relation_writes.relation)
 		if !found || metadata.durability == .Volatile {
-			continue
+				continue
 		}
 		for write in relation_writes.entries {
+			// Facts that carry ephemeral values (capability handles) are
+			// runtime state; they are skipped rather than failing the store.
+			persistable := true
+			for cell in v.tuple_values(write.tuple) {
+				if !v.value_is_persistable(cell) {
+					persistable = false
+					break
+				}
+			}
+			if !persistable {
+				continue
+			}
 			append(&writes_list, Wal_Write {
 				relation = relation_writes.relation,
 				assert   = write.kind == .Assert,
@@ -356,11 +368,10 @@ store_publish_hook :: proc(
 	// New relations are rare; a full catalogue comparison keeps the kernel
 	// side simple. This is the place to pass created relations explicitly if
 	// the scan ever shows up on a hot path.
+	// Catalogue entries persist for volatile relations too: their schema is
+	// durable while their facts are not.
 	catalog_list: [dynamic]Wal_Catalog
 	for metadata in snapshot.catalog {
-		if metadata.durability == .Volatile {
-			continue
-		}
 		sync.mutex_lock(&store.lock)
 		known := store.known[metadata.id]
 		sync.mutex_unlock(&store.lock)

@@ -645,6 +645,32 @@ kernel_create_relation :: proc(
 	}
 }
 
+// Raises the current snapshot version to at least `minimum` without changing
+// published state. Booting from a store uses this so new commits continue
+// above the durable log's versions.
+kernel_advance_version :: proc(kernel: ^Kernel, minimum: u64) -> bool {
+	sync.mutex_lock(&kernel.catalog_lock)
+	defer sync.mutex_unlock(&kernel.catalog_lock)
+	for {
+		current := kernel_snapshot(kernel)
+		if current.version >= minimum {
+			snapshot_release(current)
+			return true
+		}
+		next := snapshot_fork(kernel, current)
+		next.version = minimum
+		snapshot_compute_derived(next)
+		previous, published := kernel_try_publish(kernel, current, next)
+		if published {
+			kernel_retire(kernel, previous)
+			snapshot_release(current)
+			return true
+		}
+		snapshot_release(next)
+		snapshot_release(current)
+	}
+}
+
 // Installs a rule and publishes a new snapshot. The returned snapshot is
 // caller-owned.
 kernel_install_rule :: proc(

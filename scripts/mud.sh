@@ -60,6 +60,9 @@ for file in "${fileins[@]}"; do
   args+=(--filein "${file}")
 done
 args+=(--bind "${bind}" --sync-client host/web/sync-client.js)
+if [[ -n "${MICA_STORE:-}" ]]; then
+  args+=(--store "${MICA_STORE}")
+fi
 
 port="${bind##*:}"
 host="${bind%:*}"

@@ -24,6 +24,7 @@ main :: proc() {
 	bind := DEFAULT_BIND
 	sync_client := ""
 	actor := ""
+	store_path := ""
 	fileins: [dynamic]string
 	defer delete(fileins)
 
@@ -58,6 +59,13 @@ main :: proc() {
 			}
 			index += 1
 			actor = args[index]
+		case "--store":
+			if index + 1 >= len(args) {
+				usage()
+				os.exit(1)
+			}
+			index += 1
+			store_path = args[index]
 		case "--help", "-h":
 			usage()
 			return
@@ -82,12 +90,16 @@ main :: proc() {
 	defer web.routes_destroy(&host.routes)
 
 	world: ^r.World
-	if len(fileins) > 0 {
+	if len(fileins) > 0 || store_path != "" {
 		started_world, result := r.world_start(
 			&kernel,
 			fileins[:],
 			context.allocator,
-			r.World_Config{actor = actor, workers = DEFAULT_WORKERS},
+			r.World_Config {
+				actor = actor,
+				workers = DEFAULT_WORKERS,
+				store_path = store_path,
+			},
 		)
 		if !result.ok {
 			fmt.eprintf("webhost: cannot load world: %s\n", result.message)
@@ -95,10 +107,12 @@ main :: proc() {
 		}
 		world = started_world
 
-		entry := r.world_wait(world, world.entry)
-		if entry.kind != .Complete {
-			fmt.eprintf("webhost: world entry task did not finish: %s\n", entry.message)
-			os.exit(1)
+		if world.entry != 0 {
+			entry := r.world_wait(world, world.entry)
+			if entry.kind != .Complete {
+				fmt.eprintf("webhost: world entry task did not finish: %s\n", entry.message)
+				os.exit(1)
+			}
 		}
 		web.documents_init(&host.documents, world)
 		web.sync_host_init(&host.sync, world)
@@ -206,6 +220,6 @@ webhost_seed_person :: proc(world: ^r.World, login, display_name: string) {
 usage :: proc() {
 	fmt.eprintln(
 		"usage: webhost [--bind address:port] [--filein path]... " +
-		"[--sync-client path.js] [--actor name]",
+		"[--sync-client path.js] [--actor name] [--store dir]",
 	)
 }

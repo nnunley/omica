@@ -387,41 +387,66 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	sync.mutex_lock(&store.lock)
 	records := make([]Wal_Record, len(store.records), context.temp_allocator)
 	copy(records, store.records[:])
+	durable := store.durable
 	sync.mutex_unlock(&store.lock)
 
-	for record in records {
-		for catalog in record.catalog {
-			created, create_error := k.kernel_create_relation(kernel, catalog.metadata)
-			if create_error == .Duplicate_Relation_Name || create_error == .Invalid_Metadata {
-				continue
-			}
-			if create_error != .None {
-				return false
-			}
-			k.snapshot_release(created)
+	// Records published in one group share a version. Replay each version as
+	// one transaction so set semantics (for example a functional key retract
+	// and assert in one commit) are preserved.
+	group_start := 0
+	for group_start < len(records) {
+		version := records[group_start].version
+		group_end := group_start
+		for group_end < len(records) && records[group_end].version == version {
+			group_end += 1
 		}
-		if len(record.writes) == 0 {
-			continue
+
+		for record_index in group_start ..< group_end {
+			for catalog in records[record_index].catalog {
+				created, create_error := k.kernel_create_relation(kernel, catalog.metadata)
+				if create_error == .Duplicate_Relation_Name || create_error == .Invalid_Metadata {
+					continue
+				}
+				if create_error != .None {
+					return false
+				}
+				k.snapshot_release(created)
+			}
 		}
+
 		transaction := k.kernel_begin(kernel)
-		for write in record.writes {
-			error: k.Kernel_Error
-			if write.assert {
-				error = k.transaction_assert(&transaction, write.relation, write.tuple)
-			} else {
-				error = k.transaction_retract(&transaction, write.relation, write.tuple)
+		has_writes := false
+		for record_index in group_start ..< group_end {
+			for write in records[record_index].writes {
+				has_writes = true
+				error: k.Kernel_Error
+				if write.assert {
+					error = k.transaction_assert(&transaction, write.relation, write.tuple)
+				} else {
+					error = k.transaction_retract(&transaction, write.relation, write.tuple)
+				}
+				if error != .None {
+					k.transaction_destroy(&transaction)
+					return false
+				}
 			}
-			if error != .None {
-				k.transaction_destroy(&transaction)
+		}
+		if !has_writes {
+			k.transaction_destroy(&transaction)
+		} else {
+			committed, commit_error := k.transaction_commit(&transaction)
+			k.transaction_destroy(&transaction)
+			if commit_error != .None {
 				return false
 			}
+			k.snapshot_release(committed)
 		}
-		committed, commit_error := k.transaction_commit(&transaction)
-		k.transaction_destroy(&transaction)
-		if commit_error != .None {
-			return false
-		}
-		k.snapshot_release(committed)
+		group_start = group_end
+	}
+
+	// New commits must resume above the durable log's versions.
+	if durable > 0 {
+		_ = k.kernel_advance_version(kernel, durable)
 	}
 	return true
 }

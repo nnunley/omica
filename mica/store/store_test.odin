@@ -307,7 +307,8 @@ test_file_wal_round_trip :: proc(t: ^testing.T) {
 	testing.expect(t, store_durable_version(&store) >= 1)
 	testing.expect(t, store_restore(&store, &kernel))
 	testing.expect_value(t, file_relation_rows(t, &kernel, "Kept"), 2)
-	testing.expect_value(t, file_relation_rows(t, &kernel, "Gone"), -1)
+	// Volatile schema is durable; its facts are not.
+	testing.expect_value(t, file_relation_rows(t, &kernel, "Gone"), 0)
 }
 
 @(test)

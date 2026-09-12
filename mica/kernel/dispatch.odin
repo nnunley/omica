@@ -107,6 +107,8 @@ SYSTEM_RELATION_ID :: Relation_ID(0x7fff_fe01)
 SYSTEM_RELATION_NAME_ID :: Relation_ID(0x7fff_fe02)
 SYSTEM_ARITY_ID :: Relation_ID(0x7fff_fe03)
 SYSTEM_RELATION_DURABILITY_ID :: Relation_ID(0x7fff_fe1b)
+SYSTEM_NAMED_IDENTITY_ID :: Relation_ID(0x7fff_fe1c)
+SYSTEM_UNIT_SOURCE_ID :: Relation_ID(0x7fff_fe1d)
 SYSTEM_RULE_ID :: Relation_ID(0x7fff_fe04)
 SYSTEM_RULE_HEAD_ID :: Relation_ID(0x7fff_fe05)
 SYSTEM_RULE_SOURCE_ID :: Relation_ID(0x7fff_fe06)
@@ -161,6 +163,8 @@ system_relation_metadata :: proc(allocator := context.allocator) -> []Relation_M
 			v.symbol_intern("ExtensionalMentionedFact"),
 			4,
 		),
+		relation_metadata(SYSTEM_NAMED_IDENTITY_ID, v.symbol_intern("NamedIdentity"), 2),
+		relation_metadata(SYSTEM_UNIT_SOURCE_ID, v.symbol_intern("UnitSource"), 3),
 		relation_metadata(SYSTEM_PROGRAM_BYTES_ID, v.symbol_intern("ProgramBytes"), 2),
 		relation_metadata(SYSTEM_METHOD_SOURCE_ID, v.symbol_intern("MethodSource"), 2),
 		relation_metadata(SYSTEM_SOURCE_OWNS_FACT_ID, v.symbol_intern("SourceOwnsFact"), 3),

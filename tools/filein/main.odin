@@ -14,23 +14,33 @@ import r "../../mica/runtime"
 
 main :: proc() {
 	unit := ""
+	store_path := ""
 	paths: [dynamic]string
 	defer delete(paths)
 	arguments := os.args[1:]
 	for index := 0; index < len(arguments); index += 1 {
 		if arguments[index] == "--unit" {
 			if index + 1 >= len(arguments) {
-				fmt.eprintln("usage: filein [--unit NAME] <path>...")
+				fmt.eprintln("usage: filein [--unit NAME] [--store DIR] <path>...")
 				os.exit(1)
 			}
 			unit = arguments[index + 1]
 			index += 1
 			continue
 		}
+		if arguments[index] == "--store" {
+			if index + 1 >= len(arguments) {
+				fmt.eprintln("usage: filein [--unit NAME] [--store DIR] <path>...")
+				os.exit(1)
+			}
+			store_path = arguments[index + 1]
+			index += 1
+			continue
+		}
 		append(&paths, arguments[index])
 	}
-	if len(paths) == 0 {
-		fmt.eprintln("usage: filein [--unit NAME] <path>...")
+	if len(paths) == 0 && store_path == "" {
+		fmt.eprintln("usage: filein [--unit NAME] [--store DIR] <path>...")
 		os.exit(1)
 	}
 
@@ -38,7 +48,24 @@ main :: proc() {
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := r.run_files(&kernel, paths[:], context.allocator, r.Run_Options{unit = unit})
+	world, start := r.world_start(
+		&kernel,
+		paths[:],
+		context.allocator,
+		r.World_Config{unit = unit, store_path = store_path},
+	)
+	if !start.ok {
+		fmt.eprintf("failed: %s\n", start.message)
+		os.exit(1)
+	}
+	result := r.Run_Result{ok = true, message = start.message}
+	if world.entry != 0 {
+		outcome := r.world_wait(world, world.entry)
+		if outcome.kind != .Complete {
+			result = r.Run_Result{ok = false, message = outcome.message}
+		}
+	}
+	r.world_destroy(world)
 	if result.ok {
 		for path in paths {
 			fmt.printf("loaded %s\n", path)
