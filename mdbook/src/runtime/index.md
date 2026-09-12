@@ -65,6 +65,9 @@ world, start := runtime.world_start(
 | `world_subscribe_changes`  | Observe settled relation changes                                 |
 | `world_destroy`            | Stop the scheduler, checkpoint, and close the store              |
 
+The `tools/repl` binary wraps this API for interactive use: it starts or boots
+a world and evaluates each line with `world_eval`.
+
 Supplying an `actor` role to an individual call changes a dispatch argument; it does not replace the
 endpoint's authority. When `World_Config.actor` is set, submitted tasks run as that identity and
 authority is enforced from current policy.
