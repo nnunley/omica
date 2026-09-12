@@ -83,6 +83,9 @@ wal_decode_metadata :: proc(
 	if argument_error != .None {
 		return {}, argument_error
 	}
+	if !codec_count_allowed(reader, argument_count, 4) {
+		return {}, .Truncated
+	}
 	argument_names := make([]v.Symbol, int(argument_count), allocator)
 	for index in 0 ..< int(argument_count) {
 		argument, read_error := codec_read_string(reader, allocator)
@@ -95,11 +98,17 @@ wal_decode_metadata :: proc(
 	if index_error != .None {
 		return {}, index_error
 	}
+	if !codec_count_allowed(reader, index_count, 4) {
+		return {}, .Truncated
+	}
 	indexes := make([]k.Index_Spec, int(index_count), allocator)
 	for index in 0 ..< int(index_count) {
 		position_count, position_error := codec_read_u32(reader)
 		if position_error != .None {
 			return {}, position_error
+		}
+		if !codec_count_allowed(reader, position_count, 4) {
+			return {}, .Truncated
 		}
 		positions := make([]u16, int(position_count), allocator)
 		for position_index in 0 ..< int(position_count) {
@@ -118,6 +127,9 @@ wal_decode_metadata :: proc(
 	key_count, key_error := codec_read_u32(reader)
 	if key_error != .None {
 		return {}, key_error
+	}
+	if !codec_count_allowed(reader, key_count, 4) {
+		return {}, .Truncated
 	}
 	key_positions := make([]u16, int(key_count), allocator)
 	for index in 0 ..< int(key_count) {
@@ -213,6 +225,9 @@ wal_decode_record :: proc(
 	if write_error != .None {
 		return {}, write_error
 	}
+	if !codec_count_allowed(&reader, write_count, 9) {
+		return {}, .Truncated
+	}
 	writes := make([]Wal_Write, int(write_count), allocator)
 	for index in 0 ..< int(write_count) {
 		relation, relation_error := codec_read_u32(&reader)
@@ -236,6 +251,9 @@ wal_decode_record :: proc(
 	catalog_count, catalog_error := codec_read_u32(&reader)
 	if catalog_error != .None {
 		return {}, catalog_error
+	}
+	if !codec_count_allowed(&reader, catalog_count) {
+		return {}, .Truncated
 	}
 	catalog := make([]Wal_Catalog, int(catalog_count), allocator)
 	for index in 0 ..< int(catalog_count) {

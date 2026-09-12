@@ -84,6 +84,39 @@ test_codec_rejects_non_persistable :: proc(t: ^testing.T) {
 	testing.expect_value(t, codec_encode_value(&out, capability), Codec_Error.Not_Persistable)
 }
 
+// A corrupt element count must be rejected before it drives a huge
+// allocation. Regression: length prefixes were trusted.
+@(test)
+test_codec_count_bound :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	data := make([]u8, 16, context.temp_allocator)
+	reader := Codec_Reader{data = data, cursor = 0}
+
+	// A count larger than the bytes remaining is rejected.
+	testing.expect(t, !codec_count_allowed(&reader, 0xffff_ffff, 1))
+	testing.expect(t, !codec_count_allowed(&reader, 17, 1))
+	testing.expect(t, codec_count_allowed(&reader, 16, 1))
+
+	// A larger per-element minimum tightens the bound.
+	testing.expect(t, !codec_count_allowed(&reader, 5, 4))
+	testing.expect(t, codec_count_allowed(&reader, 4, 4))
+
+	// A corrupt encoded count decodes as truncated, not a giant allocation.
+	one, _ := v.value_int(1)
+	list := v.value_list(context.temp_allocator, []v.Value{one})
+	out: [dynamic]u8
+	defer delete(out)
+	testing.expect_value(t, codec_encode_value(&out, list), Codec_Error.None)
+	// Claim more elements than the payload can hold.
+	out[1] = 0x08
+	out[2] = 0
+	out[3] = 0
+	out[4] = 0
+	cursor := 0
+	_, decode_error := codec_decode_value(out[:], &cursor, context.temp_allocator)
+	testing.expect_value(t, decode_error, Codec_Error.Truncated)
+}
+
 @(test)
 test_store_admission_budget :: proc(t: ^testing.T) {
 	store: Store

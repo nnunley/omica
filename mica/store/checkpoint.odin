@@ -145,6 +145,11 @@ store_page_read :: proc(
 	if u32(fnv1a64(payload) & 0xffff_ffff) != checksum {
 		return nil, .Bad_Tag
 	}
+	// A page cannot hold more rows than payload bytes, so a corrupt manifest
+	// row count cannot drive a huge allocation here.
+	if uint(entry.rows) > uint(payload_length) {
+		return nil, .Truncated
+	}
 	rows := make([]v.Tuple, int(entry.rows), allocator)
 	cursor := 0
 	for index in 0 ..< int(entry.rows) {
@@ -286,6 +291,9 @@ store_manifest_read :: proc(store: ^Store, path: string) -> (Manifest_Data, bool
 	if count_error != .None {
 		return {}, false
 	}
+	if !codec_count_allowed(&reader, count, 4) {
+		return {}, false
+	}
 	relations := make([]Checkpoint_Relation, int(count), store.copy_allocator)
 	for index in 0 ..< int(count) {
 		metadata, metadata_error := wal_decode_metadata(&reader, store.copy_allocator)
@@ -294,6 +302,9 @@ store_manifest_read :: proc(store: ^Store, path: string) -> (Manifest_Data, bool
 		}
 		chunk_count, chunk_error := codec_read_u32(&reader)
 		if chunk_error != .None {
+			return {}, false
+		}
+		if !codec_count_allowed(&reader, chunk_count, 8) {
 			return {}, false
 		}
 		page_ids := make([]u32, int(chunk_count), store.copy_allocator)

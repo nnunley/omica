@@ -210,6 +210,23 @@ Codec_Reader :: struct {
 	cursor: int,
 }
 
+// Guards a length-prefixed allocation against a corrupt prefix: a count cannot
+// exceed the bytes remaining when each element needs at least `min_bytes`.
+// Without this, a bogus count drives a huge allocation before any element is
+// read.
+@(private)
+codec_count_allowed :: proc(reader: ^Codec_Reader, count: u32, min_bytes := 1) -> bool {
+	remaining := len(reader.data) - reader.cursor
+	if remaining < 0 {
+		return false
+	}
+	step := min_bytes
+	if step < 1 {
+		step = 1
+	}
+	return i64(count) * i64(step) <= i64(remaining)
+}
+
 @(private)
 codec_read_u8 :: proc(reader: ^Codec_Reader) -> (u8, Codec_Error) {
 	if reader.cursor + 1 > len(reader.data) {
@@ -367,6 +384,9 @@ codec_decode_value_reader :: proc(
 		if count_error != .None {
 			return v.Value(0), count_error
 		}
+		if !codec_count_allowed(reader, count) {
+			return v.Value(0), .Truncated
+		}
 		values := make([]v.Value, int(count), allocator)
 		for index in 0 ..< int(count) {
 			item, item_error := codec_decode_value_reader(reader, allocator)
@@ -380,6 +400,9 @@ codec_decode_value_reader :: proc(
 		count, count_error := codec_read_u32(reader)
 		if count_error != .None {
 			return v.Value(0), count_error
+		}
+		if !codec_count_allowed(reader, count) {
+			return v.Value(0), .Truncated
 		}
 		entries := make([]v.Map_Entry, int(count), allocator)
 		for index in 0 ..< int(count) {
@@ -464,6 +487,9 @@ codec_decode_value_reader :: proc(
 		if heading_error != .None {
 			return v.Value(0), heading_error
 		}
+		if !codec_count_allowed(reader, heading_count, 4) {
+			return v.Value(0), .Truncated
+		}
 		heading := make([]v.Symbol, int(heading_count), allocator)
 		for index in 0 ..< int(heading_count) {
 			name, name_error := codec_read_string(reader, allocator)
@@ -476,11 +502,17 @@ codec_decode_value_reader :: proc(
 		if row_error != .None {
 			return v.Value(0), row_error
 		}
+		if !codec_count_allowed(reader, row_count, 4) {
+			return v.Value(0), .Truncated
+		}
 		rows := make([]v.Tuple, int(row_count), allocator)
 		for row_index in 0 ..< int(row_count) {
 			cell_count, cell_error := codec_read_u32(reader)
 			if cell_error != .None {
 				return v.Value(0), cell_error
+			}
+			if !codec_count_allowed(reader, cell_count) {
+				return v.Value(0), .Truncated
 			}
 			cells := make([]v.Value, int(cell_count), allocator)
 			for cell_index in 0 ..< int(cell_count) {
@@ -528,6 +560,10 @@ codec_decode_tuple :: proc(
 	if error != .None {
 		cursor^ = reader.cursor
 		return nil, error
+	}
+	if !codec_count_allowed(&reader, count) {
+		cursor^ = reader.cursor
+		return nil, .Truncated
 	}
 	cells := make([]v.Value, int(count), allocator)
 	for index in 0 ..< int(count) {
