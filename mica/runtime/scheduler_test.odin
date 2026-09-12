@@ -281,18 +281,18 @@ test_scheduler_resume_invalidates_timer :: proc(t: ^testing.T) {
 
 	testing.expect(t, scheduler_resume(&scheduler, id, value_int_must(42)))
 
-	// The resume bumped the generation, so the armed timer is now stale.
+	// The resume bumped the generation, so the armed timer is now stale. The
+	// fire helper requires the scheduler lock (the worker also touches the
+	// entry under it).
 	sync.mutex_lock(&scheduler.lock)
 	stale := scheduler.entries[id].generation != armed
-	sync.mutex_unlock(&scheduler.lock)
 	testing.expect(t, stale)
-	testing.expect(
-		t,
-		!scheduler_timer_fire_locked(
-			&scheduler,
-			Timer_Entry{task_id = id, generation = armed},
-		),
+	fired := scheduler_timer_fire_locked(
+		&scheduler,
+		Timer_Entry{task_id = id, generation = armed},
 	)
+	sync.mutex_unlock(&scheduler.lock)
+	testing.expect(t, !fired)
 
 	outcome := scheduler_wait(&scheduler, id)
 	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
@@ -455,6 +455,12 @@ test_scheduler_wake_skips_dead_waiters :: proc(t: ^testing.T) {
 	scheduler: Scheduler
 	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
 	defer scheduler_destroy(&scheduler)
+
+	// Stop the worker before injecting fake entries below; it must never pop
+	// and try to run an entry with no task.
+	sync.mutex_lock(&scheduler.lock)
+	scheduler.stop = true
+	sync.mutex_unlock(&scheduler.lock)
 
 	receiver, _, minted := scheduler_mailbox_create(&scheduler)
 	testing.expect(t, minted)
