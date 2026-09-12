@@ -236,16 +236,28 @@ builtin_assume_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 
 	// Record the endpoint binding for the current endpoint.
 	if state.transaction != nil && !v.value_is_empty_relation(state.endpoint) {
-		_ = k.transaction_retract(
+		if err := k.transaction_retract(
 			state.transaction,
 			k.SYSTEM_ENDPOINT_ACTOR_ID,
 			v.tuple_new(env.allocator, []v.Value{state.endpoint, previous_actor}),
-		)
-		_ = k.transaction_assert(
+		); err != .None {
+			return builtin_error(
+				state,
+				"E_KERNEL",
+				"assume_actor could not retract the previous endpoint binding",
+			)
+		}
+		if err := k.transaction_assert(
 			state.transaction,
 			k.SYSTEM_ENDPOINT_ACTOR_ID,
 			v.tuple_new(env.allocator, []v.Value{state.endpoint, args[0]}),
-		)
+		); err != .None {
+			return builtin_error(
+				state,
+				"E_KERNEL",
+				"assume_actor could not record the endpoint binding",
+			)
+		}
 	}
 	return v.value_bool(true), true
 }
@@ -1378,16 +1390,28 @@ rule_active_builtin :: proc(
 	k.snapshot_release(updated)
 
 	if state.transaction != nil {
-		_ = k.transaction_retract(
+		if err := k.transaction_retract(
 			state.transaction,
 			k.SYSTEM_ACTIVE_RULE_ID,
 			v.tuple_new(env.allocator, []v.Value{rule_value, v.value_bool(!active)}),
-		)
-		_ = k.transaction_assert(
+		); err != .None {
+			return builtin_error(
+				state,
+				"E_KERNEL",
+				"rule update could not retract the previous state",
+			)
+		}
+		if err := k.transaction_assert(
 			state.transaction,
 			k.SYSTEM_ACTIVE_RULE_ID,
 			v.tuple_new(env.allocator, []v.Value{rule_value, v.value_bool(active)}),
-		)
+		); err != .None {
+			return builtin_error(
+				state,
+				"E_KERNEL",
+				"rule update could not record the new state",
+			)
+		}
 	}
 	return v.value_bool(true), true
 }
