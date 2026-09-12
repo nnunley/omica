@@ -132,7 +132,8 @@ http_parser_next :: proc(parser: ^Http_Parser) -> (Http_Request, Http_Parse_Stat
 	}
 
 	clear(&parser.headers)
-	remaining := header_bytes[line_end + 2:]
+	// A request line with no trailing CRLF has no header region at all.
+	remaining := header_bytes[min(line_end + 2, len(header_bytes)):]
 	for len(remaining) > 0 {
 		// The last header line has no trailing CRLF: its line ending is the
 		// first half of the "\r\n\r\n" terminator.

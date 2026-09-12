@@ -47,6 +47,22 @@ test_http_parse_request :: proc(t: ^testing.T) {
 	testing.expect_value(t, next_state, Http_Parse_State.Incomplete)
 }
 
+// A request with no header lines must parse to an empty header set rather than
+// trapping on the absent header region.
+@(test)
+test_http_parse_headerless_request :: proc(t: ^testing.T) {
+	parser: Http_Parser
+	http_parser_init(&parser)
+	defer http_parser_destroy(&parser)
+
+	request, state, parse_error := parse_request(t, &parser, "GET / HTTP/1.0\r\n\r\n")
+	testing.expect_value(t, state, Http_Parse_State.Ready)
+	testing.expectf(t, parse_error.status == 0, "unexpected parse error: %s", parse_error.message)
+	testing.expect_value(t, request.method, "GET")
+	testing.expect_value(t, request.target, "/")
+	testing.expect_value(t, len(request.headers), 0)
+}
+
 @(test)
 test_http_parse_incremental :: proc(t: ^testing.T) {
 	parser: Http_Parser
