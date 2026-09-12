@@ -3777,3 +3777,27 @@ end
 return g()`
 	expect_builtin_error(t, &ctx, source, "E_X")
 }
+
+// A lexically visible local function value takes precedence over a
+// compiler-recognized form or builtin of the same name.
+@(test)
+test_local_shadows_builtin :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	ctx := c.Compile_Context {
+		builtins   = make(map[string]bool),
+		relations  = make(map[string]u32),
+		identities = make(map[string]v.Value),
+	}
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	install_builtin_names(&ctx)
+
+	expect_int_builtin(
+		t,
+		&ctx,
+		`let len = fn(x) => 99
+return len([1, 2])`,
+		99,
+	)
+}

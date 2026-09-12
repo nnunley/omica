@@ -72,6 +72,10 @@ Emitter :: struct {
 	functions:     map[string]int,
 	verb_declarations: map[string]int,
 	verb_restricted:   map[string]bool,
+	// Names of the installed verb's role parameters for the body currently
+	// being emitted. A role name that coincides with a runtime function does
+	// not hide it (see mdbook/src/language/operators-and-calls.md).
+	role_params: map[string]bool,
 	break_patches: [dynamic]int,
 	continue_targets: [dynamic]int,
 	loop_depth: int,
@@ -106,6 +110,7 @@ compile_program :: proc(
 		functions = make(map[string]int),
 		verb_declarations = make(map[string]int),
 		verb_restricted = make(map[string]bool),
+		role_params = make(map[string]bool),
 		break_patches = make([dynamic]int),
 		continue_targets = make([dynamic]int),
 		pending_functions = make([dynamic]Pending_Function),
@@ -117,6 +122,7 @@ compile_program :: proc(
 		delete(emitter.functions)
 		delete(emitter.verb_declarations)
 		delete(emitter.verb_restricted)
+		delete(emitter.role_params)
 		delete(emitter.break_patches)
 		delete(emitter.continue_targets)
 		delete(emitter.pending_functions)
@@ -189,7 +195,9 @@ compile_program :: proc(
 		emitter.next_register = len(verb.params)
 		emitter.max_register = emitter.next_register
 		scope_enter(&emitter)
+		clear(&emitter.role_params)
 		for param, param_index in verb.params {
+			emitter.role_params[param.name] = true
 			append(&emitter.locals, Local {
 				name     = param.name,
 				register = param_index,
@@ -215,6 +223,7 @@ compile_program :: proc(
 		saved_max := emitter.max_register
 		saved_locals := len(emitter.locals)
 		resize(&emitter.locals, 0)
+		clear(&emitter.role_params)
 		capture_count := len(pending.captures)
 		for capture, capture_index in pending.captures {
 			declare_local(&emitter, capture.name, capture_index, false)
@@ -1119,6 +1128,34 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 	}
 	if has_splice {
 		return emit_splice_call(emitter, call, text)
+	}
+
+	// Call resolution step 1: a lexically visible local function value takes
+	// precedence over compiler-recognized forms, builtins, and verb dispatch.
+	// Installed verb role parameters are the documented exception and do not
+	// hide a runtime function of the same name.
+	if local_register, _, found := resolve_local(emitter, text); found &&
+	   !emitter.role_params[text] {
+		argument_registers := make([dynamic]int, 0, len(call.args), emitter.allocator)
+		defer delete(argument_registers)
+		for argument in call.args {
+			register, has_value := emit_expr(emitter, argument.expr)
+			if !has_value {
+				return -1, false
+			}
+			append(&argument_registers, register)
+		}
+		first_argument := marshal_arguments(emitter, argument_registers[:])
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Call_Value,
+			u8(len(call.args)),
+			i32(destination),
+			i32(local_register),
+			i32(first_argument),
+		)
+		return destination, true
 	}
 
 	if text == "some" || text == "ok" || text == "err" {
