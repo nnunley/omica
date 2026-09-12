@@ -546,18 +546,28 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 
 		transaction := k.kernel_begin(kernel)
 		has_writes := false
-		for record_index in group_start ..< group_end {
-			for write in records[record_index].writes {
-				has_writes = true
-				error: k.Kernel_Error
-				if write.assert {
-					error = k.transaction_assert(&transaction, write.relation, write.tuple)
-				} else {
-					error = k.transaction_retract(&transaction, write.relation, write.tuple)
-				}
-				if error != .None {
-					k.transaction_destroy(&transaction)
-					return false
+		// Apply retractions before assertions. A functional replacement is
+		// staged as retract(old) + assert(new); the WAL sorts by tuple value,
+		// so replaying in record order could assert the new key value while
+		// the old one is still present and fail with a functional conflict.
+		for pass := 0; pass < 2; pass += 1 {
+			want_assert := pass == 1
+			for record_index in group_start ..< group_end {
+				for write in records[record_index].writes {
+					if write.assert != want_assert {
+						continue
+					}
+					has_writes = true
+					error: k.Kernel_Error
+					if write.assert {
+						error = k.transaction_assert(&transaction, write.relation, write.tuple)
+					} else {
+						error = k.transaction_retract(&transaction, write.relation, write.tuple)
+					}
+					if error != .None {
+						k.transaction_destroy(&transaction)
+						return false
+					}
 				}
 			}
 		}

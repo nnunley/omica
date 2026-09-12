@@ -761,3 +761,104 @@ test_auto_checkpoint_on_wal_bytes :: proc(t: ^testing.T) {
 	testing.expect(t, store_checkpoint_version(&store) > 0)
 	k.kernel_detach_store(&kernel)
 }
+
+// A functional replacement (retract the old key value, assert the new) must
+// replay from the WAL. Sorting staged writes by tuple value puts the assert
+// before the retract, which replays as a functional-key conflict.
+@(test)
+test_file_wal_replays_functional_replacement :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_functional")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+		metadata := k.relation_metadata(1, v.symbol_intern("Current"), 2)
+		metadata.conflict = k.conflict_functional([]u16{0})
+		metadata.durability = .Durable
+		created, create_error := k.kernel_create_relation(&kernel, metadata)
+		testing.expect_value(t, create_error, k.Kernel_Error.None)
+		k.snapshot_release(created)
+
+		key, _ := v.value_int(1)
+		old_value, _ := v.value_int(2)
+		new_value, _ := v.value_int(1)
+
+		tx := k.kernel_begin(&kernel)
+		testing.expect_value(
+			t,
+			k.transaction_assert(
+				&tx,
+				1,
+				v.tuple_new(context.temp_allocator, []v.Value{key, old_value}),
+			),
+			k.Kernel_Error.None,
+		)
+		committed, commit_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect_value(t, commit_error, k.Kernel_Error.None)
+		latest := committed.version
+		k.snapshot_release(committed)
+
+		// Replace the key's value: retract (1,2), assert (1,1).
+		tx2 := k.kernel_begin(&kernel)
+		testing.expect_value(
+			t,
+			k.transaction_retract(
+				&tx2,
+				1,
+				v.tuple_new(context.temp_allocator, []v.Value{key, old_value}),
+			),
+			k.Kernel_Error.None,
+		)
+		testing.expect_value(
+			t,
+			k.transaction_assert(
+				&tx2,
+				1,
+				v.tuple_new(context.temp_allocator, []v.Value{key, new_value}),
+			),
+			k.Kernel_Error.None,
+		)
+		committed2, commit_error2 := k.transaction_commit(&tx2)
+		k.transaction_destroy(&tx2)
+		testing.expect_value(t, commit_error2, k.Kernel_Error.None)
+		latest = committed2.version
+		k.snapshot_release(committed2)
+
+		store_wait_durable(&store, latest)
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_restore(&store, &kernel))
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(&kernel, 1, []v.Binding{{}, {}}, &rows)
+	testing.expect_value(t, len(rows), 1)
+	if len(rows) == 1 {
+		expected, _ := v.value_int(1)
+		testing.expect(t, v.value_eq(v.tuple_values(rows[0])[1], expected))
+	}
+}
