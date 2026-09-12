@@ -445,3 +445,105 @@ end
 	thread.join(run_thread)
 	thread.destroy(run_thread)
 }
+
+// A DOM event that fails to dispatch must not be acknowledged as 202.
+@(test)
+test_sync_dom_event_failure_status :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	// No `sync_event` verb, so dispatch fails.
+	source := `verb sync_view_tree(view)
+  return dom <div id="mount"></div>
+end
+`
+	path, path_ok := write_document_source(t, "mica_sync_event_failure.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "world start failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer r.world_destroy(world)
+	entry := r.world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
+
+	host: Sync_Fixture_Host
+	sync_host_init(&host.sync, world)
+	defer sync_host_destroy(&host.sync)
+
+	server: Web_Server
+	ok, message := web_server_init(&server, "127.0.0.1:0", sync_fixture_handler, &host)
+	testing.expectf(t, ok, "server init failed: %s", message)
+	if !ok {
+		return
+	}
+	web_server_set_stream_handler(&server, sync_fixture_stream)
+	run_thread := thread.create_and_start_with_data(&server, server_run_worker)
+	if run_thread == nil {
+		return
+	}
+
+	sse_client := dial_server(t, &server)
+	send_text(sse_client, "GET /sync/events?session=5 HTTP/1.1\r\nHost: a\r\n\r\n")
+	connected := read_until(sse_client, ": connected", 3 * time.Second)
+	defer delete(connected)
+
+	need := Sync_Envelope {
+		kind       = .Need_View,
+		session_id = 5,
+		view_id    = 1,
+	}
+	need_bytes: [dynamic]u8
+	defer delete(need_bytes)
+	sync_encode_envelope(&need, &need_bytes)
+	nc := dial_server(t, &server)
+	nl := fmt.aprintf(
+		"POST /sync/input HTTP/1.1\r\nHost: a\r\nContent-Length: %d\r\n\r\n",
+		len(need_bytes),
+	)
+	send_text(nc, nl)
+	_, _ = net.send_tcp(nc, need_bytes[:])
+	nr := read_response(nc)
+	delete(nr)
+
+	payload := `{"type":"dom_event","session":"5","view":"1","revision":"0","signature":"0","refresh":true,"event":"submit","target":"t","action":"punch","fields":{}}`
+	env := Sync_Envelope {
+		kind             = .Have_View,
+		session_id       = 5,
+		view_id          = 1,
+		client_revision  = 0,
+		client_signature = 0,
+		payload          = transmute([]u8)payload,
+	}
+	eb: [dynamic]u8
+	defer delete(eb)
+	sync_encode_envelope(&env, &eb)
+	ec := dial_server(t, &server)
+	el := fmt.aprintf(
+		"POST /sync/input HTTP/1.1\r\nHost: a\r\nContent-Length: %d\r\n\r\n",
+		len(eb),
+	)
+	send_text(ec, el)
+	_, _ = net.send_tcp(ec, eb[:])
+	er := read_response(ec)
+	defer delete(er)
+	testing.expectf(
+		t,
+		!strings.contains(string(er), "202"),
+		"failed event was acknowledged: %q",
+		string(er),
+	)
+
+	net.close(ec)
+	net.close(nc)
+	net.close(sse_client)
+	web_server_stop(&server)
+	thread.join(run_thread)
+	thread.destroy(run_thread)
+}

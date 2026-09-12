@@ -187,6 +187,15 @@ sync_dispatch_dom_event :: proc(
 		},
 	}
 	event_outcome := sync_world_call(host, session, "sync_event", roles)
+	if event_outcome.kind != .Complete {
+		http_response_text(
+			response,
+			500,
+			"text/plain; charset=utf-8",
+			"sync event failed",
+		)
+		return true
+	}
 
 	// Send the resulting view. A client behind the current revision gets a
 	// full snapshot; otherwise a delta.
@@ -195,7 +204,7 @@ sync_dispatch_dom_event :: proc(
 	stale := view.has_tree &&
 		(event.revision != view.revision || event.signature != view.signature)
 	sync.mutex_unlock(&view.render_lock)
-	_ = sync_render_view(
+	if !sync_render_view(
 		host,
 		event.session_id,
 		actor,
@@ -203,8 +212,15 @@ sync_dispatch_dom_event :: proc(
 		event.revision,
 		event.signature,
 		stale,
-	)
-	_ = event_outcome
+	) {
+		http_response_text(
+			response,
+			500,
+			"text/plain; charset=utf-8",
+			"cannot render view",
+		)
+		return true
+	}
 	response.status = 202
 	return true
 }
