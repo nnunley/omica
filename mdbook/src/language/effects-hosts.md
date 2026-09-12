@@ -1,5 +1,10 @@
 # Effects and Hosts
 
+> **Port status:** `emit` is not implemented in the Odin port. It is a no-op
+> that accepts any arguments and returns an empty relation, and committed
+> effects are not recorded. The design below describes the original
+> implementation and the intended behaviour.
+
 Effects are committed outputs from Mica tasks to the outside world. They are not performed directly
 by arbitrary task code.
 

@@ -35,6 +35,9 @@ runtime_builtins := [?]Builtin_Spec {
 	{"make_functional_relation", 3, builtin_relation},
 	{"__set_field", 3, builtin_set_field},
 	{"__get_field", 2, builtin_get_field},
+	// `emit` is a no-op in this port: effects are not recorded (see
+	// mdbook/src/language/effects-hosts.md). It stays callable so existing
+	// fileins load, but it discards its arguments.
 	{"emit", 2, builtin_noop},
 	{"require", 1, builtin_require},
 	{"frob", 2, builtin_frob},
