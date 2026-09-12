@@ -1,0 +1,7 @@
+# ThreadSanitizer suppressions.
+#
+# core:mem/virtual reserves and releases memory with raw `mmap`/`munmap`
+# syscalls (core/mem/virtual/virtual_linux.odin), which ThreadSanitizer cannot
+# intercept. Address reuse across threads is therefore reported as a data race
+# in the allocator itself. Suppress those frames; races elsewhere still fail.
+race:mem_virtual::*
