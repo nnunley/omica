@@ -1497,6 +1497,35 @@ test_metadata_defaults :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_system_endpoint_relations_are_volatile :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	metadata := system_relation_metadata(context.temp_allocator)
+	volatile_ids := [?]Relation_ID {
+		SYSTEM_ENDPOINT_ID,
+		SYSTEM_ENDPOINT_ACTOR_ID,
+		SYSTEM_ENDPOINT_PRINCIPAL_ID,
+		SYSTEM_ENDPOINT_PROTOCOL_ID,
+		SYSTEM_ENDPOINT_OPEN_ID,
+	}
+	for entry in metadata {
+		for id in volatile_ids {
+			if entry.id != id {
+				continue
+			}
+			testing.expectf(
+				t,
+				entry.durability == .Volatile,
+				"relation %v should be volatile",
+				entry.id,
+			)
+		}
+		if entry.id == SYSTEM_RELATION_ID {
+			testing.expect_value(t, entry.durability, Relation_Durability.Durable)
+		}
+	}
+}
+
+@(test)
 test_dispatch_method_entries_expose_params :: proc(t: ^testing.T) {
 	kernel: Kernel
 	kernel_init(&kernel)

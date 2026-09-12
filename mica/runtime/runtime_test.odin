@@ -2154,6 +2154,12 @@ for found in keyed_names
   require(len(IndexPosition(idx, 1, 1)) == 1)
   require(len(IndexStorageKind(idx, :btree)) == 1)
 end
+let endpoints = RelationName(?rel, :Endpoint)
+require(len(endpoints) == 1)
+for found in endpoints
+  let endpoint_rel = found[:rel]
+  require(len(RelationDurability(endpoint_rel, :volatile)) == 1)
+end
 let methods = MethodSelector(?mm, :greet)
 require(len(methods) == 1)
 let m = methods[0][:mm]

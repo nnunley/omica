@@ -166,11 +166,30 @@ system_relation_metadata :: proc(allocator := context.allocator) -> []Relation_M
 		relation_metadata(SYSTEM_SOURCE_OWNS_FACT_ID, v.symbol_intern("SourceOwnsFact"), 3),
 		relation_metadata(SYSTEM_SOURCE_OWNS_RULE_ID, v.symbol_intern("SourceOwnsRule"), 2),
 		relation_metadata(SYSTEM_SOURCE_OWNS_RELATION_ID, v.symbol_intern("SourceOwnsRelation"), 2),
-		relation_metadata(SYSTEM_ENDPOINT_ID, v.symbol_intern("Endpoint"), 1),
-		relation_metadata(SYSTEM_ENDPOINT_ACTOR_ID, v.symbol_intern("EndpointActor"), 2),
-		relation_metadata(SYSTEM_ENDPOINT_PRINCIPAL_ID, v.symbol_intern("EndpointPrincipal"), 2),
-		relation_metadata(SYSTEM_ENDPOINT_PROTOCOL_ID, v.symbol_intern("EndpointProtocol"), 2),
-		relation_metadata(SYSTEM_ENDPOINT_OPEN_ID, v.symbol_intern("EndpointOpen"), 1),
+		metadata_with_durability(
+			relation_metadata(SYSTEM_ENDPOINT_ID, v.symbol_intern("Endpoint"), 1),
+			.Volatile,
+		),
+		metadata_with_durability(
+			relation_metadata(SYSTEM_ENDPOINT_ACTOR_ID, v.symbol_intern("EndpointActor"), 2),
+			.Volatile,
+		),
+		metadata_with_durability(
+			relation_metadata(
+				SYSTEM_ENDPOINT_PRINCIPAL_ID,
+				v.symbol_intern("EndpointPrincipal"),
+				2,
+			),
+			.Volatile,
+		),
+		metadata_with_durability(
+			relation_metadata(SYSTEM_ENDPOINT_PROTOCOL_ID, v.symbol_intern("EndpointProtocol"), 2),
+			.Volatile,
+		),
+		metadata_with_durability(
+			relation_metadata(SYSTEM_ENDPOINT_OPEN_ID, v.symbol_intern("EndpointOpen"), 1),
+			.Volatile,
+		),
 	}
 	metadata := make([]Relation_Metadata, len(entries), allocator)
 	copy(metadata, entries[:])

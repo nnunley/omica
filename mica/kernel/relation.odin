@@ -124,6 +124,16 @@ metadata_with_conflict :: proc(
 	return result
 }
 
+// Returns metadata with the given durability.
+metadata_with_durability :: proc(
+	metadata: Relation_Metadata,
+	durability: Relation_Durability,
+) -> Relation_Metadata {
+	result := metadata
+	result.durability = durability
+	return result
+}
+
 // Returns the argument name at `position`, if set.
 metadata_argument_name :: proc(metadata: Relation_Metadata, position: u16) -> (v.Symbol, bool) {
 	if int(position) >= len(metadata.argument_names) {
