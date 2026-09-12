@@ -405,6 +405,9 @@ run_files :: proc(
 	defer world_destroy(world)
 
 	outcome := world_wait(world, world.entry)
+	// Let any children the entry spawned finish before the world is torn
+	// down; otherwise a still-ready child can be dropped at shutdown.
+	scheduler_wait_quiescent(&world.scheduler)
 	#partial switch outcome.kind {
 	case .Complete:
 		return Run_Result{ok = true, message = "loaded"}
@@ -1171,6 +1174,12 @@ builtin_set_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		))
 		return v.Value(0), false
 	}
+	// Field syntax is an ordinary relation write: enforce the same relation
+	// authority the direct assert/retract path requires.
+	if !k.authority_can_write(state.authority, info.relation) {
+		vm.vm_set_error(state, "E_PERMISSION", "relation write denied")
+		return v.Value(0), false
+	}
 
 	receiver := args[0]
 	value := args[2]
@@ -1258,6 +1267,12 @@ builtin_get_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 			name,
 			allocator = context.temp_allocator,
 		))
+		return v.Value(0), false
+	}
+	// Field syntax is an ordinary relation read: enforce the same relation
+	// authority the direct scan path requires.
+	if !k.authority_can_read(state.authority, info.relation) {
+		vm.vm_set_error(state, "E_PERMISSION", "relation read denied")
 		return v.Value(0), false
 	}
 

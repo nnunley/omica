@@ -1991,6 +1991,92 @@ suspend()
 	expect_relation_rows(t, &kernel, "AllowedMint", 0)
 }
 
+// Field read/write must enforce the same relation authority as direct scans
+// and writes. Regression (SEC1): the __get_field/__set_field builtins called
+// the kernel transaction path directly, so a task with no relation grants
+// could read and modify a functional relation through ordinary field syntax.
+@(test)
+test_run_field_access_requires_relation_authority :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_identity(:item)
+make_relation(:AllowedRead, 1)
+make_relation(:DeniedRead, 1)
+make_relation(:AllowedWrite, 1)
+make_relation(:DeniedWrite, 1)
+make_functional_relation(:Name, 2, [0])
+assert Name(#item, "secret")
+let allowed_read_cap = mint_capability(:write, :AllowedRead)
+let denied_read_cap = mint_capability(:write, :DeniedRead)
+let allowed_write_cap = mint_capability(:write, :AllowedWrite)
+let denied_write_cap = mint_capability(:write, :DeniedWrite)
+
+verb probe(allowed_read_cap, denied_read_cap, allowed_write_cap, denied_write_cap)
+  use_capability(allowed_read_cap)
+  use_capability(denied_read_cap)
+  use_capability(allowed_write_cap)
+  use_capability(denied_write_cap)
+  try
+    let value = #item.name
+    assert AllowedRead(1)
+  catch err
+    assert DeniedRead(1)
+  end
+  try
+    #item.name = "changed"
+    assert AllowedWrite(1)
+  catch err
+    assert DeniedWrite(1)
+  end
+end
+
+spawn :probe(allowed_read_cap: allowed_read_cap, denied_read_cap: denied_read_cap, allowed_write_cap: allowed_write_cap, denied_write_cap: denied_write_cap)
+suspend()
+`
+	path, path_ok := write_temp_source(t, "mica_field_authority_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{actor = "alice"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+
+	// Both field operations were denied.
+	expect_relation_rows(t, &kernel, "DeniedRead", 1)
+	expect_relation_rows(t, &kernel, "DeniedWrite", 1)
+	expect_relation_rows(t, &kernel, "AllowedRead", 0)
+	expect_relation_rows(t, &kernel, "AllowedWrite", 0)
+
+	// The denied write left the stored value unchanged.
+	metadata, metadata_found := k.snapshot_relation_metadata_named(
+		kernel.current,
+		v.symbol_intern("Name"),
+	)
+	testing.expect(t, metadata_found)
+	if metadata_found {
+		rows: [dynamic]v.Tuple
+		k.kernel_scan_into(&kernel, metadata.id, []v.Binding{{}, {}}, &rows)
+		testing.expect_value(t, len(rows), 1)
+		if len(rows) == 1 {
+			values := v.tuple_values(rows[0])
+			text, is_text := v.value_as_string(values[1])
+			testing.expect(t, is_text)
+			testing.expect_value(t, text, "secret")
+		}
+		delete(rows)
+	}
+}
+
 @(test)
 test_run_capability_multi_revoke_and_expiry :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)

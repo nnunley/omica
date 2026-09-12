@@ -856,6 +856,29 @@ scheduler_idle :: proc(scheduler: ^Scheduler) -> bool {
 	return true
 }
 
+// Waits until nothing is running and the ready queue is empty. Parked and
+// sleeping tasks do not block, so a completed entry's spawned children are
+// given a chance to finish before the world is torn down. Without this, a
+// child still in `ready` is dropped when shutdown sets `stop`.
+@(private)
+scheduler_wait_quiescent :: proc(scheduler: ^Scheduler) {
+	sync.mutex_lock(&scheduler.lock)
+	for {
+		running := false
+		for _, entry in scheduler.entries {
+			if entry.running {
+				running = true
+				break
+			}
+		}
+		if !running && len(scheduler.ready) == 0 {
+			break
+		}
+		sync.cond_wait(&scheduler.cond, &scheduler.lock)
+	}
+	sync.mutex_unlock(&scheduler.lock)
+}
+
 @(private)
 scheduler_push_timer :: proc(scheduler: ^Scheduler, entry: Timer_Entry) {
 	insert := len(scheduler.timers)
