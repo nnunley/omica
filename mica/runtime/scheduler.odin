@@ -764,6 +764,7 @@ scheduler_submit_dispatch :: proc(
 	roles: []k.Role_Pair,
 	delay_millis: i64,
 	facts: []World_Fact = nil,
+	options: World_Call_Options = {},
 ) -> Dispatch_Result {
 	snapshot := k.kernel_snapshot(scheduler.kernel)
 	defer k.snapshot_release(snapshot)
@@ -816,6 +817,18 @@ scheduler_submit_dispatch :: proc(
 			free(task, scheduler.allocator)
 			return Dispatch_Result{error = .Fact, kernel = err}
 		}
+	}
+	// A per-call actor overrides the world identities for this task.
+	if !v.value_is_empty_relation(options.actor) {
+		endpoint := options.endpoint
+		if v.value_is_empty_relation(endpoint) {
+			endpoint = env.endpoint
+		}
+		principal := options.principal
+		if v.value_is_empty_relation(principal) {
+			principal = options.actor
+		}
+		vm.vm_set_identities(&task.state, endpoint, options.actor, principal)
 	}
 	vm.vm_set_entry_function(&task.state, i32(function_index))
 	vm.vm_set_entry_arguments(&task.state, arguments)

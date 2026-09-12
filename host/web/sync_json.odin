@@ -94,6 +94,7 @@ Sync_Session :: struct {
 	receiver:      v.Value,
 	sender:        v.Value,
 	has_mailbox:   bool,
+	actor:         v.Value,
 }
 
 // The in-process sync host: a session table, the world used to render views,
@@ -147,14 +148,22 @@ sync_host_destroy :: proc(host: ^Sync_Host) {
 	delete(host.subscription_views)
 }
 
-sync_host_ensure_session :: proc(host: ^Sync_Host, session_id: u64) -> ^Sync_Session {
+sync_host_ensure_session :: proc(
+	host: ^Sync_Host,
+	session_id: u64,
+	actor := v.Value(0),
+) -> ^Sync_Session {
 	sync.mutex_lock(&host.lock)
 	if existing, found := host.sessions[session_id]; found {
+		if !v.value_is_empty_relation(actor) {
+			existing.actor = actor
+		}
 		sync.mutex_unlock(&host.lock)
 		return existing
 	}
 	session := new(Sync_Session, host.allocator)
 	session.session_id = session_id
+	session.actor = actor
 	session.allocator = host.allocator
 	session.messages = make([dynamic]Sync_Envelope, host.allocator)
 	session.views = make(map[u64]^View_State, host.allocator)

@@ -99,7 +99,7 @@ sync_render_view :: proc(
 	roles := []k.Role_Pair {
 		{role = v.value_symbol(v.symbol_intern("view")), value = view_value},
 	}
-	outcome := r.world_call(host.world, "sync_view_tree", roles)
+	outcome := sync_world_call(host, session, "sync_view_tree", roles)
 	if outcome.kind != .Complete {
 		return false
 	}
@@ -193,7 +193,7 @@ sync_ensure_view_subscriptions :: proc(
 	roles := []k.Role_Pair {
 		{role = v.value_symbol(v.symbol_intern("view")), value = view_value},
 	}
-	outcome := r.world_call(host.world, "sync_view_dependencies", roles)
+	outcome := sync_world_call(host, session, "sync_view_dependencies", roles)
 	if outcome.kind != .Complete {
 		view.deps_error = fmt.aprintf(
 			"call %v: %s",
@@ -280,6 +280,30 @@ sync_ensure_view_subscriptions :: proc(
 		sync.mutex_unlock(&host.lock)
 	}
 	return true
+}
+
+// Calls a world verb as the session actor (when one is bound).
+@(private)
+sync_world_call :: proc(
+	host: ^Sync_Host,
+	session: ^Sync_Session,
+	selector: string,
+	roles: []k.Role_Pair,
+) -> r.Task_Outcome {
+	result := r.world_submit_call_with_options(
+		host.world,
+		selector,
+		roles,
+		nil,
+		0,
+		r.World_Call_Options{actor = session.actor},
+	)
+	if result.id == 0 {
+		return r.Task_Outcome{kind = .Aborted, message = "no applicable method"}
+	}
+	outcome := r.world_wait(host.world, result.id)
+	r.world_release(host.world, result.id)
+	return outcome
 }
 
 @(private)

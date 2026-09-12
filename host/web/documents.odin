@@ -30,12 +30,22 @@ documents_init :: proc(documents: ^Documents, world: ^r.World) {
 }
 
 documents_handle :: proc(user: rawptr, request: ^Http_Request, response: ^Http_Response) {
+	documents_handle_actor(user, v.Value(0), request, response)
+}
+
+// Handles a document route as `actor`. A zero actor uses the world defaults.
+documents_handle_actor :: proc(
+	user: rawptr,
+	actor: v.Value,
+	request: ^Http_Request,
+	response: ^Http_Response,
+) {
 	documents := (^Documents)(user)
 	if documents.world == nil {
 		http_response_text(response, 500, "text/plain; charset=utf-8", "no world loaded")
 		return
 	}
-	request_value, facts, built, message := documents_build_request(documents, request)
+	request_value, facts, built, message := documents_build_request(documents, actor, request)
 	if !built {
 		http_response_text(response, 500, "text/plain; charset=utf-8", message)
 		return
@@ -45,11 +55,13 @@ documents_handle :: proc(user: rawptr, request: ^Http_Request, response: ^Http_R
 	roles := []k.Role_Pair {
 		{role = v.value_symbol(v.symbol_intern("request")), value = request_value},
 	}
-	result := r.world_submit_call_with_facts(
+	result := r.world_submit_call_with_options(
 		documents.world,
 		"http_request",
 		roles,
 		facts[:],
+		0,
+		r.World_Call_Options{actor = actor},
 	)
 	if result.id == 0 {
 		http_response_text(response, 500, "text/plain; charset=utf-8", dispatch_failure(result))
@@ -74,6 +86,7 @@ documents_handle :: proc(user: rawptr, request: ^Http_Request, response: ^Http_R
 @(private)
 documents_build_request :: proc(
 	documents: ^Documents,
+	actor: v.Value,
 	request: ^Http_Request,
 ) -> (
 	v.Value,
@@ -132,17 +145,19 @@ documents_build_request :: proc(
 			tuple    = v.tuple_new(allocator, []v.Value{request_value, version_value}),
 		})
 	}
+	principal := actor
+	if v.value_is_empty_relation(principal) {
+		principal = r.world_principal(documents.world)
+	}
 	if principal_rel, has_principal := document_relation(snapshot, "RequestPrincipal"); has_principal {
-		append(&facts, r.World_Fact {
-			relation = principal_rel,
-			tuple    = v.tuple_new(allocator, []v.Value {
-				request_value,
-				r.world_principal(documents.world),
-			}),
-		})
+		if !v.value_is_empty_relation(principal) {
+			append(&facts, r.World_Fact {
+				relation = principal_rel,
+				tuple    = v.tuple_new(allocator, []v.Value{request_value, principal}),
+			})
+		}
 	}
 	if actor_rel, has_actor := document_relation(snapshot, "RequestActor"); has_actor {
-		actor := r.world_actor(documents.world)
 		if !v.value_is_empty_relation(actor) {
 			append(&facts, r.World_Fact {
 				relation = actor_rel,

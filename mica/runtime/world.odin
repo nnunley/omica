@@ -29,6 +29,13 @@ World_Fact :: struct {
 	tuple:    v.Tuple,
 }
 
+// Per-call identity overrides. Empty values keep the world defaults.
+World_Call_Options :: struct {
+	actor:     v.Value,
+	principal: v.Value,
+	endpoint:  v.Value,
+}
+
 World :: struct {
 	kernel:    ^k.Kernel,
 	allocator: mem.Allocator,
@@ -122,6 +129,18 @@ world_submit_call_with_facts :: proc(
 	facts: []World_Fact,
 	delay_millis := i64(0),
 ) -> Dispatch_Result {
+	return world_submit_call_with_options(world, selector, roles, facts, delay_millis, {})
+}
+
+// Submits a call with per-call identity overrides.
+world_submit_call_with_options :: proc(
+	world: ^World,
+	selector: string,
+	roles: []k.Role_Pair,
+	facts: []World_Fact,
+	delay_millis: i64,
+	options: World_Call_Options,
+) -> Dispatch_Result {
 	return scheduler_submit_dispatch(
 		&world.scheduler,
 		&world.env,
@@ -130,7 +149,30 @@ world_submit_call_with_facts :: proc(
 		roles,
 		delay_millis,
 		facts,
+		options,
 	)
+}
+
+// Applies facts from a host thread and dispatches subscriptions. Used for
+// session facts that have no owning Mica task.
+world_apply_facts :: proc(world: ^World, facts: []World_Fact) -> k.Kernel_Error {
+	if len(facts) == 0 {
+		return .None
+	}
+	tx := k.kernel_begin(world.kernel)
+	defer k.transaction_destroy(&tx)
+	for fact in facts {
+		if err := k.transaction_assert(&tx, fact.relation, fact.tuple); err != .None {
+			return err
+		}
+	}
+	committed, err := k.transaction_commit(&tx)
+	if err != .None {
+		return err
+	}
+	k.snapshot_release(committed)
+	subscriptions_dispatch(&world.env)
+	return .None
 }
 
 // Waits for a submitted task to reach a terminal outcome.

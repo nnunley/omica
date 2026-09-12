@@ -72,6 +72,8 @@ main :: proc() {
 	defer k.kernel_destroy(&kernel)
 
 	host: Webhost
+	web.auth_init(&host.auth, context.allocator)
+	defer web.auth_destroy(&host.auth)
 	if ok, message := web.routes_init(&host.routes, sync_client); !ok {
 		fmt.eprintf("webhost: %s\n", message)
 		os.exit(1)
@@ -99,6 +101,12 @@ main :: proc() {
 		}
 		web.documents_init(&host.documents, world)
 		web.sync_host_init(&host.sync, world)
+		if actor, found := world.ctx.identities["alice"]; found {
+			_ = web.auth_seed_user(&host.auth, "alice", "alice-pass", actor)
+		}
+		if actor, found := world.ctx.identities["bob"]; found {
+			_ = web.auth_seed_user(&host.auth, "bob", "bob-pass", actor)
+		}
 	}
 	// Runs at process exit, not at the end of the block above.
 	defer r.world_destroy(world)

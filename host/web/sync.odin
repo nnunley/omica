@@ -31,6 +31,7 @@ allow_post_headers := []Http_Header{{"Allow", "POST"}}
 // sync request.
 sync_handle_request :: proc(
 	host: ^Sync_Host,
+	actor: v.Value,
 	request: ^Http_Request,
 	response: ^Http_Response,
 ) -> bool {
@@ -71,7 +72,7 @@ sync_handle_request :: proc(
 			return true
 		}
 	case .Have_View:
-		session := sync_host_ensure_session(host, envelope.session_id)
+		session := sync_host_ensure_session(host, envelope.session_id, actor)
 		view := sync_view_state(session, envelope.view_id)
 		sync.mutex_lock(&view.render_lock)
 		up_to_date := view.has_tree &&
@@ -107,6 +108,7 @@ sync_handle_request :: proc(
 // `/sync/events`; otherwise it owns the connection until the stream ends.
 sync_events_stream :: proc(
 	host: ^Sync_Host,
+	actor: v.Value,
 	request: ^Http_Request,
 	socket: net.TCP_Socket,
 ) -> bool {
@@ -127,7 +129,7 @@ sync_events_stream :: proc(
 		return true
 	}
 
-	session := sync_host_ensure_session(host, session_id)
+	session := sync_host_ensure_session(host, session_id, actor)
 	generation := sync_session_claim_writer(session)
 	defer sync_session_release_writer(session, generation)
 

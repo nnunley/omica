@@ -19,7 +19,7 @@ Sync_Fixture_Host :: struct {
 @(private)
 sync_fixture_handler :: proc(user: rawptr, request: ^Http_Request, response: ^Http_Response) {
 	host := (^Sync_Fixture_Host)(user)
-	if !sync_handle_request(&host.sync, request, response) {
+	if !sync_handle_request(&host.sync, v.Value(0), request, response) {
 		http_response_text(response, 404, "text/plain; charset=utf-8", "not found\n")
 	}
 }
@@ -27,7 +27,7 @@ sync_fixture_handler :: proc(user: rawptr, request: ^Http_Request, response: ^Ht
 @(private)
 sync_fixture_stream :: proc(user: rawptr, request: ^Http_Request, socket: net.TCP_Socket) -> bool {
 	host := (^Sync_Fixture_Host)(user)
-	return sync_events_stream(&host.sync, request, socket)
+	return sync_events_stream(&host.sync, v.Value(0), request, socket)
 }
 
 // Reads until the accumulated bytes contain `needle` or the deadline passes.
