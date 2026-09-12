@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -211,6 +212,43 @@ test_server_method_not_allowed :: proc(t: ^testing.T) {
 	)
 
 	net.close(client)
+	web_server_stop(&server)
+	thread.join(run_thread)
+	thread.destroy(run_thread)
+}
+
+// Completed connections must be reclaimed during operation, not only at
+// shutdown.
+@(test)
+test_server_reaps_completed_connections :: proc(t: ^testing.T) {
+	routes: Routes
+	defer routes_destroy(&routes)
+	server: Web_Server
+	run_thread := start_server(t, &server, &routes)
+	if run_thread == nil {
+		return
+	}
+
+	for _ in 0 ..< 3 {
+		client := dial_server(t, &server)
+		send_text(client, "GET /healthz HTTP/1.1\r\nHost: a\r\n\r\n")
+		response := read_response(client)
+		delete(response)
+		net.close(client)
+	}
+
+	remaining := 0
+	for _ in 0 ..< 100 {
+		sync.mutex_lock(&server.lock)
+		remaining = len(server.connections)
+		sync.mutex_unlock(&server.lock)
+		if remaining == 0 {
+			break
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	testing.expect_value(t, remaining, 0)
+
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)

@@ -90,10 +90,41 @@ web_server_endpoint :: proc(server: ^Web_Server) -> (net.Endpoint, bool) {
 	return endpoint, err == .None
 }
 
+// Reaps connection threads that have finished. Called by the acceptor so a
+// long-running server keeps only live connections. Joining happens after the
+// array is compacted under the lock, so it cannot deadlock a worker.
+@(private)
+web_server_reap_connections :: proc(server: ^Web_Server) {
+	done: [dynamic]^Web_Connection
+	done = make([dynamic]^Web_Connection, context.allocator)
+	sync.mutex_lock(&server.lock)
+	write := 0
+	for connection in server.connections {
+		if connection.done {
+			append(&done, connection)
+			continue
+		}
+		server.connections[write] = connection
+		write += 1
+	}
+	resize(&server.connections, write)
+	sync.mutex_unlock(&server.lock)
+
+	for connection in done {
+		if connection.thread != nil {
+			thread.join(connection.thread)
+			thread.destroy(connection.thread)
+		}
+		free(connection, server.allocator)
+	}
+	delete(done)
+}
+
 // Accepts connections until `web_server_stop` closes the listener. Each
 // connection runs on its own thread.
 web_server_run :: proc(server: ^Web_Server) {
 	for {
+		web_server_reap_connections(server)
 		client, _, accept_err := net.accept_tcp(server.listener)
 		if accept_err != .None {
 			sync.mutex_lock(&server.lock)
@@ -126,6 +157,16 @@ web_server_run :: proc(server: ^Web_Server) {
 			continue
 		}
 		sync.mutex_lock(&server.lock)
+		if server.stopping {
+			// Shutdown won the race after the worker started; drain this
+			// connection here so it is not orphaned.
+			sync.mutex_unlock(&server.lock)
+			net.shutdown(client, .Both)
+			thread.join(connection.thread)
+			thread.destroy(connection.thread)
+			free(connection, server.allocator)
+			return
+		}
 		append(&server.connections, connection)
 		sync.mutex_unlock(&server.lock)
 	}
@@ -139,22 +180,26 @@ web_server_stop :: proc(server: ^Web_Server) {
 	sync.mutex_unlock(&server.lock)
 	net.close(server.listener)
 
+	// Take ownership of the connection set under the lock, then unblock and
+	// join outside it. This prevents concurrent traversal/mutation.
 	sync.mutex_lock(&server.lock)
-	for connection in server.connections {
+	drained := server.connections
+	server.connections = make([dynamic]^Web_Connection, server.allocator)
+	for connection in drained {
 		if !connection.done {
 			net.shutdown(connection.socket, .Both)
 		}
 	}
 	sync.mutex_unlock(&server.lock)
 
-	for connection in server.connections {
+	for connection in drained {
 		if connection.thread != nil {
 			thread.join(connection.thread)
 			thread.destroy(connection.thread)
 		}
 		free(connection, server.allocator)
 	}
-	delete(server.connections)
+	delete(drained)
 }
 
 @(private)
