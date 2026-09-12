@@ -1009,6 +1009,44 @@ test_vm_authority_denies_and_root_allows :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(rows), 1)
 }
 
+// Per-instruction temporaries must not accumulate: the VM reset its scratch
+// arena each instruction. Regression: these used the thread temp arena, which
+// was only reclaimed at the task boundary, so one long task grew it per step.
+@(test)
+test_vm_scratch_arena_is_reclaimed :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+	constant := i32(builder_add_constant(&builder, must_int(1)))
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 4, true)
+	for register in 0 ..< 3 {
+		builder_emit(&builder, .Load_Const, 0, i32(register), constant, 0)
+	}
+	// Each Build_List allocates a scratch slice; 20k of them would grow a
+	// non-reset arena into the megabytes.
+	ITERATIONS :: 20_000
+	for _ in 0 ..< ITERATIONS {
+		builder_emit(&builder, .Build_List, 0, 3, 0, 3)
+	}
+	builder_emit(&builder, .Return, 0, 3, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect(t, state.scratch != nil)
+	// Every instruction reclaimed its scratch, so nothing is outstanding.
+	testing.expect_value(t, state.scratch.total_used, uint(0))
+}
+
 @(test)
 test_vm_unwind_shrinks_registers :: proc(t: ^testing.T) {
 	arena := test_arena()

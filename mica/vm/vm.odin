@@ -8,6 +8,7 @@ package vm
 
 import "core:fmt"
 import "core:mem"
+import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -151,6 +152,11 @@ VM :: struct {
 	// The owning task, when the VM runs as part of one. Used by task-scoped
 	// builtins to stage effects until the task commits.
 	owner: rawptr,
+	// VM-local scratch arena for per-instruction temporaries. Reset at the top
+	// of each instruction so a long-running task does not grow the thread's
+	// temp arena without bound.
+	scratch:           ^virtual.Arena,
+	scratch_allocator: mem.Allocator,
 }
 
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
@@ -172,6 +178,11 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
 	state.status = .Ready
+	state.scratch = new(virtual.Arena, allocator)
+	if init_error := virtual.arena_init_growing(state.scratch); init_error != nil {
+		panic("failed to initialize VM scratch arena")
+	}
+	state.scratch_allocator = virtual.arena_allocator(state.scratch)
 }
 
 vm_destroy :: proc(state: ^VM) {
@@ -181,6 +192,11 @@ vm_destroy :: proc(state: ^VM) {
 	delete(state.registers)
 	delete(state.frames)
 	delete(state.builtins)
+	if state.scratch != nil {
+		virtual.arena_destroy(state.scratch)
+		free(state.scratch, state.allocator)
+		state.scratch = nil
+	}
 }
 
 // Writes a resume value into the register the suspended instruction named.
@@ -332,6 +348,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 	}
 
 	for {
+		// Per-instruction temporaries live in the VM scratch arena; reclaim
+		// them here so a long-running task does not grow memory per step.
+		virtual.arena_free_all(state.scratch)
 		top := len(state.frames) - 1
 		frame := state.frames[top]
 		if frame.ip < 0 || frame.ip >= len(program.code) {
@@ -393,7 +412,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 			callee := program.functions[instr.b]
 			argument_count := int(instr.flags)
-			args := make([]v.Value, argument_count, context.temp_allocator)
+			args := make([]v.Value, argument_count, state.scratch_allocator)
 			for index in 0 ..< argument_count {
 				args[index] = state.registers[base + int(instr.c) + index]
 			}
@@ -435,7 +454,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Build_List:
 			count := int(instr.c)
-			items := make([]v.Value, count, context.temp_allocator)
+			items := make([]v.Value, count, state.scratch_allocator)
 			for index in 0 ..< count {
 				items[index] = state.registers[base + int(instr.b) + index]
 			}
@@ -443,7 +462,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Build_Map:
 			count := int(instr.c)
-			entries := make([]v.Map_Entry, count, context.temp_allocator)
+			entries := make([]v.Map_Entry, count, state.scratch_allocator)
 			for index in 0 ..< count {
 				entries[index] = v.Map_Entry {
 					key   = state.registers[base + int(instr.b) + index * 2],
@@ -737,7 +756,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			callee := program.functions[function_index]
 			capture_count := len(callable.captures)
 			argument_count := int(instr.flags)
-			args := make([]v.Value, argument_count, context.temp_allocator)
+			args := make([]v.Value, argument_count, state.scratch_allocator)
 			for index in 0 ..< argument_count {
 				args[index] = state.registers[base + int(instr.c) + index]
 			}
@@ -1057,7 +1076,7 @@ vm_unwind :: proc(state: ^VM) -> bool {
 @(private)
 vm_build_relation :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	shape := state.program.relation_shapes[instr.b]
-	values := make([]v.Value, len(shape.heading), context.temp_allocator)
+	values := make([]v.Value, len(shape.heading), state.scratch_allocator)
 	for index in 0 ..< len(values) {
 		values[index] = state.registers[base + int(instr.c) + index]
 	}
@@ -1147,7 +1166,7 @@ vm_collection_value_at :: proc(state: ^VM, base: int, instr: Instruction) -> boo
 			return false
 		}
 		row := v.tuple_values(relation.rows[index])
-		entries := make([]v.Map_Entry, len(relation.heading), context.temp_allocator)
+		entries := make([]v.Map_Entry, len(relation.heading), state.scratch_allocator)
 		for column, column_index in relation.heading {
 			entries[column_index] = v.Map_Entry {
 				key   = v.value_symbol(column),
@@ -1207,7 +1226,7 @@ vm_index :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 				return false
 			}
 			row := relation.rows[row_index]
-			entries := make([]v.Map_Entry, len(relation.heading), context.temp_allocator)
+			entries := make([]v.Map_Entry, len(relation.heading), state.scratch_allocator)
 			for column, index in relation.heading {
 				entries[index] = v.Map_Entry {
 					key   = v.value_symbol(column),
@@ -1239,7 +1258,7 @@ vm_index :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		} else if len(relation.rows) == 1 {
 			result = v.tuple_values(relation.rows[0])[position]
 		} else {
-			cells := make([]v.Value, len(relation.rows), context.temp_allocator)
+			cells := make([]v.Value, len(relation.rows), state.scratch_allocator)
 			for row, index in relation.rows {
 				cells[index] = v.tuple_values(row)[position]
 			}
@@ -1270,7 +1289,7 @@ vm_builtin_call :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		if argc < 0 {
 			argc = int(instr.flags)
 		}
-		args := make([]v.Value, argc, context.temp_allocator)
+		args := make([]v.Value, argc, state.scratch_allocator)
 		for index in 0 ..< argc {
 			args[index] = state.registers[base + int(instr.c) + index]
 		}
@@ -1323,7 +1342,7 @@ vm_scan_rows :: proc(
 		vm_fail(state, "E_PERMISSION", "relation read denied")
 		return false
 	}
-	bindings := vm_pattern_bindings(state, base, pattern, context.temp_allocator)
+	bindings := vm_pattern_bindings(state, base, pattern, state.scratch_allocator)
 	k.relation_source_scan_into(state.source, k.Relation_ID(pattern.relation), bindings, out)
 	return true
 }
@@ -1353,8 +1372,8 @@ vm_scan_collect :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		}
 		result = converted
 	} else {
-		heading := make([]v.Symbol, output_count, context.temp_allocator)
-		positions := make([]u16, output_count, context.temp_allocator)
+		heading := make([]v.Symbol, output_count, state.scratch_allocator)
+		positions := make([]u16, output_count, state.scratch_allocator)
 		write := 0
 		for cell, index in pattern.cells {
 			if cell.kind == .Output {
@@ -1363,7 +1382,7 @@ vm_scan_collect :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 				write += 1
 			}
 		}
-		projected := make([]v.Tuple, len(rows), context.temp_allocator)
+		projected := make([]v.Tuple, len(rows), state.scratch_allocator)
 		for row, index in rows {
 			projected[index] = v.tuple_select(row, state.allocator, positions)
 		}
@@ -1409,7 +1428,7 @@ vm_scan_first :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		vm_fail(state, "E_PERMISSION", "relation read denied")
 		return false
 	}
-	bindings := vm_pattern_bindings(state, base, pattern, context.temp_allocator)
+	bindings := vm_pattern_bindings(state, base, pattern, state.scratch_allocator)
 	ctx := First_Binding_Context {
 		vm      = state,
 		base    = base,
@@ -1494,7 +1513,7 @@ vm_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	program := state.program
 	spec := program.dispatch_specs[instr.b]
 	selector := v.value_symbol(spec.selector)
-	roles := make([]k.Role_Pair, len(spec.roles), context.temp_allocator)
+	roles := make([]k.Role_Pair, len(spec.roles), state.scratch_allocator)
 	for role, index in spec.roles {
 		roles[index] = k.Role_Pair {
 			role  = v.value_symbol(role.role),
@@ -1532,7 +1551,13 @@ vm_dispatch_call :: proc(
 		param           = k.Relation_ID(program.dispatch_param_relation),
 		delegates       = k.Relation_ID(program.dispatch_delegates_relation),
 	}
-	all_entries := k.applicable_method_entries(state.source, relations, selector, roles)
+	all_entries := k.applicable_method_entries(
+		state.source,
+		relations,
+		selector,
+		roles,
+		state.scratch_allocator,
+	)
 	if len(all_entries) == 0 {
 		vm_fail(state, "E_DISPATCH", "no applicable method")
 		return false
@@ -1555,7 +1580,7 @@ vm_dispatch_call :: proc(
 		return false
 	}
 	entry := entries[0]
-	args, args_ok := k.dispatch_method_args(entry.params, roles)
+	args, args_ok := k.dispatch_method_args(entry.params, roles, state.scratch_allocator)
 	if !args_ok {
 		vm_fail(state, "E_DISPATCH", "method parameters cannot be bound")
 		return false
@@ -1638,7 +1663,7 @@ vm_positional_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> boo
 		return false
 	}
 	argument_count := int(instr.flags)
-	args := make([]v.Value, argument_count, context.temp_allocator)
+	args := make([]v.Value, argument_count, state.scratch_allocator)
 	for index in 0 ..< argument_count {
 		args[index] = state.registers[base + int(instr.c) + index]
 	}
@@ -1689,7 +1714,7 @@ vm_dynamic_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		vm_fail(state, "E_TYPE", "invoke roles are not a map")
 		return false
 	}
-	roles := make([]k.Role_Pair, len(entries), context.temp_allocator)
+	roles := make([]k.Role_Pair, len(entries), state.scratch_allocator)
 	for entry, index in entries {
 		role, is_symbol := v.value_as_symbol(entry.key)
 		if !is_symbol {
@@ -1988,7 +2013,7 @@ vm_bind_params :: proc(
 		if rest_count < 0 {
 			rest_count = 0
 		}
-		rest := make([]v.Value, rest_count, context.temp_allocator)
+		rest := make([]v.Value, rest_count, state.scratch_allocator)
 		for index in 0 ..< rest_count {
 			rest[index] = args[non_rest + index]
 		}
