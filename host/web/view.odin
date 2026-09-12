@@ -89,7 +89,14 @@ sync_render_view :: proc(
 	session, session_found := host.sessions[session_id]
 	actor_matches := session_found && session.actor == actor
 	sync.mutex_unlock(&host.lock)
-	if !actor_matches || session.closed {
+	if !actor_matches {
+		return false
+	}
+	// `closed` is guarded by `session.lock` (see `sync_session_close`).
+	sync.mutex_lock(&session.lock)
+	closed := session.closed
+	sync.mutex_unlock(&session.lock)
+	if closed {
 		return false
 	}
 	view := sync_view_state(session, view_id)
