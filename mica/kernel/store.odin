@@ -28,6 +28,19 @@ Relation_Chunk :: struct {
 	refs:   i32,
 	arena:  ^Frame_Arena,
 	pool:   ^Arena_Pool,
+	// Stable identity for the checkpoint cache. The chunk address is recycled
+	// with its pooled arena, so it cannot be used as a persistent key.
+	generation: u64,
+}
+
+// Monotonic source of chunk identities. Never reset; identities only need to
+// be unique for the life of the process.
+@(private)
+chunk_generation_counter: u64
+
+@(private)
+next_chunk_generation :: proc() -> u64 {
+	return sync.atomic_add(&chunk_generation_counter, 1) + 1
 }
 
 // A relation's materialized tuple state.
@@ -109,6 +122,7 @@ relation_chunk_create :: proc(pool: ^Arena_Pool, rows: []v.Tuple) -> ^Relation_C
 	chunk.refs = 1
 	chunk.arena = arena
 	chunk.pool = pool
+	chunk.generation = next_chunk_generation()
 	return chunk
 }
 

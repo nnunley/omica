@@ -408,7 +408,7 @@ store_checkpoint_internal :: proc(store: ^Store, kernel: ^k.Kernel, wait: bool) 
 			row_counts: [dynamic]u32
 			row_counts = make([dynamic]u32, context.temp_allocator)
 			for chunk in block.chunks {
-				key := rawptr(chunk)
+				key := chunk.generation
 				page_id, found := store.persisted[key]
 				if !found {
 					appended, appended_ok := store_page_append(

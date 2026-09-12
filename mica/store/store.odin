@@ -135,7 +135,7 @@ Store :: struct {
 	pages_file:         ^os.File,
 	pages_end:          i64,
 	next_page_id:       u32,
-	persisted:          map[rawptr]u32,
+	persisted:          map[u64]u32,
 	page_index:         map[u32]Page_Index,
 	checkpoint_version: u64,
 	manifest_relations: []Checkpoint_Relation,
@@ -227,7 +227,7 @@ store_setup :: proc(store: ^Store, options: Store_Options) {
 	}
 	store.tickets = make(map[k.Persist_Ticket]i64, store.allocator)
 	store.known = make(map[k.Relation_ID]bool, store.allocator)
-	store.persisted = make(map[rawptr]u32, store.allocator)
+	store.persisted = make(map[u64]u32, store.allocator)
 	store.page_index = make(map[u32]Page_Index, store.allocator)
 	store.queue = make([dynamic]Queue_Entry, store.allocator)
 	store.records = make([dynamic]Wal_Record, store.allocator)

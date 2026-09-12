@@ -862,3 +862,71 @@ test_file_wal_replays_functional_replacement :: proc(t: ^testing.T) {
 		testing.expect(t, v.value_eq(v.tuple_values(rows[0])[1], expected))
 	}
 }
+
+// Repeated replacement plus checkpointing recycles chunk arenas. A checkpoint
+// cache keyed by the raw chunk address mistakes a new chunk for an already
+// persisted one at the same address and references stale rows.
+@(test)
+test_file_checkpoint_survives_chunk_reuse :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_chunk_reuse")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	value_count := 30
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+		create_named_relation(t, &kernel, 1, "Counter", 1, .Durable)
+
+		for i in 0 ..< value_count {
+			value, _ := v.value_int(i64(i))
+			tx := k.kernel_begin(&kernel)
+			if i > 0 {
+				previous, _ := v.value_int(i64(i - 1))
+				k.transaction_retract(
+					&tx,
+					1,
+					v.tuple_new(context.temp_allocator, []v.Value{previous}),
+				)
+			}
+			k.transaction_assert(&tx, 1, v.tuple_new(context.temp_allocator, []v.Value{value}))
+			committed, commit_error := k.transaction_commit(&tx)
+			k.transaction_destroy(&tx)
+			testing.expect_value(t, commit_error, k.Kernel_Error.None)
+			k.snapshot_release(committed)
+			testing.expect(t, store_checkpoint(&store, &kernel))
+		}
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_restore(&store, &kernel))
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(&kernel, 1, []v.Binding{{}}, &rows)
+	testing.expect_value(t, len(rows), 1)
+	if len(rows) == 1 {
+		expected, _ := v.value_int(i64(value_count - 1))
+		testing.expect(t, v.value_eq(v.tuple_values(rows[0])[0], expected))
+	}
+}

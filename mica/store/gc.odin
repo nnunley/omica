@@ -255,8 +255,8 @@ store_pages_compact_locked :: proc(store: ^Store) -> bool {
 	store.page_index = new_index
 	store.pages_end = offset
 	store.pages_generation = new_generation
-	stale: [dynamic]rawptr
-	stale = make([dynamic]rawptr, context.temp_allocator)
+	stale: [dynamic]u64
+	stale = make([dynamic]u64, context.temp_allocator)
 	for key, page_id in store.persisted {
 		if mapped, found := remap[page_id]; found {
 			store.persisted[key] = mapped
