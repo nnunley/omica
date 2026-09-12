@@ -107,6 +107,11 @@ web_server_run :: proc(server: ^Web_Server) {
 			}
 			continue
 		}
+		// Accepted sockets inherit the listener's non-blocking flag on
+		// BSD/macOS (but not Linux). Restore blocking mode so keep-alive
+		// reads wait for the next request and SO_RCVTIMEO bounds the SSE
+		// path; the acceptor stays non-blocking to poll for shutdown.
+		_ = net.set_blocking(client, true)
 		net.set_option(client, .TCP_Nodelay, true)
 		connection := new(Web_Connection, server.allocator)
 		connection.server = server
