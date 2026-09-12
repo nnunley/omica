@@ -640,7 +640,16 @@ store_writer_proc :: proc(data: rawptr) {
 		if durable && store.mode == .File && store.kernel != nil &&
 		   store.checkpoint_bytes > 0 &&
 		   sync.atomic_load(&store.wal_bytes_since_checkpoint) >= store.checkpoint_bytes {
-			_ = store_checkpoint_internal(store, store.kernel, false)
+			if !store_checkpoint_internal(store, store.kernel, false) {
+				// Do not silently continue after a failed automatic
+				// checkpoint: mark the store failed so later commits are
+				// refused and `.Strict` cannot report success.
+				sync.mutex_lock(&store.lock)
+				store.failed = true
+				store.last_error = "automatic checkpoint failed"
+				sync.cond_broadcast(&store.cond)
+				sync.mutex_unlock(&store.lock)
+			}
 		}
 	}
 }
