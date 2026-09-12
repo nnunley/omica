@@ -1,6 +1,7 @@
 package mica_runtime
 
 import "core:fmt"
+import "core:strings"
 import "core:os"
 import "core:path/filepath"
 import "core:testing"

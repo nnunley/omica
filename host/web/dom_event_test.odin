@@ -7,7 +7,7 @@ import v "../../mica/var"
 @(test)
 test_dom_event_decode :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	body := `{"type":"dom_event","session":9,"view":21,"revision":1,"signature":12531108388691183,"refresh":true,"event":"submit","target":"exit-north","action":"mud_command","fields":{"text":"north"}}`
+	body := `{"type":"dom_event","session":"9","view":"21","revision":"1","signature":"12531108388691183","refresh":true,"event":"submit","target":"exit-north","action":"mud_command","fields":{"text":"north"}}`
 	value, message, decoded := r.json_decode_text(context.temp_allocator, body)
 	testing.expectf(t, decoded, "json: %s", message)
 	entries, is_map := v.value_as_map(value)

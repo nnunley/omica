@@ -113,17 +113,33 @@ dom_event_get :: proc(entries: []v.Map_Entry, key: string) -> (v.Value, bool) {
 	return v.Value(0), false
 }
 
+// Accepts a JSON number or a decimal string. The browser client serializes
+// session, view, revision, and signature as strings because signatures are
+// 56-bit BigInts.
 @(private)
 dom_event_u64 :: proc(entries: []v.Map_Entry, key: string) -> (u64, bool) {
 	value, found := dom_event_get(entries, key)
 	if !found {
 		return 0, false
 	}
-	integer, is_int := v.value_as_int(value)
-	if !is_int || integer < 0 {
+	if integer, is_int := v.value_as_int(value); is_int {
+		if integer < 0 {
+			return 0, false
+		}
+		return u64(integer), true
+	}
+	text, is_text := v.value_as_string(value)
+	if !is_text || len(text) == 0 {
 		return 0, false
 	}
-	return u64(integer), true
+	parsed := u64(0)
+	for c in text {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		parsed = parsed * 10 + u64(c - '0')
+	}
+	return parsed, true
 }
 
 @(private)
