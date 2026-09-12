@@ -147,11 +147,15 @@ subscriptions_register :: proc(
 		subscription.needs_resynchronization = true
 	}
 	env.subscriptions.entries[subscription_id] = subscription
-	sync.mutex_unlock(&env.subscriptions.lock)
 
+	// The entry is live in the map before the snapshot goes out, so a
+	// concurrent cancel finds it instead of racing the send. The lock is held
+	// across the send: a cancel must tombstone (not free) the entry while it
+	// is being read.
 	if subscription.initial_snapshot && !pending {
 		subscription_send_snapshot(env, subscription)
 	}
+	sync.mutex_unlock(&env.subscriptions.lock)
 	return capability, subscription, true
 }
 
@@ -195,22 +199,40 @@ subscription_send_snapshot :: proc(env: ^Builtin_Env, subscription: ^Subscriptio
 	}
 }
 
-// Activates a task-staged subscription after its transaction commits.
+// Activates a task-staged subscription after its transaction commits. A
+// subscription cancelled while staged was tombstoned, not freed; it is
+// dropped here without sending. The lock is held across the snapshot send so
+// a concurrent cancel cannot free the entry mid-send.
 @(private)
 subscriptions_activate :: proc(env: ^Builtin_Env, subscription: ^Subscription) {
+	sync.mutex_lock(&env.subscriptions.lock)
+	current, exists := env.subscriptions.entries[subscription.id]
+	if !exists || current != subscription {
+		// Already released; nothing to do.
+		sync.mutex_unlock(&env.subscriptions.lock)
+		return
+	}
 	subscription.pending_commit = false
+	if subscription.revoked {
+		subscriptions_remove_locked(&env.subscriptions, subscription.id)
+		sync.mutex_unlock(&env.subscriptions.lock)
+		return
+	}
 	if subscription.initial_snapshot {
 		subscription.initial_snapshot = false
 		subscription_send_snapshot(env, subscription)
 	}
+	sync.mutex_unlock(&env.subscriptions.lock)
 }
 
-// Discards a task-staged subscription when its transaction aborts.
+// Discards a task-staged subscription when its transaction aborts. The
+// aborting task owns the staging reference, so the entry is removed
+// unconditionally, even if a concurrent cancel already tombstoned it.
 @(private)
 subscriptions_discard :: proc(env: ^Builtin_Env, subscription: ^Subscription) {
 	_ = k.capability_store_revoke(&env.kernel.capabilities, subscription.capability)
 	sync.mutex_lock(&env.subscriptions.lock)
-	subscriptions_release_locked(&env.subscriptions, subscription.id)
+	subscriptions_remove_locked(&env.subscriptions, subscription.id)
 	sync.mutex_unlock(&env.subscriptions.lock)
 }
 
@@ -288,6 +310,23 @@ subscriptions_cancel_for_mailbox :: proc(env: ^Builtin_Env, receiver: v.Value) -
 
 @(private)
 subscriptions_release_locked :: proc(store: ^Subscription_Store, subscription_id: u64) {
+	if subscription, exists := store.entries[subscription_id]; exists {
+		if subscription.pending_commit {
+			// A task still references this entry through its staging list
+			// and will release it on commit or abort. Tombstone it instead
+			// of freeing: it must never activate or deliver again.
+			subscription.revoked = true
+			return
+		}
+		subscriptions_remove_locked(store, subscription_id)
+	}
+}
+
+// Removes the entry from the map and frees it, unconditionally. The caller
+// holds the store lock and owns the entry: the staging task aborted or
+// committed a revoked staging, neither of which leaves another reference.
+@(private)
+subscriptions_remove_locked :: proc(store: ^Subscription_Store, subscription_id: u64) {
 	if subscription, exists := store.entries[subscription_id]; exists {
 		if subscription.bindings != nil {
 			delete(subscription.bindings, store.allocator)
