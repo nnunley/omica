@@ -2,6 +2,7 @@
 // memory-backed WAL. File-backed pages and checkpoints build on this.
 package store
 
+import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
 import "core:os"
@@ -33,6 +34,9 @@ Store_Options :: struct {
 	mode:         Store_Mode,
 	// Store directory for `File` mode.
 	path:         string,
+	// Pin the store to a retained checkpoint version for point-in-time reads.
+	// Zero selects the latest manifest.
+	version:      u64,
 	durability:   Durability,
 	budget_bytes: i64,
 	warn_after:   time.Duration,
@@ -108,6 +112,9 @@ Store :: struct {
 	wal_lock: sync.Mutex,
 
 	// Chunk shadow pages and checkpoint manifest.
+	pages_generation:   u32,
+	pinned_version:     u64,
+	checkpoint_only:    bool,
 	pages_file:         ^os.File,
 	pages_end:          i64,
 	next_page_id:       u32,
@@ -137,11 +144,29 @@ store_open :: proc(store: ^Store, options: Store_Options) -> bool {
 			store_release(store)
 			return false
 		}
-		if !store_pages_open(store) {
+		manifest_name := "MANIFEST"
+		if options.version != 0 {
+			store.pinned_version = options.version
+			store.checkpoint_only = true
+			manifest_name = fmt.aprintf(
+				"MANIFEST.%d",
+				options.version,
+				allocator = context.temp_allocator,
+			)
+		}
+		manifest_path, manifest_error := filepath.join(
+			[]string{store.path, manifest_name},
+			context.temp_allocator,
+		)
+		if manifest_error != nil {
 			store_release(store)
 			return false
 		}
-		if !store_manifest_open(store) {
+		if !store_manifest_open(store, manifest_path) {
+			store_release(store)
+			return false
+		}
+		if !store_pages_open(store) {
 			store_release(store)
 			return false
 		}

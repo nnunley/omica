@@ -489,6 +489,14 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	if !store_materialize_checkpoint(store, kernel) {
 		return false
 	}
+	if store.checkpoint_only {
+		// A pinned historical checkpoint reads at its own version; the log
+		// only covers later checkpoints and is not replayed.
+		if store.checkpoint_version > 0 {
+			_ = k.kernel_advance_version(kernel, store.checkpoint_version)
+		}
+		return true
+	}
 
 	// Records published in one group share a version. Replay each version as
 	// one transaction so set semantics (for example a functional key retract
@@ -548,9 +556,11 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 		group_start = group_end
 	}
 
-	// New commits must resume above the durable log's versions.
-	if durable > 0 {
-		_ = k.kernel_advance_version(kernel, durable)
+	// New commits must resume above the durable log's and checkpoint's
+	// versions.
+	target := max(durable, store.checkpoint_version)
+	if target > 0 {
+		_ = k.kernel_advance_version(kernel, target)
 	}
 	return true
 }

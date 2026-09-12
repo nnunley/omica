@@ -93,7 +93,9 @@ world_start :: proc(
 		s.store_attach(durable, kernel)
 	}
 
-	if world.store != nil && s.store_durable_version(world.store) > 0 {
+	if world.store != nil &&
+	   (s.store_durable_version(world.store) > 0 ||
+		   s.store_checkpoint_version(world.store) > 0) {
 		result := world_boot(world, world.store, config)
 		if !result.ok {
 			world_destroy(world)

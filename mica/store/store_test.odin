@@ -516,3 +516,180 @@ test_checkpoint_round_trip :: proc(t: ^testing.T) {
 	testing.expect_value(t, file_relation_rows(t, &kernel, "Kept"), 301)
 	testing.expect_value(t, file_relation_rows(t, &kernel, "Gone"), 0)
 }
+
+@(private)
+commit_single :: proc(t: ^testing.T, kernel: ^k.Kernel, relation: k.Relation_ID, value: i64) {
+	tx := k.kernel_begin(kernel)
+	number, _ := v.value_int(value)
+	testing.expect_value(
+		t,
+		k.transaction_assert(&tx, relation, v.tuple_new(context.temp_allocator, []v.Value{number})),
+		k.Kernel_Error.None,
+	)
+	committed, commit_error := k.transaction_commit(&tx)
+	k.transaction_destroy(&tx)
+	testing.expect(t, commit_error == k.Kernel_Error.None)
+	if commit_error == k.Kernel_Error.None {
+		k.snapshot_release(committed)
+	}
+}
+
+@(private)
+restore_at_version :: proc(
+	t: ^testing.T,
+	path: string,
+	version: u64,
+) -> (
+	k.Kernel,
+	^Store,
+	bool,
+) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	store := new(Store, context.allocator)
+	if !store_open(store, Store_Options {
+		mode    = .File,
+		path    = path,
+		version = version,
+	}) {
+		free(store, context.allocator)
+		k.kernel_destroy(&kernel)
+		return {}, nil, false
+	}
+	if !store_restore(store, &kernel) {
+		store_destroy(store)
+		free(store, context.allocator)
+		k.kernel_destroy(&kernel)
+		return {}, nil, false
+	}
+	return kernel, store, true
+}
+
+@(private)
+count_rows :: proc(kernel: ^k.Kernel, name: string) -> int {
+	snapshot := k.kernel_snapshot(kernel)
+	metadata, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern(name))
+	k.snapshot_release(snapshot)
+	if !found {
+		return -1
+	}
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(kernel, metadata.id, []v.Binding{{}}, &rows)
+	return len(rows)
+}
+
+@(test)
+test_manifest_retention_and_point_in_time :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_history")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	first_version: u64
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+		create_named_relation(t, &kernel, 1, "K", 1, .Durable)
+
+		// Six commits and checkpoints; retention keeps the last four.
+		for index in 1 ..= 6 {
+			commit_single(t, &kernel, 1, i64(index))
+			testing.expect(t, store_checkpoint(&store, &kernel))
+		}
+		testing.expect_value(t, store_retained_version_count(&store), MANIFEST_RETENTION)
+		first_version = store_oldest_retained_version(&store)
+		testing.expect(t, first_version != 0)
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	// Point in time: the oldest retained checkpoint follows the third commit.
+	kernel, store, restored := restore_at_version(t, path, first_version)
+	if restored {
+		testing.expect_value(t, count_rows(&kernel, "K"), 3)
+		store_destroy(store)
+		free(store, context.allocator)
+		k.kernel_destroy(&kernel)
+	}
+
+	// Latest: every row.
+	latest_kernel, latest_store, latest_ok := restore_at_version(t, path, 0)
+	if latest_ok {
+		testing.expect_value(t, count_rows(&latest_kernel, "K"), 6)
+		store_destroy(latest_store)
+		free(latest_store, context.allocator)
+		k.kernel_destroy(&latest_kernel)
+	}
+}
+
+@(test)
+test_page_compaction :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_compact")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+		create_named_relation(t, &kernel, 1, "K", 1, .Durable)
+
+		tx := k.kernel_begin(&kernel)
+		for index in 0 ..< 300 {
+			number, _ := v.value_int(i64(index))
+			k.transaction_assert(&tx, 1, v.tuple_new(context.temp_allocator, []v.Value{number}))
+		}
+		committed, commit_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect(t, commit_error == k.Kernel_Error.None)
+		if commit_error == k.Kernel_Error.None {
+			k.snapshot_release(committed)
+		}
+		testing.expect(t, store_checkpoint(&store, &kernel))
+
+		// Churn enough that pruning leaves dead pages behind.
+		for index in 0 ..< 6 {
+			commit_single(t, &kernel, 1, i64(1000 + index))
+			testing.expect(t, store_checkpoint(&store, &kernel))
+			}
+		pages_before := store_page_count(&store)
+		testing.expect(t, store_pages_compact(&store))
+		pages_after := store_page_count(&store)
+		testing.expectf(t, pages_after < pages_before, "pages %d -> %d", pages_before, pages_after)
+
+		// The store stays writable and checkpoints after compaction.
+		commit_single(t, &kernel, 1, 2000)
+		testing.expect(t, store_checkpoint(&store, &kernel))
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel, store, restored := restore_at_version(t, path, 0)
+	if restored {
+		testing.expect_value(t, count_rows(&kernel, "K"), 307)
+		store_destroy(store)
+		free(store, context.allocator)
+		k.kernel_destroy(&kernel)
+	}
+}

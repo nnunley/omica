@@ -12,6 +12,7 @@
 // replays only that tail.
 package store
 
+import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
@@ -22,7 +23,19 @@ import v "../var"
 PAGE_MAGIC :: "MICAPG01"
 PAGE_HEADER_SIZE :: 28
 MANIFEST_MAGIC :: "MICAMF01"
-MANIFEST_VERSION :: u32(1)
+MANIFEST_VERSION :: u32(2)
+// Retained manifest generations beyond the current one.
+MANIFEST_RETENTION :: 4
+// Compact pages only when at least this many are dead and they are a
+// meaningful fraction of the file.
+GC_DEAD_MIN :: 64
+
+// A decoded manifest.
+Manifest_Data :: struct {
+	version:    u64,
+	generation: u32,
+	relations:  []Checkpoint_Relation,
+}
 
 // One relation entry in a checkpoint manifest.
 Checkpoint_Relation :: struct {
@@ -147,7 +160,9 @@ store_page_read :: proc(
 // Scans the pages file, rebuilding the page index, and truncates a torn tail.
 @(private)
 store_pages_open :: proc(store: ^Store) -> bool {
-	path, join_error := filepath_join(store.allocator, store.path, "pages")
+	pages_name := fmt.aprintf("pages.%d", store.pages_generation, allocator = store.allocator)
+	defer delete(pages_name, store.allocator)
+	path, join_error := filepath_join(store.allocator, store.path, pages_name)
 	if join_error != nil {
 		return false
 	}
@@ -214,19 +229,16 @@ store_pages_open :: proc(store: ^Store) -> bool {
 	return true
 }
 
-// Encodes the manifest for `relations`.
+// Encodes a manifest.
 @(private)
-store_manifest_encode :: proc(
-	out: ^[dynamic]u8,
-	version: u64,
-	relations: []Checkpoint_Relation,
-) -> bool {
+store_manifest_encode :: proc(out: ^[dynamic]u8, data: ^Manifest_Data) -> bool {
 	manifest_magic: string = MANIFEST_MAGIC
 	append(out, ..transmute([]u8)manifest_magic)
 	codec_write_u32(out, MANIFEST_VERSION)
-	codec_write_u64(out, version)
-	codec_write_u32(out, u32(len(relations)))
-	for relation in relations {
+	codec_write_u32(out, data.generation)
+	codec_write_u64(out, data.version)
+	codec_write_u32(out, u32(len(data.relations)))
+	for relation in data.relations {
 		if error := wal_encode_metadata(out, relation.metadata); error != .None {
 			return false
 		}
@@ -239,107 +251,60 @@ store_manifest_encode :: proc(
 	return true
 }
 
-// Writes a new manifest generation and switches `MANIFEST` atomically.
+// Decodes a manifest file.
 @(private)
-store_manifest_write :: proc(
-	store: ^Store,
-	version: u64,
-	relations: []Checkpoint_Relation,
-) -> bool {
-	data: [dynamic]u8
-	data = make([dynamic]u8, context.temp_allocator)
-	defer delete(data)
-	if !store_manifest_encode(&data, version, relations) {
-		return false
-	}
-	temp_path, temp_error := filepath_join(store.allocator, store.path, "MANIFEST.tmp")
-	if temp_error != nil {
-		return false
-	}
-	manifest_path, manifest_error := filepath_join(store.allocator, store.path, "MANIFEST")
-	if manifest_error != nil {
-		return false
-	}
-	file, open_error := os.open(
-		temp_path,
-		os.O_RDWR | os.O_CREATE | os.O_TRUNC,
-	)
-	if open_error != nil {
-		return false
-	}
-	written, write_error := os.write(file, data[:])
-	if write_error != nil || written != len(data) {
-		os.close(file)
-		return false
-	}
-	if sync_error := os.sync(file); sync_error != nil {
-		os.close(file)
-		return false
-	}
-	os.close(file)
-	if rename_error := os.rename(temp_path, manifest_path); rename_error != nil {
-		return false
-	}
-	return true
-}
-
-// Reads the manifest if it exists into `store.manifest_relations`.
-@(private)
-store_manifest_open :: proc(store: ^Store) -> bool {
-	path, join_error := filepath_join(store.allocator, store.path, "MANIFEST")
-	if join_error != nil {
-		return false
-	}
-	if !os.exists(path) {
-		return true
-	}
+store_manifest_read :: proc(store: ^Store, path: string) -> (Manifest_Data, bool) {
 	file, open_error := os.open(path, os.O_RDONLY)
 	if open_error != nil {
-		return false
+		return {}, false
 	}
 	defer os.close(file)
 	size, size_error := os.file_size(file)
-	if size_error != nil || size < 12 {
-		return false
+	if size_error != nil || size < 16 {
+		return {}, false
 	}
 	data := make([]u8, int(size), context.temp_allocator)
 	defer delete(data, context.temp_allocator)
 	read, read_error := os.read(file, data)
 	if read_error != nil || read != int(size) {
-		return false
+		return {}, false
 	}
 	if data[0] != MANIFEST_MAGIC[0] || data[7] != MANIFEST_MAGIC[7] {
-		return false
+		return {}, false
 	}
 	reader := Codec_Reader{data = data, cursor = 12}
+	generation, generation_error := codec_read_u32(&reader)
+	if generation_error != .None {
+		return {}, false
+	}
 	version, version_error := codec_read_u64(&reader)
 	if version_error != .None {
-		return false
+		return {}, false
 	}
 	count, count_error := codec_read_u32(&reader)
 	if count_error != .None {
-		return false
+		return {}, false
 	}
 	relations := make([]Checkpoint_Relation, int(count), store.copy_allocator)
 	for index in 0 ..< int(count) {
 		metadata, metadata_error := wal_decode_metadata(&reader, store.copy_allocator)
 		if metadata_error != .None {
-			return false
+			return {}, false
 		}
 		chunk_count, chunk_error := codec_read_u32(&reader)
 		if chunk_error != .None {
-			return false
+			return {}, false
 		}
 		page_ids := make([]u32, int(chunk_count), store.copy_allocator)
 		row_counts := make([]u32, int(chunk_count), store.copy_allocator)
 		for chunk_index in 0 ..< int(chunk_count) {
 			page_id, page_error := codec_read_u32(&reader)
 			if page_error != .None {
-				return false
+				return {}, false
 			}
 			rows, rows_error := codec_read_u32(&reader)
 			if rows_error != .None {
-				return false
+				return {}, false
 			}
 			page_ids[chunk_index] = page_id
 			row_counts[chunk_index] = rows
@@ -350,8 +315,56 @@ store_manifest_open :: proc(store: ^Store) -> bool {
 			row_counts = row_counts,
 		}
 	}
-	store.manifest_relations = relations
-	store.checkpoint_version = version
+	return Manifest_Data {
+		version    = version,
+		generation = generation,
+		relations  = relations,
+	}, true
+}
+
+// Writes a manifest to `path` atomically (temp file plus rename).
+@(private)
+store_manifest_write_to :: proc(store: ^Store, path: string, data: ^Manifest_Data) -> bool {
+	encoded: [dynamic]u8
+	encoded = make([dynamic]u8, context.temp_allocator)
+	defer delete(encoded)
+	if !store_manifest_encode(&encoded, data) {
+		return false
+	}
+	temp_path := fmt.aprintf("%s.tmp", path, allocator = context.temp_allocator)
+	file, open_error := os.open(temp_path, os.O_RDWR | os.O_CREATE | os.O_TRUNC)
+	if open_error != nil {
+		return false
+	}
+	written, write_error := os.write(file, encoded[:])
+	if write_error != nil || written != len(encoded) {
+		os.close(file)
+		return false
+	}
+	if sync_error := os.sync(file); sync_error != nil {
+		os.close(file)
+		return false
+	}
+	os.close(file)
+	if rename_error := os.rename(temp_path, path); rename_error != nil {
+		return false
+	}
+	return true
+}
+
+// Loads the manifest at `path` into store state.
+@(private)
+store_manifest_open :: proc(store: ^Store, path: string) -> bool {
+	if !os.exists(path) {
+		return true
+	}
+	data, read_ok := store_manifest_read(store, path)
+	if !read_ok {
+		return false
+	}
+	store.manifest_relations = data.relations
+	store.checkpoint_version = data.version
+	store.pages_generation = data.generation
 	return true
 }
 
@@ -370,11 +383,12 @@ store_checkpoint :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	relations = make([dynamic]Checkpoint_Relation, context.temp_allocator)
 	defer delete(relations)
 
-	for block in snapshot.blocks {
+	for metadata in snapshot.catalog {
 		relation := Checkpoint_Relation {
-			metadata = clone_metadata(store.copy_allocator, block.metadata),
+			metadata = clone_metadata(store.copy_allocator, metadata),
 		}
-		if block.metadata.durability == .Durable {
+		block, has_block := k.snapshot_relation_block(snapshot, metadata.id)
+		if has_block && metadata.durability == .Durable {
 			page_ids: [dynamic]u32
 			page_ids = make([dynamic]u32, context.temp_allocator)
 			row_counts: [dynamic]u32
@@ -414,9 +428,24 @@ store_checkpoint :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	if sync_error := os.sync(store.pages_file); sync_error != nil {
 		return false
 	}
-	if !store_manifest_write(store, snapshot.version, relations[:]) {
+	data := Manifest_Data {
+		version    = snapshot.version,
+		generation = store.pages_generation,
+		relations  = relations[:],
+	}
+	current_path, current_error := filepath_join(store.allocator, store.path, "MANIFEST")
+	if current_error != nil {
 		return false
 	}
+	if !store_manifest_write_to(store, current_path, &data) {
+		return false
+	}
+	// Retain the manifest for point-in-time reads.
+	retained_path := versioned_manifest_path(store, snapshot.version)
+	if !store_manifest_write_to(store, retained_path, &data) {
+		return false
+	}
+	store_manifest_prune(store)
 	if !store_wal_rotate(store, snapshot.version) {
 		return false
 	}
@@ -425,6 +454,7 @@ store_checkpoint :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	copy(owned, relations[:])
 	store.manifest_relations = owned
 	store.checkpoint_version = snapshot.version
+	store_gc_if_needed(store)
 	return true
 }
 
@@ -472,6 +502,10 @@ store_page_count :: proc(store: ^Store) -> int {
 
 store_checkpoint_version :: proc(store: ^Store) -> u64 {
 	return store.checkpoint_version
+}
+
+store_retained_version_count :: proc(store: ^Store) -> int {
+	return len(store_manifest_versions(store))
 }
 
 // Joins two path components, returning the join error.
