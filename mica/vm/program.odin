@@ -260,6 +260,10 @@ Program_Error :: enum {
 // --- Builder ---------------------------------------------------------------
 
 Builder :: struct {
+	// Allocator that owns every slice reachable from the builder. Stored so
+	// that `builder_destroy` frees through the same allocator the compiler
+	// used to allocate (notably `Function.defaults`).
+	allocator:     mem.Allocator,
 	code:          [dynamic]Instruction,
 	constants:     [dynamic]v.Value,
 	functions:     [dynamic]Function,
@@ -276,38 +280,41 @@ Builder :: struct {
 	dispatch_method_program_relation:  u32,
 }
 
-builder_init :: proc(builder: ^Builder) {
-	builder.code = make([dynamic]Instruction)
-	builder.constants = make([dynamic]v.Value)
-	builder.functions = make([dynamic]Function)
-	builder.patterns = make([dynamic]Scan_Pattern)
-	builder.relation_shapes = make([dynamic]Relation_Shape)
-	builder.dispatch_specs = make([dynamic]Dispatch_Spec)
-	builder.builtins = make([dynamic]v.Symbol)
+builder_init :: proc(builder: ^Builder, allocator := context.allocator) {
+	builder.allocator = allocator
+	builder.code = make([dynamic]Instruction, allocator)
+	builder.constants = make([dynamic]v.Value, allocator)
+	builder.functions = make([dynamic]Function, allocator)
+	builder.patterns = make([dynamic]Scan_Pattern, allocator)
+	builder.relation_shapes = make([dynamic]Relation_Shape, allocator)
+	builder.dispatch_specs = make([dynamic]Dispatch_Spec, allocator)
+	builder.builtins = make([dynamic]v.Symbol, allocator)
 	builder.entry = -1
 	builder.open_function = -1
 }
 
 builder_destroy :: proc(builder: ^Builder) {
+	// Dynamic arrays remember the allocator they were made with; plain slices
+	// do not, so they are freed with `builder.allocator` explicitly.
 	delete(builder.code)
 	delete(builder.constants)
 	for function in builder.functions {
 		if function.defaults != nil {
-			delete(function.defaults)
+			delete(function.defaults, builder.allocator)
 		}
 	}
 	delete(builder.functions)
 	for pattern in builder.patterns {
-		delete(pattern.column_names)
-		delete(pattern.cells)
+		delete(pattern.column_names, builder.allocator)
+		delete(pattern.cells, builder.allocator)
 	}
 	delete(builder.patterns)
 	for shape in builder.relation_shapes {
-		delete(shape.heading)
+		delete(shape.heading, builder.allocator)
 	}
 	delete(builder.relation_shapes)
 	for spec in builder.dispatch_specs {
-		delete(spec.roles)
+		delete(spec.roles, builder.allocator)
 	}
 	delete(builder.dispatch_specs)
 	delete(builder.builtins)
@@ -315,7 +322,7 @@ builder_destroy :: proc(builder: ^Builder) {
 
 // Adds a relation value heading, copying it. Returns the shape index.
 builder_add_relation_shape :: proc(builder: ^Builder, heading: []v.Symbol) -> i32 {
-	names := make([]v.Symbol, len(heading))
+	names := make([]v.Symbol, len(heading), builder.allocator)
 	copy(names, heading)
 	append(&builder.relation_shapes, Relation_Shape{heading = names})
 	return i32(len(builder.relation_shapes) - 1)
@@ -334,9 +341,9 @@ builder_add_pattern :: proc(
 	column_names: []v.Symbol,
 	cells: []Pattern_Cell,
 ) -> i32 {
-	names := make([]v.Symbol, len(column_names))
+	names := make([]v.Symbol, len(column_names), builder.allocator)
 	copy(names, column_names)
-	pattern_cells := make([]Pattern_Cell, len(cells))
+	pattern_cells := make([]Pattern_Cell, len(cells), builder.allocator)
 	copy(pattern_cells, cells)
 	append(&builder.patterns, Scan_Pattern {
 		relation     = relation,
@@ -351,7 +358,7 @@ builder_add_dispatch_spec :: proc(
 	selector: v.Symbol,
 	roles: []Dispatch_Role,
 ) -> i32 {
-	owned := make([]Dispatch_Role, len(roles))
+	owned := make([]Dispatch_Role, len(roles), builder.allocator)
 	copy(owned, roles)
 	append(&builder.dispatch_specs, Dispatch_Spec {
 		selector = selector,
@@ -468,6 +475,8 @@ program_destroy :: proc(program: ^Program, alloc: mem.Allocator) {
 			free(raw_data(callable.captures), alloc)
 		}
 	}
+	// `callables` is a dynamic array, so it frees through the allocator it was
+	// created with (`alloc` in `builder_build`).
 	delete(program.callables)
 	free(raw_data(program.code), alloc)
 	free(raw_data(program.constants), alloc)

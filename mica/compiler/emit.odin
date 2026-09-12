@@ -88,7 +88,7 @@ compile_program :: proc(
 	allocator := context.allocator,
 ) -> Compiled_Program {
 	builder: vm.Builder
-	vm.builder_init(&builder)
+	vm.builder_init(&builder, allocator)
 	defer vm.builder_destroy(&builder)
 	if ctx != nil {
 		builder.dispatch_method_selector_relation = ctx.dispatch_method_selector_relation
@@ -1057,7 +1057,7 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		}
 		if computed_splice {
 			elements := make([]^Expr, len(call.args), emitter.allocator)
-			defer delete(elements)
+			defer delete(elements, emitter.allocator)
 			for argument, index in call.args {
 				elements[index] = argument.expr
 			}
@@ -2088,7 +2088,7 @@ emit_fn_literal :: proc(emitter: ^Emitter, fn: Fn) -> (int, bool) {
 	captures := make([]Local, len(emitter.locals), emitter.allocator)
 	copy(captures, emitter.locals[:])
 	capture_registers := make([]int, len(captures), emitter.allocator)
-	defer delete(capture_registers)
+	defer delete(capture_registers, emitter.allocator)
 	for capture, capture_index in captures {
 		capture_registers[capture_index] = capture.register
 	}

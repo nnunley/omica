@@ -622,3 +622,52 @@ test_emit_fn_literal :: proc(t: ^testing.T) {
 	testing.expect_value(t, makes, 1)
 	testing.expect_value(t, calls, 1)
 }
+
+// Regression test for allocator ownership across the compiler -> VM builder
+// boundary. `set_param_metadata` allocates `function.defaults` with the compile
+// allocator, but `builder_destroy` frees them with whatever `context.allocator`
+// is current. When the two differ, the free goes through the wrong allocator.
+@(test)
+test_compile_defaults_allocator_ownership :: proc(t: ^testing.T) {
+	backing := context.allocator
+
+	compile_track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&compile_track, backing)
+	compile_track.bad_free_callback = mem.tracking_allocator_bad_free_callback_add_to_array
+	defer mem.tracking_allocator_destroy(&compile_track)
+
+	context_track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&context_track, backing)
+	context_track.bad_free_callback = mem.tracking_allocator_bad_free_callback_add_to_array
+	defer mem.tracking_allocator_destroy(&context_track)
+
+	ctx := new_context()
+	defer {
+		delete(ctx.builtins)
+		delete(ctx.relations)
+		delete(ctx.identities)
+	}
+
+	source := `verb greet(?name = "world")
+  return name
+end
+`
+	compile_alloc := mem.tracking_allocator(&compile_track)
+	ast, parse_errors := parse_program(source, compile_alloc)
+	testing.expectf(t, len(parse_errors) == 0, "parse errors: %v", parse_errors)
+
+	// Compile with a distinct ambient allocator so a free through
+	// `context.allocator` shows up as a bad free rather than a clean free.
+	previous := context.allocator
+	context.allocator = mem.tracking_allocator(&context_track)
+	compiled := compile_program(ast, &ctx, compile_alloc)
+	context.allocator = previous
+
+	testing.expectf(t, len(compiled.errors) == 0, "compile errors: %v", compiled.errors)
+	testing.expectf(
+		t,
+		len(context_track.bad_free_array) == 0,
+		"builder freed compiler-allocated memory through context.allocator: %v",
+		context_track.bad_free_array,
+	)
+}
