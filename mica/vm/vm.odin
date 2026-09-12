@@ -306,6 +306,13 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 		if state.entry_function >= 0 {
 			entry = int(state.entry_function)
 		}
+		// A hand-built program or a bogus entry override must fail cleanly,
+		// not index past the function table. Compiler output always passes
+		// program_validate before running.
+		if entry < 0 || entry >= len(program.functions) {
+			vm_fail(state, "E_VM_FAULT", "entry function out of range")
+			return .Failed
+		}
 		entry_function := program.functions[entry]
 		append(&state.frames, Frame {
 			function      = entry,
@@ -315,6 +322,10 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			caller_dst    = -1,
 		})
 		resize(&state.registers, entry_function.register_count)
+		if len(state.entry_arguments) > len(state.registers) {
+			vm_fail(state, "E_VM_FAULT", "too many entry arguments")
+			return .Failed
+		}
 		for argument, index in state.entry_arguments {
 			state.registers[index] = argument
 		}
@@ -1018,6 +1029,15 @@ vm_unwind :: proc(state: ^VM) -> bool {
 	resize(&state.frames, handler.frame + 1)
 	frame := state.frames[handler.frame]
 	state.frames[handler.frame].ip = int(handler.target)
+	// Drop the dead frames' registers, mirroring Return: only the handler
+	// frame's window stays live. Without this, errors caught in a loop grow
+	// the register file on every iteration.
+	if frame.function >= 0 && frame.function < len(state.program.functions) {
+		function := state.program.functions[frame.function]
+		if frame.register_base + function.register_count < len(state.registers) {
+			resize(&state.registers, frame.register_base + function.register_count)
+		}
+	}
 	if handler_is_finally {
 		// Run the finally body, then re-raise the error when it completes.
 		append(&state.pending_raises, Pending_Raise {

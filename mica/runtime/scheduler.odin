@@ -347,6 +347,15 @@ scheduler_mailbox_create :: proc(
 	)
 	box.receiver = receiver_value
 	box.sender = sender_value
+	if !minted {
+		// No handles exist for this mailbox; drop the box instead of
+		// leaving a phantom entry no sender or receiver can reach.
+		delete(box.messages)
+		delete(box.waiters)
+		free(box, scheduler.allocator)
+		sync.mutex_unlock(&scheduler.lock)
+		return v.Value(0), v.Value(0), false
+	}
 	scheduler.mailboxes[mailbox] = box
 	sync.mutex_unlock(&scheduler.lock)
 	return receiver_value, sender_value, minted
@@ -517,25 +526,27 @@ scheduler_mailbox_close :: proc(scheduler: ^Scheduler, receiver: v.Value) -> boo
 	return true
 }
 
-// Wakes the first waiter of `box` with all queued messages for that mailbox.
+// Wakes the first live waiter of `box` with all queued messages for that
+// mailbox. Waiters whose entry is gone, terminal, or already woken are
+// skipped so a dead waiter cannot strand messages for the waiters behind it.
 @(private)
 scheduler_wake_mailbox_locked :: proc(scheduler: ^Scheduler, box: ^Mailbox) {
-	if len(box.messages) == 0 || len(box.waiters) == 0 {
+	for len(box.messages) > 0 && len(box.waiters) > 0 {
+		waiter := box.waiters[0]
+		ordered_remove(&box.waiters, 0)
+		entry, found := scheduler.entries[waiter.task_id]
+		if !found || entry.done || entry.has_pending {
+			continue
+		}
+		messages := v.value_list(scheduler.allocator, box.messages[:])
+		clear(&box.messages)
+		group := v.value_list(scheduler.allocator, []v.Value{waiter.receiver, messages})
+		entry.pending_value = v.value_list(scheduler.allocator, []v.Value{group})
+		entry.has_pending = true
+		entry.generation += 1
+		append(&scheduler.ready, waiter.task_id)
 		return
 	}
-	waiter := box.waiters[0]
-	ordered_remove(&box.waiters, 0)
-	entry, found := scheduler.entries[waiter.task_id]
-	if !found || entry.done || entry.has_pending {
-		return
-	}
-	messages := v.value_list(scheduler.allocator, box.messages[:])
-	clear(&box.messages)
-	group := v.value_list(scheduler.allocator, []v.Value{waiter.receiver, messages})
-	entry.pending_value = v.value_list(scheduler.allocator, []v.Value{group})
-	entry.has_pending = true
-	entry.generation += 1
-	append(&scheduler.ready, waiter.task_id)
 }
 
 // The result of draining mailbox receivers.

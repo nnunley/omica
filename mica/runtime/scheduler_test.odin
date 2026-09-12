@@ -443,8 +443,58 @@ test_scheduler_resume_removes_mailbox_waiters :: proc(t: ^testing.T) {
 	testing.expect_value(t, value, i64(7))
 }
 
+// A dead waiter at the head of the queue must not strand messages for the
+// live waiters behind it. Regression: the wake dropped the delivery when the
+// first waiter was gone, terminal, or already woken.
 @(test)
-test_scheduler_cancel_parked :: proc(t: ^testing.T) {	kernel: k.Kernel
+test_scheduler_wake_skips_dead_waiters :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
+	defer scheduler_destroy(&scheduler)
+
+	receiver, _, minted := scheduler_mailbox_create(&scheduler)
+	testing.expect(t, minted)
+
+	// A terminal entry and a live entry; neither runs, so no task pointers
+	// are needed and both are removed before destroy.
+	done_entry := new(Scheduler_Entry, context.allocator)
+	done_entry.done = true
+	live_entry := new(Scheduler_Entry, context.allocator)
+	sync.mutex_lock(&scheduler.lock)
+	scheduler.entries[9001] = done_entry
+	scheduler.entries[9002] = live_entry
+	mailbox, mailbox_ok := mailbox_target(&scheduler, receiver, false)
+	testing.expect(t, mailbox_ok)
+	box := scheduler.mailboxes[mailbox]
+	message, _ := v.value_int(1)
+	append(&box.messages, message)
+	append(&box.waiters, Mailbox_Waiter{task_id = 9001, receiver = receiver})
+	append(&box.waiters, Mailbox_Waiter{task_id = 9002, receiver = receiver})
+	ready_before := len(scheduler.ready)
+
+	scheduler_wake_mailbox_locked(&scheduler, box)
+
+	testing.expect(t, !done_entry.has_pending)
+	testing.expect(t, live_entry.has_pending)
+	testing.expect_value(t, len(scheduler.ready), ready_before + 1)
+	testing.expect_value(t, scheduler.ready[len(scheduler.ready) - 1], Task_ID(9002))
+	testing.expect_value(t, len(box.waiters), 0)
+	testing.expect_value(t, len(box.messages), 0)
+
+	delete_key(&scheduler.entries, Task_ID(9001))
+	delete_key(&scheduler.entries, Task_ID(9002))
+	sync.mutex_unlock(&scheduler.lock)
+	free(done_entry, context.allocator)
+	free(live_entry, context.allocator)
+}
+
+@(test)
+test_scheduler_cancel_parked :: proc(t: ^testing.T) {
+	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 

@@ -1010,6 +1010,40 @@ test_vm_authority_denies_and_root_allows :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_vm_unwind_shrinks_registers :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	// Two functions with roomy register windows; the handler lives in
+	// function 0 while function 1's dead window sits above it.
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 8, true)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+	builder_begin_function(&builder, v.symbol_intern("child"), 0, 8, true)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+	program := builder_build(&builder, alloc)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+
+	// A live handler frame plus a dead child frame with registers above it.
+	append(&state.frames, Frame{function = 0, ip = 0, register_base = 0})
+	append(&state.frames, Frame{function = 1, ip = 0, register_base = 8, caller_base = 0})
+	resize(&state.registers, 16)
+	append(&state.handlers, Handler{frame = 0, target = 0, error_register = -1, kind = .Catch})
+
+	testing.expect(t, vm_unwind(&state))
+	testing.expect_value(t, len(state.frames), 1)
+	testing.expect_value(t, len(state.registers), 8)
+}
+
+@(test)
 test_vm_call_depth_limit :: proc(t: ^testing.T) {
 	arena := test_arena()
 	defer test_arena_destroy(arena)
