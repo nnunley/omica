@@ -535,23 +535,28 @@ Mailbox_Take :: struct {
 	value: v.Value,
 }
 
-// Drains ready messages for the receivers of a task parked on `mailbox_recv`.
-// `No_Receivers` means every supplied handle is unknown, revoked, or expired.
-scheduler_mailbox_take :: proc(scheduler: ^Scheduler, task: ^Task) -> Mailbox_Take {
+// Drains queued messages for `task`'s receivers. The caller holds the
+// scheduler lock. Returns the groups and the number of live receivers.
+@(private)
+scheduler_collect_messages_locked :: proc(
+	scheduler: ^Scheduler,
+	task: ^Task,
+) -> (
+	[dynamic]v.Value,
+	int,
+) {
 	receivers, is_list := v.value_as_list(task.state.request_value)
-	if !is_list || len(receivers) == 0 {
-		return Mailbox_Take{kind = .No_Receivers}
-	}
 	groups: [dynamic]v.Value
-	defer delete(groups)
-	live_receivers := 0
-	sync.mutex_lock(&scheduler.lock)
+	if !is_list {
+		return groups, 0
+	}
+	live := 0
 	for receiver in receivers {
 		mailbox, _, ok := mailbox_target(scheduler, receiver, false)
 		if !ok {
 			continue
 		}
-		live_receivers += 1
+		live += 1
 		box, found := scheduler.mailboxes[mailbox]
 		if !found || len(box.messages) == 0 {
 			continue
@@ -561,14 +566,29 @@ scheduler_mailbox_take :: proc(scheduler: ^Scheduler, task: ^Task) -> Mailbox_Ta
 		group := v.value_list(scheduler.allocator, []v.Value{receiver, messages})
 		append(&groups, group)
 	}
+	return groups, live
+}
+
+// Drains ready messages for the receivers of a task parked on `mailbox_recv`.
+// `No_Receivers` means every supplied handle is unknown, revoked, or expired.
+scheduler_mailbox_take :: proc(scheduler: ^Scheduler, task: ^Task) -> Mailbox_Take {
+	receivers, is_list := v.value_as_list(task.state.request_value)
+	if !is_list || len(receivers) == 0 {
+		return Mailbox_Take{kind = .No_Receivers}
+	}
+	sync.mutex_lock(&scheduler.lock)
+	groups, live := scheduler_collect_messages_locked(scheduler, task)
 	sync.mutex_unlock(&scheduler.lock)
 	if len(groups) > 0 {
-		return Mailbox_Take {
+		result := Mailbox_Take {
 			kind  = .Ready,
 			value = v.value_list(scheduler.allocator, groups[:]),
 		}
+		delete(groups)
+		return result
 	}
-	if live_receivers == 0 {
+	delete(groups)
+	if live == 0 {
 		return Mailbox_Take{kind = .No_Receivers}
 	}
 	return Mailbox_Take{kind = .Empty}
@@ -624,6 +644,20 @@ scheduler_park_mailbox_locked :: proc(
 	entry: ^Scheduler_Entry,
 	millis: i64,
 ) {
+	// A sender may have queued a message after the worker's unlocked take but
+	// before this registration. Recheck under the lock and resume instead of
+	// parking, so the message is not missed.
+	queued, _ := scheduler_collect_messages_locked(scheduler, entry.task)
+	if len(queued) > 0 {
+		entry.pending_value = v.value_list(scheduler.allocator, queued[:])
+		entry.has_pending = true
+		append(&scheduler.ready, id)
+		sync.cond_broadcast(&scheduler.cond)
+		delete(queued)
+		return
+	}
+	delete(queued)
+
 	receivers, is_list := v.value_as_list(entry.task.state.request_value)
 	if is_list {
 		seen: [dynamic]u64
