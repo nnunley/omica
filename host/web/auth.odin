@@ -83,26 +83,40 @@ auth_hash :: proc(user: ^Auth_User, password: string) -> bool {
 	return err == nil
 }
 
+// Dummy credentials used to spend the same KDF work on an unknown login as on
+// a known one, so response timing does not reveal whether an account exists.
+@(private)
+AUTH_DUMMY_SALT: [argon2id.RECOMMENDED_SALT_SIZE]u8
+
+@(private)
+AUTH_DUMMY_HASH: [argon2id.RECOMMENDED_TAG_SIZE]u8
+
 auth_verify_user :: proc(auth: ^Auth, login, password: string) -> (v.Value, bool) {
 	sync.mutex_lock(&auth.lock)
 	user, found := auth.users[login]
 	sync.mutex_unlock(&auth.lock)
-	if !found {
-		return v.Value(0), false
+
+	// Always derive: returning early for an unknown login leaks account
+	// existence through timing.
+	salt := AUTH_DUMMY_SALT
+	expected := AUTH_DUMMY_HASH
+	if found {
+		salt = user.salt
+		expected = user.hash
 	}
 	candidate: [argon2id.RECOMMENDED_TAG_SIZE]u8
 	err := argon2id.derive(
 		&argon2id.PARAMS_OWASP_SMALL,
 		transmute([]u8)password,
-		user.salt[:],
+		salt[:],
 		candidate[:],
 	)
-	if err != nil {
+	if err != nil || !found {
 		return v.Value(0), false
 	}
 	diff: u8
 	for index in 0 ..< len(candidate) {
-		diff |= candidate[index] ~ user.hash[index]
+		diff |= candidate[index] ~ expected[index]
 	}
 	if diff != 0 {
 		return v.Value(0), false

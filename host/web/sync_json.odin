@@ -155,15 +155,19 @@ sync_host_ensure_session :: proc(
 ) -> ^Sync_Session {
 	sync.mutex_lock(&host.lock)
 	if existing, found := host.sessions[session_id]; found {
+		sync.mutex_unlock(&host.lock)
 		// A session is bound to the actor that created it. A different actor
 		// presenting the id must be rejected, not rebound.
 		if existing.actor != actor {
-			sync.mutex_unlock(&host.lock)
 			return nil
 		}
-		sync.mutex_unlock(&host.lock)
 		return existing
 	}
+	sync.mutex_unlock(&host.lock)
+
+	// Build the session outside host.lock: creating the mailbox takes the
+	// scheduler lock, and holding host.lock across it invites a lock-order
+	// inversion. A concurrent creator is resolved by the recheck below.
 	session := new(Sync_Session, host.allocator)
 	session.session_id = session_id
 	session.actor = actor
@@ -177,6 +181,16 @@ sync_host_ensure_session :: proc(
 			session.sender = sender
 			session.has_mailbox = true
 		}
+	}
+
+	sync.mutex_lock(&host.lock)
+	if existing, found := host.sessions[session_id]; found {
+		sync.mutex_unlock(&host.lock)
+		sync_session_destroy(host, session)
+		if existing.actor != actor {
+			return nil
+		}
+		return existing
 	}
 	host.sessions[session_id] = session
 	sync.mutex_unlock(&host.lock)

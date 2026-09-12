@@ -79,6 +79,19 @@ test_sync_query_u64 :: proc(t: ^testing.T) {
 	first, first_ok := sync_query_u64("/sync/events?x=1&session=9", "session")
 	testing.expect(t, first_ok)
 	testing.expect_value(t, first, u64(9))
+
+	// An overflowing value is rejected, not wrapped.
+	_, overflow := sync_query_u64(
+		"/sync/events?session=18446744073709551616",
+		"session",
+	)
+	testing.expect(t, !overflow)
+	limit, limit_ok := sync_query_u64(
+		"/sync/events?session=18446744073709551615",
+		"session",
+	)
+	testing.expect(t, limit_ok)
+	testing.expect_value(t, limit, max(u64))
 }
 
 @(test)

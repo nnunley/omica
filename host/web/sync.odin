@@ -325,6 +325,10 @@ sync_events_stream :: proc(
 				)
 				delete(batch[index].payload, session.allocator)
 				if !sent {
+					// Free the payloads we never got to send.
+					for pending in batch[index + 1:] {
+						delete(pending.payload, session.allocator)
+					}
 					delete(batch)
 					return true
 				}
@@ -332,13 +336,15 @@ sync_events_stream :: proc(
 			delete(batch)
 			continue
 		case .Closed, .Replaced:
+			sync_finish_stream(socket, &builder)
 			return true
 		case .Timeout:
 		}
 
 		read, recv_err := net.recv_tcp(socket, probe[:])
 		if read == 0 && recv_err == .None {
-			// The client closed the stream.
+			// The client closed the stream; send the terminating chunk.
+			sync_finish_stream(socket, &builder)
 			return true
 		}
 		if time.tick_since(last_heartbeat) >= SYNC_HEARTBEAT {
@@ -350,6 +356,14 @@ sync_events_stream :: proc(
 			}
 		}
 	}
+}
+
+// Sends the terminating zero-length chunk that ends a chunked SSE stream.
+@(private)
+sync_finish_stream :: proc(socket: net.TCP_Socket, builder: ^strings.Builder) {
+	strings.builder_reset(builder)
+	http_write_chunk(builder, nil)
+	_ = web_send_all(socket, transmute([]u8)strings.to_string(builder^))
 }
 
 @(private)
@@ -395,7 +409,11 @@ sync_query_u64 :: proc(target: string, key: string) -> (u64, bool) {
 			if c < '0' || c > '9' {
 				return 0, false
 			}
-			parsed = parsed * 10 + u64(c - '0')
+			digit := u64(c - '0')
+			if parsed > (max(u64) - digit) / 10 {
+				return 0, false
+			}
+			parsed = parsed * 10 + digit
 		}
 		return parsed, true
 	}

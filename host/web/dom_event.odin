@@ -137,7 +137,11 @@ dom_event_u64 :: proc(entries: []v.Map_Entry, key: string) -> (u64, bool) {
 		if c < '0' || c > '9' {
 			return 0, false
 		}
-		parsed = parsed * 10 + u64(c - '0')
+		digit := u64(c - '0')
+		if parsed > (max(u64) - digit) / 10 {
+			return 0, false
+		}
+		parsed = parsed * 10 + digit
 	}
 	return parsed, true
 }

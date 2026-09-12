@@ -28,6 +28,17 @@ test_http_encode_drops_invalid_headers :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(encoded, "X-Ok: yes"))
 }
 
+// An SSE stream ends with the zero-length chunk terminator.
+@(test)
+test_http_write_chunk_terminator :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	builder: strings.Builder
+	strings.builder_init(&builder, context.temp_allocator)
+	defer strings.builder_destroy(&builder)
+	http_write_chunk(&builder, nil)
+	testing.expect_value(t, strings.to_string(builder), "0\r\n\r\n")
+}
+
 @(private)
 parse_request :: proc(
 	t: ^testing.T,
