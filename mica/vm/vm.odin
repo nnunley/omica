@@ -77,12 +77,22 @@ Handler :: struct {
 	target:         i32,
 	error_register: i32,
 	kind:           Handler_Kind,
+	// A catch-body finally routes exceptions through itself before they
+	// propagate outward; a try-body finally only intercepts returns.
+	routes_exceptions: bool,
 }
 
 // A return diverted through a finally body.
 Pending_Return :: struct {
 	frame: int,
 	value: v.Value,
+}
+
+// An exception diverted through a finally body, re-raised when the finally
+// body completes.
+Pending_Raise :: struct {
+	frame: int,
+	error: v.Value,
 }
 
 VM :: struct {
@@ -113,6 +123,7 @@ VM :: struct {
 	handlers: [dynamic]Handler,
 	// Returns diverted through a finally body, innermost last.
 	pending_returns: [dynamic]Pending_Return,
+	pending_raises:  [dynamic]Pending_Raise,
 	// Execution limits. Zero means unlimited.
 	max_call_depth:     int,
 	instruction_budget: u64,
@@ -154,6 +165,7 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.entry_function = -1
 	state.handlers = make([dynamic]Handler)
 	state.pending_returns = make([dynamic]Pending_Return)
+	state.pending_raises = make([dynamic]Pending_Raise)
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
 	state.status = .Ready
@@ -161,6 +173,7 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 
 vm_destroy :: proc(state: ^VM) {
 	delete(state.pending_returns)
+	delete(state.pending_raises)
 	delete(state.handlers)
 	delete(state.registers)
 	delete(state.frames)
@@ -844,13 +857,22 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Push_Finally:
 			append(&state.handlers, Handler {
-				frame          = top,
-				target         = instr.a,
-				error_register = -1,
-				kind           = .Finally,
+				frame             = top,
+				target            = instr.a,
+				error_register    = -1,
+				kind              = .Finally,
+				routes_exceptions = instr.flags & 1 != 0,
 			})
 
 		case .Resume_Return:
+			if len(state.pending_raises) > 0 &&
+			   state.pending_raises[len(state.pending_raises) - 1].frame == top {
+				// An exception diverted through this finally: re-raise it.
+				pending := pop(&state.pending_raises)
+				state.error = pending.error
+				state.status = .Failed
+				break
+			}
 			if len(state.pending_returns) > 0 &&
 			   state.pending_returns[len(state.pending_returns) - 1].frame == top {
 				pending := state.pending_returns[len(state.pending_returns) - 1]
@@ -947,6 +969,17 @@ vm_remove_frame_handlers :: proc(state: ^VM, frame: int) {
 	if pending_write != len(state.pending_returns) {
 		resize(&state.pending_returns, pending_write)
 	}
+	raise_write := 0
+	for pending in state.pending_raises {
+		if pending.frame == frame {
+			continue
+		}
+		state.pending_raises[raise_write] = pending
+		raise_write += 1
+	}
+	if raise_write != len(state.pending_raises) {
+		resize(&state.pending_raises, raise_write)
+	}
 }
 
 // Transfers control to the innermost handler. Returns false when no handler
@@ -957,9 +990,13 @@ vm_unwind :: proc(state: ^VM) -> bool {
 		return false
 	}
 	handler_index := -1
+	handler_is_finally := false
 	for index := len(state.handlers) - 1; index >= 0; index -= 1 {
-		if state.handlers[index].kind == .Catch {
+		handler := state.handlers[index]
+		if handler.kind == .Catch ||
+		   (handler.kind == .Finally && handler.routes_exceptions) {
 			handler_index = index
+			handler_is_finally = handler.kind == .Finally
 			break
 		}
 	}
@@ -978,6 +1015,15 @@ vm_unwind :: proc(state: ^VM) -> bool {
 	resize(&state.frames, handler.frame + 1)
 	frame := state.frames[handler.frame]
 	state.frames[handler.frame].ip = int(handler.target)
+	if handler_is_finally {
+		// Run the finally body, then re-raise the error when it completes.
+		append(&state.pending_raises, Pending_Raise {
+			frame = handler.frame,
+			error = state.error,
+		})
+		state.status = .Ready
+		return true
+	}
 	if handler.error_register >= 0 {
 		state.registers[frame.register_base + int(handler.error_register)] = state.error
 	}

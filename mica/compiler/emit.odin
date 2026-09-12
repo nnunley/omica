@@ -2302,7 +2302,9 @@ emit_try :: proc(emitter: ^Emitter, try: Try) -> (int, bool) {
 		if try.has_finally {
 			append(
 				&catch_finally_pushes,
-				emit_instruction(emitter, .Push_Finally, 0, 0, 0, 0),
+				// flags bit 0: route exceptions through this finally before
+				// they propagate to an outer catch.
+				emit_instruction(emitter, .Push_Finally, 1, 0, 0, 0),
 			)
 		}
 		clause_register, clause_has_value := emit_block(emitter, clause.body)

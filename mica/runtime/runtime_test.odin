@@ -4008,3 +4008,37 @@ require(len(ready_two) > 0)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
+
+// A finally body must run when the guarded catch body raises, before the
+// exception propagates to an outer catch.
+@(test)
+test_run_finally_runs_on_catch_raise :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	ctx := c.Compile_Context {
+		builtins   = make(map[string]bool),
+		relations  = make(map[string]u32),
+		identities = make(map[string]v.Value),
+	}
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	install_builtin_names(&ctx)
+
+	expect_int_builtin(
+		t,
+		&ctx,
+		`let n = 0
+try
+  try
+    raise E_X
+  catch
+    raise E_Y
+  finally
+    n = n + 1
+  end
+catch
+end
+return n`,
+		1,
+	)
+}
