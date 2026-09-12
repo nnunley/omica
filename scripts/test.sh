@@ -130,8 +130,22 @@ run_timeout() {
     gtimeout "${secs}" "$@"
     return $?
   fi
-  "$@" &
+  # A background job gets stdin from /dev/null, so save stdin on a high fd and
+  # restore it for the command: the REPL and other stdin consumers must still
+  # see their input.
+  local have_stdin=0
+  if exec 9<&0 2>/dev/null; then
+    have_stdin=1
+  fi
+  if [[ "${have_stdin}" == "1" ]]; then
+    "$@" <&9 &
+  else
+    "$@" &
+  fi
   local pid=$!
+  if [[ "${have_stdin}" == "1" ]]; then
+    exec 9<&- 2>/dev/null || true
+  fi
   (
     sleep "${secs}"
     stop_process "${pid}"
@@ -139,7 +153,9 @@ run_timeout() {
   local watchdog=$!
   local rc=0
   wait "${pid}" || rc=$?
-  kill -s TERM "${watchdog}" 2>/dev/null || true
+  # Kill the watchdog *and its sleep child*: killing only the subshell would
+  # orphan the `sleep`, leaving one reparented sleep per command.
+  kill_tree TERM "${watchdog}"
   wait "${watchdog}" 2>/dev/null || true
   return "${rc}"
 }
