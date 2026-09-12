@@ -383,6 +383,39 @@ test_file_wal_truncated_tail :: proc(t: ^testing.T) {
 	store_destroy(&second)
 }
 
+// A crash while creating the WAL can leave a file shorter than its header.
+// Opening the store must recover instead of indexing past the end.
+@(test)
+test_file_wal_short_header :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_short_header")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	testing.expect(t, os.make_directory_all(path, os.Permissions_Default) == nil)
+	wal_path, _ := filepath.join([]string{path, "wal"}, context.temp_allocator)
+	wal_file, open_error := os.open(wal_path, os.O_RDWR | os.O_CREATE)
+	testing.expect(t, open_error == nil)
+	if open_error == nil {
+		torn := []u8{0x4d, 0x49, 0x43, 0x41, 0x01}
+		written, write_error := os.write(wal_file, torn)
+		testing.expect(t, write_error == nil && written == len(torn))
+		os.close(wal_file)
+	}
+
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect_value(t, store_durable_version(&store), u64(0))
+	testing.expect(t, !store_failed(&store))
+}
+
 @(test)
 test_file_wal_durability_none_does_not_sync :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)

@@ -594,6 +594,63 @@ test_vm_scan_first_binds_register :: proc(t: ^testing.T) {
 	testing.expect_value(t, state.result, must_identity(1))
 }
 
+// Scan_First must enforce the same read authority as Scan_Collect/Exists.
+// Regression: it scanned without any permission check.
+@(test)
+test_vm_scan_first_denies_unauthorized :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	kernel, relation := relation_setup()
+	defer k.kernel_destroy(&kernel)
+	relation_seed(&kernel, relation, [][2]v.Value {
+		{must_identity(1), must_identity(2)},
+	})
+	source := k.Relation_Source{snapshot = kernel.current, use_stored_derived = true}
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	lamp := must_identity(2)
+	lamp_constant := i32(builder_add_constant(&builder, lamp))
+	owner := v.symbol_intern("owner")
+	item := v.symbol_intern("item")
+	pattern := builder_add_pattern(
+		&builder,
+		u32(relation),
+		[]v.Symbol{owner, item},
+		[]Pattern_Cell{{kind = .Output, operand = 0}, {kind = .Const, operand = lamp_constant}},
+	)
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 3, true)
+	builder_emit(&builder, .Scan_First, 0, 1, pattern, 0)
+	builder_emit(&builder, .Branch, 0, 1, 1, 0)
+	builder_emit(&builder, .Return, 0, 1, 0, 0)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	authority := k.authority_empty(alloc)
+	defer k.authority_destroy(&authority)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	vm_set_workspace(&state, &source, nil)
+	vm_set_authority(&state, &authority)
+
+	testing.expect_value(t, vm_run(&state), VM_Status.Failed)
+	error, error_ok := v.value_as_error(state.error)
+	testing.expect(t, error_ok)
+	code, code_ok := v.symbol_name(error.code)
+	testing.expect(t, code_ok)
+	testing.expect_value(t, code, "E_PERMISSION")
+}
+
 @(test)
 test_vm_assert_and_retract :: proc(t: ^testing.T) {
 	arena := test_arena()

@@ -1385,6 +1385,10 @@ vm_scan_first :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		return false
 	}
 	pattern := state.program.patterns[instr.b]
+	if !k.authority_can_read(state.authority, k.Relation_ID(pattern.relation)) {
+		vm_fail(state, "E_PERMISSION", "relation read denied")
+		return false
+	}
 	bindings := vm_pattern_bindings(state, base, pattern, context.temp_allocator)
 	ctx := First_Binding_Context {
 		vm      = state,

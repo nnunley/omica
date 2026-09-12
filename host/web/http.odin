@@ -385,6 +385,11 @@ http_encode_response :: proc(response: ^Http_Response, builder: ^strings.Builder
 		fmt.sbprintf(builder, "Content-Type: %s\r\n", response.content_type)
 	}
 	for header in response.headers {
+		// Never emit a name or value that could split the response; callers
+		// should have validated, this is defense in depth.
+		if !is_token(header.name) || !valid_header_value(header.value) {
+			continue
+		}
 		fmt.sbprintf(builder, "%s: %s\r\n", header.name, header.value)
 	}
 	if response.close {

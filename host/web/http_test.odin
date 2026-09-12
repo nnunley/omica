@@ -8,6 +8,26 @@ as_bytes :: proc(text: string) -> []u8 {
 	return transmute([]byte)text
 }
 
+// Header values that would split the response must never be emitted.
+@(test)
+test_http_encode_drops_invalid_headers :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	builder: strings.Builder
+	strings.builder_init(&builder, context.temp_allocator)
+	defer strings.builder_destroy(&builder)
+	response := Http_Response {
+		status  = 200,
+		headers = []Http_Header {
+			{"Location", "/mud\r\nX-Evil: 1"},
+			{"X-Ok", "yes"},
+		},
+	}
+	http_encode_response(&response, &builder)
+	encoded := strings.to_string(builder)
+	testing.expect(t, !strings.contains(encoded, "X-Evil"))
+	testing.expect(t, strings.contains(encoded, "X-Ok: yes"))
+}
+
 @(private)
 parse_request :: proc(
 	t: ^testing.T,

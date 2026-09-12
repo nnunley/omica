@@ -43,6 +43,42 @@ test_auth_form_decode :: proc(t: ^testing.T) {
 	testing.expect_value(t, auth_form_value(fields, "return"), "/mud")
 }
 
+// A login redirect target must be a local path with no control characters:
+// embedded CRLF would split the response and // would redirect off-site.
+@(test)
+test_auth_login_return_path_sanitized :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	testing.expect_value(t, auth_safe_return_path("/mud"), "/mud")
+	testing.expect_value(t, auth_safe_return_path("/deep/path?a=1"), "/deep/path?a=1")
+	testing.expect_value(t, auth_safe_return_path(""), "/mud")
+	testing.expect_value(t, auth_safe_return_path("relative"), "/mud")
+	testing.expect_value(t, auth_safe_return_path("//evil.com"), "/mud")
+	testing.expect_value(t, auth_safe_return_path("/\\evil.com"), "/mud")
+	testing.expect_value(t, auth_safe_return_path("/x\r\nSet-Cookie: evil=1"), "/mud")
+
+	auth: Auth
+	auth_init(&auth, context.temp_allocator)
+	defer auth_destroy(&auth)
+	actor, _ := v.value_identity_raw(0x2003)
+	testing.expect(t, auth_seed_user(&auth, "carol", "carol-pass", actor))
+
+	request := Http_Request {
+		method = "POST",
+		target = "/auth/login",
+	}
+	request.body = as_bytes("login=carol&password=carol-pass&return=%2Fok%0D%0AX-Evil%3A%201")
+	response: Http_Response
+	testing.expect(t, auth_handle(&auth, &request, &response))
+	testing.expect_value(t, response.status, 303)
+	location := ""
+	for header in response.headers {
+		if header.name == "Location" {
+			location = header.value
+		}
+	}
+	testing.expect_value(t, location, "/mud")
+}
+
 @(test)
 test_auth_login_request :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)

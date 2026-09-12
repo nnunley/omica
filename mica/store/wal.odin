@@ -281,7 +281,9 @@ store_wal_open :: proc(store: ^Store, path: string) -> bool {
 	if size_error != nil {
 		return false
 	}
-	if size == 0 {
+	// A file shorter than the header is a torn write from a crash during
+	// creation; recreate the header rather than indexing past the end.
+	if size < WAL_HEADER_SIZE {
 		header: [WAL_HEADER_SIZE]u8
 		copy(header[:8], WAL_MAGIC)
 		version := WAL_VERSION

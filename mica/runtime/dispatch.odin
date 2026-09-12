@@ -136,7 +136,6 @@ install_methods :: proc(
 						value_int_must(i64(position) + i64(mode) * 256),
 					}),
 				); err != k.Kernel_Error.None {
-					k.transaction_destroy(&tx)
 					return method_install_error(env, verb.name, err)
 				}
 			}

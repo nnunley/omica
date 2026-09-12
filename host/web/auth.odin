@@ -184,6 +184,24 @@ auth_request_cookie :: proc(request: ^Http_Request, name: string) -> string {
 	return ""
 }
 
+// A login redirect target must be a local absolute path with no control
+// characters, so it cannot inject response headers or redirect off-site.
+@(private)
+auth_safe_return_path :: proc(value: string) -> string {
+	if value == "" || value[0] != '/' {
+		return "/mud"
+	}
+	if len(value) > 1 && (value[1] == '/' || value[1] == '\\') {
+		return "/mud"
+	}
+	for c in value {
+		if c < 0x20 || c == 0x7f {
+			return "/mud"
+		}
+	}
+	return value
+}
+
 // Handles local auth POSTs: `/auth/login` and `/auth/logout`. Returns false
 // for other paths so document routes can serve the login page.
 auth_handle :: proc(auth: ^Auth, request: ^Http_Request, response: ^Http_Response) -> bool {
@@ -196,10 +214,7 @@ auth_handle :: proc(auth: ^Auth, request: ^Http_Request, response: ^Http_Respons
 		form := auth_parse_form(request.body)
 		login := auth_form_value(form, "login")
 		password := auth_form_value(form, "password")
-		return_path := auth_form_value(form, "return")
-		if return_path == "" || return_path[0] != '/' {
-			return_path = "/mud"
-		}
+		return_path := auth_safe_return_path(auth_form_value(form, "return"))
 		if login == "" || password == "" {
 			http_response_text(response, 400, "text/plain; charset=utf-8", "login and password are required")
 			return true
