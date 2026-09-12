@@ -637,6 +637,7 @@ kernel_create_relation :: proc(
 				relation = metadata.id,
 				name     = metadata.name,
 			}})
+			kernel_store_persist(kernel, 0, next.version, next, nil)
 			return next, .None
 		}
 		snapshot_release(next)

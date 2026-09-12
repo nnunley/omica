@@ -4,6 +4,8 @@ package store
 
 import "core:mem"
 import "core:mem/virtual"
+import "core:os"
+import "core:path/filepath"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -13,10 +15,25 @@ import v "../var"
 Store_Mode :: enum {
 	// Records are kept in memory; no file is written.
 	Memory,
+	// Records are appended to a write-ahead log under `path`.
+	File,
+}
+
+// Controls when WAL appends are flushed to stable storage.
+Durability :: enum {
+	// Never fsync; the OS decides.
+	None,
+	// One fsync per writer drain batch.
+	Group,
+	// One fsync per record.
+	Strict,
 }
 
 Store_Options :: struct {
 	mode:         Store_Mode,
+	// Store directory for `File` mode.
+	path:         string,
+	durability:   Durability,
 	budget_bytes: i64,
 	warn_after:   time.Duration,
 	timeout:      time.Duration,
@@ -78,6 +95,15 @@ Store :: struct {
 	arena:          ^virtual.Arena,
 	copy_allocator: mem.Allocator,
 
+	// File mode state.
+	path:       string,
+	wal_path:   string,
+	file:       ^os.File,
+	wal_end:    i64,
+	durability: Durability,
+	syncs:      u64,
+	failed:     bool,
+
 	thread: ^thread.Thread,
 	stop:   bool,
 	closed: bool,
@@ -85,7 +111,36 @@ Store :: struct {
 
 // Initialises a memory store. Zero options use the defaults.
 store_init :: proc(store: ^Store, options := Store_Options{}) {
+	store_setup(store, options)
+	store_start_writer(store)
+}
+
+// Opens a store, recovering any existing write-ahead log. Returns false when
+// the store cannot be opened; the store is left destroyed on failure.
+store_open :: proc(store: ^Store, options: Store_Options) -> bool {
+	store_setup(store, options)
+	if options.mode == .File {
+		if !store_wal_open(store, options.path) {
+			store_release(store)
+			return false
+		}
+	}
+	store_start_writer(store)
+	return true
+}
+
+@(private)
+store_start_writer :: proc(store: ^Store) {
+	store.thread = thread.create_and_start_with_data(store, store_writer_proc)
+	if store.thread == nil {
+		panic("failed to start store writer thread")
+	}
+}
+
+@(private)
+store_setup :: proc(store: ^Store, options: Store_Options) {
 	store.mode = options.mode
+	store.durability = options.durability
 	store.allocator = context.allocator
 	store.budget_bytes = options.budget_bytes
 	if store.budget_bytes <= 0 {
@@ -111,11 +166,6 @@ store_init :: proc(store: ^Store, options := Store_Options{}) {
 		panic("failed to initialize store arena")
 	}
 	store.copy_allocator = virtual.arena_allocator(store.arena)
-
-	store.thread = thread.create_and_start_with_data(store, store_writer_proc)
-	if store.thread == nil {
-		panic("failed to start store writer thread")
-	}
 }
 
 store_destroy :: proc(store: ^Store) {
@@ -131,6 +181,44 @@ store_destroy :: proc(store: ^Store) {
 		store.thread = nil
 	}
 
+	if store.file != nil {
+		os.close(store.file)
+		store.file = nil
+	}
+	if store.path != "" {
+		delete(store.path, store.allocator)
+		store.path = ""
+	}
+	if store.wal_path != "" {
+		delete(store.wal_path, store.allocator)
+		store.wal_path = ""
+	}
+
+	delete(store.tickets)
+	delete(store.known)
+	delete(store.queue)
+	delete(store.records)
+	if store.arena != nil {
+		virtual.arena_destroy(store.arena)
+		free(store.arena, store.allocator)
+		store.arena = nil
+	}
+}
+
+@(private)
+store_release :: proc(store: ^Store) {
+	if store.file != nil {
+		os.close(store.file)
+		store.file = nil
+	}
+	if store.path != "" {
+		delete(store.path, store.allocator)
+		store.path = ""
+	}
+	if store.wal_path != "" {
+		delete(store.wal_path, store.allocator)
+		store.wal_path = ""
+	}
 	delete(store.tickets)
 	delete(store.known)
 	delete(store.queue)
@@ -196,6 +284,9 @@ store_admit_hook :: proc(user: rawptr, bytes: i64) -> (k.Persist_Ticket, bool) {
 
 	sync.mutex_lock(&store.lock)
 	defer sync.mutex_unlock(&store.lock)
+	if store.failed {
+		return 0, false
+	}
 	deadline := time.tick_add(time.tick_now(), store.timeout)
 	for store.reserved_bytes + bytes > store.budget_bytes && !store.closed {
 		remaining := time.tick_diff(time.tick_now(), deadline)
@@ -284,6 +375,19 @@ store_publish_hook :: proc(
 		delete(catalog_list)
 	}
 
+	if len(entry.writes) == 0 && len(entry.catalog) == 0 {
+		// Nothing durable in this publish (for example a read-only commit or
+		// a volatile-only write set); return the reservation untouched.
+		sync.mutex_lock(&store.lock)
+		if bytes, found := store.tickets[ticket]; found {
+			delete_key(&store.tickets, ticket)
+			store.reserved_bytes -= bytes
+		}
+		sync.cond_broadcast(&store.cond)
+		sync.mutex_unlock(&store.lock)
+		return
+	}
+
 	sync.mutex_lock(&store.lock)
 	if bytes, found := store.tickets[ticket]; found {
 		entry.bytes = bytes
@@ -315,6 +419,9 @@ store_durable_version_hook :: proc(user: rawptr) -> u64 {
 @(private)
 store_writer_proc :: proc(data: rawptr) {
 	store := (^Store)(data)
+	batch: [dynamic]Queue_Entry
+	batch = make([dynamic]Queue_Entry, store.allocator)
+	defer delete(batch)
 	for {
 		sync.mutex_lock(&store.lock)
 		for len(store.queue) == 0 && !store.stop {
@@ -324,26 +431,54 @@ store_writer_proc :: proc(data: rawptr) {
 			sync.mutex_unlock(&store.lock)
 			return
 		}
-		entry := store.queue[0]
-		ordered_remove(&store.queue, 0)
+		append(&batch, ..store.queue[:])
+		clear(&store.queue)
 		sync.mutex_unlock(&store.lock)
 
-		// Memory mode: the record itself is the durable artifact.
-		record := Wal_Record {
-			version = entry.version,
-			writes  = entry.writes,
-			catalog = entry.catalog,
+		// I/O runs outside the store lock: commits hand off, they do not wait.
+		durable := true
+		if store.mode == .File {
+			sync.mutex_lock(&store.lock)
+			failed := store.failed
+			sync.mutex_unlock(&store.lock)
+			if !failed {
+				durable = store_wal_append_batch(store, batch[:])
+			}
 		}
 
 		sync.mutex_lock(&store.lock)
-		append(&store.records, record)
-		if entry.version > store.durable {
-			store.durable = entry.version
+		if !durable {
+			store.failed = true
 		}
-		store.reserved_bytes -= entry.bytes
+		if durable {
+			for entry in batch {
+				append(&store.records, Wal_Record {
+					version = entry.version,
+					writes  = entry.writes,
+					catalog = entry.catalog,
+				})
+				if entry.version > store.durable {
+					store.durable = entry.version
+				}
+			}
+		}
+		for entry in batch {
+			store.reserved_bytes -= entry.bytes
+		}
 		sync.cond_broadcast(&store.cond)
 		sync.mutex_unlock(&store.lock)
+		clear(&batch)
 	}
+}
+
+store_sync_count :: proc(store: ^Store) -> u64 {
+	return sync.atomic_load(&store.syncs)
+}
+
+store_failed :: proc(store: ^Store) -> bool {
+	sync.mutex_lock(&store.lock)
+	defer sync.mutex_unlock(&store.lock)
+	return store.failed
 }
 
 // --- Copies -----------------------------------------------------------------

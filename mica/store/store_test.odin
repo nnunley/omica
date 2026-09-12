@@ -1,5 +1,7 @@
 package store
 
+import "core:os"
+import "core:path/filepath"
 import "core:sync"
 import "core:testing"
 import "core:time"
@@ -153,16 +155,23 @@ test_kernel_persist_pipeline :: proc(t: ^testing.T) {
 	store_wait_durable(&store, committed.version)
 	testing.expect(t, store_durable_version(&store) >= committed.version)
 
-	// Catalogue plus one durable write; the volatile relation is skipped.
-	testing.expect_value(t, store_record_count(&store), 1)
+	// Catalogue records for the durable relation, plus the write record; the
+	// volatile relation contributes nothing.
+	testing.expect(t, store_record_count(&store) >= 1)
 	sync.mutex_lock(&store.lock)
-	record := store.records[0]
-	testing.expect_value(t, len(record.writes), 1)
-	if len(record.writes) == 1 {
-		testing.expect_value(t, record.writes[0].relation, k.Relation_ID(1))
-		testing.expect(t, record.writes[0].assert)
+	write_records := 0
+	wrote_durable := false
+	for record in store.records {
+		write_records += len(record.writes)
+		for write in record.writes {
+			if write.relation == k.Relation_ID(1) && write.assert {
+				wrote_durable = true
+			}
+			testing.expect(t, write.relation != k.Relation_ID(2))
+		}
 	}
-	testing.expect(t, len(record.catalog) >= 1)
+	testing.expect_value(t, write_records, 1)
+	testing.expect(t, wrote_durable)
 	sync.mutex_unlock(&store.lock)
 }
 
@@ -195,4 +204,213 @@ test_kernel_admission_overload :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, commit_error, k.Kernel_Error.Overloaded)
 	testing.expect_value(t, kernel.current.version, before)
+}
+
+@(private)
+temp_store_path :: proc(t: ^testing.T, name: string) -> string {
+	directory, directory_error := os.temp_dir(context.temp_allocator)
+	testing.expectf(t, directory_error == nil, "temp dir: %v", directory_error)
+	if directory_error != nil {
+		return ""
+	}
+	path, join_error := filepath.join(
+		[]string{directory, name},
+		context.temp_allocator,
+	)
+	testing.expectf(t, join_error == nil, "join: %v", join_error)
+	return path
+}
+
+@(private)
+file_relation_rows :: proc(t: ^testing.T, kernel: ^k.Kernel, name: string) -> int {
+	snapshot := k.kernel_snapshot(kernel)
+	metadata, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern(name))
+	k.snapshot_release(snapshot)
+	if !found {
+		return -1
+	}
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(kernel, metadata.id, []v.Binding{{}}, &rows)
+	return len(rows)
+}
+
+@(test)
+test_file_wal_round_trip :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_round_trip")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(
+				&store,
+				Store_Options{mode = .File, path = path, durability = .Group},
+			),
+		)
+		store_attach(&store, &kernel)
+		create_named_relation(t, &kernel, 1, "Kept", 1, .Durable)
+		create_named_relation(t, &kernel, 2, "Gone", 1, .Volatile)
+
+		tx := k.kernel_begin(&kernel)
+		one, _ := v.value_int(1)
+		two, _ := v.value_int(2)
+		testing.expect_value(
+			t,
+			k.transaction_assert(&tx, 1, v.tuple_new(context.temp_allocator, []v.Value{one})),
+			k.Kernel_Error.None,
+		)
+		testing.expect_value(
+			t,
+			k.transaction_assert(&tx, 1, v.tuple_new(context.temp_allocator, []v.Value{two})),
+			k.Kernel_Error.None,
+		)
+		testing.expect_value(
+			t,
+			k.transaction_assert(&tx, 2, v.tuple_new(context.temp_allocator, []v.Value{two})),
+			k.Kernel_Error.None,
+		)
+		committed, commit_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expectf(t, commit_error == k.Kernel_Error.None, "commit: %v", commit_error)
+		if commit_error != k.Kernel_Error.None {
+			store_destroy(&store)
+			k.kernel_destroy(&kernel)
+			return
+		}
+		latest := committed.version
+		k.snapshot_release(committed)
+		store_wait_durable(&store, latest)
+		testing.expect(t, store_sync_count(&store) >= 1)
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_durable_version(&store) >= 1)
+	testing.expect(t, store_restore(&store, &kernel))
+	testing.expect_value(t, file_relation_rows(t, &kernel, "Kept"), 2)
+	testing.expect_value(t, file_relation_rows(t, &kernel, "Gone"), -1)
+}
+
+@(test)
+test_file_wal_truncated_tail :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_truncated")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	latest: u64
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(
+				&store,
+				Store_Options{mode = .File, path = path, durability = .Group},
+			),
+		)
+		store_attach(&store, &kernel)
+		create_named_relation(t, &kernel, 1, "Kept", 1, .Durable)
+		tx := k.kernel_begin(&kernel)
+		one, _ := v.value_int(1)
+		k.transaction_assert(&tx, 1, v.tuple_new(context.temp_allocator, []v.Value{one}))
+		committed, commit_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect(t, commit_error == k.Kernel_Error.None)
+		latest = committed.version
+		k.snapshot_release(committed)
+		store_wait_durable(&store, latest)
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	// Append a torn record header and reopening must drop it.
+	wal_path, _ := filepath.join([]string{path, "wal"}, context.temp_allocator)
+	wal_file, open_error := os.open(wal_path, os.O_WRONLY | os.O_APPEND)
+	testing.expect(t, open_error == nil)
+	if open_error == nil {
+		garbage := []u8{0xde, 0xad, 0xbe}
+		written, write_error := os.write(wal_file, garbage)
+		testing.expect(t, write_error == nil && written == len(garbage))
+		os.close(wal_file)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	testing.expect_value(t, store_durable_version(&store), latest)
+	testing.expect(t, !store_failed(&store))
+	store_destroy(&store)
+
+	// The torn tail is truncated, so reopening again is clean.
+	second: Store
+	testing.expect(
+		t,
+		store_open(&second, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	testing.expect_value(t, store_durable_version(&second), latest)
+	store_destroy(&second)
+}
+
+@(test)
+test_file_wal_durability_none_does_not_sync :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_no_sync")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .None}),
+	)
+	defer store_destroy(&store)
+	store_attach(&store, &kernel)
+	create_named_relation(t, &kernel, 1, "NoSync", 1, .Durable)
+	tx := k.kernel_begin(&kernel)
+	one, _ := v.value_int(1)
+	k.transaction_assert(&tx, 1, v.tuple_new(context.temp_allocator, []v.Value{one}))
+	committed, commit_error := k.transaction_commit(&tx)
+	k.transaction_destroy(&tx)
+	testing.expect(t, commit_error == k.Kernel_Error.None)
+	if commit_error == k.Kernel_Error.None {
+		store_wait_durable(&store, committed.version)
+		k.snapshot_release(committed)
+	}
+	testing.expect_value(t, store_sync_count(&store), u64(0))
 }
