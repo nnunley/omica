@@ -1201,7 +1201,28 @@ parse_list_literal :: proc(parser: ^Parser) -> ^Expr {
 		break
 	}
 	expect(parser, .RBracket, "expected ']' after list elements")
-	return expr_node(parser, List_Literal{elements = to_slice(parser, elements)})
+	elements_slice := to_slice(parser, elements)
+	if at(parser, .LBrace) {
+		advance(parser)
+		rows: [dynamic]^Expr
+		skip_newlines(parser)
+		for !at(parser, .RBrace) && !at(parser, .Eof) {
+			append(&rows, parse_expression(parser))
+			skip_newlines(parser)
+			if at(parser, .Comma) {
+				advance(parser)
+				skip_newlines(parser)
+				continue
+			}
+			break
+		}
+		expect(parser, .RBrace, "expected '}' after relation literal rows")
+		return expr_node(parser, Relation_Literal {
+			heading = elements_slice,
+			rows    = to_slice(parser, rows),
+		})
+	}
+	return expr_node(parser, List_Literal{elements = elements_slice})
 }
 
 @(private)

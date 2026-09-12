@@ -451,6 +451,9 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 	case List_Literal:
 		return emit_list(emitter, n)
 
+	case Relation_Literal:
+		return emit_relation_literal(emitter, n)
+
 	case Map_Literal:
 		return emit_map(emitter, n)
 
@@ -1405,6 +1408,34 @@ emit_list_concat :: proc(emitter: ^Emitter, lists: []int) -> (int, bool) {
 		i32(destination),
 		builtin,
 		i32(first),
+	)
+	return destination, true
+}
+
+@(private)
+emit_relation_literal :: proc(emitter: ^Emitter, literal: Relation_Literal) -> (int, bool) {
+	heading, heading_ok := emit_list(
+		emitter,
+		List_Literal{elements = literal.heading},
+	)
+	if !heading_ok {
+		return -1, false
+	}
+	rows, rows_ok := emit_list(emitter, List_Literal{elements = literal.rows})
+	if !rows_ok {
+		return -1, false
+	}
+	argument_registers := []int{heading, rows}
+	first_argument := marshal_arguments(emitter, argument_registers)
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__relation_literal"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		2,
+		i32(destination),
+		builtin,
+		i32(first_argument),
 	)
 	return destination, true
 }

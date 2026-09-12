@@ -95,6 +95,7 @@ runtime_builtins := [?]Builtin_Spec {
 	{"fileout_rules", -1, builtin_fileout_rules},
 	{"tasks", 0, builtin_tasks},
 	{"log", -1, builtin_log},
+	{"__relation_literal", 2, builtin_relation_literal},
 	{"project", -1, builtin_project},
 	{"union", 2, builtin_union},
 	{"difference", 2, builtin_difference},
@@ -2274,6 +2275,44 @@ relation_argument :: proc(args: []v.Value, index: int) -> (^v.Relation_Value, bo
 		return nil, false
 	}
 	return relation, true
+}
+
+// Builds a relation value from a heading list and a list of row lists.
+@(private)
+builtin_relation_literal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	heading_values, heading_ok := v.value_as_list(args[0])
+	if !heading_ok {
+		return builtin_error(state, "E_TYPE", "relation literal heading must be a list")
+	}
+	heading := make([]v.Symbol, len(heading_values), context.temp_allocator)
+	for value, index in heading_values {
+		symbol, is_symbol := v.value_as_symbol(value)
+		if !is_symbol {
+			return builtin_error(
+				state,
+				"E_TYPE",
+				"relation literal headings must be symbols",
+			)
+		}
+		heading[index] = symbol
+	}
+	row_values, rows_ok := v.value_as_list(args[1])
+	if !rows_ok {
+		return builtin_error(state, "E_TYPE", "relation literal rows must be a list")
+	}
+	rows := make([]v.Tuple, len(row_values), context.temp_allocator)
+	for value, index in row_values {
+		cells, is_list := v.value_as_list(value)
+		if !is_list {
+			return builtin_error(state, "E_TYPE", "relation literal rows must be lists")
+		}
+		rows[index] = v.tuple_new(state.allocator, cells)
+	}
+	result, relation_error := v.value_relation(state.allocator, heading, rows)
+	if relation_error != .None {
+		return builtin_error(state, "E_INVARG", "relation literal shape is invalid")
+	}
+	return result, true
 }
 
 @(private)

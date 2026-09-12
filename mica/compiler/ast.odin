@@ -83,6 +83,13 @@ Splice :: struct {
 	value: ^Expr,
 }
 
+// A relation literal: a bracketed heading followed by brace-enclosed rows,
+// for example `[:person, :team] { [:alice, :operations] }`.
+Relation_Literal :: struct {
+	heading: []^Expr,
+	rows:    []^Expr,
+}
+
 List_Literal :: struct {
 	elements: []^Expr,
 }
@@ -381,6 +388,7 @@ Expr :: union {
 	Wildcard,
 	Splice,
 	List_Literal,
+	Relation_Literal,
 	Map_Literal,
 	Range_Literal,
 	Binding,

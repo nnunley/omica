@@ -3282,3 +3282,39 @@ assert Out(guarded(), projected())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
+
+@(test)
+test_run_relation_literals :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `require len([:a] {[1], [2]}) == 2
+require to_literal([:person, :team] {[:alice, :operations]}) == "[:person, :team] {[:alice, :operations]}"
+
+require project([:person, :team] {
+  [:alice, :operations],
+  [:bob, :operations],
+  [:chandra, :research]
+}, :team) == [:team] {[:operations], [:research]}
+
+require natural_join(
+  [:person, :team] {[:alice, :operations], [:bob, :research]},
+  [:team, :room] {[:operations, :north], [:research, :south]}
+) == [:person, :team, :room] {
+  [:alice, :operations, :north],
+  [:bob, :research, :south]
+}
+
+require project([:person, :team] {}) == [] {}
+`
+	path, path_ok := write_temp_source(t, "mica_relation_literals_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}

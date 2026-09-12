@@ -6,9 +6,6 @@ implementation; they are collected here.
 
 ## Language
 
-- Relation literals such as `[:person, :team] { [:alice, :operations] }` are
-  not supported yet. Build literals with `make_relation` plus `assert`, or a
-  query that produces the rows you need.
 - A relation call with no named query variables is a boolean predicate test.
   Bound values and wildcards participate in matching and do not appear in a
   result heading; only named query variables do.
