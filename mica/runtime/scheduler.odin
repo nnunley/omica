@@ -234,6 +234,11 @@ scheduler_resume :: proc(scheduler: ^Scheduler, id: Task_ID, value: v.Value) -> 
 		sync.mutex_unlock(&scheduler.lock)
 		return false
 	}
+	// The task is leaving whatever it was parked on. Invalidate any armed
+	// timer and drop its mailbox waiters so a stale wakeup firing later finds
+	// a newer generation and no waiter to touch.
+	scheduler_remove_mailbox_waiter_locked(scheduler, id)
+	entry.generation += 1
 	entry.has_pending = true
 	entry.pending_value = value
 	append(&scheduler.ready, id)
@@ -1015,42 +1020,51 @@ scheduler_worker_proc :: proc(data: rawptr) {
 			sync.mutex_unlock(&scheduler.lock)
 			continue
 		}
+		// Claim the entry and snapshot its resume mode under the lock. The
+		// pending value, started flag, and generation belong to the scheduler
+		// state machine; nothing here may be touched again after unlocking.
+		// Drop its mailbox waiters: it is no longer parked, so no send may
+		// wake it through a stale waiter after this point.
 		entry.running = true
+		scheduler_remove_mailbox_waiter_locked(scheduler, id)
+		task := entry.task
+		pending := entry.pending_value
+		consume_pending := entry.has_pending
+		already_started := entry.started
+		entry.has_pending = false
+		entry.started = true
 		sync.mutex_unlock(&scheduler.lock)
 
 		outcome: Task_Outcome
-		if entry.has_pending {
-			pending := entry.pending_value
-			entry.has_pending = false
-			outcome = task_resume_with(entry.task, pending)
-		} else if entry.started {
-			outcome = task_resume(entry.task)
+		if consume_pending {
+			outcome = task_resume_with(task, pending)
+		} else if already_started {
+			outcome = task_resume(task)
 		} else {
-			outcome = task_run(entry.task)
-			entry.started = true
+			outcome = task_run(task)
 		}
 
 		// Spawns resume the parent immediately with the child id; the child
 		// runs on another worker.
-		outcome = scheduler_run_spawns(scheduler, entry.task, outcome)
+		outcome = scheduler_run_spawns(scheduler, task, outcome)
 
 		// Mailbox receives with queued messages resume without parking.
 		for outcome.kind == .Pending && outcome.suspend == .Mailbox_Recv {
-			take := scheduler_mailbox_take(scheduler, entry.task)
+			take := scheduler_mailbox_take(scheduler, task)
 			switch take.kind {
 			case .Ready:
-				outcome = task_resume_with(entry.task, take.value)
+				outcome = task_resume_with(task, take.value)
 				continue
 			case .No_Receivers:
 				outcome = task_fail(
-					entry.task,
+					task,
 					"E_INVARG",
 					"mailbox has no live receivers",
 				)
 			case .Empty:
 				if outcome.millis == 0 {
 					empty := v.value_list(scheduler.allocator, nil)
-					outcome = task_resume_with(entry.task, empty)
+					outcome = task_resume_with(task, empty)
 					continue
 				}
 			}
@@ -1060,7 +1074,7 @@ scheduler_worker_proc :: proc(data: rawptr) {
 		sync.mutex_lock(&scheduler.lock)
 		entry.running = false
 		if entry.cancelled && outcome.kind == .Pending {
-			outcome = task_cancel(entry.task)
+			outcome = task_cancel(task)
 		}
 		scheduler_finish_locked(scheduler, id, entry, outcome)
 		sync.cond_broadcast(&scheduler.cond)
@@ -1098,16 +1112,33 @@ scheduler_timer_proc :: proc(data: rawptr) {
 
 		// Remove the timer we selected, not the last (unsorted pop) entry.
 		ordered_remove(&scheduler.timers, 0)
-		entry, found := scheduler.entries[next.task_id]
-		if found && !entry.done && entry.generation == next.generation {
-			if entry.result.suspend == .Mailbox_Recv {
-				scheduler_remove_mailbox_waiter_locked(scheduler, next.task_id)
-				entry.pending_value = v.value_list(scheduler.allocator, nil)
-				entry.has_pending = true
-			}
-			append(&scheduler.ready, next.task_id)
-		}
+		scheduler_timer_fire_locked(scheduler, next)
 		sync.cond_broadcast(&scheduler.cond)
 		sync.mutex_unlock(&scheduler.lock)
 	}
+}
+
+// Wakes the task named by an expired timer. The caller holds the scheduler
+// lock. The entry only fires when it is still parked on the wait that armed
+// the timer: terminal, running, already-woken, or re-parked (generation
+// bumped) entries are left alone, and an armed timer left behind by an early
+// resume or mailbox delivery becomes a no-op. Does not broadcast; the caller
+// wakes the workers after firing.
+@(private)
+scheduler_timer_fire_locked :: proc(scheduler: ^Scheduler, timer: Timer_Entry) -> bool {
+	entry, found := scheduler.entries[timer.task_id]
+	if !found ||
+	   entry.done ||
+	   entry.running ||
+	   entry.has_pending ||
+	   entry.generation != timer.generation {
+		return false
+	}
+	if entry.result.suspend == .Mailbox_Recv {
+		scheduler_remove_mailbox_waiter_locked(scheduler, timer.task_id)
+		entry.pending_value = v.value_list(scheduler.allocator, nil)
+		entry.has_pending = true
+	}
+	append(&scheduler.ready, timer.task_id)
+	return true
 }

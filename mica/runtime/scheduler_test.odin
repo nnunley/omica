@@ -241,9 +241,210 @@ test_scheduler_resume_with_value :: proc(t: ^testing.T) {
 	testing.expect_value(t, value, i64(42))
 }
 
+// An early host resume must invalidate the sleep timer: the stale timer firing
+// later must not requeue or touch the entry. Regression for the lost-wakeup
+// and stale-timer races.
 @(test)
-test_scheduler_cancel_parked :: proc(t: ^testing.T) {
+test_scheduler_resume_invalidates_timer :: proc(t: ^testing.T) {
 	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
+		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
+	defer scheduler_destroy(&scheduler)
+
+	id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
+	testing.expect(t, scheduler_wait_suspended(&scheduler, id, .Sleep))
+
+	// The sleep armed exactly one timer carrying the entry's generation.
+	sync.mutex_lock(&scheduler.lock)
+	entry := scheduler.entries[id]
+	armed := entry.generation
+	armed_count := 0
+	for timer in scheduler.timers {
+		if timer.task_id == id && timer.generation == armed {
+			armed_count += 1
+		}
+	}
+	sync.mutex_unlock(&scheduler.lock)
+	testing.expect_value(t, armed_count, 1)
+
+	testing.expect(t, scheduler_resume(&scheduler, id, value_int_must(42)))
+
+	// The resume bumped the generation, so the armed timer is now stale.
+	sync.mutex_lock(&scheduler.lock)
+	stale := scheduler.entries[id].generation != armed
+	sync.mutex_unlock(&scheduler.lock)
+	testing.expect(t, stale)
+	testing.expect(
+		t,
+		!scheduler_timer_fire_locked(
+			&scheduler,
+			Timer_Entry{task_id = id, generation = armed},
+		),
+	)
+
+	outcome := scheduler_wait(&scheduler, id)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+	value, value_ok := v.value_as_int(outcome.value)
+	testing.expect(t, value_ok)
+	testing.expect_value(t, value, i64(42))
+}
+
+// The timer must only wake an entry still parked on the wait that armed it:
+// terminal, running, already-woken, or re-parked entries are left alone.
+@(test)
+test_scheduler_timer_fire_guards :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
+		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
+	defer scheduler_destroy(&scheduler)
+
+	id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
+	testing.expect(t, scheduler_wait_suspended(&scheduler, id, .Sleep))
+
+	sync.mutex_lock(&scheduler.lock)
+	entry := scheduler.entries[id]
+	generation := entry.generation
+	ready_before := len(scheduler.ready)
+
+	// The live timer for the current park fires.
+	testing.expect(
+		t,
+		scheduler_timer_fire_locked(
+			&scheduler,
+			Timer_Entry{task_id = id, generation = generation},
+		),
+	)
+	testing.expect_value(t, len(scheduler.ready), ready_before + 1)
+
+	// A stale generation, a running entry, and an already-woken entry do not.
+	entry.running = true
+	testing.expect(
+		t,
+		!scheduler_timer_fire_locked(
+			&scheduler,
+			Timer_Entry{task_id = id, generation = generation},
+		),
+	)
+	entry.running = false
+	entry.has_pending = true
+	testing.expect(
+		t,
+		!scheduler_timer_fire_locked(
+			&scheduler,
+			Timer_Entry{task_id = id, generation = generation},
+		),
+	)
+	entry.has_pending = false
+	testing.expect(
+		t,
+		!scheduler_timer_fire_locked(
+			&scheduler,
+			Timer_Entry{task_id = id, generation = generation + 1},
+		),
+	)
+	// The live firing above queued the entry; wake a worker for it exactly as
+	// the timer loop does after firing.
+	sync.cond_broadcast(&scheduler.cond)
+	sync.mutex_unlock(&scheduler.lock)
+
+	// The single live firing above woke the sleeper; it runs to completion.
+	outcome := scheduler_wait(&scheduler, id)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+}
+
+// A host resume drops the entry's mailbox waiters, so a later send cannot
+// wake the entry through a stale waiter once it has moved on.
+@(test)
+test_scheduler_resume_removes_mailbox_waiters :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
+		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
+	defer scheduler_destroy(&scheduler)
+
+	receiver, _, minted := scheduler_mailbox_create(&scheduler)
+	testing.expect(t, minted)
+
+	id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
+	testing.expect(t, scheduler_wait_suspended(&scheduler, id, .Sleep))
+
+	// Register a waiter for the parked entry, as a mailbox park would.
+	sync.mutex_lock(&scheduler.lock)
+	entry := scheduler.entries[id]
+	entry.task.state.request_value = v.value_list(
+		context.temp_allocator,
+		[]v.Value{receiver},
+	)
+	scheduler_park_mailbox_locked(&scheduler, id, entry, 0)
+	waiters := 0
+	for _, box in scheduler.mailboxes {
+		for waiter in box.waiters {
+			if waiter.task_id == id {
+				waiters += 1
+			}
+		}
+	}
+	sync.mutex_unlock(&scheduler.lock)
+	testing.expect_value(t, waiters, 1)
+
+	testing.expect(t, scheduler_resume(&scheduler, id, value_int_must(7)))
+
+	sync.mutex_lock(&scheduler.lock)
+	waiters = 0
+	for _, box in scheduler.mailboxes {
+		for waiter in box.waiters {
+			if waiter.task_id == id {
+				waiters += 1
+			}
+		}
+	}
+	sync.mutex_unlock(&scheduler.lock)
+	testing.expect_value(t, waiters, 0)
+
+	outcome := scheduler_wait(&scheduler, id)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+	value, value_ok := v.value_as_int(outcome.value)
+	testing.expect(t, value_ok)
+	testing.expect_value(t, value, i64(7))
+}
+
+@(test)
+test_scheduler_cancel_parked :: proc(t: ^testing.T) {	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
