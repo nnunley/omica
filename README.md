@@ -81,6 +81,18 @@ odin test mica/store
 odin test host/web
 ```
 
+Or run everything through the test runner, which also builds the tools, runs
+the end-to-end CLI and web smoke tests, checks for allocator faults, and can
+run the unit tests under ThreadSanitizer:
+
+```sh
+scripts/test.sh all    # unit + integration
+scripts/test.sh tsan   # unit tests under ThreadSanitizer
+```
+
+CI runs `scripts/test.sh all` on Linux and macOS plus `scripts/test.sh tsan` on
+Linux.
+
 The rest of this document explains the model behind those commands.
 
 ## Identify
