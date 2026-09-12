@@ -3742,6 +3742,13 @@ test_read_only_store_boot_has_no_pending_writes :: proc(t: ^testing.T) {
 				!s.store_has_pending_writes(world.store),
 				"read-only boot appended to the WAL",
 			)
+			// Rule reconstruction advanced the version without writing the
+			// log; a checkpoint must still complete rather than wait forever.
+			testing.expectf(
+				t,
+				world_checkpoint(world),
+				"checkpoint after boot failed",
+			)
 			world_destroy(world)
 		}
 		k.kernel_destroy(&kernel)

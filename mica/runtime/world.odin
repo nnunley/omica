@@ -835,6 +835,13 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	// Rule reconstruction is derived from persisted facts, so keep it off the
 	// log; reattach before any new work can commit.
 	s.store_attach(store, world.kernel)
+	// The reconstructed state is durable by construction (it is rebuilt from
+	// persisted facts on every boot), but reconstruction advanced the kernel
+	// version without writing the log. Mark it durable so a later checkpoint
+	// does not wait for records that were never written.
+	reconstructed := k.kernel_snapshot(world.kernel)
+	s.store_mark_reconstructed(store, reconstructed.version)
+	k.snapshot_release(reconstructed)
 
 	workers := config.workers
 	if workers < 1 {

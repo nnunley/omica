@@ -397,6 +397,13 @@ store_mark_durable :: proc(store: ^Store, version: u64) {
 	sync.mutex_unlock(&store.lock)
 }
 
+// Marks `version` durable after a boot reconstructs deterministic state (for
+// example rule definitions rebuilt from persisted facts) without writing the
+// log. A later checkpoint must not wait for records that were never written.
+store_mark_reconstructed :: proc(store: ^Store, version: u64) {
+	store_mark_durable(store, version)
+}
+
 // Rewrites the WAL with only the records after `version`. The checkpoint
 // covers everything at or below it. Runs at the end of a checkpoint while
 // holding the WAL lock, so no writer I/O interleaves.
