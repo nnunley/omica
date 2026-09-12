@@ -226,7 +226,7 @@ store_pages_compact_locked :: proc(store: ^Store) -> bool {
 		}
 	}
 	current := Manifest_Data {
-		version    = store.checkpoint_version,
+		version    = sync.atomic_load(&store.checkpoint_version),
 		generation = new_generation,
 		relations  = store.manifest_relations,
 	}

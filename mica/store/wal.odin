@@ -509,9 +509,10 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	if store.checkpoint_only {
 		// A pinned historical checkpoint reads at its own version; the log
 		// only covers later checkpoints and is not replayed.
-		if store.checkpoint_version > 0 {
-			_ = k.kernel_advance_version(kernel, store.checkpoint_version)
-			store_mark_durable(store, store.checkpoint_version)
+		checkpoint_version := sync.atomic_load(&store.checkpoint_version)
+		if checkpoint_version > 0 {
+			_ = k.kernel_advance_version(kernel, checkpoint_version)
+			store_mark_durable(store, checkpoint_version)
 		}
 		return true
 	}
@@ -526,7 +527,7 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 		for group_end < len(records) && records[group_end].version == version {
 			group_end += 1
 		}
-		if version <= store.checkpoint_version {
+		if version <= sync.atomic_load(&store.checkpoint_version) {
 			group_start = group_end
 			continue
 		}
@@ -587,7 +588,7 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	// New commits must resume above the durable log's and checkpoint's
 	// versions. Restored state is durable by definition, so the store's
 	// durable version catches up before any further checkpoint waits on it.
-	target := max(durable, store.checkpoint_version)
+	target := max(durable, sync.atomic_load(&store.checkpoint_version))
 	if target > 0 {
 		_ = k.kernel_advance_version(kernel, target)
 		store_mark_durable(store, target)

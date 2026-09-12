@@ -364,7 +364,7 @@ store_manifest_open :: proc(store: ^Store, path: string) -> bool {
 		return false
 	}
 	store.manifest_relations = data.relations
-	store.checkpoint_version = data.version
+	sync.atomic_store(&store.checkpoint_version, data.version)
 	store.pages_generation = data.generation
 	return true
 }
@@ -385,7 +385,7 @@ store_checkpoint :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 store_checkpoint_internal :: proc(store: ^Store, kernel: ^k.Kernel, wait: bool) -> bool {
 	snapshot := k.kernel_snapshot(kernel)
 	defer k.snapshot_release(snapshot)
-	if snapshot.version <= store.checkpoint_version {
+	if snapshot.version <= sync.atomic_load(&store.checkpoint_version) {
 		// The current checkpoint already covers this state.
 		return true
 	}
@@ -468,7 +468,7 @@ store_checkpoint_internal :: proc(store: ^Store, kernel: ^k.Kernel, wait: bool) 
 	owned := make([]Checkpoint_Relation, len(relations), store.copy_allocator)
 	copy(owned, relations[:])
 	store.manifest_relations = owned
-	store.checkpoint_version = snapshot.version
+	sync.atomic_store(&store.checkpoint_version, snapshot.version)
 	store_gc_if_needed(store)
 	return true
 }
@@ -516,7 +516,7 @@ store_page_count :: proc(store: ^Store) -> int {
 }
 
 store_checkpoint_version :: proc(store: ^Store) -> u64 {
-	return store.checkpoint_version
+	return sync.atomic_load(&store.checkpoint_version)
 }
 
 store_retained_version_count :: proc(store: ^Store) -> int {
