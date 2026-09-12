@@ -113,7 +113,9 @@ sync_handle_dom_event :: proc(
 	request: ^Http_Request,
 	response: ^Http_Response,
 ) -> bool {
-	event, parsed := dom_event_decode(request.body, context.temp_allocator)
+	// Role values must outlive the connection thread's temp arena, so they are
+	// allocated from the world allocator.
+	event, parsed := dom_event_decode(request.body, host.world.allocator)
 	if !parsed {
 		http_response_text(response, 400, "text/plain; charset=utf-8", "invalid sync envelope")
 		return true
@@ -121,11 +123,11 @@ sync_handle_dom_event :: proc(
 	session := sync_host_ensure_session(host, event.session_id, actor)
 	session_value, _ := v.value_int(i64(event.session_id))
 	view_value, _ := v.value_int(i64(event.view_id))
-	field_entries := make([]v.Map_Entry, len(event.fields), context.temp_allocator)
+	field_entries := make([]v.Map_Entry, len(event.fields), host.world.allocator)
 	for field, index in event.fields {
 		field_entries[index] = v.Map_Entry {
 			key   = v.value_symbol(v.symbol_intern(field.name)),
-			value = v.value_string(context.temp_allocator, field.value),
+			value = v.value_string(host.world.allocator, field.value),
 		}
 	}
 	roles := []k.Role_Pair {
@@ -134,19 +136,19 @@ sync_handle_dom_event :: proc(
 		{role = v.value_symbol(v.symbol_intern("view")), value = view_value},
 		{
 			role = v.value_symbol(v.symbol_intern("event")),
-			value = v.value_string(context.temp_allocator, event.event),
+			value = v.value_string(host.world.allocator, event.event),
 		},
 		{
 			role = v.value_symbol(v.symbol_intern("target")),
-			value = v.value_string(context.temp_allocator, event.target),
+			value = v.value_string(host.world.allocator, event.target),
 		},
 		{
 			role = v.value_symbol(v.symbol_intern("action")),
-			value = v.value_string(context.temp_allocator, event.action),
+			value = v.value_string(host.world.allocator, event.action),
 		},
 		{
 			role = v.value_symbol(v.symbol_intern("fields")),
-			value = v.value_map(context.temp_allocator, field_entries),
+			value = v.value_map(host.world.allocator, field_entries),
 		},
 	}
 	event_outcome := sync_world_call(host, session, "sync_event", roles)

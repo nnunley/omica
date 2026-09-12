@@ -103,6 +103,8 @@ main :: proc() {
 		web.documents_init(&host.documents, world)
 		web.sync_host_init(&host.sync, world)
 		webhost_configure_auth(world, true, false)
+		webhost_seed_person(world, "alice", "Alice")
+		webhost_seed_person(world, "bob", "Bob")
 		if actor, found := world.ctx.identities["alice"]; found {
 			_ = web.auth_seed_user(&host.auth, "alice", "alice-pass", actor)
 		}
@@ -155,6 +157,49 @@ webhost_configure_auth :: proc(world: ^r.World, local_enabled, github_enabled: b
 		},
 	}
 	_ = r.world_apply_facts(world, facts)
+}
+
+// Asserts the person facts a seeded user needs to act as a player. The
+// reference auth store writes these when it ensures a user person.
+@(private)
+webhost_seed_person :: proc(world: ^r.World, login, display_name: string) {
+	person_relation, has_person := world.ctx.relations["mud/Person"]
+	person, has_person_identity := world.ctx.identities[login]
+	if !has_person || !has_person_identity {
+		return
+	}
+	facts: [dynamic]r.World_Fact
+	facts = make([dynamic]r.World_Fact, context.temp_allocator)
+	append(&facts, r.World_Fact {
+		relation = k.Relation_ID(person_relation),
+		tuple    = v.tuple_new(context.temp_allocator, []v.Value{person}),
+	})
+	if display_relation, has_display := world.ctx.relations["mud/DisplayName"]; has_display {
+		append(&facts, r.World_Fact {
+			relation = k.Relation_ID(display_relation),
+			tuple    = v.tuple_new(context.temp_allocator, []v.Value {
+				person,
+				v.value_string(context.temp_allocator, display_name),
+			}),
+		})
+	}
+	if description_relation, has_description := world.ctx.relations["mud/Description"]; has_description {
+		append(&facts, r.World_Fact {
+			relation = k.Relation_ID(description_relation),
+			tuple    = v.tuple_new(context.temp_allocator, []v.Value {
+				person,
+				v.value_string(
+					context.temp_allocator,
+					fmt.aprintf(
+						"%s, present through local login.",
+						display_name,
+						allocator = context.temp_allocator,
+					),
+				),
+			}),
+		})
+	}
+	_ = r.world_apply_facts(world, facts[:])
 }
 
 @(private)
