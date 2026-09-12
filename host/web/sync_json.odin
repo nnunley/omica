@@ -5,8 +5,10 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 import r "../../mica/runtime"
+import v "../../mica/var"
 
 // Bound on queued envelopes per session.
 SYNC_OUTPUT_LIMIT :: 128
@@ -87,21 +89,33 @@ Sync_Session :: struct {
 	writer_active: bool,
 	messages:      [dynamic]Sync_Envelope,
 	allocator:     mem.Allocator,
+	// View state and the dependency-subscription mailbox.
+	views:         map[u64]^View_State,
+	receiver:      v.Value,
+	sender:        v.Value,
+	has_mailbox:   bool,
 }
 
-// The in-process sync host: a session table plus the world used to render
-// views.
+// The in-process sync host: a session table, the world used to render views,
+// and a pump that turns dependency changes into deltas.
 Sync_Host :: struct {
-	lock:      sync.Mutex,
-	sessions:  map[u64]^Sync_Session,
-	world:     ^r.World,
-	allocator: mem.Allocator,
+	lock:                sync.Mutex,
+	sessions:            map[u64]^Sync_Session,
+	subscription_views:  map[u64]View_Key,
+	world:               ^r.World,
+	allocator:           mem.Allocator,
+	stopping:            bool,
+	pump:                ^thread.Thread,
 }
 
 sync_host_init :: proc(host: ^Sync_Host, world: ^r.World, allocator := context.allocator) {
 	host.world = world
 	host.allocator = allocator
 	host.sessions = make(map[u64]^Sync_Session, allocator)
+	host.subscription_views = make(map[u64]View_Key, allocator)
+	if world != nil {
+		host.pump = thread.create_and_start_with_data(host, sync_pump_proc)
+	}
 }
 
 // Reports whether the host has a world to render with.
@@ -113,6 +127,13 @@ sync_host_destroy :: proc(host: ^Sync_Host) {
 	if host == nil {
 		return
 	}
+	sync.mutex_lock(&host.lock)
+	host.stopping = true
+	sync.mutex_unlock(&host.lock)
+	if host.pump != nil {
+		thread.join(host.pump)
+		thread.destroy(host.pump)
+	}
 	for _, session in host.sessions {
 		sync_session_close(session)
 	}
@@ -120,9 +141,10 @@ sync_host_destroy :: proc(host: ^Sync_Host) {
 		sync_session_wait_idle(session)
 	}
 	for _, session in host.sessions {
-		sync_session_destroy(session)
+		sync_session_destroy(host, session)
 	}
 	delete(host.sessions)
+	delete(host.subscription_views)
 }
 
 sync_host_ensure_session :: proc(host: ^Sync_Host, session_id: u64) -> ^Sync_Session {
@@ -135,6 +157,15 @@ sync_host_ensure_session :: proc(host: ^Sync_Host, session_id: u64) -> ^Sync_Ses
 	session.session_id = session_id
 	session.allocator = host.allocator
 	session.messages = make([dynamic]Sync_Envelope, host.allocator)
+	session.views = make(map[u64]^View_State, host.allocator)
+	if host.world != nil {
+		receiver, sender, mailbox_ok := r.world_mailbox_create(host.world)
+		if mailbox_ok {
+			session.receiver = receiver
+			session.sender = sender
+			session.has_mailbox = true
+		}
+	}
 	host.sessions[session_id] = session
 	sync.mutex_unlock(&host.lock)
 	return session
@@ -267,10 +298,14 @@ sync_session_wait_idle :: proc(session: ^Sync_Session) {
 }
 
 @(private)
-sync_session_destroy :: proc(session: ^Sync_Session) {
+sync_session_destroy :: proc(host: ^Sync_Host, session: ^Sync_Session) {
 	for message in session.messages {
 		delete(message.payload, session.allocator)
 	}
 	delete(session.messages)
+	for _, view in session.views {
+		sync_view_destroy(host, view)
+	}
+	delete(session.views)
 	free(session, session.allocator)
 }

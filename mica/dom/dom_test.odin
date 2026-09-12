@@ -178,3 +178,106 @@ test_dom_support_predicates :: proc(t: ^testing.T) {
 	testing.expect(t, !is_supported_dom_attribute("data-"))
 	testing.expect(t, !is_supported_dom_attribute("data-HasUpper"))
 }
+
+@(private)
+diff_element :: proc(tag: string, attrs: []Dom_Attr, children: []Dom_Node) -> Dom_Node {
+	return Dom_Node(Dom_Element{tag = tag, attrs = attrs, children = children})
+}
+
+@(private)
+diff_text :: proc(text: string) -> Dom_Node {
+	return Dom_Node(Dom_Text{text = text})
+}
+
+@(private)
+diff_payload :: proc(before, after: Dom_Node) -> string {
+	path: [dynamic]u64
+	path = make([dynamic]u64, context.temp_allocator)
+	defer delete(path)
+	patches: [dynamic]Dom_Patch
+	patches = make([dynamic]Dom_Patch, context.temp_allocator)
+	defer delete(patches)
+	dom_diff_nodes(before, after, &path, &patches, context.temp_allocator)
+	return dom_patch_payload_json(1, 2, patches[:], context.temp_allocator)
+}
+
+@(test)
+test_dom_diff_text_and_attrs :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	payload := diff_payload(
+		diff_element("div", nil, []Dom_Node{diff_text("a")}),
+		diff_element("div", nil, []Dom_Node{diff_text("b")}),
+	)
+	testing.expect_value(
+		t,
+		payload,
+		`{"patches":[{"op":"set_text","path":[0],"text":"b"}],"revision":2,"type":"dom_patch","view":1}`,
+	)
+
+	payload = diff_payload(
+		diff_element("div", []Dom_Attr{{"class", "a"}}, nil),
+		diff_element("div", []Dom_Attr{{"class", "b"}}, nil),
+	)
+	testing.expect_value(
+		t,
+		payload,
+		`{"patches":[{"name":"class","op":"set_attr","path":[],"value":"b"}],"revision":2,"type":"dom_patch","view":1}`,
+	)
+
+	payload = diff_payload(
+		diff_element("div", []Dom_Attr{{"class", "a"}}, nil),
+		diff_element("div", nil, nil),
+	)
+	testing.expect_value(
+		t,
+		payload,
+		`{"patches":[{"name":"class","op":"remove_attr","path":[]}],"revision":2,"type":"dom_patch","view":1}`,
+	)
+}
+
+@(test)
+test_dom_diff_children :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	payload := diff_payload(
+		diff_element("div", nil, []Dom_Node{diff_text("a")}),
+		diff_element("div", nil, []Dom_Node{diff_text("a"), diff_text("c")}),
+	)
+	testing.expect_value(
+		t,
+		payload,
+		`{"patches":[{"node":{"text":"c"},"op":"append_child","path":[]}],"revision":2,"type":"dom_patch","view":1}`,
+	)
+
+	payload = diff_payload(
+		diff_element("div", nil, []Dom_Node{diff_text("a"), diff_text("b")}),
+		diff_element("div", nil, []Dom_Node{diff_text("a")}),
+	)
+	testing.expect_value(
+		t,
+		payload,
+		`{"patches":[{"op":"remove_child","path":[1]}],"revision":2,"type":"dom_patch","view":1}`,
+	)
+
+	payload = diff_payload(
+		diff_element("div", nil, nil),
+		diff_element("span", nil, nil),
+	)
+	testing.expect_value(
+		t,
+		payload,
+		`{"patches":[{"node":{"attrs":{},"children":[],"tag":"span"},"op":"replace","path":[]}],"revision":2,"type":"dom_patch","view":1}`,
+	)
+}
+
+@(test)
+test_dom_diff_keyed_children :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	first := diff_element("li", []Dom_Attr{{"id", "a"}}, nil)
+	second := diff_element("li", []Dom_Attr{{"id", "b"}}, nil)
+	payload := diff_payload(
+		diff_element("ul", nil, []Dom_Node{first, second}),
+		diff_element("ul", nil, []Dom_Node{second, first}),
+	)
+	expected := `{"patches":[{"op":"remove_child","path":[1]},{"index":0,"node":{"attrs":{"id":"b"},"children":[],"tag":"li"},"op":"insert_child","path":[]}],"revision":2,"type":"dom_patch","view":1}`
+	testing.expect_value(t, payload, expected)
+}

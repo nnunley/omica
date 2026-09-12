@@ -6,6 +6,7 @@ package web
 
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:time"
 import dom "../../mica/dom"
 import k "../../mica/kernel"
@@ -52,13 +53,14 @@ sync_handle_request :: proc(
 		return true
 	}
 	switch envelope.kind {
-	case .Need_View, .Have_View:
+	case .Need_View:
 		if !sync_render_view(
 			host,
 			envelope.session_id,
 			envelope.view_id,
 			envelope.client_revision,
 			envelope.client_signature,
+			true,
 		) {
 			http_response_text(
 				response,
@@ -68,60 +70,37 @@ sync_handle_request :: proc(
 			)
 			return true
 		}
+	case .Have_View:
+		session := sync_host_ensure_session(host, envelope.session_id)
+		view := sync_view_state(session, envelope.view_id)
+		sync.mutex_lock(&view.render_lock)
+		up_to_date := view.has_tree &&
+			envelope.client_revision == view.revision &&
+			envelope.client_signature == view.signature
+		sync.mutex_unlock(&view.render_lock)
+		if !up_to_date {
+			if !sync_render_view(
+				host,
+				envelope.session_id,
+				envelope.view_id,
+				envelope.client_revision,
+				envelope.client_signature,
+				true,
+			) {
+				http_response_text(
+					response,
+					500,
+					"text/plain; charset=utf-8",
+					"cannot render view",
+				)
+				return true
+			}
+		}
 	case .View_Snapshot, .View_Delta:
 		// Client view state is not forwarded into the world yet.
 	}
 	response.status = 202
 	return true
-}
-
-// Renders `view_id` through the world and queues a ViewSnapshot. M2 keeps the
-// revision at one; later milestones track revisions and send deltas.
-sync_render_view :: proc(
-	host: ^Sync_Host,
-	session_id: u64,
-	view_id: u64,
-	client_revision: u64,
-	client_signature: u64,
-) -> bool {
-	if !sync_host_ready(host) {
-		return false
-	}
-	view_value, view_ok := v.value_int(i64(view_id))
-	if !view_ok {
-		return false
-	}
-	roles := []k.Role_Pair {
-		{role = v.value_symbol(v.symbol_intern("view")), value = view_value},
-	}
-	outcome := r.world_call(host.world, "sync_view_tree", roles)
-	if outcome.kind != .Complete {
-		return false
-	}
-	node, node_error := dom.dom_node_from_value(outcome.value, context.temp_allocator)
-	if node_error != "" {
-		return false
-	}
-	revision := u64(1)
-	payload := dom.dom_snapshot_payload_json(
-		view_id,
-		revision,
-		node,
-		context.temp_allocator,
-	)
-	payload_bytes := transmute([]u8)payload
-	envelope := Sync_Envelope {
-		kind             = .View_Snapshot,
-		session_id       = session_id,
-		view_id          = view_id,
-		client_revision  = client_revision,
-		client_signature = client_signature,
-		server_revision  = revision,
-		server_signature = sync_payload_signature(revision, payload_bytes),
-		payload          = payload_bytes,
-	}
-	session := sync_host_ensure_session(host, session_id)
-	return sync_session_post(session, &envelope)
 }
 
 // Streams SSE events for one session. Returns false when the path is not
@@ -155,6 +134,9 @@ sync_events_stream :: proc(
 	builder: strings.Builder
 	strings.builder_init(&builder, context.temp_allocator)
 	defer strings.builder_destroy(&builder)
+	chunk_builder: strings.Builder
+	strings.builder_init(&chunk_builder, context.temp_allocator)
+	defer strings.builder_destroy(&chunk_builder)
 
 	strings.write_string(&builder, "HTTP/1.1 200 OK\r\n")
 	strings.write_string(&builder, "Content-Type: text/event-stream; charset=utf-8\r\n")
@@ -183,8 +165,15 @@ sync_events_stream :: proc(
 			for _, index in batch {
 				strings.builder_reset(&builder)
 				sync_write_event(&builder, &batch[index])
-				http_write_chunk(&builder, transmute([]u8)strings.to_string(builder))
-				sent := web_send_all(socket, transmute([]u8)strings.to_string(builder))
+				strings.builder_reset(&chunk_builder)
+				http_write_chunk(
+					&chunk_builder,
+					transmute([]u8)strings.to_string(builder),
+				)
+				sent := web_send_all(
+					socket,
+					transmute([]u8)strings.to_string(chunk_builder),
+				)
 				delete(batch[index].payload, session.allocator)
 				if !sent {
 					delete(batch)

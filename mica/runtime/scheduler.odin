@@ -566,6 +566,32 @@ scheduler_mailbox_take :: proc(scheduler: ^Scheduler, task: ^Task) -> Mailbox_Ta
 	return Mailbox_Take{kind = .Empty}
 }
 
+// Drains queued messages for a receiver handle. The caller owns the returned
+// messages and the dynamic array. Returns false for an unknown handle.
+scheduler_mailbox_drain :: proc(
+	scheduler: ^Scheduler,
+	receiver: v.Value,
+	allocator: mem.Allocator,
+) -> (
+	[dynamic]v.Value,
+	bool,
+) {
+	mailbox, _, ok := mailbox_target(scheduler, receiver, false)
+	if !ok {
+		return nil, false
+	}
+	sync.mutex_lock(&scheduler.lock)
+	defer sync.mutex_unlock(&scheduler.lock)
+	box, found := scheduler.mailboxes[mailbox]
+	if !found {
+		return nil, false
+	}
+	messages := make([dynamic]v.Value, allocator)
+	append(&messages, ..box.messages[:])
+	clear(&box.messages)
+	return messages, true
+}
+
 // Reports whether a mailbox handle is a live endpoint of the requested kind.
 @(private)
 mailbox_handle_live :: proc(scheduler: ^Scheduler, value: v.Value, sender: bool) -> bool {

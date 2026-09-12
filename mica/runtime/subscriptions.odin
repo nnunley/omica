@@ -21,7 +21,6 @@ import v "../var"
 // Default bound on queued messages per subscription in a mailbox.
 DEFAULT_SUBSCRIPTION_QUEUE_BUDGET :: 64
 
-@(private)
 Subscription_Subject :: enum {
 	Facts,
 	Relation,

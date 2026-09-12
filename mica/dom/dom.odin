@@ -329,18 +329,31 @@ dom_node_from_value :: proc(
 	if !is_children_list {
 		return nil, "DOM element children must be a list"
 	}
-	children := make([]Dom_Node, len(children_list), allocator)
-	for child, index in children_list {
+	children: [dynamic]Dom_Node
+	children = make([dynamic]Dom_Node, allocator)
+	for child in children_list {
+		// List interpolations expand into their elements, matching the XML
+		// writer's flattening.
+		if nested, is_list := v.value_as_list(child); is_list {
+			for element in nested {
+				node, child_error := dom_node_from_value(element, allocator)
+				if child_error != "" {
+					return nil, child_error
+				}
+				append(&children, node)
+			}
+			continue
+		}
 		node, child_error := dom_node_from_value(child, allocator)
 		if child_error != "" {
 			return nil, child_error
 		}
-		children[index] = node
+		append(&children, node)
 	}
 	return Dom_Node(Dom_Element {
 		tag      = tag,
 		attrs    = attrs,
-		children = children,
+		children = children[:],
 	}), ""
 }
 
@@ -474,7 +487,7 @@ dom_snapshot_payload_json :: proc(
 	strings.write_string(&builder, ",\"view\":")
 	fmt.sbprintf(&builder, "%d", view)
 	strings.write_byte(&builder, '}')
-	return strings.to_string(builder)
+	return strings.clone(strings.to_string(builder), allocator)
 }
 
 @(private)
@@ -620,7 +633,7 @@ dom_patch_payload_json :: proc(
 	strings.write_string(&builder, "\",\"view\":")
 	fmt.sbprintf(&builder, "%d", view)
 	strings.write_byte(&builder, '}')
-	return strings.to_string(builder)
+	return strings.clone(strings.to_string(builder), allocator)
 }
 
 @(private)

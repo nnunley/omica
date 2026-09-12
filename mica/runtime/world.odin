@@ -143,6 +143,52 @@ world_release :: proc(world: ^World, id: Task_ID) {
 	scheduler_release(&world.scheduler, id)
 }
 
+// Creates a host-owned mailbox. The returned receiver and sender are
+// capability handles; the host drains the receiver and passes the sender to
+// `world_subscribe_changes`.
+world_mailbox_create :: proc(world: ^World) -> (receiver, sender: v.Value, ok: bool) {
+	return scheduler_mailbox_create(&world.scheduler)
+}
+
+// Drains queued messages for a host-owned receiver.
+world_mailbox_drain :: proc(world: ^World, receiver: v.Value) -> ([dynamic]v.Value, bool) {
+	return scheduler_mailbox_drain(&world.scheduler, receiver, world.allocator)
+}
+
+// Registers a change subscription on behalf of the host. `sender` is a host
+// mailbox sender handle; messages arrive on the paired receiver.
+world_subscribe_changes :: proc(
+	world: ^World,
+	sender: v.Value,
+	subject: Subscription_Subject,
+	relation: k.Relation_ID,
+	bindings: []v.Binding,
+	initial_snapshot: bool,
+	cursor: u64,
+	has_cursor: bool,
+	queue_budget: int,
+) -> (
+	v.Value,
+	bool,
+) {
+	return subscriptions_register(
+		&world.env,
+		sender,
+		subject,
+		relation,
+		bindings,
+		initial_snapshot,
+		cursor,
+		has_cursor,
+		queue_budget,
+	)
+}
+
+// Cancels a host-registered subscription.
+world_cancel_subscription :: proc(world: ^World, capability: v.Value) -> bool {
+	return subscriptions_cancel(&world.env, capability)
+}
+
 // The world's default principal and actor identities.
 world_principal :: proc(world: ^World) -> v.Value {
 	return world.env.principal
