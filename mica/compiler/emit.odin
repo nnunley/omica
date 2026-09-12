@@ -111,6 +111,7 @@ compile_program :: proc(
 		pending_functions = make([dynamic]Pending_Function),
 	}
 	defer {
+		delete(emitter.errors)
 		delete(emitter.scopes)
 		delete(emitter.locals)
 		delete(emitter.functions)
@@ -1835,11 +1836,15 @@ set_param_metadata :: proc(emitter: ^Emitter, index: int, params: []Param) -> bo
 			has_rest = true
 		}
 	}
+	if !ok {
+		delete(defaults, emitter.allocator)
+		return false
+	}
 	function := &emitter.builder.functions[index]
 	function.required_count = u16(required)
 	function.has_rest = has_rest
 	function.defaults = defaults
-	return ok
+	return true
 }
 
 @(private)

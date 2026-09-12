@@ -671,3 +671,40 @@ end
 		context_track.bad_free_array,
 	)
 }
+
+// On an invalid parameter list the function must be left untouched. The old
+// code assigned required_count / has_rest / defaults before returning false.
+@(test)
+test_param_metadata_not_mutated_on_error :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer {
+		delete(ctx.builtins)
+		delete(ctx.relations)
+		delete(ctx.identities)
+	}
+
+	source := `verb broken(?optional = 1, required)
+  return required
+end
+`
+	ast, parse_errors := parse_program(source, allocator)
+	testing.expectf(t, len(parse_errors) == 0, "parse errors: %v", parse_errors)
+	compiled := compile_program(ast, &ctx, allocator)
+	testing.expectf(t, len(compiled.errors) > 0, "expected a compile error")
+
+	name := v.symbol_intern("broken")
+	found := false
+	for function in compiled.program.functions {
+		if function.name != name {
+			continue
+		}
+		found = true
+		testing.expect_value(t, function.required_count, 0)
+		testing.expect(t, function.has_rest == false)
+		testing.expect(t, function.defaults == nil)
+	}
+	testing.expect(t, found)
+}
