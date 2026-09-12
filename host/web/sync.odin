@@ -60,6 +60,18 @@ sync_handle_request :: proc(
 	}
 	switch envelope.kind {
 	case .Need_View:
+		// The stream client normally creates the session, but an input can
+		// arrive first. Ensure the session here (as Have_View does) so request
+		// ordering cannot turn a legal Need_View into a failed render.
+		if sync_host_ensure_session(host, envelope.session_id, actor) == nil {
+			http_response_text(
+				response,
+				403,
+				"text/plain; charset=utf-8",
+				"session actor mismatch",
+			)
+			return true
+		}
 		if !sync_render_view(
 			host,
 			envelope.session_id,

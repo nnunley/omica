@@ -176,6 +176,58 @@ end
 	thread.destroy(run_thread)
 }
 
+// A Need_View that arrives before the SSE stream connects must still create
+// the session and render. Regression: it returned 500 "cannot render view"
+// because the input path assumed the stream had already made the session.
+@(test)
+test_sync_need_view_creates_missing_session :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb sync_view_tree(view)
+  return dom <div><span>hello</span></div>
+end
+`
+	path, path_ok := write_document_source(t, "mica_sync_need_view.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "world start failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer r.world_destroy(world)
+	entry := r.world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
+
+	host: Sync_Host
+	sync_host_init(&host, world)
+	defer sync_host_destroy(&host)
+
+	envelope := Sync_Envelope {
+		kind       = .Need_View,
+		session_id = 11,
+		view_id    = 1,
+	}
+	bytes: [dynamic]u8
+	defer delete(bytes)
+	sync_encode_envelope(&envelope, &bytes)
+
+	request := Http_Request {
+		method = "POST",
+		target = "/sync/input",
+	}
+	request.body = bytes[:]
+	response: Http_Response
+	testing.expect(t, sync_handle_request(&host, v.Value(0), &request, &response))
+	testing.expectf(t, response.status == 202, "status %d", response.status)
+}
+
 @(test)
 test_sync_dependency_delta :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
