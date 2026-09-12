@@ -364,7 +364,18 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	}
 
 	for path, index in paths {
-		result := install_rules(&world.env, world.kernel, asts[index], &declarations, path)
+		source := ""
+		if index < len(world.sources) {
+			source = world.sources[index]
+		}
+		result := install_rules(
+			&world.env,
+			world.kernel,
+			asts[index],
+			&declarations,
+			path,
+			source,
+		)
 		if !result.ok {
 			return result
 		}

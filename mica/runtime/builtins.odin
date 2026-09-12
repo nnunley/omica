@@ -72,6 +72,7 @@ runtime_builtins := [?]Builtin_Spec {
 	{"dom_text", 1, builtin_dom_text},
 	{"dom_raw", 1, builtin_dom_raw},
 	{"dom_element", 3, builtin_dom_element},
+	{"dom_diff", 2, builtin_dom_diff},
 	{"to_xml", 1, builtin_to_xml},
 	{"sync_signature", 2, builtin_sync_signature},
 	{"dom_snapshot_payload", 3, builtin_dom_snapshot_payload},
@@ -85,6 +86,13 @@ runtime_builtins := [?]Builtin_Spec {
 	{"assume_actor", 1, builtin_assume_actor},
 	{"enable_rule", 1, builtin_enable_rule},
 	{"disable_rule", 1, builtin_disable_rule},
+	{"rules", 1, builtin_rules},
+	{"describe_rule", 1, builtin_describe_rule},
+	{"log", -1, builtin_log},
+	{"project", -1, builtin_project},
+	{"union", 2, builtin_union},
+	{"difference", 2, builtin_difference},
+	{"natural_join", 2, builtin_natural_join},
 	{"json_encode", 1, builtin_json_encode},
 	{"json_decode", 1, builtin_json_decode},
 	{"json_null", 0, builtin_json_null},
@@ -547,6 +555,203 @@ builtin_embed_text :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		values[index] = converted
 	}
 	return v.value_list(state.allocator, values), true
+}
+
+// Converts a DOM node back into the map shape `dom_element` and `dom_text`
+// produce, matching `DomNode::to_mica_value` in the Rust host protocol.
+@(private)
+dom_node_to_value :: proc(node: dom.Dom_Node, allocator: mem.Allocator) -> v.Value {
+	#partial switch n in node {
+	case dom.Dom_Text:
+		return v.value_map(allocator, []v.Map_Entry {
+			{
+				key   = v.value_symbol(v.symbol_intern("text")),
+				value = v.value_string(allocator, n.text),
+			},
+		})
+	case dom.Dom_Element:
+		attrs := make([]v.Map_Entry, len(n.attrs), allocator)
+		for attribute, index in n.attrs {
+			attrs[index] = v.Map_Entry {
+				key   = v.value_string(allocator, attribute.name),
+				value = v.value_string(allocator, attribute.value),
+			}
+		}
+		children := make([]v.Value, len(n.children), allocator)
+		for child, index in n.children {
+			children[index] = dom_node_to_value(child, allocator)
+		}
+		return v.value_map(allocator, []v.Map_Entry {
+			{
+				key   = v.value_symbol(v.symbol_intern("attrs")),
+				value = v.value_map(allocator, attrs),
+			},
+			{
+				key   = v.value_symbol(v.symbol_intern("children")),
+				value = v.value_list(allocator, children),
+			},
+			{
+				key   = v.value_symbol(v.symbol_intern("tag")),
+				value = v.value_string(allocator, n.tag),
+			},
+		})
+	}
+	return v.value_map(allocator, []v.Map_Entry{})
+}
+
+// Converts one DOM patch into the map shape `DomPatch::to_mica_value` uses.
+@(private)
+dom_patch_to_value :: proc(patch: ^dom.Dom_Patch, allocator: mem.Allocator) -> v.Value {
+	op: string
+	extra: []v.Map_Entry
+	path: []u64
+	switch value in patch^ {
+	case dom.Dom_Patch_Replace:
+		op = "replace"
+		path = value.path
+		extra = []v.Map_Entry {{
+			key   = v.value_symbol(v.symbol_intern("node")),
+			value = dom_node_to_value(value.node, allocator),
+		}}
+	case dom.Dom_Patch_Set_Text:
+		op = "set_text"
+		path = value.path
+		extra = []v.Map_Entry {{
+			key   = v.value_symbol(v.symbol_intern("text")),
+			value = v.value_string(allocator, value.text),
+		}}
+	case dom.Dom_Patch_Set_Attr:
+		op = "set_attr"
+		path = value.path
+		extra = []v.Map_Entry {
+			{
+				key   = v.value_symbol(v.symbol_intern("name")),
+				value = v.value_string(allocator, value.name),
+			},
+			{
+				key   = v.value_symbol(v.symbol_intern("value")),
+				value = v.value_string(allocator, value.value),
+			},
+		}
+	case dom.Dom_Patch_Remove_Attr:
+		op = "remove_attr"
+		path = value.path
+		extra = []v.Map_Entry {{
+			key   = v.value_symbol(v.symbol_intern("name")),
+			value = v.value_string(allocator, value.name),
+		}}
+	case dom.Dom_Patch_Append_Child:
+		op = "append_child"
+		path = value.path
+		extra = []v.Map_Entry {{
+			key   = v.value_symbol(v.symbol_intern("node")),
+			value = dom_node_to_value(value.node, allocator),
+		}}
+	case dom.Dom_Patch_Insert_Child:
+		op = "insert_child"
+		path = value.path
+		index, _ := v.value_int(i64(value.index))
+		extra = []v.Map_Entry {
+			{key = v.value_symbol(v.symbol_intern("index")), value = index},
+			{
+				key   = v.value_symbol(v.symbol_intern("node")),
+				value = dom_node_to_value(value.node, allocator),
+			},
+		}
+	case dom.Dom_Patch_Remove_Child:
+		op = "remove_child"
+		path = value.path
+	}
+	path_values := make([]v.Value, len(path), allocator)
+	for index, position in path {
+		path_values[position], _ = v.value_int(i64(index))
+	}
+	entries := make([]v.Map_Entry, 2 + len(extra), allocator)
+	entries[0] = v.Map_Entry {
+		key   = v.value_symbol(v.symbol_intern("op")),
+		value = v.value_string(allocator, op),
+	}
+	entries[1] = v.Map_Entry {
+		key   = v.value_symbol(v.symbol_intern("path")),
+		value = v.value_list(allocator, path_values),
+	}
+	for entry, index in extra {
+		entries[2 + index] = entry
+	}
+	return v.value_map(allocator, entries)
+}
+
+@(private)
+builtin_dom_diff :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	before, before_error := dom.dom_node_from_value(args[0], state.allocator)
+	if before_error != "" {
+		return builtin_error(state, "E_TYPE", before_error)
+	}
+	defer dom.dom_node_release(before, state.allocator)
+	after, after_error := dom.dom_node_from_value(args[1], state.allocator)
+	if after_error != "" {
+		return builtin_error(state, "E_TYPE", after_error)
+	}
+	defer dom.dom_node_release(after, state.allocator)
+
+	path: [dynamic]u64
+	path = make([dynamic]u64, state.allocator)
+	defer delete(path)
+	patches: [dynamic]dom.Dom_Patch
+	patches = make([dynamic]dom.Dom_Patch, state.allocator)
+	defer {
+		for &patch in patches {
+			dom.dom_patch_release(&patch, state.allocator)
+		}
+		delete(patches)
+	}
+	dom.dom_diff_nodes(before, after, &path, &patches, state.allocator)
+	values := make([]v.Value, len(patches), state.allocator)
+	for &patch, index in patches {
+		values[index] = dom_patch_to_value(&patch, state.allocator)
+	}
+	return v.value_list(state.allocator, values), true
+}
+
+// `log(message)` and `log(:level, message)`: records a host-facing log line.
+// Levels are `:trace`, `:debug`, `:info`, `:warn`, and `:error`.
+@(private)
+builtin_log :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 1 && len(args) != 2 {
+		return builtin_error(state, "E_INVARG", "log expects log(message) or log(:level, message)")
+	}
+	if !k.authority_can_effect(state.authority) {
+		return builtin_error(state, "E_PERMISSION", "log is not permitted")
+	}
+	level := "info"
+	message_index := 0
+	if len(args) == 2 {
+		level_symbol, is_symbol := v.value_as_symbol(args[0])
+		if !is_symbol {
+			return builtin_error(state, "E_TYPE", "log level must be a symbol")
+		}
+		level_name, has_name := v.symbol_name(level_symbol)
+		if !has_name {
+			return builtin_error(state, "E_INVARG", "log level must be named")
+		}
+		level = level_name
+		message_index = 1
+	}
+	message, is_string := v.value_as_string(args[message_index])
+	if !is_string {
+		return builtin_error(state, "E_TYPE", "log message must be a string")
+	}
+	switch level {
+	case "trace", "debug", "info", "warn", "error":
+	case:
+		return builtin_error(
+			state,
+			"E_INVARG",
+			"log level must be one of :trace, :debug, :info, :warn, or :error",
+		)
+	}
+	fmt.eprintf("mica log [%s] %s\n", level, message)
+	return v.value_empty_relation(), true
 }
 
 @(private)
@@ -1107,6 +1312,73 @@ rule_active_builtin :: proc(
 		)
 	}
 	return v.value_bool(true), true
+}
+
+// Rule introspection: `rules(:Relation)` returns the active rule identities
+// whose head relation matches the named relation; `describe_rule(#rule)`
+// returns one rule's installed source.
+@(private)
+builtin_rules :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 1 {
+		return builtin_error(state, "E_INVARG", "rules expects rules(:Relation)")
+	}
+	name_symbol, is_symbol := v.value_as_symbol(args[0])
+	if !is_symbol {
+		return builtin_error(state, "E_TYPE", "rules expects a relation name symbol")
+	}
+	name, has_name := v.symbol_name(name_symbol)
+	if !has_name {
+		return builtin_error(state, "E_INVARG", "rules expects a named relation symbol")
+	}
+	env := builtin_env(state)
+	relation_id, known := env.ctx.relations[name]
+	if !known {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			fmt.aprintf("unknown relation :%s", name, allocator = state.allocator),
+		)
+	}
+	snapshot := k.kernel_snapshot(env.kernel)
+	defer k.snapshot_release(snapshot)
+	rule_ids: [dynamic]v.Value
+	rule_ids = make([dynamic]v.Value, state.allocator)
+	for definition in snapshot.rules {
+		if !definition.active || definition.rule.head_relation != k.Relation_ID(relation_id) {
+			continue
+		}
+		identity, identity_ok := v.value_identity_raw(u64(definition.id))
+		if identity_ok {
+			append(&rule_ids, identity)
+		}
+	}
+	return v.value_list(state.allocator, rule_ids[:]), true
+}
+
+@(private)
+builtin_describe_rule :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 1 {
+		return builtin_error(state, "E_INVARG", "describe_rule expects describe_rule(#rule)")
+	}
+	rule_value := args[0]
+	raw: u64
+	if identity, is_identity := v.value_as_identity(rule_value); is_identity {
+		raw = v.identity_raw(identity)
+	} else if number, is_int := v.value_as_int(rule_value); is_int && number >= 0 {
+		raw = u64(number)
+	} else {
+		return builtin_error(state, "E_TYPE", "rule id must be an identity or integer")
+	}
+	env := builtin_env(state)
+	snapshot := k.kernel_snapshot(env.kernel)
+	defer k.snapshot_release(snapshot)
+	for definition in snapshot.rules {
+		if v.identity_raw(definition.id) != raw {
+			continue
+		}
+		return v.value_string(state.allocator, definition.source), true
+	}
+	return builtin_error(state, "E_INVARG", "rule does not exist")
 }
 
 @(private)
@@ -1820,6 +2092,247 @@ builtin_index_or :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	}
 
 	return builtin_error(state, "E_TYPE", "index_or expects a map, list, or relation")
+}
+
+// --- Relation value algebra ------------------------------------------------
+
+// Reports whether two relation values have the same heading.
+@(private)
+relation_headings_equal :: proc(left, right: ^v.Relation_Value) -> bool {
+	if len(left.heading) != len(right.heading) {
+		return false
+	}
+	for column, index in left.heading {
+		if column != right.heading[index] {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+relation_argument :: proc(args: []v.Value, index: int) -> (^v.Relation_Value, bool) {
+	relation, is_relation := v.value_as_relation(args[index])
+	if !is_relation {
+		return nil, false
+	}
+	return relation, true
+}
+
+@(private)
+builtin_project :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) < 1 {
+		return builtin_error(state, "E_INVARG", "project expects project(relation, :column, ...)")
+	}
+	relation, is_relation := v.value_as_relation(args[0])
+	if !is_relation {
+		return builtin_error(state, "E_TYPE", "project expects a relation argument")
+	}
+	if len(args) == 1 {
+		// The zero-column projection: an existence test as a relation.
+		rows := make([]v.Tuple, len(relation.rows), context.temp_allocator)
+		for _, index in relation.rows {
+			rows[index] = v.tuple_new(state.allocator, nil)
+		}
+		empty_heading := make([]v.Symbol, 0, context.temp_allocator)
+		value, relation_error := v.value_relation(state.allocator, empty_heading, rows)
+		if relation_error != .None {
+			return builtin_error(state, "E_INVARG", "project could not build a relation")
+		}
+		return value, true
+	}
+
+	positions := make([]int, len(args) - 1, context.temp_allocator)
+	for argument, index in args[1:] {
+		column, is_symbol := v.value_as_symbol(argument)
+		if !is_symbol {
+			return builtin_error(state, "E_TYPE", "project expects symbol column arguments")
+		}
+		position := -1
+		for name, name_index in relation.heading {
+			if name == column {
+				position = name_index
+				break
+			}
+		}
+		if position < 0 {
+			column_name, _ := v.symbol_name(column)
+			return builtin_error(
+				state,
+				"E_INVARG",
+				fmt.aprintf(
+					"relation has no column :%s",
+					column_name,
+					allocator = state.allocator,
+				),
+			)
+		}
+		positions[index] = position
+	}
+
+	heading := make([]v.Symbol, len(positions), context.temp_allocator)
+	for position, index in positions {
+		heading[index] = relation.heading[position]
+	}
+	rows := make([]v.Tuple, len(relation.rows), context.temp_allocator)
+	for row, row_index in relation.rows {
+		values := v.tuple_values(row)
+		selected := make([]v.Value, len(positions), context.temp_allocator)
+		for position, index in positions {
+			selected[index] = values[position]
+		}
+		rows[row_index] = v.tuple_new(state.allocator, selected)
+	}
+	value, relation_error := v.value_relation(state.allocator, heading, rows)
+	if relation_error != .None {
+		return builtin_error(state, "E_INVARG", "project could not build a relation")
+	}
+	return value, true
+}
+
+@(private)
+builtin_union :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 2 {
+		return builtin_error(state, "E_INVARG", "union expects union(left, right)")
+	}
+	left, left_ok := relation_argument(args, 0)
+	if !left_ok {
+		return builtin_error(state, "E_TYPE", "union expects relation arguments")
+	}
+	right, right_ok := relation_argument(args, 1)
+	if !right_ok {
+		return builtin_error(state, "E_TYPE", "union expects relation arguments")
+	}
+	if !relation_headings_equal(left, right) {
+		return builtin_error(state, "E_INVARG", "relation headings are incompatible")
+	}
+	rows: [dynamic]v.Tuple
+	rows = make([dynamic]v.Tuple, 0, len(left.rows) + len(right.rows), context.temp_allocator)
+	append(&rows, ..left.rows)
+	append(&rows, ..right.rows)
+	value, relation_error := v.value_relation(state.allocator, left.heading, rows[:])
+	if relation_error != .None {
+		return builtin_error(state, "E_INVARG", "union could not build a relation")
+	}
+	return value, true
+}
+
+@(private)
+builtin_difference :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 2 {
+		return builtin_error(state, "E_INVARG", "difference expects difference(left, right)")
+	}
+	left, left_ok := relation_argument(args, 0)
+	if !left_ok {
+		return builtin_error(state, "E_TYPE", "difference expects relation arguments")
+	}
+	right, right_ok := relation_argument(args, 1)
+	if !right_ok {
+		return builtin_error(state, "E_TYPE", "difference expects relation arguments")
+	}
+	if !relation_headings_equal(left, right) {
+		return builtin_error(state, "E_INVARG", "relation headings are incompatible")
+	}
+	rows: [dynamic]v.Tuple
+	rows = make([dynamic]v.Tuple, 0, len(left.rows), context.temp_allocator)
+	for row in left.rows {
+		found := false
+		for other in right.rows {
+			if v.tuple_cmp(row, other) == .Equal {
+				found = true
+				break
+			}
+		}
+		if !found {
+			append(&rows, row)
+		}
+	}
+	value, relation_error := v.value_relation(state.allocator, left.heading, rows[:])
+	if relation_error != .None {
+		return builtin_error(state, "E_INVARG", "difference could not build a relation")
+	}
+	return value, true
+}
+
+@(private)
+builtin_natural_join :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 2 {
+		return builtin_error(state, "E_INVARG", "natural_join expects natural_join(left, right)")
+	}
+	left, left_ok := relation_argument(args, 0)
+	if !left_ok {
+		return builtin_error(state, "E_TYPE", "natural_join expects relation arguments")
+	}
+	right, right_ok := relation_argument(args, 1)
+	if !right_ok {
+		return builtin_error(state, "E_TYPE", "natural_join expects relation arguments")
+	}
+
+	left_positions := make([dynamic]int, 0, len(left.heading), context.temp_allocator)
+	right_positions := make([dynamic]int, 0, len(left.heading), context.temp_allocator)
+	for column, left_position in left.heading {
+		for name, right_position in right.heading {
+			if name != column {
+				continue
+			}
+			append(&left_positions, left_position)
+			append(&right_positions, right_position)
+			break
+		}
+	}
+	right_only := make([dynamic]int, 0, len(right.heading), context.temp_allocator)
+	for column, right_position in right.heading {
+		shared := false
+		for name in left.heading {
+			if name == column {
+				shared = true
+				break
+			}
+		}
+		if !shared {
+			append(&right_only, right_position)
+		}
+	}
+
+	heading: [dynamic]v.Symbol
+	heading = make([dynamic]v.Symbol, 0, len(left.heading) + len(right_only), context.temp_allocator)
+	append(&heading, ..left.heading)
+	for position in right_only {
+		append(&heading, right.heading[position])
+	}
+
+	rows: [dynamic]v.Tuple
+	rows = make([dynamic]v.Tuple, 0, 16, context.temp_allocator)
+	for left_row in left.rows {
+		left_values := v.tuple_values(left_row)
+		for right_row in right.rows {
+			right_values := v.tuple_values(right_row)
+			matched := true
+			for shared_index in 0 ..< len(left_positions) {
+				left_value := left_values[left_positions[shared_index]]
+				right_value := right_values[right_positions[shared_index]]
+				if !v.value_eq(left_value, right_value) {
+					matched = false
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			combined: [dynamic]v.Value
+			combined = make([dynamic]v.Value, 0, len(left_values) + len(right_only), context.temp_allocator)
+			append(&combined, ..left_values)
+			for position in right_only {
+				append(&combined, right_values[position])
+			}
+			append(&rows, v.tuple_new(state.allocator, combined[:]))
+		}
+	}
+	value, relation_error := v.value_relation(state.allocator, heading[:], rows[:])
+	if relation_error != .None {
+		return builtin_error(state, "E_INVARG", "natural_join could not build a relation")
+	}
+	return value, true
 }
 
 // --- Text utilities --------------------------------------------------------

@@ -2497,3 +2497,192 @@ probe()
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 7)
 }
+
+@(test)
+test_run_relation_algebra :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Person, 2)
+make_relation(:Active, 1)
+make_relation(:TeamOnce, 1)
+make_relation(:PersonActive, 2)
+make_relation(:AnyPerson, 1)
+make_relation(:Remaining, 1)
+make_relation(:Color, 1)
+
+assert Person(:alice, :ops)
+assert Person(:bob, :ops)
+assert Person(:chandra, :research)
+assert Active(:alice)
+assert Active(:bob)
+assert TeamOnce(:ops)
+assert TeamOnce(:research)
+assert PersonActive(:alice, :ops)
+assert PersonActive(:bob, :ops)
+assert AnyPerson(:alice)
+assert AnyPerson(:bob)
+assert AnyPerson(:chandra)
+assert Remaining(:chandra)
+assert Color(:red)
+assert Color(:blue)
+
+let people = Person(?person, ?team)
+let active = Active(?person)
+let remaining = Remaining(?person)
+let any_person = AnyPerson(?person)
+
+require project(people, :team) == TeamOnce(?team)
+require len(project(people)) == 1
+require natural_join(people, active) == PersonActive(?person, ?team)
+require union(active, remaining) == any_person
+require difference(any_person, active) == remaining
+require len(natural_join(people, Color(?color))) == 6
+`
+	path, path_ok := write_temp_source(t, "mica_relation_algebra_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}
+
+@(test)
+test_run_relation_algebra_errors :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Person, 2)
+make_relation(:Active, 1)
+make_relation(:Caught, 1)
+
+assert Person(:alice, :ops)
+assert Active(:alice)
+
+verb probe()
+  try
+    return union(Person(?person, ?team), Active(?person))
+  catch E_INVARG
+    return :heading_mismatch
+  end
+end
+assert Caught(probe())
+`
+	path, path_ok := write_temp_source(t, "mica_relation_algebra_error_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Caught", 1)
+}
+
+@(test)
+test_run_dom_diff_builtin :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `let patches = dom_diff(dom_text("old"), dom_text("new"))
+require len(patches) == 1
+require patches[0][:op] == "set_text"
+require patches[0][:text] == "new"
+require len(patches[0][:path]) == 0
+
+let element_patches = dom_diff(
+  dom_element("ul", {}, []),
+  dom_element("ul", {:id -> "messages"}, [dom_text("hi")])
+)
+require len(element_patches) == 2
+require element_patches[0][:op] == "set_attr"
+require element_patches[0][:name] == "id"
+require element_patches[0][:value] == "messages"
+require element_patches[1][:op] == "append_child"
+require element_patches[1][:node][:text] == "hi"
+`
+	path, path_ok := write_temp_source(t, "mica_dom_diff_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}
+
+@(test)
+test_run_log_builtin :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Caught, 1)
+
+verb probe()
+  try
+    log(:nope, "bad level")
+    return :no_error
+  catch E_INVARG
+    return :caught
+  end
+end
+
+log("hello")
+log(:debug, "lower level")
+assert Caught(probe())
+`
+	path, path_ok := write_temp_source(t, "mica_log_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Caught", 1)
+}
+
+@(test)
+test_run_rule_introspection :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:DirectDependency, 2)
+make_relation(:DependsOn, 2)
+
+DependsOn(component, dependency) :-
+  DirectDependency(component, dependency)
+
+assert DirectDependency(:service_a, :service_b)
+
+let active = rules(:DependsOn)
+require len(active) == 1
+let source = describe_rule(active[0])
+require string_contains(source, "DirectDependency")
+
+disable_rule(active[0])
+require len(rules(:DependsOn)) == 0
+enable_rule(active[0])
+require len(rules(:DependsOn)) == 1
+`
+	path, path_ok := write_temp_source(t, "mica_rule_introspection_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+}

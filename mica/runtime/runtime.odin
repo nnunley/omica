@@ -813,6 +813,7 @@ install_rules :: proc(
 	ast: ^c.Program_AST,
 	declarations: ^Declarations,
 	path: string,
+	source: string,
 ) -> Run_Result {
 	facts: [dynamic]Rule_Fact
 	defer delete(facts)
@@ -833,7 +834,7 @@ install_rules :: proc(
 			kernel,
 			v.Identity(declarations.next_rule),
 			rule,
-			path,
+			source,
 		)
 		if install_err != k.Kernel_Error.None {
 			return Run_Result{ok = false, message = fmt.aprintf(
@@ -847,7 +848,7 @@ install_rules :: proc(
 		append(&facts, Rule_Fact {
 			id     = v.Identity(declarations.next_rule),
 			head   = rule.head_relation,
-			source = path,
+			source = source,
 			active = true,
 		})
 		declarations.next_rule += 1
