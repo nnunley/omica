@@ -77,7 +77,10 @@ Emitter :: struct {
 	// not hide it (see mdbook/src/language/operators-and-calls.md).
 	role_params: map[string]bool,
 	break_patches: [dynamic]int,
-	continue_targets: [dynamic]int,
+	// Placeholder jump offsets for `continue`, and the index into
+	// `continue_patches` where each active loop's continues begin.
+	continue_patches: [dynamic]int,
+	continue_marks:   [dynamic]int,
 	loop_depth: int,
 	empty_constant: int,
 	pending_functions: [dynamic]Pending_Function,
@@ -112,7 +115,8 @@ compile_program :: proc(
 		verb_restricted = make(map[string]bool),
 		role_params = make(map[string]bool),
 		break_patches = make([dynamic]int),
-		continue_targets = make([dynamic]int),
+		continue_patches = make([dynamic]int),
+		continue_marks = make([dynamic]int),
 		pending_functions = make([dynamic]Pending_Function),
 	}
 	defer {
@@ -124,7 +128,8 @@ compile_program :: proc(
 		delete(emitter.verb_restricted)
 		delete(emitter.role_params)
 		delete(emitter.break_patches)
-		delete(emitter.continue_targets)
+		delete(emitter.continue_patches)
+		delete(emitter.continue_marks)
 		delete(emitter.pending_functions)
 	}
 
@@ -505,13 +510,11 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 		return -1, false
 
 	case Continue:
-		if len(emitter.continue_targets) == 0 {
+		if len(emitter.continue_marks) == 0 {
 			push_error(emitter, "continue outside a loop")
 			return -1, false
 		}
-		target := emitter.continue_targets[len(emitter.continue_targets) - 1]
-		index := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
-		patch_jump(emitter, index, target)
+		append(&emitter.continue_patches, emit_instruction(emitter, .Jump, 0, 0, 0, 0))
 		return -1, false
 
 	case Assert:
@@ -3103,6 +3106,18 @@ emit_if :: proc(emitter: ^Emitter, conditional: If) -> (int, bool) {
 	return result, true
 }
 
+// Patches every `continue` recorded for the innermost active loop to `target`
+// and pops its mark.
+@(private)
+patch_loop_continues :: proc(emitter: ^Emitter, target: int) {
+	mark := emitter.continue_marks[len(emitter.continue_marks) - 1]
+	for index in mark ..< len(emitter.continue_patches) {
+		patch_jump(emitter, emitter.continue_patches[index], target)
+	}
+	resize(&emitter.continue_patches, mark)
+	pop(&emitter.continue_marks)
+}
+
 @(private)
 emit_while :: proc(emitter: ^Emitter, loop: While) -> (int, bool) {
 	result := alloc_register(emitter)
@@ -3111,7 +3126,7 @@ emit_while :: proc(emitter: ^Emitter, loop: While) -> (int, bool) {
 	defer emitter.loop_depth -= 1
 
 	loop_start := current_offset(emitter)
-	append(&emitter.continue_targets, loop_start)
+	append(&emitter.continue_marks, len(emitter.continue_patches))
 
 	condition, condition_ok := emit_expr(emitter, loop.condition)
 	if !condition_ok {
@@ -3131,7 +3146,7 @@ emit_while :: proc(emitter: ^Emitter, loop: While) -> (int, bool) {
 	back_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
 	patch_jump(emitter, back_jump, loop_start)
 
-	pop(&emitter.continue_targets)
+	patch_loop_continues(emitter, loop_start)
 	patch_jump(emitter, exit_jump, current_offset(emitter))
 	for index in break_mark ..< len(emitter.break_patches) {
 		patch_jump(emitter, emitter.break_patches[index], current_offset(emitter))
@@ -3167,7 +3182,7 @@ emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 
 	break_mark := len(emitter.break_patches)
 	loop_start := current_offset(emitter)
-	append(&emitter.continue_targets, loop_start)
+	append(&emitter.continue_marks, len(emitter.continue_patches))
 
 	condition_register := alloc_register(emitter)
 	vm.builder_emit(
@@ -3222,6 +3237,11 @@ emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 	_ = result
 	_ = has_result
 
+	// A `continue` in a for loop advances the index first, so it targets the
+	// increment block rather than the loop condition.
+	increment_start := current_offset(emitter)
+	patch_loop_continues(emitter, increment_start)
+
 	one_register := emit_constant(emitter, int_value(1))
 	vm.builder_emit(
 		emitter.builder,
@@ -3235,7 +3255,6 @@ emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 	back_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
 	patch_jump(emitter, back_jump, loop_start)
 
-	pop(&emitter.continue_targets)
 	patch_jump(emitter, exit_jump, current_offset(emitter))
 	for index in break_mark ..< len(emitter.break_patches) {
 		patch_jump(emitter, emitter.break_patches[index], current_offset(emitter))

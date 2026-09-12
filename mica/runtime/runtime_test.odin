@@ -3801,3 +3801,32 @@ return len([1, 2])`,
 		99,
 	)
 }
+
+// `continue` in a for loop must advance the index, not repeat the element.
+@(test)
+test_for_loop_continue_advances_index :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	ctx := c.Compile_Context {
+		builtins   = make(map[string]bool),
+		relations  = make(map[string]u32),
+		identities = make(map[string]v.Value),
+	}
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	install_builtin_names(&ctx)
+
+	expect_int_builtin(
+		t,
+		&ctx,
+		`let n = 0
+for x in [1, 2]
+  n = n + 1
+  if n < 3
+    continue
+  end
+end
+return n`,
+		2,
+	)
+}
