@@ -3747,3 +3747,33 @@ test_read_only_store_boot_has_no_pending_writes :: proc(t: ^testing.T) {
 		k.kernel_destroy(&kernel)
 	}
 }
+
+// Returning from inside a protected region must retire that frame's handlers,
+// so a later raise at the same depth does not unwind into the completed frame.
+@(test)
+test_return_inside_try_retires_handlers :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	ctx := c.Compile_Context {
+		builtins   = make(map[string]bool),
+		relations  = make(map[string]u32),
+		identities = make(map[string]v.Value),
+	}
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	install_builtin_names(&ctx)
+
+	source := `let f = fn()
+  try
+    return 1
+  catch
+    return 2
+  end
+end
+f()
+let g = fn()
+  raise E_X
+end
+return g()`
+	expect_builtin_error(t, &ctx, source, "E_X")
+}

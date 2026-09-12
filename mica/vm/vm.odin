@@ -382,6 +382,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				state.frames[top].ip = int(handler.target)
 				break
 			}
+			vm_remove_frame_handlers(state, top)
 			returned := pop(&state.frames)
 			resize(&state.registers, base)
 			if len(state.frames) == 0 {
@@ -847,6 +848,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 					break
 				}
 				pop(&state.pending_returns)
+				vm_remove_frame_handlers(state, top)
 				returned := pop(&state.frames)
 				resize(&state.registers, base)
 				if len(state.frames) == 0 {
@@ -902,6 +904,36 @@ vm_finally_handler :: proc(state: ^VM, frame: int) -> int {
 		}
 	}
 	return -1
+}
+
+// Retires every handler (and pending return) owned by `frame` when its call
+// frame is popped. Without this, a handler left behind by an early return can
+// be found by a later unwind at the same depth and use the wrong register
+// window.
+@(private)
+vm_remove_frame_handlers :: proc(state: ^VM, frame: int) {
+	write := 0
+	for handler in state.handlers {
+		if handler.frame == frame {
+			continue
+		}
+		state.handlers[write] = handler
+		write += 1
+	}
+	if write != len(state.handlers) {
+		resize(&state.handlers, write)
+	}
+	pending_write := 0
+	for pending in state.pending_returns {
+		if pending.frame == frame {
+			continue
+		}
+		state.pending_returns[pending_write] = pending
+		pending_write += 1
+	}
+	if pending_write != len(state.pending_returns) {
+		resize(&state.pending_returns, pending_write)
+	}
 }
 
 // Transfers control to the innermost handler. Returns false when no handler
