@@ -124,6 +124,10 @@ test_checked_arithmetic :: proc(t: ^testing.T) {
 
 	_, overflow_ok := value_checked_mul(must_int(INT_MAX), two)
 	testing.expect(t, !overflow_ok)
+
+	// A product that overflows i64 must fail, not wrap to a small value.
+	_, wrapped_ok := value_checked_mul(must_int(4294967296), must_int(4294967296))
+	testing.expect(t, !wrapped_ok)
 }
 
 @(test)

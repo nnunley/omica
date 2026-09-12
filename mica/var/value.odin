@@ -12,6 +12,7 @@
 // transaction arena that allocated them.
 package var
 
+import "base:intrinsics"
 import "core:math"
 
 // The process-local value ABI version. Increment when the physical layout or
@@ -442,8 +443,12 @@ value_checked_sub :: proc(a, b: Value) -> (Value, bool) {
 value_checked_mul :: proc(a, b: Value) -> (Value, bool) {
 	if left, lok := value_as_int(a); lok {
 		if right, rok := value_as_int(b); rok {
-			if product, ok := value_int(left * right); ok {
-				return product, true
+			product, overflowed := intrinsics.overflow_mul(left, right)
+			if overflowed {
+				return Value(0), false
+			}
+			if result, ok := value_int(product); ok {
+				return result, true
 			}
 			return Value(0), false
 		}
