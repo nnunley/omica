@@ -22,7 +22,11 @@ delegates_star :: proc(
 		&edges,
 	)
 	for edge in edges {
-		children[v.tuple_values(edge)[0]] = true
+		values := v.tuple_values(edge)
+		if len(values) < 1 {
+			continue
+		}
+		children[values[0]] = true
 	}
 	delete(edges)
 
@@ -78,7 +82,11 @@ delegates_star_from :: proc(
 			&edges,
 		)
 		for edge in edges {
-			proto := v.tuple_values(edge)[1]
+			values := v.tuple_values(edge)
+			if len(values) < 2 {
+				continue
+			}
+			proto := values[1]
 			if !seen[proto] {
 				seen[proto] = true
 				append(&frontier, proto)
@@ -121,7 +129,11 @@ delegates_reaches :: proc(
 			&edges,
 		)
 		for edge in edges {
-			proto := v.tuple_values(edge)[1]
+			values := v.tuple_values(edge)
+			if len(values) < 2 {
+				continue
+			}
+			proto := values[1]
 			if v.value_eq(proto, ancestor) {
 				delete(edges)
 				return true
