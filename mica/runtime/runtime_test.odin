@@ -3830,3 +3830,57 @@ return n`,
 		2,
 	)
 }
+
+// A wildcard retract must require write authority, like a concrete retract.
+@(test)
+test_run_wildcard_retract_requires_write :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+make_relation(:Secret, 1)
+make_relation(:Cleared, 1)
+make_relation(:Denied, 1)
+assert Secret(1)
+assert Secret(2)
+assert Secret(3)
+grant #alice
+  read:
+    :Secret
+  write:
+    :Cleared
+    :Denied
+end
+commit()
+verb clear()
+  try
+    retract Secret(_)
+    assert Cleared(1)
+  catch err
+    assert Denied(1)
+  end
+end
+spawn :clear()
+suspend()
+`
+	path, path_ok := write_temp_source(t, "mica_wildcard_retract_authority.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{actor = "alice"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Denied", 1)
+	expect_relation_rows(t, &kernel, "Cleared", 0)
+	expect_relation_rows(t, &kernel, "Secret", 3)
+}

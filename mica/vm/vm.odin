@@ -1625,6 +1625,10 @@ vm_retract_where :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		return false
 	}
 	pattern := state.program.patterns[instr.b]
+	if !k.authority_can_write(state.authority, k.Relation_ID(pattern.relation)) {
+		vm_fail(state, "E_PERMISSION", "relation write denied")
+		return false
+	}
 	rows: [dynamic]v.Tuple
 	defer delete(rows)
 	if !vm_scan_rows(state, base, pattern, &rows) {
