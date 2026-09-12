@@ -1325,17 +1325,12 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 	// dispatch so every declaration is considered and restrictions are checked.
 	if function_index, found := emitter.functions[text]; found {
 		if emitter.verb_declarations[text] > 1 || emitter.verb_restricted[text] {
-			selector := emit_constant(emitter, v.value_symbol(v.symbol_intern(text)))
-			destination := alloc_register(emitter)
-			vm.builder_emit(
-				emitter.builder,
-				.Positional_Dispatch,
-				u8(len(call.args)),
-				i32(destination),
-				i32(selector),
-				i32(first_argument),
+			return emit_named_positional_dispatch(
+				emitter,
+				text,
+				first_argument,
+				len(call.args),
 			)
-			return destination, true
 		}
 		destination := alloc_register(emitter)
 		vm.builder_emit(
@@ -1378,8 +1373,30 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 		return destination, true
 	}
 
-	push_error(emitter, fmt.aprintf("unknown callable: %s", text, allocator = emitter.allocator))
-	return -1, false
+	// Verbs resolve late, like the rest of the world: a call to a name that is
+	// not yet installed compiles to positional dispatch and fails at runtime
+	// with "no applicable method" if nothing matches.
+	return emit_named_positional_dispatch(emitter, text, first_argument, len(call.args))
+}
+
+@(private)
+emit_named_positional_dispatch :: proc(
+	emitter: ^Emitter,
+	name_text: string,
+	first_argument: int,
+	argument_count: int,
+) -> (int, bool) {
+	selector := emit_constant(emitter, v.value_symbol(v.symbol_intern(name_text)))
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Positional_Dispatch,
+		u8(argument_count),
+		i32(destination),
+		i32(selector),
+		i32(first_argument),
+	)
+	return destination, true
 }
 
 @(private)

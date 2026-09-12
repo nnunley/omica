@@ -3318,3 +3318,38 @@ require project([:person, :team] {}) == [] {}
 	result := run_files(&kernel, []string{path}, context.temp_allocator)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
+
+@(test)
+test_run_late_bound_verb_call :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Loaded, 1)
+
+verb probe()
+  return missing_verb(1, 2)
+end
+
+assert Loaded(1)
+`
+	path, path_ok := write_temp_source(t, "mica_late_bound_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	// The call resolves at runtime and reports no applicable method.
+	outcome := world_call(world, "probe", nil)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Aborted)
+}
