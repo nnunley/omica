@@ -672,6 +672,10 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if !valid_register(instr.c, register_count) {
 					return .Bad_Register
 				}
+				// The VM reads the argument registers `c .. c+flags-1`.
+				if int(instr.c) + int(instr.flags) > register_count {
+					return .Bad_Arguments
+				}
 			case .Commit:
 			case .Is_Truthy:
 				if !valid_register(instr.a, register_count) ||
@@ -735,8 +739,14 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				   !valid_register(instr.b, register_count) {
 					return .Bad_Register
 				}
-				if instr.flags > 0 && !valid_register(instr.c, register_count) {
-					return .Bad_Register
+				if instr.flags > 0 {
+					if !valid_register(instr.c, register_count) {
+						return .Bad_Register
+					}
+					// The VM reads the argument registers `c .. c+flags-1`.
+					if int(instr.c) + int(instr.flags) > register_count {
+						return .Bad_Arguments
+					}
 				}
 			case .Mailbox_Recv:
 				if !valid_register(instr.a, register_count) ||
@@ -804,8 +814,14 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				   !valid_register(instr.b, register_count) {
 					return .Bad_Register
 				}
-				if instr.flags > 0 && !valid_register(instr.c, register_count) {
-					return .Bad_Register
+				if instr.flags > 0 {
+					if !valid_register(instr.c, register_count) {
+						return .Bad_Register
+					}
+					// The VM reads the argument registers `c .. c+flags-1`.
+					if int(instr.c) + int(instr.flags) > register_count {
+						return .Bad_Arguments
+					}
 				}
 			case .Call_Splice:
 				if !valid_register(instr.a, register_count) ||

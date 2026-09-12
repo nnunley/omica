@@ -404,6 +404,49 @@ test_program_validation_rejects_bad_register :: proc(t: ^testing.T) {
 	testing.expect_value(t, program_validate(program), Program_Error.Bad_Register)
 }
 
+// Variadic opcodes read registers `c .. c+flags-1`; the validator must reject
+// an argument range that runs past the register file.
+@(test)
+test_program_validation_rejects_short_argument_range :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	// Builtin_Call: two arguments starting at r1, but only r0..r1 exist.
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+	builder_add_builtin(&builder, v.symbol_intern("noop"))
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder, .Builtin_Call, 2, 0, 0, 1)
+	builder_emit(&builder, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder)
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.Bad_Arguments)
+
+	// Call_Value: same shape through a function-value register.
+	builder2: Builder
+	builder_init(&builder2)
+	defer builder_destroy(&builder2)
+	builder_begin_function(&builder2, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder2, .Call_Value, 2, 0, 1, 1)
+	builder_emit(&builder2, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder2)
+	program2 := builder_build(&builder2, alloc)
+	testing.expect_value(t, program_validate(program2), Program_Error.Bad_Arguments)
+
+	// Positional_Dispatch: two arguments starting at r1.
+	builder3: Builder
+	builder_init(&builder3)
+	defer builder_destroy(&builder3)
+	builder_begin_function(&builder3, v.symbol_intern("main"), 0, 2, true)
+	builder_emit(&builder3, .Positional_Dispatch, 2, 0, 1, 1)
+	builder_emit(&builder3, .Return, 0, 0, 0, 0)
+	builder_end_function(&builder3)
+	program3 := builder_build(&builder3, alloc)
+	testing.expect_value(t, program_validate(program3), Program_Error.Bad_Arguments)
+}
+
 @(test)
 test_program_disassembly :: proc(t: ^testing.T) {
 	arena := test_arena()
