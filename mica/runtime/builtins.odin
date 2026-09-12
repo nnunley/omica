@@ -726,8 +726,8 @@ dom_patch_to_value :: proc(patch: ^dom.Dom_Patch, allocator: mem.Allocator) -> v
 		path = value.path
 	}
 	path_values := make([]v.Value, len(path), allocator)
-	for index, position in path {
-		path_values[position], _ = v.value_int(i64(index))
+	for position, index in path {
+		path_values[index], _ = v.value_int(i64(position))
 	}
 	entries := make([]v.Map_Entry, 2 + len(extra), allocator)
 	entries[0] = v.Map_Entry {

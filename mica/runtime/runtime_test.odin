@@ -2790,6 +2790,28 @@ require element_patches[0][:name] == "id"
 require element_patches[0][:value] == "messages"
 require element_patches[1][:op] == "append_child"
 require element_patches[1][:node][:text] == "hi"
+
+let sibling_patches = dom_diff(
+  dom_element("div", {}, [dom_text("same"), dom_text("old")]),
+  dom_element("div", {}, [dom_text("same"), dom_text("new")])
+)
+require len(sibling_patches) == 1
+require sibling_patches[0][:op] == "set_text"
+require sibling_patches[0][:text] == "new"
+let sibling_path = sibling_patches[0][:path]
+require len(sibling_path) == 1
+require sibling_path[0] == 1
+
+let deep_patches = dom_diff(
+  dom_element("div", {}, [dom_text("same"), dom_element("ul", {}, [dom_text("a"), dom_text("old")])]),
+  dom_element("div", {}, [dom_text("same"), dom_element("ul", {}, [dom_text("a"), dom_text("new")])])
+)
+require len(deep_patches) == 1
+require deep_patches[0][:op] == "set_text"
+let deep_path = deep_patches[0][:path]
+require len(deep_path) == 2
+require deep_path[0] == 1
+require deep_path[1] == 1
 `
 	path, path_ok := write_temp_source(t, "mica_dom_diff_test.mica", source)
 	if !path_ok {
