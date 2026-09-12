@@ -1346,7 +1346,8 @@ test_empty_commit_and_idempotent_writes :: proc(t: ^testing.T) {
 	version_before := kernel.current.version
 	empty := kernel_begin(&kernel)
 	commit_transaction(t, &empty)
-	testing.expect_value(t, kernel.current.version, version_before + 1)
+	// An empty commit publishes nothing and must not advance the version.
+	testing.expect_value(t, kernel.current.version, version_before)
 
 	seed := kernel_begin(&kernel)
 	transaction_assert(&seed, relation, present)
@@ -2243,4 +2244,27 @@ test_slot_map_init_no_leak :: proc(t: ^testing.T) {
 		"slot_map_init leaked %d allocation(s)",
 		len(track.allocation_map),
 	)
+}
+
+// A transaction that makes no writes must not publish a new version. A
+// read-only commit advancing the version makes read-only CLI evals grow the
+// store on the shutdown checkpoint.
+@(test)
+test_read_only_commit_does_not_advance_version :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	before := kernel_snapshot(&kernel)
+	before_version := before.version
+	snapshot_release(before)
+
+	tx := transaction_begin(&kernel)
+	committed, err := transaction_commit(&tx)
+	testing.expect_value(t, err, Kernel_Error.None)
+	if committed != nil {
+		testing.expect_value(t, committed.version, before_version)
+		snapshot_release(committed)
+	}
+	transaction_destroy(&tx)
 }

@@ -136,7 +136,7 @@ world_destroy :: proc(world: ^World) {
 		k.kernel_detach_store(world.kernel)
 		// A clean shutdown checkpoints, so the next boot starts from a fresh
 		// manifest instead of replaying a long log.
-		if world.started {
+		if world.started && s.store_has_pending_writes(world.store) {
 			_ = s.store_checkpoint(world.store, world.kernel)
 		}
 		s.store_destroy(world.store)
@@ -691,7 +691,6 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 		s.store_attach(store, world.kernel)
 		return Run_Result{ok = false, message = "cannot restore the stored world"}
 	}
-	s.store_attach(store, world.kernel)
 
 	world.ctx = c.Compile_Context {
 		builtins                            = make(map[string]bool, allocator),
@@ -831,6 +830,9 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	if !rule_result.ok {
 		return rule_result
 	}
+	// Rule reconstruction is derived from persisted facts, so keep it off the
+	// log; reattach before any new work can commit.
+	s.store_attach(store, world.kernel)
 
 	workers := config.workers
 	if workers < 1 {

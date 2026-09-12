@@ -664,6 +664,12 @@ store_failed :: proc(store: ^Store) -> bool {
 	return store.failed
 }
 
+// Reports whether durable writes have been appended since the last checkpoint.
+// A world that only booted and read can skip its shutdown checkpoint.
+store_has_pending_writes :: proc(store: ^Store) -> bool {
+	return sync.atomic_load(&store.wal_bytes_since_checkpoint) > 0
+}
+
 // --- Copies -----------------------------------------------------------------
 
 @(private)

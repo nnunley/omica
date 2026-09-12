@@ -9,6 +9,7 @@ import "core:testing"
 import "core:time"
 import c "../compiler"
 import k "../kernel"
+import s "../store"
 import vm "../vm"
 import v "../var"
 
@@ -3664,4 +3665,85 @@ test_json_decode_string_no_leak :: proc(t: ^testing.T) {
 		"json_decode_text leaked %d allocation(s)",
 		len(track.allocation_map),
 	)
+}
+
+// A read-only boot must not append to the WAL. Rule reconstruction is derived
+// from persisted facts, so the shutdown checkpoint is skipped and the store
+// does not grow.
+@(test)
+test_read_only_store_boot_has_no_pending_writes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := ""
+	for candidate in ([]string {
+		"apps/examples/equipment-service.mica",
+		"../apps/examples/equipment-service.mica",
+		"../../apps/examples/equipment-service.mica",
+	}) {
+		if os.is_file(candidate) {
+			path = candidate
+			break
+		}
+	}
+	if path == "" {
+		testing.expect(t, false, "equipment example not found")
+		return
+	}
+
+	directory, directory_error := os.temp_dir(context.temp_allocator)
+	if directory_error != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	store_path, join_error := filepath.join(
+		[]string{directory, "mica_read_only_boot"},
+		context.temp_allocator,
+	)
+	if join_error != nil {
+		testing.expect(t, false, "cannot join the store path")
+		return
+	}
+	os.remove_all(store_path)
+	defer os.remove_all(store_path)
+
+	// First world: load a rule-bearing source and persist it.
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		world, start := world_start(
+			&kernel,
+			[]string{path},
+			context.temp_allocator,
+			World_Config{store_path = store_path},
+		)
+		testing.expectf(t, start.ok, "load failed: %s", start.message)
+		if start.ok {
+			entry := world_wait(world, world.entry)
+			testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+			testing.expect(t, world_checkpoint(world))
+			world_destroy(world)
+		}
+		k.kernel_destroy(&kernel)
+	}
+
+	// Second world: read-only boot, no user work.
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		world, start := world_start(
+			&kernel,
+			nil,
+			context.temp_allocator,
+			World_Config{store_path = store_path},
+		)
+		testing.expectf(t, start.ok, "boot failed: %s", start.message)
+		if start.ok {
+			testing.expectf(
+				t,
+				!s.store_has_pending_writes(world.store),
+				"read-only boot appended to the WAL",
+			)
+			world_destroy(world)
+		}
+		k.kernel_destroy(&kernel)
+	}
 }

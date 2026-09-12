@@ -99,7 +99,8 @@ test_task_commit_boundary_continues :: proc(t: ^testing.T) {
 
 	outcome := task_run(&task)
 	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
-	testing.expect(t, kernel.current.version > initial_version)
+	// A commit boundary with no writes publishes nothing.
+	testing.expect_value(t, kernel.current.version, initial_version)
 }
 
 @(test)

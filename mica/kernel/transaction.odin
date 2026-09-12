@@ -494,6 +494,13 @@ TRANSACTION_RETRY_LIMIT :: 8
 transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Error) {
 	kernel := transaction.kernel
 
+	// A transaction that made no writes has nothing to publish. Forking would
+	// advance the snapshot version, which makes read-only CLI `--eval` queries
+	// grow the store on the shutdown checkpoint.
+	if len(transaction.writes) == 0 {
+		return kernel_snapshot(kernel), .None
+	}
+
 	// Reserve durable capacity before the commit can publish. A store at its
 	// budget blocks here, and a timeout fails the transaction without
 	// publishing, so visible state never runs unboundedly ahead of the store.
