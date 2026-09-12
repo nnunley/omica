@@ -25,32 +25,44 @@ value_deep_copy :: proc(alloc: mem.Allocator, value: Value) -> Value {
 		return value_bytes(alloc, data)
 	case .List:
 		values, _ := value_as_list(value)
-		copied := make([]Value, len(values), alloc)
+		scratch := make([]Value, len(values), alloc)
 		for item, i in values {
-			copied[i] = value_deep_copy(alloc, item)
+			scratch[i] = value_deep_copy(alloc, item)
 		}
-		return value_list(alloc, copied)
+		// `value_list` copies its input, so free the scratch array afterwards.
+		result := value_list(alloc, scratch)
+		delete(scratch, alloc)
+		return result
 	case .Map:
 		entries, _ := value_as_map(value)
-		copied := make([]Map_Entry, len(entries), alloc)
+		scratch := make([]Map_Entry, len(entries), alloc)
 		for entry, i in entries {
-			copied[i] = Map_Entry {
+			scratch[i] = Map_Entry {
 				key   = value_deep_copy(alloc, entry.key),
 				value = value_deep_copy(alloc, entry.value),
 			}
 		}
-		return value_map(alloc, copied)
+		result := value_map(alloc, scratch)
+		delete(scratch, alloc)
+		return result
 	case .Relation:
 		relation, _ := value_as_relation(value)
-		rows := make([]Tuple, len(relation.rows), alloc)
+		scratch := make([]Tuple, len(relation.rows), alloc)
 		for row, i in relation.rows {
-			rows[i] = tuple_deep_copy(alloc, row)
+			scratch[i] = tuple_deep_copy(alloc, row)
 		}
-		copied, _ := value_relation(alloc, relation.heading, rows)
+		// `value_relation` copies its heading and rows; free the scratch array.
+		copied, _ := value_relation(alloc, relation.heading, scratch)
+		delete(scratch, alloc)
 		return copied
 	case .Range:
 		start, end, has_end, _ := value_as_range(value)
-		return value_range(alloc, value_deep_copy(alloc, start), value_deep_copy(alloc, end), has_end)
+		return value_range(
+			alloc,
+			value_deep_copy(alloc, start),
+			value_deep_copy(alloc, end),
+			has_end,
+		)
 	case .Error:
 		error, _ := value_as_error(value)
 		message := error.message

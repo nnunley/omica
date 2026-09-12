@@ -1,6 +1,7 @@
 package var
 
 import "core:fmt"
+import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:testing"
@@ -989,4 +990,32 @@ test_symbol_cache_cycles_through_many_names :: proc(t: ^testing.T) {
 	for _ in 0 ..< 8 {
 		testing.expect_value(t, symbol_intern("cache-cycle-first"), first)
 	}
+}
+
+// `value_deep_copy` must free the scratch arrays it builds: the value
+// constructors copy their inputs, so the scratch would otherwise leak.
+@(test)
+test_value_deep_copy_frees_scratch :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	alloc := mem.tracking_allocator(&track)
+
+	list := value_list(alloc, []Value{must_int(1), must_int(2)})
+	mapping := value_map(alloc, []Map_Entry{{key = must_int(1), value = must_int(2)}})
+
+	list_copy := value_deep_copy(alloc, list)
+	map_copy := value_deep_copy(alloc, mapping)
+
+	value_deep_free(alloc, list_copy)
+	value_deep_free(alloc, map_copy)
+	value_deep_free(alloc, list)
+	value_deep_free(alloc, mapping)
+
+	testing.expectf(
+		t,
+		len(track.allocation_map) == 0,
+		"value_deep_copy leaked %d allocation(s)",
+		len(track.allocation_map),
+	)
 }
