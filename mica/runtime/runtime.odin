@@ -326,6 +326,7 @@ substitute_include_text :: proc(
 
 		relative := source[cursor + 1:end_quote]
 		full := relative
+		joined_allocated := false
 		if !filepath.is_abs(relative) {
 			joined, join_err := filepath.join(
 				[]string{base_directory, relative},
@@ -338,17 +339,25 @@ substitute_include_text :: proc(
 				}
 			}
 			full = joined
+			joined_allocated = true
 		}
 		contents, read_err := os.read_entire_file(full, allocator)
 		if read_err != nil {
+			message := fmt.aprintf(
+				"include_text cannot read %s",
+				full,
+				allocator = allocator,
+			)
+			if joined_allocated {
+				delete(full, allocator)
+			}
 			return "", Run_Result {
 				ok      = false,
-				message = fmt.aprintf(
-					"include_text cannot read %s",
-					full,
-					allocator = allocator,
-				),
+				message = message,
 			}
+		}
+		if joined_allocated {
+			delete(full, allocator)
 		}
 		write_mica_string_literal(&builder, string(contents))
 		index = closing + 1

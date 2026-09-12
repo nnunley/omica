@@ -166,6 +166,7 @@ store_pages_open :: proc(store: ^Store) -> bool {
 	if join_error != nil {
 		return false
 	}
+	defer delete(path, store.allocator)
 	file, open_error := os.open(path, os.O_RDWR | os.O_CREATE)
 	if open_error != nil {
 		return false
@@ -450,6 +451,7 @@ store_checkpoint_internal :: proc(store: ^Store, kernel: ^k.Kernel, wait: bool) 
 	if current_error != nil {
 		return false
 	}
+	defer delete(current_path, store.allocator)
 	if !store_manifest_write_to(store, current_path, &data) {
 		return false
 	}

@@ -249,6 +249,9 @@ store_pages_compact_locked :: proc(store: ^Store) -> bool {
 		return false
 	}
 	store.pages_file = reopened
+	// Free the pre-compaction index map before replacing it; its backing
+	// storage would otherwise leak on every compaction.
+	delete(store.page_index)
 	store.page_index = new_index
 	store.pages_end = offset
 	store.pages_generation = new_generation
