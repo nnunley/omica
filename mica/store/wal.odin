@@ -390,6 +390,11 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	durable := store.durable
 	sync.mutex_unlock(&store.lock)
 
+	// The checkpoint supplies the base state; only later WAL records replay.
+	if !store_materialize_checkpoint(store, kernel) {
+		return false
+	}
+
 	// Records published in one group share a version. Replay each version as
 	// one transaction so set semantics (for example a functional key retract
 	// and assert in one commit) are preserved.
@@ -399,6 +404,10 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 		group_end := group_start
 		for group_end < len(records) && records[group_end].version == version {
 			group_end += 1
+		}
+		if version <= store.checkpoint_version {
+			group_start = group_end
+			continue
 		}
 
 		for record_index in group_start ..< group_end {

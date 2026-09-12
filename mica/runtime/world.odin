@@ -244,6 +244,15 @@ world_release :: proc(world: ^World, id: Task_ID) {
 	scheduler_release(&world.scheduler, id)
 }
 
+// Writes a chunk-page checkpoint of the current world state. Returns false
+// when no store is attached or the checkpoint fails.
+world_checkpoint :: proc(world: ^World) -> bool {
+	if world.store == nil {
+		return false
+	}
+	return s.store_checkpoint(world.store, world.kernel)
+}
+
 // Creates a host-owned mailbox. The returned receiver and sender are
 // capability handles; the host drains the receiver and passes the sender to
 // `world_subscribe_changes`.

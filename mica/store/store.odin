@@ -104,6 +104,16 @@ Store :: struct {
 	syncs:      u64,
 	failed:     bool,
 
+	// Chunk shadow pages and checkpoint manifest.
+	pages_file:         ^os.File,
+	pages_end:          i64,
+	next_page_id:       u32,
+	persisted:          map[rawptr]u32,
+	page_index:         map[u32]Page_Index,
+	checkpoint_version: u64,
+	manifest_relations: []Checkpoint_Relation,
+	checkpoint_lock:    sync.Mutex,
+
 	thread: ^thread.Thread,
 	stop:   bool,
 	closed: bool,
@@ -121,6 +131,14 @@ store_open :: proc(store: ^Store, options: Store_Options) -> bool {
 	store_setup(store, options)
 	if options.mode == .File {
 		if !store_wal_open(store, options.path) {
+			store_release(store)
+			return false
+		}
+		if !store_pages_open(store) {
+			store_release(store)
+			return false
+		}
+		if !store_manifest_open(store) {
 			store_release(store)
 			return false
 		}
@@ -156,6 +174,8 @@ store_setup :: proc(store: ^Store, options: Store_Options) {
 	}
 	store.tickets = make(map[k.Persist_Ticket]i64, store.allocator)
 	store.known = make(map[k.Relation_ID]bool, store.allocator)
+	store.persisted = make(map[rawptr]u32, store.allocator)
+	store.page_index = make(map[u32]Page_Index, store.allocator)
 	store.queue = make([dynamic]Queue_Entry, store.allocator)
 	store.records = make([dynamic]Wal_Record, store.allocator)
 	// Ticket zero means "no reservation"; real tickets start at one.
@@ -185,6 +205,10 @@ store_destroy :: proc(store: ^Store) {
 		os.close(store.file)
 		store.file = nil
 	}
+	if store.pages_file != nil {
+		os.close(store.pages_file)
+		store.pages_file = nil
+	}
 	if store.path != "" {
 		delete(store.path, store.allocator)
 		store.path = ""
@@ -196,6 +220,8 @@ store_destroy :: proc(store: ^Store) {
 
 	delete(store.tickets)
 	delete(store.known)
+	delete(store.persisted)
+	delete(store.page_index)
 	delete(store.queue)
 	delete(store.records)
 	if store.arena != nil {
@@ -211,6 +237,10 @@ store_release :: proc(store: ^Store) {
 		os.close(store.file)
 		store.file = nil
 	}
+	if store.pages_file != nil {
+		os.close(store.pages_file)
+		store.pages_file = nil
+	}
 	if store.path != "" {
 		delete(store.path, store.allocator)
 		store.path = ""
@@ -221,6 +251,8 @@ store_release :: proc(store: ^Store) {
 	}
 	delete(store.tickets)
 	delete(store.known)
+	delete(store.persisted)
+	delete(store.page_index)
 	delete(store.queue)
 	delete(store.records)
 	if store.arena != nil {

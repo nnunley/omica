@@ -5,6 +5,7 @@
 // avoids a kernel-to-store import cycle.
 package kernel
 
+import "core:sync"
 import v "../var"
 
 // Identifies one reserved share of the store's durable budget.
@@ -102,4 +103,36 @@ kernel_persist_bytes :: proc(transaction: ^Transaction) -> i64 {
 		}
 	}
 	return total
+}
+
+// A restored relation with its materialized block.
+Checkpoint_Relation :: struct {
+	metadata: Relation_Metadata,
+	block:    ^Relation_Block,
+}
+
+// Installs restored relations and their blocks with one publication. Used
+// when booting from a checkpoint. Takes ownership of each block reference.
+kernel_install_checkpoint :: proc(kernel: ^Kernel, entries: []Checkpoint_Relation) -> bool {
+	sync.mutex_lock(&kernel.catalog_lock)
+	defer sync.mutex_unlock(&kernel.catalog_lock)
+	for {
+		current := kernel_snapshot(kernel)
+		next := snapshot_fork(kernel, current)
+		for entry in entries {
+			if _, exists := snapshot_relation_metadata(current, entry.metadata.id); !exists {
+				snapshot_add_relation(next, metadata_clone(kernel.world_allocator, entry.metadata))
+			}
+			snapshot_set_block(next, entry.block)
+		}
+		snapshot_compute_derived(next)
+		previous, published := kernel_try_publish(kernel, current, next)
+		if published {
+			kernel_retire(kernel, previous)
+			snapshot_release(current)
+			return true
+		}
+		snapshot_release(next)
+		snapshot_release(current)
+	}
 }

@@ -415,3 +415,102 @@ test_file_wal_durability_none_does_not_sync :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, store_sync_count(&store), u64(0))
 }
+
+@(test)
+test_checkpoint_round_trip :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_checkpoint")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	checkpoint_version: u64
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(
+				&store,
+				Store_Options{mode = .File, path = path, durability = .Group},
+			),
+		)
+		store_attach(&store, &kernel)
+		create_named_relation(t, &kernel, 1, "Kept", 1, .Durable)
+		create_named_relation(t, &kernel, 2, "Gone", 1, .Volatile)
+
+		tx := k.kernel_begin(&kernel)
+		for index in 0 ..< 300 {
+			number, _ := v.value_int(i64(index))
+			testing.expect_value(
+				t,
+				k.transaction_assert(&tx, 1, v.tuple_new(context.temp_allocator, []v.Value{number})),
+				k.Kernel_Error.None,
+			)
+		}
+		volatile_number, _ := v.value_int(7)
+		testing.expect_value(
+			t,
+			k.transaction_assert(&tx, 2, v.tuple_new(context.temp_allocator, []v.Value{volatile_number})),
+			k.Kernel_Error.None,
+		)
+		committed, commit_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect(t, commit_error == k.Kernel_Error.None)
+		if commit_error != k.Kernel_Error.None {
+			store_destroy(&store)
+			k.kernel_destroy(&kernel)
+			return
+		}
+		k.snapshot_release(committed)
+
+		testing.expect(t, store_checkpoint(&store, &kernel))
+		checkpoint_version = store_checkpoint_version(&store)
+		pages_after_checkpoint := store_page_count(&store)
+		testing.expect(t, pages_after_checkpoint >= 1)
+
+		// A small tail after the checkpoint.
+		tx2 := k.kernel_begin(&kernel)
+		tail_number, _ := v.value_int(999)
+		k.transaction_assert(&tx2, 1, v.tuple_new(context.temp_allocator, []v.Value{tail_number}))
+		tail, tail_error := k.transaction_commit(&tx2)
+		k.transaction_destroy(&tx2)
+		testing.expect(t, tail_error == k.Kernel_Error.None)
+		if tail_error == k.Kernel_Error.None {
+			store_wait_durable(&store, tail.version)
+			k.snapshot_release(tail)
+		}
+
+		// A second checkpoint persists only the chunks the tail touched.
+		testing.expect(t, store_checkpoint(&store, &kernel))
+		checkpoint_version = store_checkpoint_version(&store)
+		pages_after_tail := store_page_count(&store)
+		testing.expectf(
+			t,
+			pages_after_tail - pages_after_checkpoint <= 2,
+			"tail checkpoint added %d pages",
+			pages_after_tail - pages_after_checkpoint,
+		)
+
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect_value(t, store_checkpoint_version(&store), checkpoint_version)
+	testing.expect(t, store_restore(&store, &kernel))
+	testing.expect_value(t, file_relation_rows(t, &kernel, "Kept"), 301)
+	testing.expect_value(t, file_relation_rows(t, &kernel, "Gone"), 0)
+}

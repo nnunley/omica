@@ -15,6 +15,7 @@ import r "../../mica/runtime"
 main :: proc() {
 	unit := ""
 	store_path := ""
+	checkpoint := false
 	paths: [dynamic]string
 	defer delete(paths)
 	arguments := os.args[1:]
@@ -26,6 +27,10 @@ main :: proc() {
 			}
 			unit = arguments[index + 1]
 			index += 1
+			continue
+		}
+		if arguments[index] == "--checkpoint" {
+			checkpoint = true
 			continue
 		}
 		if arguments[index] == "--store" {
@@ -64,6 +69,9 @@ main :: proc() {
 		if outcome.kind != .Complete {
 			result = r.Run_Result{ok = false, message = outcome.message}
 		}
+	}
+	if checkpoint && !r.world_checkpoint(world) {
+		result = r.Run_Result{ok = false, message = "checkpoint failed"}
 	}
 	r.world_destroy(world)
 	if result.ok {

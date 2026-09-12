@@ -3139,6 +3139,7 @@ assert Marker(#alice, :seed)
 				value = who,
 			}})
 			testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+			testing.expect(t, world_checkpoint(world))
 			world_destroy(world)
 		}
 		k.kernel_destroy(&kernel)
