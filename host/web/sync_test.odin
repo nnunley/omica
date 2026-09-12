@@ -14,6 +14,7 @@ import r "../../mica/runtime"
 @(private)
 Sync_Fixture_Host :: struct {
 	sync: Sync_Host,
+	auth: Auth,
 }
 
 @(private)
@@ -27,7 +28,14 @@ sync_fixture_handler :: proc(user: rawptr, request: ^Http_Request, response: ^Ht
 @(private)
 sync_fixture_stream :: proc(user: rawptr, request: ^Http_Request, socket: net.TCP_Socket) -> bool {
 	host := (^Sync_Fixture_Host)(user)
-	return sync_events_stream(&host.sync, v.Value(0), request, socket)
+	return sync_events_stream(
+		&host.sync,
+		v.Value(0),
+		&host.auth,
+		auth_request_token(request),
+		request,
+		socket,
+	)
 }
 
 // Reads until the accumulated bytes contain `needle` or the deadline passes.
@@ -226,6 +234,93 @@ end
 	response: Http_Response
 	testing.expect(t, sync_handle_request(&host, v.Value(0), &request, &response))
 	testing.expectf(t, response.status == 202, "status %d", response.status)
+}
+
+// A revoked session token must end its open SSE stream. Regression (I19): the
+// stream captured its identity at accept time and kept running after logout.
+@(test)
+test_sync_stream_ends_on_logout :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb sync_view_tree(view)
+  return dom <div id="mount"><span>hello</span></div>
+end
+`
+	path, path_ok := write_document_source(t, "mica_stream_logout.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "world start failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer r.world_destroy(world)
+	entry := r.world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
+
+	host: Sync_Fixture_Host
+	sync_host_init(&host.sync, world)
+	defer sync_host_destroy(&host.sync)
+	auth_init(&host.auth, context.temp_allocator)
+	defer auth_destroy(&host.auth)
+	actor, _ := v.value_identity_raw(0x3001)
+	testing.expect(t, auth_seed_user(&host.auth, "erin", "erin-pass", actor))
+	token := auth_create_session(&host.auth, actor)
+
+	server: Web_Server
+	ok, message := web_server_init(&server, "127.0.0.1:0", sync_fixture_handler, &host)
+	testing.expectf(t, ok, "server init failed: %s", message)
+	if !ok {
+		return
+	}
+	web_server_set_stream_handler(&server, sync_fixture_stream)
+	run_thread := thread.create_and_start_with_data(&server, server_run_worker)
+	if run_thread == nil {
+		return
+	}
+
+	client := dial_server(t, &server)
+	request := fmt.aprintf(
+		"GET /sync/events?session=9 HTTP/1.1\r\nHost: a\r\nCookie: %s=%s\r\n\r\n",
+		AUTH_COOKIE,
+		token,
+		allocator = context.temp_allocator,
+	)
+	send_text(client, request)
+	connected := read_until(client, ": connected", 3 * time.Second)
+	defer delete(connected)
+	testing.expectf(
+		t,
+		strings.contains(string(connected), ": connected"),
+		"connected: %q",
+		string(connected),
+	)
+
+	// Revoke the token; the stream must close rather than keep sending.
+	auth_revoke_session(&host.auth, token)
+	_ = net.set_option(client, .Receive_Timeout, 250 * time.Millisecond)
+	closed := false
+	buffer: [1024]u8
+	deadline := time.tick_now()
+	for time.tick_since(deadline) < 3 * time.Second {
+		read, recv_err := net.recv_tcp(client, buffer[:])
+		if read == 0 && recv_err == .None {
+			closed = true
+			break
+		}
+	}
+	testing.expect(t, closed, "stream stayed open after logout")
+
+	net.close(client)
+	web_server_stop(&server)
+	thread.join(run_thread)
+	thread.destroy(run_thread)
 }
 
 @(test)

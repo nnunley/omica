@@ -33,5 +33,12 @@ webhost_handle :: proc(user: rawptr, request: ^web.Http_Request, response: ^web.
 webhost_stream :: proc(user: rawptr, request: ^web.Http_Request, socket: net.TCP_Socket) -> bool {
 	host := (^Webhost)(user)
 	actor := web.auth_actor_for_request(&host.auth, request)
-	return web.sync_events_stream(&host.sync, actor, request, socket)
+	return web.sync_events_stream(
+		&host.sync,
+		actor,
+		&host.auth,
+		web.auth_request_token(request),
+		request,
+		socket,
+	)
 }

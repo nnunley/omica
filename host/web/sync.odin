@@ -242,6 +242,8 @@ sync_dispatch_dom_event :: proc(
 sync_events_stream :: proc(
 	host: ^Sync_Host,
 	actor: v.Value,
+	auth: ^Auth,
+	token: string,
 	request: ^Http_Request,
 	socket: net.TCP_Socket,
 ) -> bool {
@@ -298,6 +300,14 @@ sync_events_stream :: proc(
 	last_heartbeat := time.tick_now()
 	probe: [1]u8
 	for {
+		// A revoked or expired session token must end its stream too; the
+		// connection captured its identity at accept time, so re-validate.
+		if auth != nil && token != "" {
+			if _, valid := auth_actor(auth, token); !valid {
+				sync_session_close(session)
+				return true
+			}
+		}
 		batch, kind := sync_session_take(session, generation, 0)
 		switch kind {
 		case .Messages:

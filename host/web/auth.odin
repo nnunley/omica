@@ -156,6 +156,11 @@ auth_actor_for_request :: proc(auth: ^Auth, request: ^Http_Request) -> v.Value {
 	return actor
 }
 
+// Returns the session token carried by the request, or "" when absent.
+auth_request_token :: proc(request: ^Http_Request) -> string {
+	return auth_request_cookie(request, AUTH_COOKIE)
+}
+
 // Revokes a session token server-side. Logout must not rely on the browser
 // discarding its cookie: a copied token stays valid otherwise.
 auth_revoke_session :: proc(auth: ^Auth, token: string) {
