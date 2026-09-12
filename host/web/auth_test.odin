@@ -131,6 +131,52 @@ test_auth_login_request :: proc(t: ^testing.T) {
 	_ = get_response
 }
 
+// Logout must revoke the token server-side. Regression (SEC3): the handler
+// only cleared the browser cookie, so a copied token stayed valid.
+@(test)
+test_auth_logout_revokes_token :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	auth: Auth
+	auth_init(&auth, context.temp_allocator)
+	defer auth_destroy(&auth)
+
+	actor, _ := v.value_identity_raw(0x2004)
+	testing.expect(t, auth_seed_user(&auth, "dave", "dave-pass", actor))
+
+	login := Http_Request{method = "POST", target = "/auth/login"}
+	login.body = as_bytes("login=dave&password=dave-pass")
+	login_response: Http_Response
+	testing.expect(t, auth_handle(&auth, &login, &login_response))
+	testing.expect_value(t, login_response.status, 303)
+
+	cookie := ""
+	for header in login_response.headers {
+		if header.name == "Set-Cookie" {
+			cookie = header.value
+		}
+	}
+	token := strings.split(cookie, "=", context.temp_allocator)[1]
+	token = strings.split(token, ";", context.temp_allocator)[0]
+	resolved, has_actor := auth_actor(&auth, token)
+	testing.expect(t, has_actor)
+	testing.expect_value(t, resolved, actor)
+
+	logout := Http_Request{method = "POST", target = "/auth/logout"}
+	logout.headers = make([]Http_Header, 1, context.temp_allocator)
+	logout.headers[0] = Http_Header {
+		"Cookie",
+		strings.concatenate([]string{AUTH_COOKIE, "=", token}, context.temp_allocator),
+	}
+	logout_response: Http_Response
+	testing.expect(t, auth_handle(&auth, &logout, &logout_response))
+	testing.expect_value(t, logout_response.status, 303)
+
+	// The token no longer resolves, and a request presenting it is anonymous.
+	_, still := auth_actor(&auth, token)
+	testing.expect(t, !still)
+	testing.expect(t, auth_actor_for_request(&auth, &logout) == v.Value(0))
+}
+
 @(test)
 test_sync_render_uses_session_actor :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)

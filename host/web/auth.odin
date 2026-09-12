@@ -156,6 +156,17 @@ auth_actor_for_request :: proc(auth: ^Auth, request: ^Http_Request) -> v.Value {
 	return actor
 }
 
+// Revokes a session token server-side. Logout must not rely on the browser
+// discarding its cookie: a copied token stays valid otherwise.
+auth_revoke_session :: proc(auth: ^Auth, token: string) {
+	if token == "" {
+		return
+	}
+	sync.mutex_lock(&auth.lock)
+	delete_key(&auth.sessions, token)
+	sync.mutex_unlock(&auth.lock)
+}
+
 @(private)
 auth_request_cookie :: proc(request: ^Http_Request, name: string) -> string {
 	for header in request.headers {
@@ -247,6 +258,9 @@ auth_handle :: proc(auth: ^Auth, request: ^Http_Request, response: ^Http_Respons
 		)
 		return true
 	case "/auth/logout":
+		// End the session server-side as well; the browser discarding its
+		// cookie does not invalidate a token someone else may hold.
+		auth_revoke_session(auth, auth_request_cookie(request, AUTH_COOKIE))
 		response.status = 303
 		response.headers = make([]Http_Header, 2, context.temp_allocator)
 		response.headers[0] = Http_Header{"Location", "/mud"}
