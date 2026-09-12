@@ -415,3 +415,60 @@ test_scheduler_external_request :: proc(t: ^testing.T) {
 	testing.expect(t, value_ok)
 	testing.expect_value(t, value, i64(99))
 }
+
+// Two delayed tasks must both wake: the timer service must remove the timer it
+// selected, not the last entry.
+@(test)
+test_scheduler_multiple_timers :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program_a := compile_task_program(t, proc(builder: ^vm.Builder) {
+		delay := vm.builder_add_constant(builder, value_int_must(50))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
+		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+	program_b := compile_task_program(t, proc(builder: ^vm.Builder) {
+		delay := vm.builder_add_constant(builder, value_int_must(100))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
+		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
+		vm.builder_emit(builder, .Return, 0, 0, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 2})
+	defer scheduler_destroy(&scheduler)
+
+	id_a := scheduler_submit(&scheduler, scheduler_task(program_a, &kernel))
+	id_b := scheduler_submit(&scheduler, scheduler_task(program_b, &kernel))
+
+	time.sleep(200 * time.Millisecond)
+
+	done_a := false
+	done_b := false
+	sync.mutex_lock(&scheduler.lock)
+	if entry, ok := scheduler.entries[id_a]; ok {
+		done_a = entry.done
+	}
+	if entry, ok := scheduler.entries[id_b]; ok {
+		done_b = entry.done
+	}
+	sync.mutex_unlock(&scheduler.lock)
+
+	testing.expect(t, done_a)
+	testing.expect(t, done_b)
+
+	// Cancel anything still parked so destroy does not wait on it.
+	if !done_a {
+		_ = scheduler_cancel(&scheduler, id_a)
+	}
+	if !done_b {
+		_ = scheduler_cancel(&scheduler, id_b)
+	}
+}

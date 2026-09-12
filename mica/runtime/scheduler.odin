@@ -965,7 +965,12 @@ scheduler_worker_proc :: proc(data: rawptr) {
 			return
 		}
 		id := pop(&scheduler.ready)
-		entry := scheduler.entries[id]
+		entry, found := scheduler.entries[id]
+		if !found || entry.done || entry.running {
+			// A stale or duplicate wakeup; skip it.
+			sync.mutex_unlock(&scheduler.lock)
+			continue
+		}
 		entry.running = true
 		sync.mutex_unlock(&scheduler.lock)
 
@@ -1047,7 +1052,8 @@ scheduler_timer_proc :: proc(data: rawptr) {
 			continue
 		}
 
-		pop(&scheduler.timers)
+		// Remove the timer we selected, not the last (unsorted pop) entry.
+		ordered_remove(&scheduler.timers, 0)
 		entry, found := scheduler.entries[next.task_id]
 		if found && !entry.done && entry.generation == next.generation {
 			if entry.result.suspend == .Mailbox_Recv {
