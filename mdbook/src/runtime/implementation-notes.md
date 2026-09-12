@@ -21,6 +21,9 @@ implementation; they are collected here.
   compilation tier.
 - The HTTP/1.1 + SSE host in `host/web` serves the browser client. There is no
   WebTransport or ZeroMQ transport.
+- The LLM host bridge (`llm_responses_stream`, `llm_chat_stream_to`) is not
+  implemented in this port. The agent app shell loads, but model calls raise
+  `E_NOT_IMPLEMENTED` (issue #8).
 - Committed effects are recorded; delivery is the host's responsibility.
 - `world_eval` compiles source against a live world for command-line use, which
   recompiles the stored sources with their top-level expressions removed.

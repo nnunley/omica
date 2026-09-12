@@ -55,14 +55,15 @@ The MUD app is described in more detail in [`mud/README.md`](./mud/README.md).
 ## Agent Web App
 
 The agent web app is a coding agent shell that reuses the MUD's sync and tool-window patterns for a
-transcript, workspace, inspector, and command bar. Run it with:
+transcript, workspace, inspector, and command bar.
 
-```sh
-scripts/agent.sh
-```
+> **Not implemented in the Odin port.** The LLM host bridge
+> (`llm_responses_stream` / `llm_chat_stream_to`) does not exist here, so the shell loads but cannot
+> call a model: those verbs raise `E_NOT_IMPLEMENTED`. The `scripts/agent.sh` runner and
+> `mica-daemon` instructions below belong to the Rust implementation. See issue
+> [#8](https://github.com/rdaum/omica/issues/8).
 
-Open the printed `/agent` URL in a browser. The shell is described in more detail in
-[`agent/README.md`](./agent/README.md).
+The shell is described in more detail in [`agent/README.md`](./agent/README.md).
 
 ## MUD Telnet
 
