@@ -7,11 +7,14 @@
 #   scripts/test.sh tsan         # unit tests under ThreadSanitizer
 #   scripts/test.sh all          # unit + integration
 #
-# Every external command runs under a timeout (GNU `timeout` or a portable
-# fallback), so a hang fails the step instead of blocking the run. A run fails
-# on a test failure, a crash, a tracking allocator "bad free", or a
-# ThreadSanitizer report. Leaks are reported in the log summary; set
-# STRICT_LEAKS=1 to fail on them too (there is a known backlog of
+# Every external command runs under a wall-clock limit (GNU `timeout`/`gtimeout`
+# when present, otherwise a portable background-watchdog fallback) and its
+# output is captured to a file, so a hang is reported as a failure instead of
+# blocking the run. The watchdog kills the whole process tree, not just the
+# direct child, so a test binary cannot outlive its compiler and hold the run
+# open. A run fails on a test failure, a crash, a tracking allocator "bad free",
+# a timeout, or a ThreadSanitizer report. Leaks are reported in the log summary;
+# set STRICT_LEAKS=1 to fail on them too (there is a known backlog of
 # parser/lexer/builder leaks).
 #
 # Portable across Linux and macOS: no GNU-only utilities.
@@ -19,8 +22,9 @@
 # Environment:
 #   ODIN_BIN       Odin compiler (default: `odin` on PATH, else ../odin-setup/odin)
 #   STRICT_LEAKS   set to 1 to fail on any tracking-allocator leak
-#   TEST_TIMEOUT   per-command timeout in seconds (default 300)
+#   TEST_TIMEOUT   per-command timeout in seconds (default 120)
 #   TSAN_TIMEOUT   per-package ThreadSanitizer timeout in seconds (default 1200)
+#   PORTABLE_TIMEOUT  set to 1 to force the portable timeout fallback
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,25 +43,33 @@ packages=(mica/var mica/kernel mica/vm mica/compiler mica/runtime mica/dom mica/
 bin_dir="${repo_root}/.cache/test-bin"
 log_dir="${repo_root}/.cache/test-logs"
 strict_leaks="${STRICT_LEAKS:-0}"
-test_timeout="${TEST_TIMEOUT:-300}"
+test_timeout="${TEST_TIMEOUT:-120}"
 tsan_timeout="${TSAN_TIMEOUT:-1200}"
 fail=0
 cleanup_pids=()
 cleanup_paths=()
 
-# Terminates a process and any children, escalating to SIGKILL.
+# Sends `sig` to a process and every descendant, grandchildren first.
+kill_tree() {
+  local sig="$1" pid="$2" child
+  [[ -n "${pid}" ]] || return 0
+  for child in $(pgrep -P "${pid}" 2>/dev/null || true); do
+    kill_tree "${sig}" "${child}"
+  done
+  kill -s "${sig}" "${pid}" 2>/dev/null || true
+}
+
+# Terminates a process tree, escalating to SIGKILL.
 stop_process() {
   local pid="$1"
   [[ -n "${pid}" ]] || return 0
-  kill -TERM "${pid}" 2>/dev/null || true
-  pkill -P "${pid}" 2>/dev/null || true
+  kill_tree TERM "${pid}"
   local i
   for ((i = 0; i < 50; i++)); do
     kill -0 "${pid}" 2>/dev/null || return 0
     sleep 0.1
   done
-  kill -KILL "${pid}" 2>/dev/null || true
-  pkill -KILL -P "${pid}" 2>/dev/null || true
+  kill_tree KILL "${pid}"
 }
 
 # Kills leftover servers and removes temp dirs, including on interrupt.
@@ -101,16 +113,20 @@ mud_fileins=(
   apps/mud/http.mica
 )
 
-# Runs "$@" with a wall-clock limit, using GNU `timeout`/`gtimeout` when
-# present and a portable Background+watchdog fallback otherwise (macOS).
+# Runs "$@" with a wall-clock limit. GNU timeout/gtimeout knows to kill the
+# child's process group; the portable fallback runs the command in the
+# background and a watchdog kills the whole tree on expiry. The caller is
+# expected to redirect output to a file, never capture it with $(...), so a
+# lingering process cannot hold the run open. Set PORTABLE_TIMEOUT=1 to force
+# the fallback (used to exercise it on Linux).
 run_timeout() {
   local secs="$1"
   shift
-  if command -v timeout >/dev/null 2>&1; then
+  if [[ "${PORTABLE_TIMEOUT:-0}" != "1" ]] && command -v timeout >/dev/null 2>&1; then
     timeout "${secs}" "$@"
     return $?
   fi
-  if command -v gtimeout >/dev/null 2>&1; then
+  if [[ "${PORTABLE_TIMEOUT:-0}" != "1" ]] && command -v gtimeout >/dev/null 2>&1; then
     gtimeout "${secs}" "$@"
     return $?
   fi
@@ -118,15 +134,23 @@ run_timeout() {
   local pid=$!
   (
     sleep "${secs}"
-    kill -TERM "${pid}" 2>/dev/null || true
-    sleep 2
-    kill -KILL "${pid}" 2>/dev/null || true
+    stop_process "${pid}"
   ) &
   local watchdog=$!
   local rc=0
   wait "${pid}" || rc=$?
-  kill -TERM "${watchdog}" 2>/dev/null || true
+  kill -s TERM "${watchdog}" 2>/dev/null || true
   wait "${watchdog}" 2>/dev/null || true
+  return "${rc}"
+}
+
+# Runs a command under the timeout, sending combined output to `${log}` and
+# returning the command's exit status.
+capture() {
+  local log="$1" secs="$2"
+  shift 2
+  local rc=0
+  run_timeout "${secs}" "$@" >"${log}" 2>&1 || rc=$?
   return "${rc}"
 }
 
@@ -143,20 +167,22 @@ note() { printf '\n== %s\n' "$*"; }
 pass() { echo "ok   $*"; }
 problem() { echo "FAIL $*"; fail=1; }
 
-# Saves output and decides pass/fail for one test target.
+# Classifies one already-captured test log.
 inspect() {
-  local label="$1" out="$2"
-  local log="${log_dir}/$(slugify "${label}").log"
-  printf '%s\n' "${out}" > "${log}"
+  local label="$1" log="$2" rc="$3"
   local bad leaks
-  bad="$(grep -c '+++ bad free' <<<"${out}" || true)"
-  leaks="$(grep -c '+++ leak' <<<"${out}" || true)"
-  if grep -qE "test failed|Signal caught|\[FATAL\]" <<<"${out}"; then
+  bad="$(grep -ac '+++ bad free' "${log}" || true)"
+  leaks="$(grep -ac '+++ leak' "${log}" || true)"
+  if [[ "${rc}" -eq 124 || "${rc}" -eq 137 || "${rc}" -eq 143 ]]; then
+    problem "${label}: timed out or killed (rc=${rc}) (${log})"
+  elif [[ "${rc}" -ne 0 ]]; then
+    problem "${label}: test failure (rc=${rc}) (${log})"
+    grep -aE "test failed|\[ERROR\]|^ - " "${log}" | head -20 || true
+  elif grep -qaE "test failed|Signal caught|\[FATAL\]" "${log}"; then
     problem "${label}: test failure (${log})"
-    grep -E "^ - |\[ERROR\]" <<<"${out}" | head -20 || true
+    grep -aE "^ - |\[ERROR\]" "${log}" | head -20 || true
   elif [[ "${bad}" -gt 0 ]]; then
     problem "${label}: ${bad} bad free(s) (${log})"
-    grep '+++ bad free' <<<"${out}" | head -5 || true
   elif [[ "${strict_leaks}" == "1" && "${leaks}" -gt 0 ]]; then
     problem "${label}: ${leaks} leak(s) (${log})"
   else
@@ -166,10 +192,12 @@ inspect() {
 
 run_unit() {
   note "unit tests"
+  local pkg log rc
   for pkg in "${packages[@]}"; do
-    local out
-    out="$(run_timeout "${test_timeout}" "${odin_bin}" test "${pkg}" 2>&1)" || true
-    inspect "unit:${pkg}" "${out}"
+    log="${log_dir}/$(slugify "unit:${pkg}").log"
+    rc=0
+    capture "${log}" "${test_timeout}" "${odin_bin}" test "${pkg}" || rc=$?
+    inspect "unit:${pkg}" "${log}" "${rc}"
   done
 }
 
@@ -179,32 +207,33 @@ run_tsan() {
     echo "missing ${supp}" >&2
     exit 1
   fi
+  export TSAN_OPTIONS="suppressions=${supp}"
   note "ThreadSanitizer unit tests"
+  local pkg log rc races
   for pkg in "${packages[@]}"; do
     # One test thread avoids cross-test address-reuse false positives; the
     # kernel/runtime internal concurrency tests still run.
-    local out
-    out="$(TSAN_OPTIONS="suppressions=${supp}" \
-      run_timeout "${tsan_timeout}" "${odin_bin}" test "${pkg}" \
-      -sanitize:thread -define:ODIN_TEST_THREADS=1 2>&1)" || true
-    local log="${log_dir}/$(slugify "tsan:${pkg}").log"
-    printf '%s\n' "${out}" > "${log}"
-    local races
-    races="$(grep -c 'SUMMARY: ThreadSanitizer' <<<"${out}" || true)"
-    if grep -qE "test failed|Signal caught|\[FATAL\]" <<<"${out}"; then
-      problem "tsan:${pkg}: test failure (${log})"
+    log="${log_dir}/$(slugify "tsan:${pkg}").log"
+    rc=0
+    capture "${log}" "${tsan_timeout}" "${odin_bin}" test "${pkg}" \
+      -sanitize:thread -define:ODIN_TEST_THREADS=1 || rc=$?
+    races="$(grep -ac 'SUMMARY: ThreadSanitizer' "${log}" || true)"
+    if [[ "${rc}" -ne 0 ]]; then
+      problem "tsan:${pkg}: test failure (rc=${rc}) (${log})"
     elif [[ "${races}" -gt 0 ]]; then
       problem "tsan:${pkg}: ${races} race report(s) (${log})"
-      grep 'SUMMARY: ThreadSanitizer' <<<"${out}" | sed -E 's/.* in //' \
+      grep -a 'SUMMARY: ThreadSanitizer' "${log}" | sed -E 's/.* in //' \
         | sort | uniq -c | sort -rn | head -5
     else
       pass "tsan:${pkg}"
     fi
   done
+  unset TSAN_OPTIONS
 }
 
 build_tools() {
   note "build tools"
+  local tool
   for tool in filein repl webhost parse_corpus; do
     if run_timeout "${test_timeout}" "${odin_bin}" build "tools/${tool}" \
       -out:"${bin_dir}/${tool}"; then
@@ -283,9 +312,10 @@ run_integration() {
   else
     problem "integration:filein-load"
   fi
+  capture "${tmp}/eval.log" "${test_timeout}" "${filein}" --store "${tmp}/db" \
+    --eval 'return ReadyForUse(#sensor_17)' || true
   local out
-  out="$(run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db" \
-    --eval 'return ReadyForUse(#sensor_17)' 2>&1 || true)"
+  out="$(cat "${tmp}/eval.log")"
   if [[ "${out}" == "true" || "${out}" == "false" ]]; then
     pass "integration:filein-eval"
   else
@@ -321,8 +351,9 @@ run_integration() {
     --checkpoint "${tmp}/color.mica" >/dev/null
   run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db2" \
     --eval 'assert Color(:red)' >/dev/null
-  out="$(run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db2" \
-    --eval 'return Color(:red)' 2>&1 || true)"
+  capture "${tmp}/mutation.log" "${test_timeout}" "${filein}" --store "${tmp}/db2" \
+    --eval 'return Color(:red)' || true
+  out="$(cat "${tmp}/mutation.log")"
   if [[ "${out}" == "true" ]]; then
     pass "integration:store-mutation"
   else
@@ -330,13 +361,13 @@ run_integration() {
   fi
 
   # REPL evaluates a line.
-  local repl_out
-  repl_out="$(printf '1 + 1\n' | run_timeout 30 "${repl}" 2>&1 || true)"
-  if grep -q "mica> 2" <<<"${repl_out}"; then
+  printf '1 + 1\n' > "${tmp}/repl.in"
+  capture "${tmp}/repl.log" 30 "${repl}" < "${tmp}/repl.in" || true
+  if grep -q "mica> 2" "${tmp}/repl.log"; then
     pass "integration:repl"
   else
     problem "integration:repl"
-    printf '%s\n' "${repl_out}" | tail -5
+    tail -5 "${tmp}/repl.log" || true
   fi
 
   if ! command -v curl >/dev/null 2>&1; then
