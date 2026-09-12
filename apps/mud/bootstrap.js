@@ -1,5 +1,20 @@
 import { bootstrapServerRenderedSync } from "/sync-client.js?surface=mud";
-window.micaMud = bootstrapServerRenderedSync(document.getElementById("mount"));
+
+// Development status readout: shows sync status and uncaught errors.
+const syncStatus = document.createElement("div");
+syncStatus.id = "sync-status";
+syncStatus.style.cssText =
+    "position:fixed;bottom:4px;right:6px;font:11px ui-monospace,monospace;" +
+    "color:#9fe8b0;background:rgba(0,0,0,.55);padding:2px 6px;border-radius:4px;z-index:99999";
+syncStatus.textContent = "sync: starting";
+document.addEventListener("DOMContentLoaded", () => document.body.append(syncStatus));
+window.addEventListener("error", (event) => {
+    syncStatus.textContent = `error: ${event.message ?? event.error}`;
+});
+window.addEventListener("unhandledrejection", (event) => {
+    syncStatus.textContent = `rejection: ${event.reason}`;
+});
+window.micaMud = bootstrapServerRenderedSync(document.getElementById("mount"), syncStatus);
 
 const HOLD_TO_EXAMINE_MS = 520;
 const RIGHT_COLUMN_WIDTH_KEY = "micaMudRightColumnWidth";
