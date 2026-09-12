@@ -640,15 +640,23 @@ store_writer_proc :: proc(data: rawptr) {
 		if durable && store.mode == .File && store.kernel != nil &&
 		   store.checkpoint_bytes > 0 &&
 		   sync.atomic_load(&store.wal_bytes_since_checkpoint) >= store.checkpoint_bytes {
-			if !store_checkpoint_internal(store, store.kernel, false) {
-				// Do not silently continue after a failed automatic
-				// checkpoint: mark the store failed so later commits are
-				// refused and `.Strict` cannot report success.
-				sync.mutex_lock(&store.lock)
-				store.failed = true
-				store.last_error = "automatic checkpoint failed"
-				sync.cond_broadcast(&store.cond)
-				sync.mutex_unlock(&store.lock)
+			// Serialize with manual checkpoints without blocking: if a manual
+			// checkpoint holds the lock, skip this automatic one and retry on
+			// the next batch. Blocking here could deadlock a manual checkpoint
+			// that is waiting for the writer to advance durability.
+			if sync.mutex_try_lock(&store.checkpoint_lock) {
+				ok := store_checkpoint_internal(store, store.kernel, false)
+				sync.mutex_unlock(&store.checkpoint_lock)
+				if !ok {
+					// Do not silently continue after a failed automatic
+					// checkpoint: mark the store failed so later commits are
+					// refused and `.Strict` cannot report success.
+					sync.mutex_lock(&store.lock)
+					store.failed = true
+					store.last_error = "automatic checkpoint failed"
+					sync.cond_broadcast(&store.cond)
+					sync.mutex_unlock(&store.lock)
+				}
 			}
 		}
 	}
