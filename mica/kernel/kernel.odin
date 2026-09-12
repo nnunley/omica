@@ -64,6 +64,9 @@ Kernel :: struct {
 
 	// Bounded window of committed fact changes for subscriptions.
 	changes: Change_Feed,
+
+	// Optional durable store hooks. Zero value means in-memory only.
+	store: Store_Hooks,
 }
 
 // A pool of reset-able virtual arenas shared by transactions, snapshots, and
@@ -382,6 +385,9 @@ PUBLISH_ATTEMPT_LIMIT :: 64
 // A prepared commit waiting for a group publication.
 Commit_Entry :: struct {
 	transaction: ^Transaction,
+	// Durable budget reservation from admission; consumed by the store on
+	// successful publication.
+	ticket: Persist_Ticket,
 	// The snapshot the candidate was prepared against, retained by the owner.
 	base:      ^Snapshot,
 	candidate: ^Snapshot,
@@ -461,6 +467,14 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 					entry.candidate.version,
 					entry.transaction.writes[:],
 				)
+				kernel_store_persist(
+					kernel,
+					entry.ticket,
+					entry.candidate.version,
+					entry.candidate,
+					entry.transaction.writes[:],
+				)
+				entry.ticket = 0
 				return
 			}
 			winner := kernel_snapshot(kernel)
@@ -523,6 +537,16 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 				merged.version,
 				merged_writes[:],
 			)
+			for entry in batch {
+				kernel_store_persist(
+					kernel,
+					entry.ticket,
+					merged.version,
+					merged,
+					entry.transaction.writes[:],
+				)
+				entry.ticket = 0
+			}
 			snapshot_release(base)
 			return
 		}

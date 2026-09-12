@@ -1609,6 +1609,8 @@ kernel_error_code :: proc(err: k.Kernel_Error) -> string {
 		return "E_READ_ONLY"
 	case .Conflict:
 		return "E_CONFLICT"
+	case .Overloaded:
+		return "E_OVERLOADED"
 	case .Duplicate_Relation_Name, .Invalid_Metadata:
 		return "E_METADATA"
 	case .No_Such_Rule, .Unstratified_Negation, .Unsafe_Negation, .Unsafe_Guard, .Unbound_Head_Variable:

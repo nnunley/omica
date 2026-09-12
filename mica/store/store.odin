@@ -1,0 +1,375 @@
+// Durable store spine: budget admission, a version-ordered writer, and a
+// memory-backed WAL. File-backed pages and checkpoints build on this.
+package store
+
+import "core:mem"
+import "core:mem/virtual"
+import "core:sync"
+import "core:thread"
+import "core:time"
+import k "../kernel"
+import v "../var"
+
+Store_Mode :: enum {
+	// Records are kept in memory; no file is written.
+	Memory,
+}
+
+Store_Options :: struct {
+	mode:         Store_Mode,
+	budget_bytes: i64,
+	warn_after:   time.Duration,
+	timeout:      time.Duration,
+}
+
+DEFAULT_STORE_BUDGET_BYTES :: i64(128) << 20
+DEFAULT_STORE_WARN_AFTER :: 2 * time.Second
+DEFAULT_STORE_TIMEOUT :: 10 * time.Second
+
+// One persisted fact change.
+Wal_Write :: struct {
+	relation: k.Relation_ID,
+	assert:   bool,
+	tuple:    v.Tuple,
+}
+
+// One persisted catalogue change.
+Wal_Catalog :: struct {
+	metadata: k.Relation_Metadata,
+}
+
+// A durable write-ahead record for one published version.
+Wal_Record :: struct {
+	version: u64,
+	writes:  []Wal_Write,
+	catalog: []Wal_Catalog,
+}
+
+@(private)
+Queue_Entry :: struct {
+	version: u64,
+	ticket:  k.Persist_Ticket,
+	bytes:   i64,
+	writes:  []Wal_Write,
+	catalog: []Wal_Catalog,
+}
+
+Store :: struct {
+	mode:      Store_Mode,
+	allocator: mem.Allocator,
+
+	lock: sync.Mutex,
+	cond: sync.Cond,
+
+	budget_bytes:   i64,
+	reserved_bytes: i64,
+	tickets:        map[k.Persist_Ticket]i64,
+	next_ticket:    k.Persist_Ticket,
+
+	queue:   [dynamic]Queue_Entry,
+	records: [dynamic]Wal_Record,
+	known:   map[k.Relation_ID]bool,
+	durable: u64,
+
+	warn_after: time.Duration,
+	timeout:    time.Duration,
+
+	// Owns deep copies of queued and recorded facts; reset on destroy.
+	arena:          ^virtual.Arena,
+	copy_allocator: mem.Allocator,
+
+	thread: ^thread.Thread,
+	stop:   bool,
+	closed: bool,
+}
+
+// Initialises a memory store. Zero options use the defaults.
+store_init :: proc(store: ^Store, options := Store_Options{}) {
+	store.mode = options.mode
+	store.allocator = context.allocator
+	store.budget_bytes = options.budget_bytes
+	if store.budget_bytes <= 0 {
+		store.budget_bytes = DEFAULT_STORE_BUDGET_BYTES
+	}
+	store.warn_after = options.warn_after
+	if store.warn_after <= 0 {
+		store.warn_after = DEFAULT_STORE_WARN_AFTER
+	}
+	store.timeout = options.timeout
+	if store.timeout <= 0 {
+		store.timeout = DEFAULT_STORE_TIMEOUT
+	}
+	store.tickets = make(map[k.Persist_Ticket]i64, store.allocator)
+	store.known = make(map[k.Relation_ID]bool, store.allocator)
+	store.queue = make([dynamic]Queue_Entry, store.allocator)
+	store.records = make([dynamic]Wal_Record, store.allocator)
+	// Ticket zero means "no reservation"; real tickets start at one.
+	store.next_ticket = 1
+
+	store.arena = new(virtual.Arena, store.allocator)
+	if error := virtual.arena_init_growing(store.arena); error != nil {
+		panic("failed to initialize store arena")
+	}
+	store.copy_allocator = virtual.arena_allocator(store.arena)
+
+	store.thread = thread.create_and_start_with_data(store, store_writer_proc)
+	if store.thread == nil {
+		panic("failed to start store writer thread")
+	}
+}
+
+store_destroy :: proc(store: ^Store) {
+	sync.mutex_lock(&store.lock)
+	store.stop = true
+	store.closed = true
+	sync.cond_broadcast(&store.cond)
+	sync.mutex_unlock(&store.lock)
+
+	if store.thread != nil {
+		thread.join(store.thread)
+		thread.destroy(store.thread)
+		store.thread = nil
+	}
+
+	delete(store.tickets)
+	delete(store.known)
+	delete(store.queue)
+	delete(store.records)
+	if store.arena != nil {
+		virtual.arena_destroy(store.arena)
+		free(store.arena, store.allocator)
+		store.arena = nil
+	}
+}
+
+// Attaches the store to a kernel so commits admit and publish into it.
+store_attach :: proc(store: ^Store, kernel: ^k.Kernel) {
+	k.kernel_attach_store(kernel, store_hooks(store))
+}
+
+store_hooks :: proc(store: ^Store) -> k.Store_Hooks {
+	return k.Store_Hooks {
+		user             = store,
+		admit            = store_admit_hook,
+		release          = store_release_hook,
+		publish          = store_publish_hook,
+		wait_durable     = store_wait_durable_hook,
+		durable_version  = store_durable_version_hook,
+	}
+}
+
+// Blocks until `version` is durable.
+store_wait_durable :: proc(store: ^Store, version: u64) {
+	sync.mutex_lock(&store.lock)
+	for store.durable < version && !store.closed {
+		sync.cond_wait(&store.cond, &store.lock)
+	}
+	sync.mutex_unlock(&store.lock)
+}
+
+store_durable_version :: proc(store: ^Store) -> u64 {
+	sync.mutex_lock(&store.lock)
+	defer sync.mutex_unlock(&store.lock)
+	return store.durable
+}
+
+store_reserved_bytes :: proc(store: ^Store) -> i64 {
+	sync.mutex_lock(&store.lock)
+	defer sync.mutex_unlock(&store.lock)
+	return store.reserved_bytes
+}
+
+store_record_count :: proc(store: ^Store) -> int {
+	sync.mutex_lock(&store.lock)
+	defer sync.mutex_unlock(&store.lock)
+	return len(store.records)
+}
+
+// --- Hooks ------------------------------------------------------------------
+
+@(private)
+store_admit_hook :: proc(user: rawptr, bytes: i64) -> (k.Persist_Ticket, bool) {
+	store := (^Store)(user)
+	if bytes <= 0 {
+		return 0, true
+	}
+
+	sync.mutex_lock(&store.lock)
+	defer sync.mutex_unlock(&store.lock)
+	deadline := time.tick_add(time.tick_now(), store.timeout)
+	for store.reserved_bytes + bytes > store.budget_bytes && !store.closed {
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 {
+			return 0, false
+		}
+		sync.cond_wait_with_timeout(&store.cond, &store.lock, remaining)
+	}
+	if store.closed {
+		return 0, false
+	}
+	ticket := store.next_ticket
+	store.next_ticket += 1
+	store.tickets[ticket] = bytes
+	store.reserved_bytes += bytes
+	return ticket, true
+}
+
+@(private)
+store_release_hook :: proc(user: rawptr, ticket: k.Persist_Ticket) {
+	store := (^Store)(user)
+	if ticket == 0 {
+		return
+	}
+	sync.mutex_lock(&store.lock)
+	if bytes, found := store.tickets[ticket]; found {
+		delete_key(&store.tickets, ticket)
+		store.reserved_bytes -= bytes
+		sync.cond_broadcast(&store.cond)
+	}
+	sync.mutex_unlock(&store.lock)
+}
+
+// Copies the published writes and any new catalogue entries, then queues them
+// for the writer. Runs on the committing thread; it only copies memory.
+@(private)
+store_publish_hook :: proc(
+	user: rawptr,
+	ticket: k.Persist_Ticket,
+	version: u64,
+	snapshot: ^k.Snapshot,
+	writes: []k.Relation_Writes,
+) {
+	store := (^Store)(user)
+	entry := Queue_Entry{version = version, ticket = ticket}
+
+	writes_list: [dynamic]Wal_Write
+	for relation_writes in writes {
+		metadata, found := k.snapshot_relation_metadata(snapshot, relation_writes.relation)
+		if !found || metadata.durability == .Volatile {
+			continue
+		}
+		for write in relation_writes.entries {
+			append(&writes_list, Wal_Write {
+				relation = relation_writes.relation,
+				assert   = write.kind == .Assert,
+				tuple    = v.tuple_deep_copy(store.copy_allocator, write.tuple),
+			})
+		}
+	}
+	if len(writes_list) > 0 {
+		entry.writes = make([]Wal_Write, len(writes_list), store.copy_allocator)
+		copy(entry.writes, writes_list[:])
+		delete(writes_list)
+	}
+
+	// New relations are rare; a full catalogue comparison keeps the kernel
+	// side simple. This is the place to pass created relations explicitly if
+	// the scan ever shows up on a hot path.
+	catalog_list: [dynamic]Wal_Catalog
+	for metadata in snapshot.catalog {
+		if metadata.durability == .Volatile {
+			continue
+		}
+		sync.mutex_lock(&store.lock)
+		known := store.known[metadata.id]
+		sync.mutex_unlock(&store.lock)
+		if known {
+			continue
+		}
+		append(&catalog_list, Wal_Catalog{metadata = clone_metadata(store.copy_allocator, metadata)})
+	}
+	if len(catalog_list) > 0 {
+		entry.catalog = make([]Wal_Catalog, len(catalog_list), store.copy_allocator)
+		copy(entry.catalog, catalog_list[:])
+		delete(catalog_list)
+	}
+
+	sync.mutex_lock(&store.lock)
+	if bytes, found := store.tickets[ticket]; found {
+		entry.bytes = bytes
+		delete_key(&store.tickets, ticket)
+	}
+	for catalog in entry.catalog {
+		store.known[catalog.metadata.id] = true
+	}
+	append(&store.queue, entry)
+	sync.cond_broadcast(&store.cond)
+	sync.mutex_unlock(&store.lock)
+}
+
+@(private)
+store_wait_durable_hook :: proc(user: rawptr, version: u64) {
+	store_wait_durable((^Store)(user), version)
+}
+
+@(private)
+store_durable_version_hook :: proc(user: rawptr) -> u64 {
+	store := (^Store)(user)
+	sync.mutex_lock(&store.lock)
+	defer sync.mutex_unlock(&store.lock)
+	return store.durable
+}
+
+// --- Writer -----------------------------------------------------------------
+
+@(private)
+store_writer_proc :: proc(data: rawptr) {
+	store := (^Store)(data)
+	for {
+		sync.mutex_lock(&store.lock)
+		for len(store.queue) == 0 && !store.stop {
+			sync.cond_wait(&store.cond, &store.lock)
+		}
+		if len(store.queue) == 0 && store.stop {
+			sync.mutex_unlock(&store.lock)
+			return
+		}
+		entry := store.queue[0]
+		ordered_remove(&store.queue, 0)
+		sync.mutex_unlock(&store.lock)
+
+		// Memory mode: the record itself is the durable artifact.
+		record := Wal_Record {
+			version = entry.version,
+			writes  = entry.writes,
+			catalog = entry.catalog,
+		}
+
+		sync.mutex_lock(&store.lock)
+		append(&store.records, record)
+		if entry.version > store.durable {
+			store.durable = entry.version
+		}
+		store.reserved_bytes -= entry.bytes
+		sync.cond_broadcast(&store.cond)
+		sync.mutex_unlock(&store.lock)
+	}
+}
+
+// --- Copies -----------------------------------------------------------------
+
+@(private)
+clone_metadata :: proc(
+	allocator: mem.Allocator,
+	metadata: k.Relation_Metadata,
+) -> k.Relation_Metadata {
+	result := metadata
+	if len(metadata.argument_names) > 0 {
+		result.argument_names = make([]v.Symbol, len(metadata.argument_names), allocator)
+		copy(result.argument_names, metadata.argument_names)
+	}
+	if len(metadata.indexes) > 0 {
+		result.indexes = make([]k.Index_Spec, len(metadata.indexes), allocator)
+		for spec, index in metadata.indexes {
+			positions := make([]u16, len(spec.positions), allocator)
+			copy(positions, spec.positions)
+			result.indexes[index] = k.Index_Spec{positions = positions}
+		}
+	}
+	if len(metadata.conflict.key_positions) > 0 {
+		keys := make([]u16, len(metadata.conflict.key_positions), allocator)
+		copy(keys, metadata.conflict.key_positions)
+		result.conflict.key_positions = keys
+	}
+	return result
+}

@@ -494,6 +494,19 @@ TRANSACTION_RETRY_LIMIT :: 8
 transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Error) {
 	kernel := transaction.kernel
 
+	// Reserve durable capacity before the commit can publish. A store at its
+	// budget blocks here, and a timeout fails the transaction without
+	// publishing, so visible state never runs unboundedly ahead of the store.
+	persist_ticket: Persist_Ticket
+	persist_bytes := kernel_persist_bytes(transaction)
+	if persist_bytes > 0 {
+		admitted: bool
+		persist_ticket, admitted = kernel_admit_persist(kernel, persist_bytes)
+		if !admitted {
+			return nil, .Overloaded
+		}
+	}
+
 	write_stripes := transaction_write_stripes(transaction)
 	for present, stripe in write_stripes {
 		if present {
@@ -517,6 +530,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		if current.version != transaction.base.version {
 			if err := transaction_validate_conflicts(transaction, current); err != .None {
 				snapshot_release(current)
+				kernel_release_persist(kernel, persist_ticket)
 				return nil, err
 			}
 		}
@@ -529,6 +543,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		snapshot_retain(current)
 		entry := Commit_Entry {
 			transaction = transaction,
+			ticket      = persist_ticket,
 			base        = current,
 			candidate   = candidate,
 		}
@@ -545,6 +560,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		}
 	}
 	if published == nil {
+		kernel_release_persist(kernel, persist_ticket)
 		return nil, .Conflict
 	}
 	return published, .None

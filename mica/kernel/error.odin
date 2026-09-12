@@ -17,4 +17,6 @@ Kernel_Error :: enum {
 	Unsafe_Guard,
 	Unbound_Head_Variable,
 	Read_Only,
+	// The durable store refused admission; the transaction did not publish.
+	Overloaded,
 }
