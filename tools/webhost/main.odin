@@ -165,6 +165,11 @@ main :: proc() {
 		thread.join(watcher)
 		thread.destroy(watcher)
 	}
+	// The acceptor and every connection thread are stopped. Retire the sync
+	// pump before the deferred world_destroy tears down the runtime it reads.
+	if world != nil {
+		web.sync_host_destroy(&host.sync)
+	}
 }
 
 // Publishes the mud RuntimeConfig sign-in flags when the world declares the
