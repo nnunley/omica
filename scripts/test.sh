@@ -7,16 +7,20 @@
 #   scripts/test.sh tsan         # unit tests under ThreadSanitizer
 #   scripts/test.sh all          # unit + integration
 #
-# Every external command runs under `timeout`, so a hang fails the step instead
-# of blocking the run. A run fails on a test failure, a crash, a tracking
-# allocator "bad free", or a ThreadSanitizer report. Leaks are reported in the
-# log summary; set STRICT_LEAKS=1 to fail on them too (there is a known backlog
-# of parser/lexer/builder leaks).
+# Every external command runs under a timeout (GNU `timeout` or a portable
+# fallback), so a hang fails the step instead of blocking the run. A run fails
+# on a test failure, a crash, a tracking allocator "bad free", or a
+# ThreadSanitizer report. Leaks are reported in the log summary; set
+# STRICT_LEAKS=1 to fail on them too (there is a known backlog of
+# parser/lexer/builder leaks).
+#
+# Portable across Linux and macOS: no GNU-only utilities.
 #
 # Environment:
 #   ODIN_BIN       Odin compiler (default: `odin` on PATH, else ../odin-setup/odin)
 #   STRICT_LEAKS   set to 1 to fail on any tracking-allocator leak
 #   TEST_TIMEOUT   per-command timeout in seconds (default 300)
+#   TSAN_TIMEOUT   per-package ThreadSanitizer timeout in seconds (default 1200)
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,6 +42,42 @@ strict_leaks="${STRICT_LEAKS:-0}"
 test_timeout="${TEST_TIMEOUT:-300}"
 tsan_timeout="${TSAN_TIMEOUT:-1200}"
 fail=0
+cleanup_pids=()
+cleanup_paths=()
+
+# Terminates a process and any children, escalating to SIGKILL.
+stop_process() {
+  local pid="$1"
+  [[ -n "${pid}" ]] || return 0
+  kill -TERM "${pid}" 2>/dev/null || true
+  pkill -P "${pid}" 2>/dev/null || true
+  local i
+  for ((i = 0; i < 50; i++)); do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -KILL "${pid}" 2>/dev/null || true
+  pkill -KILL -P "${pid}" 2>/dev/null || true
+}
+
+# Kills leftover servers and removes temp dirs, including on interrupt.
+cleanup() {
+  local rc=$? i
+  if [[ ${#cleanup_pids[@]} -gt 0 ]]; then
+    for ((i = ${#cleanup_pids[@]} - 1; i >= 0; i--)); do
+      stop_process "${cleanup_pids[i]}"
+    done
+  fi
+  if [[ ${#cleanup_paths[@]} -gt 0 ]]; then
+    for ((i = 0; i < ${#cleanup_paths[@]}; i++)); do
+      rm -rf "${cleanup_paths[i]}"
+    done
+  fi
+  return "${rc}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p "${bin_dir}" "${log_dir}"
 
@@ -60,6 +100,40 @@ mud_fileins=(
   apps/mud/ui-retrieval.mica
   apps/mud/http.mica
 )
+
+# Runs "$@" with a wall-clock limit, using GNU `timeout`/`gtimeout` when
+# present and a portable Background+watchdog fallback otherwise (macOS).
+run_timeout() {
+  local secs="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${secs}" "$@"
+    return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "${secs}" "$@"
+    return $?
+  fi
+  "$@" &
+  local pid=$!
+  (
+    sleep "${secs}"
+    kill -TERM "${pid}" 2>/dev/null || true
+    sleep 2
+    kill -KILL "${pid}" 2>/dev/null || true
+  ) &
+  local watchdog=$!
+  local rc=0
+  wait "${pid}" || rc=$?
+  kill -TERM "${watchdog}" 2>/dev/null || true
+  wait "${watchdog}" 2>/dev/null || true
+  return "${rc}"
+}
+
+# A stable digest of every file in a directory (POSIX cksum).
+store_digest() {
+  find "$1" -type f -exec cksum {} + 2>/dev/null | sort
+}
 
 slugify() {
   printf '%s' "$1" | tr '/: ' '---'
@@ -94,7 +168,7 @@ run_unit() {
   note "unit tests"
   for pkg in "${packages[@]}"; do
     local out
-    out="$(timeout "${test_timeout}" "${odin_bin}" test "${pkg}" 2>&1)" || true
+    out="$(run_timeout "${test_timeout}" "${odin_bin}" test "${pkg}" 2>&1)" || true
     inspect "unit:${pkg}" "${out}"
   done
 }
@@ -110,9 +184,9 @@ run_tsan() {
     # One test thread avoids cross-test address-reuse false positives; the
     # kernel/runtime internal concurrency tests still run.
     local out
-    out="$(TSAN_OPTIONS="suppressions=${supp}" timeout "${tsan_timeout}" \
-      "${odin_bin}" test "${pkg}" -sanitize:thread \
-      -define:ODIN_TEST_THREADS=1 2>&1)" || true
+    out="$(TSAN_OPTIONS="suppressions=${supp}" \
+      run_timeout "${tsan_timeout}" "${odin_bin}" test "${pkg}" \
+      -sanitize:thread -define:ODIN_TEST_THREADS=1 2>&1)" || true
     local log="${log_dir}/$(slugify "tsan:${pkg}").log"
     printf '%s\n' "${out}" > "${log}"
     local races
@@ -132,7 +206,7 @@ run_tsan() {
 build_tools() {
   note "build tools"
   for tool in filein repl webhost parse_corpus; do
-    if timeout "${test_timeout}" "${odin_bin}" build "tools/${tool}" \
+    if run_timeout "${test_timeout}" "${odin_bin}" build "tools/${tool}" \
       -out:"${bin_dir}/${tool}"; then
       pass "build:${tool}"
     else
@@ -145,16 +219,20 @@ run_web_smoke() {
   local webhost="$1"
   local tmp
   tmp="$(mktemp -d)"
+  cleanup_paths+=("${tmp}")
   local log="${tmp}/server.log"
   local args=()
   for file in "${mud_fileins[@]}"; do
     args+=(--filein "${file}")
   done
-  timeout "${test_timeout}" "${webhost}" "${args[@]}" --store "${tmp}/db" \
+  # Background the server directly (not through run_timeout) so the PID we
+  # track is the server itself and stopping it cannot orphan anything.
+  "${webhost}" "${args[@]}" --store "${tmp}/db" \
     --bind 127.0.0.1:0 --sync-client host/web/sync-client.js >"${log}" 2>&1 &
   local pid=$!
-  local base="" rc=0
-  for _ in $(seq 1 150); do
+  cleanup_pids+=("${pid}")
+  local base="" rc=0 i
+  for ((i = 0; i < 150; i++)); do
     base="$(grep -oE 'http://127.0.0.1:[0-9]+' "${log}" | head -1 || true)"
     [[ -n "${base}" ]] && break
     kill -0 "${pid}" 2>/dev/null || break
@@ -166,9 +244,11 @@ run_web_smoke() {
     rc=1
   else
     check_code() {
-      local what="$1" expected="$2"; shift 2
+      local what="$1" expected="$2"
+      shift 2
       local code
-      code="$(curl -s --max-time "${test_timeout}" -o /dev/null -w '%{http_code}' "$@" || true)"
+      code="$(curl -s --max-time "${test_timeout}" -o /dev/null \
+        -w '%{http_code}' "$@" || true)"
       if [[ "${code}" == "${expected}" ]]; then
         pass "web-smoke:${what}"
       else
@@ -182,12 +262,7 @@ run_web_smoke() {
     check_code bad-login 401 -X POST -d 'login=alice&password=wrong' "${base}/auth/login"
     check_code traversal 404 --path-as-is "${base}/mud/../../etc/passwd"
   fi
-  kill "${pid}" 2>/dev/null || true
-  for _ in $(seq 1 50); do
-    kill -0 "${pid}" 2>/dev/null || break
-    sleep 0.1
-  done
-  kill -9 "${pid}" 2>/dev/null || true
+  stop_process "${pid}"
   wait "${pid}" 2>/dev/null || true
   rm -rf "${tmp}"
   return "${rc}"
@@ -199,16 +274,17 @@ run_integration() {
   local filein="${bin_dir}/filein" repl="${bin_dir}/repl" webhost="${bin_dir}/webhost"
   local tmp
   tmp="$(mktemp -d)"
+  cleanup_paths+=("${tmp}")
 
   # filein: load and query a checkpointed store.
-  if timeout "${test_timeout}" "${filein}" --store "${tmp}/db" --unit equipment \
+  if run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db" --unit equipment \
     --checkpoint apps/examples/equipment-service.mica >/dev/null; then
     pass "integration:filein-load"
   else
     problem "integration:filein-load"
   fi
   local out
-  out="$(timeout "${test_timeout}" "${filein}" --store "${tmp}/db" \
+  out="$(run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db" \
     --eval 'return ReadyForUse(#sensor_17)' 2>&1 || true)"
   if [[ "${out}" == "true" || "${out}" == "false" ]]; then
     pass "integration:filein-eval"
@@ -219,7 +295,7 @@ run_integration() {
   # A checkpoint after a store boot must complete (regression: reconstruction
   # advanced the version without writing the log, so the checkpoint waited for
   # records that never arrived).
-  if timeout 30 "${filein}" --store "${tmp}/db" \
+  if run_timeout 30 "${filein}" --store "${tmp}/db" \
     --checkpoint apps/examples/equipment-service.mica >/dev/null 2>&1; then
     pass "integration:checkpoint-after-boot"
   else
@@ -228,10 +304,10 @@ run_integration() {
 
   # Read-only evals must not grow the store.
   local before after
-  before="$(find "${tmp}/db" -type f -print0 | sort -z | xargs -0 -r cat | md5sum)"
-  timeout "${test_timeout}" "${filein}" --store "${tmp}/db" --eval 'return 1' >/dev/null
-  timeout "${test_timeout}" "${filein}" --store "${tmp}/db" --eval 'return 2' >/dev/null
-  after="$(find "${tmp}/db" -type f -print0 | sort -z | xargs -0 -r cat | md5sum)"
+  before="$(store_digest "${tmp}/db")"
+  run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db" --eval 'return 1' >/dev/null
+  run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db" --eval 'return 2' >/dev/null
+  after="$(store_digest "${tmp}/db")"
   if [[ "${before}" == "${after}" ]]; then
     pass "integration:read-only-eval"
   else
@@ -241,11 +317,11 @@ run_integration() {
   # A mutation survives a restart (fresh store; booting an existing store
   # ignores new fileins).
   printf 'make_relation(:Color, 1)\n' > "${tmp}/color.mica"
-  timeout "${test_timeout}" "${filein}" --store "${tmp}/db2" \
+  run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db2" \
     --checkpoint "${tmp}/color.mica" >/dev/null
-  timeout "${test_timeout}" "${filein}" --store "${tmp}/db2" \
+  run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db2" \
     --eval 'assert Color(:red)' >/dev/null
-  out="$(timeout "${test_timeout}" "${filein}" --store "${tmp}/db2" \
+  out="$(run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db2" \
     --eval 'return Color(:red)' 2>&1 || true)"
   if [[ "${out}" == "true" ]]; then
     pass "integration:store-mutation"
@@ -255,7 +331,7 @@ run_integration() {
 
   # REPL evaluates a line.
   local repl_out
-  repl_out="$(printf '1 + 1\n' | timeout 30 "${repl}" 2>&1 || true)"
+  repl_out="$(printf '1 + 1\n' | run_timeout 30 "${repl}" 2>&1 || true)"
   if grep -q "mica> 2" <<<"${repl_out}"; then
     pass "integration:repl"
   else
