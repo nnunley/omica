@@ -214,6 +214,8 @@ builtin_assume_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 	// Refresh the task's authority for the new actor, preserving adopted
 	// capability grants.
 	if state.authority != nil && !state.authority.root {
+		previous_epoch := state.authority.epoch
+		previous_now := state.authority.now
 		adopted: [dynamic]^k.Capability_Grant
 		defer delete(adopted)
 		for grant in state.authority.capabilities {
@@ -230,6 +232,9 @@ builtin_assume_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 			actor_value,
 			env.allocator,
 		)
+		// Keep the execution clock: a fresh authority starts at epoch/now 0,
+		// which would make already-expired grants appear live again.
+		k.authority_set_clock(state.authority, previous_epoch, previous_now)
 		k.snapshot_release(snapshot)
 		for grant in adopted {
 			k.authority_adopt_capability(state.authority, grant)
