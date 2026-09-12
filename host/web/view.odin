@@ -32,6 +32,9 @@ View_State :: struct {
 	subscriptions:       [dynamic]v.Value,
 	dependencies_loaded: bool,
 	deps_error:          string,
+	// `dirty` and `force_snapshot` are signaling flags shared between the
+	// render path (under `render_lock`) and the pump (under `session.lock`);
+	// they are atomic so the two paths cannot race on them.
 	dirty:               bool,
 	force_snapshot:      bool,
 	allocator:           mem.Allocator,
@@ -117,7 +120,7 @@ sync_render_view :: proc(
 	if !view.has_tree {
 		revision = 1
 	}
-	full := force_snapshot || view.force_snapshot || !view.has_tree
+	full := force_snapshot || sync.atomic_load(&view.force_snapshot) || !view.has_tree
 
 	kind: Sync_Kind
 	payload: string
@@ -134,8 +137,8 @@ sync_render_view :: proc(
 		dom.dom_diff_nodes(view.tree, node, &path, &patches, view.allocator)
 		if len(patches) == 0 {
 			dom.dom_node_release(node, view.allocator)
-			view.dirty = false
-			view.force_snapshot = false
+			sync.atomic_store(&view.dirty, false)
+			sync.atomic_store(&view.force_snapshot, false)
 			return true
 		}
 		kind = .View_Delta
@@ -169,8 +172,8 @@ sync_render_view :: proc(
 	view.has_tree = true
 	view.revision = revision
 	view.signature = envelope.server_signature
-	view.dirty = false
-	view.force_snapshot = false
+	sync.atomic_store(&view.dirty, false)
+	sync.atomic_store(&view.force_snapshot, false)
 	return true
 }
 
@@ -410,9 +413,9 @@ sync_pump_session :: proc(host: ^Sync_Host, session: ^Sync_Session) {
 		}
 		sync.mutex_lock(&session.lock)
 		if view, found := session.views[key.view_id]; found {
-			view.dirty = true
+			sync.atomic_store(&view.dirty, true)
 			if kind_name == "resynchronize" || kind_name == "revoked" {
-				view.force_snapshot = true
+				sync.atomic_store(&view.force_snapshot, true)
 			}
 		}
 		sync.mutex_unlock(&session.lock)
@@ -424,7 +427,7 @@ sync_pump_session :: proc(host: ^Sync_Host, session: ^Sync_Session) {
 	defer delete(to_render)
 	sync.mutex_lock(&session.lock)
 	for view_id, view in session.views {
-		if view.dirty {
+		if sync.atomic_load(&view.dirty) {
 			append(&to_render, view_id)
 		}
 	}
