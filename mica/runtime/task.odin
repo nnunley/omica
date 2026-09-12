@@ -62,6 +62,18 @@ Task :: struct {
 
 	// Set by the scheduler; a running task aborts at its next boundary.
 	cancel_requested: bool,
+
+	// Task-owned effects staged until the current transaction commits and
+	// discarded on abort (see #47).
+	pending_sends:         [dynamic]Pending_Send,
+	pending_subscriptions: [dynamic]^Subscription,
+	pending_cancels:       [dynamic]v.Value,
+}
+
+// A mailbox send staged until the task commits.
+Pending_Send :: struct {
+	sender: v.Value,
+	value:  v.Value,
 }
 
 // Creates a task over `kernel`. The caller owns `program` and `env` and must
@@ -91,6 +103,10 @@ task_init :: proc(
 	}
 	vm.vm_set_mailbox_validator(&task.state, mailbox_receivers_live, env)
 	register_runtime_builtins(&task.state)
+	task.pending_sends = make([dynamic]Pending_Send, allocator)
+	task.pending_subscriptions = make([dynamic]^Subscription, allocator)
+	task.pending_cancels = make([dynamic]v.Value, allocator)
+	task.state.owner = task
 	if env != nil && env.enforce_authority {
 		task_set_actor_authority(task, env.actor, allocator)
 	}
@@ -126,10 +142,55 @@ task_set_authority :: proc(task: ^Task, authority: k.Authority) {
 
 task_destroy :: proc(task: ^Task) {
 	task_discard_tx(task)
+	task_discard_pending(task)
+	delete(task.pending_sends)
+	delete(task.pending_subscriptions)
+	delete(task.pending_cancels)
 	if task.has_authority {
 		k.authority_destroy(&task.authority)
 	}
 	vm.vm_destroy(&task.state)
+}
+
+// Returns the task owning `state`, or nil for a standalone VM.
+@(private)
+task_from_state :: proc(state: ^vm.VM) -> ^Task {
+	if state == nil || state.owner == nil {
+		return nil
+	}
+	return (^Task)(state.owner)
+}
+
+// Flushes staged task effects after a successful commit.
+@(private)
+task_flush_pending :: proc(task: ^Task) {
+	if task.env != nil {
+		for pending in task.pending_sends {
+			_ = scheduler_mailbox_send(task.env.scheduler, pending.sender, pending.value)
+		}
+		for subscription in task.pending_subscriptions {
+			subscriptions_activate(task.env, subscription)
+		}
+		for capability in task.pending_cancels {
+			_ = subscriptions_cancel(task.env, capability)
+		}
+	}
+	clear(&task.pending_sends)
+	clear(&task.pending_subscriptions)
+	clear(&task.pending_cancels)
+}
+
+// Discards staged task effects on abort.
+@(private)
+task_discard_pending :: proc(task: ^Task) {
+	if task.env != nil {
+		for subscription in task.pending_subscriptions {
+			subscriptions_discard(task.env, subscription)
+		}
+	}
+	clear(&task.pending_sends)
+	clear(&task.pending_subscriptions)
+	clear(&task.pending_cancels)
 }
 
 @(private)
@@ -164,6 +225,7 @@ task_commit :: proc(task: ^Task) -> k.Kernel_Error {
 		return err
 	}
 	k.snapshot_release(committed)
+	task_flush_pending(task)
 	if task.env != nil {
 		subscriptions_dispatch(task.env)
 	}
@@ -173,6 +235,7 @@ task_commit :: proc(task: ^Task) -> k.Kernel_Error {
 @(private)
 task_abort :: proc(task: ^Task, message: string) -> Task_Outcome {
 	task_discard_tx(task)
+	task_discard_pending(task)
 	task.outcome = Task_Outcome {
 		kind    = .Aborted,
 		error   = task.state.error,

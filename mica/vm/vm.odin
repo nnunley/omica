@@ -148,6 +148,9 @@ VM :: struct {
 	// When non-negative, the function index to start at instead of the program
 	// entry. Used to start spawned method tasks.
 	entry_function: i32,
+	// The owning task, when the VM runs as part of one. Used by task-scoped
+	// builtins to stage effects until the task commits.
+	owner: rawptr,
 }
 
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {

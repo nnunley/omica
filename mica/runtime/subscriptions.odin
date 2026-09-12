@@ -30,6 +30,7 @@ Subscription_Subject :: enum {
 @(private)
 Subscription :: struct {
 	capability:              v.Value,
+	id:                      u64,
 	sender:                  v.Value,
 	subject:                 Subscription_Subject,
 	relation:                k.Relation_ID,
@@ -38,6 +39,11 @@ Subscription :: struct {
 	queue_budget:            int,
 	needs_resynchronization: bool,
 	revoked:                 bool,
+	// Registered by a task but not yet committed; delivery is deferred until
+	// the task commits (or discarded on abort).
+	pending_commit:          bool,
+	// Deliver an initial snapshot when the subscription activates.
+	initial_snapshot:        bool,
 	// Deep-copied rows for :relation subjects. The snapshot that produced them
 	// may be reclaimed, so the subscription owns its baseline.
 	baseline:                []v.Tuple,
@@ -84,12 +90,14 @@ subscriptions_register :: proc(
 	cursor: u64,
 	has_cursor: bool,
 	queue_budget: int,
+	pending: bool,
 ) -> (
 	v.Value,
+	^Subscription,
 	bool,
 ) {
 	if env.scheduler == nil {
-		return v.Value(0), false
+		return v.Value(0), nil, false
 	}
 	snapshot := k.kernel_snapshot(env.kernel)
 	defer k.snapshot_release(snapshot)
@@ -117,10 +125,11 @@ subscriptions_register :: proc(
 	if !minted {
 		sync.mutex_unlock(&env.subscriptions.lock)
 		subscription_baseline_free(env.subscriptions.allocator, baseline)
-		return v.Value(0), false
+		return v.Value(0), nil, false
 	}
 	subscription := new(Subscription, env.subscriptions.allocator)
 	subscription.capability = capability
+	subscription.id = subscription_id
 	subscription.sender = sender
 	subscription.subject = subject
 	subscription.relation = relation
@@ -129,6 +138,8 @@ subscriptions_register :: proc(
 	subscription.cursor = cursor_value
 	subscription.queue_budget = queue_budget
 	subscription.baseline = baseline
+	subscription.pending_commit = pending
+	subscription.initial_snapshot = initial_snapshot && !has_cursor
 	// A relation subscription resumed from an older cursor cannot be given a
 	// baseline as of that cursor, so its first delivery is a replacement
 	// snapshot rather than a silent gap in the reported changes.
@@ -138,35 +149,69 @@ subscriptions_register :: proc(
 	env.subscriptions.entries[subscription_id] = subscription
 	sync.mutex_unlock(&env.subscriptions.lock)
 
-	if initial_snapshot && !has_cursor {
-		switch subject {
-		case .Catalogue:
-			entries := subscription_catalogue_entries(env, snapshot)
-			defer delete(entries)
-			message := subscription_catalogue_message(
-				env,
-				capability,
-				"snapshot",
-				version,
-				entries[:],
-			)
-			_ = scheduler_mailbox_send(env.scheduler, sender, message)
-		case .Facts, .Relation:
-			rows := subscription_scan_rows(env, subject, relation, bindings)
-			defer delete(rows)
-			row_values := subscription_row_values(env, rows[:])
-			defer delete(row_values)
-			message := subscription_snapshot_message(
-				env,
-				capability,
-				subscription_subject_name(subject),
-				version,
-				row_values[:],
-			)
-			_ = scheduler_mailbox_send(env.scheduler, sender, message)
-		}
+	if subscription.initial_snapshot && !pending {
+		subscription_send_snapshot(env, subscription)
 	}
-	return capability, true
+	return capability, subscription, true
+}
+
+// Sends a subscription's initial snapshot. Used at registration and when a
+// task-staged subscription activates on commit.
+@(private)
+subscription_send_snapshot :: proc(env: ^Builtin_Env, subscription: ^Subscription) {
+	snapshot := k.kernel_snapshot(env.kernel)
+	version := snapshot.version
+	defer k.snapshot_release(snapshot)
+	switch subscription.subject {
+	case .Catalogue:
+		entries := subscription_catalogue_entries(env, snapshot)
+		defer delete(entries)
+		message := subscription_catalogue_message(
+			env,
+			subscription.capability,
+			"snapshot",
+			version,
+			entries[:],
+		)
+		_ = scheduler_mailbox_send(env.scheduler, subscription.sender, message)
+	case .Facts, .Relation:
+		rows := subscription_scan_rows(
+			env,
+			subscription.subject,
+			subscription.relation,
+			subscription.bindings,
+		)
+		defer delete(rows)
+		row_values := subscription_row_values(env, rows[:])
+		defer delete(row_values)
+		message := subscription_snapshot_message(
+			env,
+			subscription.capability,
+			subscription_subject_name(subscription.subject),
+			version,
+			row_values[:],
+		)
+		_ = scheduler_mailbox_send(env.scheduler, subscription.sender, message)
+	}
+}
+
+// Activates a task-staged subscription after its transaction commits.
+@(private)
+subscriptions_activate :: proc(env: ^Builtin_Env, subscription: ^Subscription) {
+	subscription.pending_commit = false
+	if subscription.initial_snapshot {
+		subscription.initial_snapshot = false
+		subscription_send_snapshot(env, subscription)
+	}
+}
+
+// Discards a task-staged subscription when its transaction aborts.
+@(private)
+subscriptions_discard :: proc(env: ^Builtin_Env, subscription: ^Subscription) {
+	_ = k.capability_store_revoke(&env.kernel.capabilities, subscription.capability)
+	sync.mutex_lock(&env.subscriptions.lock)
+	subscriptions_release_locked(&env.subscriptions, subscription.id)
+	sync.mutex_unlock(&env.subscriptions.lock)
 }
 
 // Cancels a subscription by its capability handle.
@@ -265,6 +310,9 @@ subscriptions_dispatch :: proc(env: ^Builtin_Env) {
 	to_release: [dynamic]u64
 	defer delete(to_release)
 	for subscription_id, subscription in store.entries {
+		if subscription.pending_commit {
+			continue
+		}
 		if !subscription_is_live(env, subscription) {
 			// Replace whatever is queued with a final revoked marker so the
 			// consumer learns the subscription ended.

@@ -392,7 +392,7 @@ world_subscribe_changes :: proc(
 	v.Value,
 	bool,
 ) {
-	return subscriptions_register(
+	capability, _, registered := subscriptions_register(
 		&world.env,
 		sender,
 		subject,
@@ -402,7 +402,9 @@ world_subscribe_changes :: proc(
 		cursor,
 		has_cursor,
 		queue_budget,
+		false,
 	)
+	return capability, registered
 }
 
 // Cancels a host-registered subscription.

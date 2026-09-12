@@ -4088,3 +4088,38 @@ return n`,
 		2,
 	)
 }
+
+// An aborted task must not publish staged mailbox sends or subscriptions.
+@(test)
+test_run_aborted_task_publishes_nothing :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Note, 1)
+make_relation(:Out, 1)
+let [receiver, sender] = mailbox()
+verb work(sender)
+  mailbox_send(sender, 1)
+  let sub = subscribe_changes(sender, :facts, some(:Note), [none], :changes)
+  raise E_X
+end
+let id = spawn :work(sender: sender)
+suspend()
+assert Note(1)
+commit()
+let messages = mailbox_recv([receiver], 200)
+require(len(messages) == 0)
+assert Out(1)
+`
+	path, path_ok := write_temp_source(t, "mica_aborted_publication_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Out", 1)
+}

@@ -994,6 +994,14 @@ builtin_mailbox_send :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 	if env.scheduler == nil {
 		return builtin_error(state, "E_MAILBOX", "mailboxes need a running scheduler")
 	}
+	// Stage the send until the task commits; an aborted task publishes nothing.
+	if task := task_from_state(state); task != nil && task.has_tx {
+		append(&task.pending_sends, Pending_Send {
+			sender = args[0],
+			value  = args[1],
+		})
+		return args[1], true
+	}
 	if !scheduler_mailbox_send(env.scheduler, args[0], args[1]) {
 		return builtin_error(state, "E_MAILBOX", "mailbox_send expects a live sender capability")
 	}
@@ -1749,7 +1757,9 @@ builtin_subscribe_changes :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 		queue_budget = int(budget_value)
 	}
 
-	capability, registered := subscriptions_register(
+	task := task_from_state(state)
+	pending := task != nil && task.has_tx
+	capability, subscription, registered := subscriptions_register(
 		env,
 		sender,
 		subject,
@@ -1759,9 +1769,13 @@ builtin_subscribe_changes :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 		cursor,
 		has_cursor,
 		queue_budget,
+		pending,
 	)
 	if !registered {
 		return builtin_error(state, "E_SUBSCRIPTION", "cannot register subscription")
+	}
+	if pending {
+		append(&task.pending_subscriptions, subscription)
 	}
 	return capability, true
 }
@@ -1769,6 +1783,12 @@ builtin_subscribe_changes :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 @(private)
 builtin_cancel_subscription :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	env := builtin_env(state)
+	// Stage the cancellation until the task commits; an aborted task
+	// publishes nothing.
+	if task := task_from_state(state); task != nil && task.has_tx {
+		append(&task.pending_cancels, args[0])
+		return v.value_bool(true), true
+	}
 	if !subscriptions_cancel(env, args[0]) {
 		return builtin_error(state, "E_INVARG", "unknown subscription")
 	}
