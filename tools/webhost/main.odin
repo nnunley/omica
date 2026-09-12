@@ -15,6 +15,7 @@ import "core:os"
 import web "../../host/web"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
+import v "../../mica/var"
 
 DEFAULT_BIND :: "127.0.0.1:8080"
 DEFAULT_WORKERS :: 4
@@ -101,6 +102,7 @@ main :: proc() {
 		}
 		web.documents_init(&host.documents, world)
 		web.sync_host_init(&host.sync, world)
+		webhost_configure_auth(world, true, false)
 		if actor, found := world.ctx.identities["alice"]; found {
 			_ = web.auth_seed_user(&host.auth, "alice", "alice-pass", actor)
 		}
@@ -124,6 +126,35 @@ main :: proc() {
 		fmt.printf("listening on %s\n", bind)
 	}
 	web.web_server_run(&server)
+}
+
+// Publishes the mud RuntimeConfig sign-in flags when the world declares the
+// schema. Local password auth is enabled; GitHub OAuth is not implemented.
+@(private)
+webhost_configure_auth :: proc(world: ^r.World, local_enabled, github_enabled: bool) {
+	config_relation, has_relation := world.ctx.relations["mud/RuntimeConfig"]
+	local_identity, has_local := world.ctx.identities["mud/config_local_password_auth"]
+	github_identity, has_github := world.ctx.identities["mud/config_github_auth"]
+	if !has_relation || !has_local || !has_github {
+		return
+	}
+	facts := []r.World_Fact {
+		{
+			relation = k.Relation_ID(config_relation),
+			tuple    = v.tuple_new(
+				context.temp_allocator,
+				[]v.Value{local_identity, v.value_bool(local_enabled)},
+			),
+		},
+		{
+			relation = k.Relation_ID(config_relation),
+			tuple    = v.tuple_new(
+				context.temp_allocator,
+				[]v.Value{github_identity, v.value_bool(github_enabled)},
+			),
+		},
+	}
+	_ = r.world_apply_facts(world, facts)
 }
 
 @(private)

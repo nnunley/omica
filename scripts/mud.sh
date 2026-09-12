@@ -44,7 +44,13 @@ fileins=(
   apps/mud/http.mica
 )
 
+needs_build="0"
 if [[ ! -x "${webhost_bin}" || "${MICA_WEB_REBUILD:-0}" == "1" ]]; then
+  needs_build="1"
+elif [[ -n "$(find tools/webhost host/web mica -name '*.odin' -newer "${webhost_bin}" -print -quit 2>/dev/null)" ]]; then
+  needs_build="1"
+fi
+if [[ "${needs_build}" == "1" ]]; then
   mkdir -p "$(dirname "${webhost_bin}")"
   "${odin_bin}" build tools/webhost -out:"${webhost_bin}"
 fi
