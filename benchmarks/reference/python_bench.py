@@ -108,6 +108,80 @@ def harness_empty() -> int:
     return 1
 
 
+def language_arithmetic_branch() -> int:
+    """100k iterations of a guarded multiply-add (the branch shape)."""
+    index = 0
+    total = 0
+    while index < 100_000:
+        if index % 2 == 0:
+            total = total + index * 3
+        else:
+            total = total - index
+        index = index + 1
+    return total
+
+
+def language_list_build() -> int:
+    """Build a 2000-element list one item at a time."""
+    items: list[int] = []
+    index = 0
+    while index < 2000:
+        items.append(index)
+        index = index + 1
+    return len(items)
+
+
+def language_string_slice() -> int:
+    """2000 slices plus length checks over a fixed string."""
+    text = "the quick brown fox jumps over the lazy dog"
+    index = 0
+    total = 0
+    while index < 2000:
+        part = text[index % 20:index % 20 + 5]
+        total = total + len(part)
+        index = index + 1
+    return total
+
+
+def language_sort() -> int:
+    """Sort a 512-element descending list."""
+    items = list(range(512, 0, -1))
+    return len(sorted(items))
+
+
+def relation_scan_large() -> int:
+    """Scan a 5000-row table and count (vs relation_scan's 1000)."""
+    points = [(index, index * 2) for index in range(5000)]
+    return len(points)
+
+
+def relation_join_scan() -> int:
+    """Nested scan over two 1000-row tables keyed on the first column."""
+    points = list(range(1000))
+    labels = {index: index + 1 for index in range(1000)}
+    count = 0
+    for key in points:
+        if key in labels:
+            count = count + 1
+    return count
+
+
+def relation_rule_closure() -> int:
+    """Transitive closure over a 40-node chain."""
+    edges = [(index, index + 1) for index in range(40)]
+    reach = set(edges)
+    # Fixpoint over the chain: a->b, b->c implies a->c.
+    changed = True
+    while changed:
+        changed = False
+        for a, b in list(reach):
+            for c, d in list(reach):
+                if b == c and (a, d) not in reach:
+                    reach.add((a, d))
+                    changed = True
+    return len(reach)
+
+
 WORKLOADS = [
     ("language_arithmetic.mica", language_arithmetic),
     ("language_list.mica", language_list),
@@ -117,6 +191,13 @@ WORKLOADS = [
     ("language_string_append.mica", language_string_append),
     ("language_call.mica", language_call),
     ("harness_empty.mica", harness_empty),
+    ("language_arithmetic_branch.mica", language_arithmetic_branch),
+    ("language_list_build.mica", language_list_build),
+    ("language_string_slice.mica", language_string_slice),
+    ("language_sort.mica", language_sort),
+    ("relation_scan_large.mica", relation_scan_large),
+    ("relation_join_scan.mica", relation_join_scan),
+    ("relation_rule_closure.mica", relation_rule_closure),
 ]
 
 
