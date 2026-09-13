@@ -213,7 +213,11 @@ compile_program :: proc(
 	vm.builder_end_function(&builder)
 	builder.functions[main_index].register_count = emitter.max_register
 
-	// Verb bodies.
+	// Verb bodies. These run as world methods in their own tasks, so they have
+	// no access to the entry task's locals; clear the local table so a name
+	// from the loading script is reported as unknown rather than resolved to a
+	// register in another frame.
+	resize(&emitter.locals, 0)
 	verb_index := 0
 	for item in ast.items {
 		verb, is_verb := item.(Verb_Item)

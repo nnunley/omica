@@ -796,3 +796,56 @@ test_call_arity_limit_is_diagnosed :: proc(t: ^testing.T) {
 	compiled := compile_program(ast, &ctx, allocator)
 	testing.expectf(t, len(compiled.errors) > 0, "expected an arity diagnostic")
 }
+
+// A verb runs as a world method in its own task, so it has no access to the
+// loading script's locals. Referencing one must be an "unknown name"
+// diagnostic, not a move from a register that only exists in the entry frame.
+@(test)
+test_verb_cannot_read_entry_locals :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	source := `let loaderValue = 7
+verb probe()
+  return loaderValue
+end
+`
+	ast, parse_errors := parse_program(source, allocator)
+	testing.expectf(t, len(parse_errors) == 0, "parse errors: %v", parse_errors)
+	compiled := compile_program(ast, &ctx, allocator)
+	testing.expectf(
+		t,
+		len(compiled.errors) > 0,
+		"a verb reading an entry local should be an unknown name",
+	)
+	if len(compiled.errors) > 0 {
+		testing.expectf(
+			t,
+			strings.contains(compiled.errors[0].message, "unknown name"),
+			"expected an unknown name diagnostic, got %q",
+			compiled.errors[0].message,
+		)
+	}
+}
+
+// The same name is valid inside the entry task, which owns it.
+@(test)
+test_entry_task_reads_its_own_locals :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	program := compile_test_program(t, "let loaderValue = 7\nloaderValue + 1", &ctx, allocator)
+	state := run_test_program(t, program, allocator)
+	defer vm.vm_destroy(&state)
+	expect_int_result(t, &state, 8)
+}
