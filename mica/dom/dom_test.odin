@@ -222,6 +222,7 @@ test_dom_support_predicates :: proc(t: ^testing.T) {
 	testing.expect(t, !is_supported_dom_tag("bogus"))
 	testing.expect(t, is_supported_dom_attribute("class"))
 	testing.expect(t, is_supported_dom_attribute("data-sync-event"))
+	testing.expect(t, is_supported_dom_attribute("data-sync-disable-with"))
 	testing.expect(t, is_supported_dom_attribute("data-custom-thing"))
 	testing.expect(t, is_supported_dom_attribute("aria-live"))
 	testing.expect(t, !is_supported_dom_attribute("onclick"))

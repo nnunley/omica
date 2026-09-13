@@ -1358,7 +1358,9 @@ parse_primary :: proc(parser: ^Parser) -> ^Expr {
 		name := parse_qualified_name(parser, token)
 		return expr_node(parser, Name{parts = to_slice(parser, make_name_parts(parser, name))})
 	case .LParen:
+		skip_newlines(parser)
 		inner := parse_expression(parser)
+		skip_newlines(parser)
 		expect(parser, .RParen, "expected ')' after expression")
 		return inner
 	case .LBracket:

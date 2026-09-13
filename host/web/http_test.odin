@@ -39,6 +39,24 @@ test_http_write_chunk_terminator :: proc(t: ^testing.T) {
 	testing.expect_value(t, strings.to_string(builder), "0\r\n\r\n")
 }
 
+// Responses must not let a browser sniff an untyped body into another type.
+@(test)
+test_http_encode_security_headers :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	builder: strings.Builder
+	strings.builder_init(&builder, context.temp_allocator)
+	defer strings.builder_destroy(&builder)
+	body := "hi"
+	response := Http_Response {
+		status = 200,
+		body   = transmute([]byte)body,
+	}
+	http_encode_response(&response, &builder)
+	encoded := strings.to_string(builder)
+	testing.expect(t, strings.contains(encoded, "X-Content-Type-Options: nosniff"))
+	testing.expect(t, strings.contains(encoded, "Content-Type: application/octet-stream"))
+}
+
 @(private)
 parse_request :: proc(
 	t: ^testing.T,
@@ -247,6 +265,7 @@ test_http_encode_response :: proc(t: ^testing.T) {
 	expected := "HTTP/1.1 200 OK\r\n" +
 		"Content-Length: 2\r\n" +
 		"Content-Type: text/plain\r\n" +
+		"X-Content-Type-Options: nosniff\r\n" +
 		"X-Test: 1\r\n" +
 		"Connection: close\r\n" +
 		"\r\n" +

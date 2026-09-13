@@ -31,6 +31,17 @@ first_item_expr :: proc(t: ^testing.T, program: ^Program_AST) -> ^Expr {
 	return item.expr
 }
 
+// Newlines are allowed after '(' and before ')'.
+@(test)
+test_parse_parenthesized_newlines :: proc(t: ^testing.T) {
+	program := parse_ok(t, "let x = (\n  1 + 2\n)")
+	expr := first_item_expr(t, program)
+	binding, binding_ok := expr^.(Binding)
+	testing.expect(t, binding_ok)
+	_, is_binary := binding.value^.(Binary)
+	testing.expect(t, is_binary)
+}
+
 @(test)
 test_parse_binding_and_precedence :: proc(t: ^testing.T) {
 	program := parse_ok(t, "let x = 1 + 2 * 3")

@@ -383,7 +383,11 @@ http_encode_response :: proc(response: ^Http_Response, builder: ^strings.Builder
 	fmt.sbprintf(builder, "Content-Length: %d\r\n", len(response.body))
 	if response.content_type != "" {
 		fmt.sbprintf(builder, "Content-Type: %s\r\n", response.content_type)
+	} else if len(response.body) > 0 {
+		// Never let an untyped body be sniffed into a different type.
+		strings.write_string(builder, "Content-Type: application/octet-stream\r\n")
 	}
+	strings.write_string(builder, "X-Content-Type-Options: nosniff\r\n")
 	for header in response.headers {
 		// Never emit a name or value that could split the response; callers
 		// should have validated, this is defense in depth.

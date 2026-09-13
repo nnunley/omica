@@ -165,8 +165,10 @@ task_from_state :: proc(state: ^vm.VM) -> ^Task {
 @(private)
 task_flush_pending :: proc(task: ^Task) {
 	if task.env != nil {
-		for pending in task.pending_sends {
-			_ = scheduler_mailbox_send(task.env.scheduler, pending.sender, pending.value)
+		if task.env.scheduler != nil {
+			for pending in task.pending_sends {
+				_ = scheduler_mailbox_send(task.env.scheduler, pending.sender, pending.value)
+			}
 		}
 		for subscription in task.pending_subscriptions {
 			subscriptions_activate(task.env, subscription)

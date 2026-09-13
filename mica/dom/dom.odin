@@ -149,6 +149,7 @@ DOM_ATTRIBUTES := []string {
 	"data-sync-action",
 	"data-sync-coalesce",
 	"data-sync-debounce",
+	"data-sync-disable-with",
 	"data-sync-event",
 	"data-sync-fire-and-forget",
 	"data-sync-follow",
