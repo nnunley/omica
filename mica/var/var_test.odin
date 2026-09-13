@@ -511,16 +511,18 @@ test_heap_ordering :: proc(t: ^testing.T) {
 	frob_high := value_frob(alloc, delegate_high, must_int(1))
 	testing.expect(t, value_cmp(frob_low, frob_high) == .Less)
 
-	// Relation values order by heading column ids, then rows.
-	heading_low := []Symbol{symbol_intern("order-column-low")}
-	heading_high := []Symbol{symbol_intern("order-column-high")}
+	// Relation values order by heading name, then rows. Intern `b` before `a`
+	// so an id-based order would put `b` first; the name order must put `a`
+	// first regardless of interning order.
+	b := symbol_intern("order-column-b")
+	a := symbol_intern("order-column-a")
 	row_one := tuple_new(alloc, []Value{must_int(1)})
 	row_two := tuple_new(alloc, []Value{must_int(2)})
-	relation_low, _ := value_relation(alloc, heading_low, []Tuple{row_one})
-	relation_heading_high, _ := value_relation(alloc, heading_high, []Tuple{row_one})
-	relation_row_high, _ := value_relation(alloc, heading_low, []Tuple{row_two})
-	testing.expect(t, value_cmp(relation_low, relation_heading_high) == .Less)
-	testing.expect(t, value_cmp(relation_low, relation_row_high) == .Less)
+	relation_a, _ := value_relation(alloc, []Symbol{a}, []Tuple{row_one})
+	relation_b, _ := value_relation(alloc, []Symbol{b}, []Tuple{row_one})
+	relation_row_high, _ := value_relation(alloc, []Symbol{a}, []Tuple{row_two})
+	testing.expect(t, value_cmp(relation_a, relation_b) == .Less)
+	testing.expect(t, value_cmp(relation_a, relation_row_high) == .Less)
 }
 
 @(test)
@@ -1318,4 +1320,38 @@ test_string_span_and_find_any :: proc(t: ^testing.T) {
 	mixed_span, mixed_span_ok = string_span(mixed, 4, letters)
 	testing.expect(t, mixed_span_ok)
 	testing.expect_value(t, mixed_span, 7)
+}
+
+// Relation heading canonicalization must be deterministic: sorted by column
+// name, not by symbol id. Symbol ids are interning order, so an id sort makes
+// the physical layout depend on which symbols a process interned first, which
+// makes positional row access silently order-dependent across runs.
+@(test)
+test_relation_heading_order_is_name_based :: proc(t: ^testing.T) {
+	alloc := context.temp_allocator
+
+	// Intern the columns in an order that is the reverse of their names, so a
+	// name sort and an id sort disagree.
+	zeta := symbol_intern("zeta-column")
+	mu := symbol_intern("mu-column")
+	alpha := symbol_intern("alpha-column")
+	testing.expect(t, symbol_id(zeta) < symbol_id(mu) && symbol_id(mu) < symbol_id(alpha))
+
+	row := tuple_new(alloc, []Value{must_int(1), must_int(2), must_int(3)})
+	value, err := value_relation(alloc, []Symbol{zeta, mu, alpha}, []Tuple{row})
+	testing.expect_value(t, err, Relation_Value_Error.None)
+	relation, ok := value_as_relation(value)
+	testing.expect(t, ok)
+
+	// The physical order is by name: alpha, mu, zeta.
+	expected := []Symbol{alpha, mu, zeta}
+	for column, index in expected {
+		testing.expect_value(t, relation.heading[index], column)
+	}
+	// And the row is permuted to match, so alpha's cell is the one for zeta's
+	// declared position (1), by name lookup rather than position.
+	cells := tuple_values(relation.rows[0])
+	testing.expect_value(t, cells[0], must_int(3))
+	testing.expect_value(t, cells[1], must_int(2))
+	testing.expect_value(t, cells[2], must_int(1))
 }

@@ -749,8 +749,14 @@ value_relation :: proc(
 	for i in 0 ..< len(order) {
 		order[i] = Heading_Sort_Entry{symbol = heading[i], index = u16(i)}
 	}
+	// Sort columns by name, not by symbol id. A symbol id is interning order, so
+	// an id sort makes the physical layout of a heading depend on which symbols
+	// a process interned first: same source, different column order across runs
+	// and across test orderings. A name sort is stable everywhere. Column order
+	// remains unobservable from Mica either way; this only removes the
+	// order-dependence that positional row access could silently rely on.
 	slice.sort_by(order, proc(a, b: Heading_Sort_Entry) -> bool {
-		return symbol_id(a.symbol) < symbol_id(b.symbol)
+		return symbol_name_less(a.symbol, b.symbol)
 	})
 	for i in 1 ..< len(order) {
 		if order[i - 1].symbol == order[i].symbol {

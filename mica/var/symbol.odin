@@ -116,6 +116,22 @@ symbol_name :: proc(s: Symbol) -> (string, bool) {
 	return symbol_table.names[index], true
 }
 
+// Reports whether the name of `a` orders before the name of `b`, by bytes.
+//
+// Symbol ids are interning order, so an id comparison depends on which symbols
+// a process happened to intern first. Relation heading canonicalization (see
+// `value_relation`) needs an order that is stable across processes and test
+// orderings, so it compares names instead. Unknown ids fall back to the id so
+// the order stays total.
+symbol_name_less :: proc(a, b: Symbol) -> bool {
+	a_name, a_ok := symbol_name(a)
+	b_name, b_ok := symbol_name(b)
+	if !a_ok || !b_ok {
+		return u32(a) < u32(b)
+	}
+	return a_name < b_name
+}
+
 @(private)
 symbol_table_intern :: proc(name: string) -> (Symbol, string) {
 	sync.mutex_lock(&symbol_table.mutex)

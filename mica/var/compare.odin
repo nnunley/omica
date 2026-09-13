@@ -177,7 +177,9 @@ value_cmp_same_kind :: proc(left, right: Value, kind: Value_Kind) -> Ordering {
 		n := min(len(l.heading), len(r.heading))
 		for i in 0 ..< n {
 			if l.heading[i] != r.heading[i] {
-				if symbol_id(l.heading[i]) < symbol_id(r.heading[i]) {
+				// Headings are canonicalized by name (see `value_relation`), so
+				// compare in that same order rather than by interning id.
+				if symbol_name_less(l.heading[i], r.heading[i]) {
 					return .Less
 				}
 				return .Greater
