@@ -1,10 +1,27 @@
+// Shared benchmark grant preamble. The Rust host derives endpoint authority
+// from grant facts, so the harness runs as #bench; the Odin host parses the
+// same block. Grants cover the relations and verbs each bench uses.
+make_identity(:bench)
+make_relation(:CanInvoke, 2)
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+grant #bench
+  invoke:
+    :bench
+    :worker
+  read:
+    :BenchPoint
+  write:
+    :BenchPoint
+end
 // Sequential relation commit throughput.
 //
 // Per-call workload: one worker performs 256 retract+assert+commit
 // transactions, then reports through a mailbox the caller waits on. Divide
-// the reported per-call time by 256 for the per-commit cost. Using a worker
-// (rather than one call per commit) keeps task-dispatch overhead out of the
-// measured cost.
+// the reported per-call time by 256 for the per-commit cost. The explicit
+// commit() inside the loop is what makes each iteration a real commit; using
+// a worker (rather than one call per commit) keeps task-dispatch overhead out
+// of the measured cost.
 make_relation(:BenchPoint, 1)
 assert BenchPoint(0)
 
@@ -13,6 +30,7 @@ verb worker(sender, count)
   while index < count
     retract BenchPoint(0)
     assert BenchPoint(0)
+    commit()
     index = index + 1
   end
   mailbox_send(sender, 1)

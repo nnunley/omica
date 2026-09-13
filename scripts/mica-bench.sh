@@ -23,7 +23,8 @@ workers="${MICA_BENCH_WORKERS:-8}"
 
 run_odin() {
   local driver="${repo_root}/.cache/test-bin/micabench"
-  "${odin_bin}" build "${repo_root}/tools/micabench" -out:"${driver}"
+  # -o:speed optimizes the driver *and* the linked runtime/VM libraries.
+  "${odin_bin}" build "${repo_root}/tools/micabench" -o:speed -out:"${driver}"
   local out="${results}/odin.tsv"
   : >"${out}"
   local file
@@ -34,18 +35,18 @@ run_odin() {
 }
 
 run_rust() {
-  # The Rust driver is expected to print the same TSV columns:
-  #   name<TAB>median_ns<TAB>min_ns<TAB>samples
-  local driver="${MICA_RUST_BENCH:-}"
-  if [[ -z "${driver}" || ! -x "${driver}" ]]; then
-    echo "set MICA_RUST_BENCH to the Rust micabench binary" >&2
+  # The Rust driver is the `bench` subcommand of the `mica` runner; always
+  # point at the release build.
+  local driver="${MICA_RUST_BENCH:-/home/ryan/src/mica/target/release/mica}"
+  if [[ ! -x "${driver}" ]]; then
+    echo "set MICA_RUST_BENCH to the release mica binary (cargo build --release -p mica-runner)" >&2
     exit 1
   fi
   local out="${results}/rust.tsv"
   : >"${out}"
   local file
   for file in "${corpus}"/*.mica; do
-    "${driver}" --samples "${samples}" --workers "${workers}" "${file}" | tee -a "${out}"
+    "${driver}" bench --samples "${samples}" "${file}" | tee -a "${out}"
   done
   echo "wrote ${out}"
 }

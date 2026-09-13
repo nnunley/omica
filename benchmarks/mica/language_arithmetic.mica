@@ -1,3 +1,14 @@
+// Shared benchmark grant preamble. The Rust host derives endpoint authority
+// from grant facts, so the harness runs as #bench; the Odin host parses the
+// same block. Grants cover the relations and verbs each bench uses.
+make_identity(:bench)
+make_relation(:CanInvoke, 2)
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+grant #bench
+  invoke:
+    :bench
+end
 // Arithmetic over a loop.
 //
 // Per-call workload: 100k iterations of integer multiply-add.

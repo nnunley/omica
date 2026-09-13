@@ -348,9 +348,13 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 	}
 
 	for {
-		// Per-instruction temporaries live in the VM scratch arena; reclaim
-		// them here so a long-running task does not grow memory per step.
-		virtual.arena_free_all(state.scratch)
+		// Per-instruction temporaries live in the VM scratch arena. Reclaim
+		// them only when the arena was actually used: freeing unconditionally
+		// takes an arena mutex and zeroes memory on every instruction, which
+		// dominated simple integer loops.
+		if state.scratch.total_used > 0 {
+			virtual.arena_free_all(state.scratch)
+		}
 		top := len(state.frames) - 1
 		frame := state.frames[top]
 		if frame.ip < 0 || frame.ip >= len(program.code) {
