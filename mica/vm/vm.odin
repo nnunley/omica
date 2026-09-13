@@ -386,7 +386,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			virtual.arena_free_all(state.scratch)
 		}
 		top := len(state.frames) - 1
-		frame := state.frames[top]
+		// `frames` is non-empty here (the entry frame is pushed above and
+		// Return pops only while frames remain) and `top` is derived from its
+		// length, so this access cannot be out of bounds. Avoid the copy of
+		// the whole frame and the repeated bounds-checked indexing.
+		#no_bounds_check frame := &state.frames[top]
 		if frame.ip < 0 || frame.ip >= len(program.code) {
 			vm_fail(state, "E_VM_FAULT", "instruction pointer out of range")
 			return .Failed
@@ -411,8 +415,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 		}
 
-		instr := program.code[frame.ip]
-		state.frames[top].ip = frame.ip + 1
+		// The range check above already proved the index valid.
+		#no_bounds_check instr := program.code[frame.ip]
+		frame.ip += 1
 		base := frame.register_base
 
 		switch instr.op {
@@ -434,11 +439,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Branch:
 			if vm_truthy(state.registers[base + int(instr.a)]) {
-				state.frames[top].ip += int(instr.b)
+				frame.ip += int(instr.b)
 			}
 
 		case .Jump:
-			state.frames[top].ip += int(instr.b)
+			frame.ip += int(instr.b)
 
 		case .Call:
 			if vm_depth_exceeded(state) {
