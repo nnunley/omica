@@ -62,8 +62,12 @@ run_rust() {
       echo "skip $(basename "${file}") (not implemented in this runtime)"
       continue
     fi
-    taskset -c "${MICA_BENCH_CPU}" "${driver}" bench --samples "${samples}" "${file}" \
-      | tee -a "${out}"
+    if [[ -n "${MICA_BENCH_CPU:-}" ]]; then
+      taskset -c "${MICA_BENCH_CPU}" "${driver}" bench --samples "${samples}" "${file}" \
+        | tee -a "${out}"
+    else
+      "${driver}" bench --samples "${samples}" "${file}" | tee -a "${out}"
+    fi
   done
   echo "wrote ${out}"
 }
