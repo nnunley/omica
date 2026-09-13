@@ -57,34 +57,48 @@ run_rust() {
   echo "wrote ${out}"
 }
 
+run_python() {
+  local driver="${repo_root}/benchmarks/reference/python_bench.py"
+  local out="${results}/python.tsv"
+  python3 "${driver}" | tee "${out}"
+  echo "wrote ${out}"
+}
+
 compare() {
-  python3 - "${results}/odin.tsv" "${results}/rust.tsv" <<'PY'
+  python3 - "${results}/odin.tsv" "${results}/rust.tsv" "${results}/python.tsv" <<'PY'
 import sys
 
 def load(path):
     rows = {}
-    with open(path) as handle:
-        for line in handle:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) >= 2:
-                rows[parts[0]] = int(parts[1])
+    try:
+        with open(path) as handle:
+            for line in handle:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 2:
+                    rows[parts[0]] = int(parts[1])
+    except FileNotFoundError:
+        pass
     return rows
 
 odin = load(sys.argv[1])
 rust = load(sys.argv[2])
-names = sorted(set(odin) | set(rust))
-print(f"{'bench':<32}{'odin_ns':>14}{'rust_ns':>14}{'odin/rust':>12}")
+python = load(sys.argv[3])
+names = sorted(set(odin) | set(rust) | set(python))
+print(f"{'bench':<30}{'odin_ms':>10}{'rust_ms':>10}{'py_ms':>10}{'odin/py':>9}{'odin/rust':>10}")
 for name in names:
-    o = odin.get(name)
-    r = rust.get(name)
-    ratio = f"{o / r:.2f}x" if o and r else "-"
-    print(f"{name:<32}{o if o is not None else '-':>14}{r if r is not None else '-':>14}{ratio:>12}")
+    o, r, p = odin.get(name), rust.get(name), python.get(name)
+    def ms(v):
+        return f"{v / 1e6:.3f}" if v is not None else "-"
+    def ratio(a, b):
+        return f"{a / b:.2f}x" if a is not None and b else "-"
+    print(f"{name:<30}{ms(o):>10}{ms(r):>10}{ms(p):>10}{ratio(o, p):>9}{ratio(o, r):>10}")
 PY
 }
 
 case "${1:-odin}" in
   odin)    run_odin ;;
   rust)    run_rust ;;
+  python)  run_python ;;
   compare) compare ;;
-  *) echo "usage: scripts/mica-bench.sh [odin|rust|compare]" >&2; exit 2 ;;
+  *) echo "usage: scripts/mica-bench.sh [odin|rust|python|compare]" >&2; exit 2 ;;
 esac
