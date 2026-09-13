@@ -158,3 +158,72 @@ test_lex_unterminated_string_records_error :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.tokens[0].kind, Token_Kind.Error)
 	testing.expect_value(t, result.tokens[len(result.tokens) - 1].kind, Token_Kind.Eof)
 }
+
+// `\r\n`, `\n`, and a lone `\r` each count as exactly one line break. A lone
+// `\r` previously emitted a `Newline` token without advancing the line, which
+// put later tokens on the wrong line.
+@(test)
+test_lex_line_break_forms :: proc(t: ^testing.T) {
+	// Tokens are (kind, line). `a` is line 1; a collapsed break token is
+	// reported on the line where it started; the next token is on the line
+	// after the break(s).
+	expect_lines :: proc(t: ^testing.T, source: string, expected: []int) {
+		result := lex(source, context.temp_allocator)
+		testing.expectf(
+			t,
+			len(result.tokens) == len(expected),
+			"%q: expected %d tokens, got %d",
+			source,
+			len(expected),
+			len(result.tokens),
+		)
+		for line, index in expected {
+			if index >= len(result.tokens) {
+				return
+			}
+			testing.expectf(
+				t,
+				result.tokens[index].line == line,
+				"%q token %d: expected line %d, got %d",
+				source,
+				index,
+				line,
+				result.tokens[index].line,
+			)
+		}
+	}
+
+	// a / NL / b / NL / eof
+	expect_lines(t, "a\nb\n", []int{1, 1, 2, 2, 3})
+	expect_lines(t, "a\r\nb\r\n", []int{1, 1, 2, 2, 3})
+	// a / NL / b / eof: one break from `\r`.
+	expect_lines(t, "a\rb", []int{1, 1, 2, 2})
+	// a / NL(2 breaks) / b / eof.
+	expect_lines(t, "a\r\n\r\nb", []int{1, 1, 3, 3})
+	// a / NL(4 breaks) / b / eof.
+	expect_lines(t, "a\n\n\r\n\rb", []int{1, 1, 5, 5})
+}
+
+// Line breaks inside a string or bytes literal advance the line the same way,
+// and `\r\n` counts once rather than once per byte.
+@(test)
+test_lex_line_breaks_in_literals :: proc(t: ^testing.T) {
+	for source in ([]string {
+		"\"a\rb\"\nx",
+		"\"a\r\nb\"\nx",
+		"b\"a\rb\"\nx",
+	}) {
+		result := lex(source, context.temp_allocator)
+		// The trailing identifier `x` sits on line 3: one break inside the
+		// literal, one after it.
+		last_ident := result.tokens[len(result.tokens) - 2]
+		testing.expect_value(t, last_ident.kind, Token_Kind.Ident)
+		testing.expectf(
+			t,
+			last_ident.line == 3,
+			"%q: expected the identifier on line 3, got %d",
+			source,
+			last_ident.line,
+		)
+	}
+}

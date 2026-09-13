@@ -87,16 +87,21 @@ verb lex(source) -> list
 
     // String literal. A backslash escapes the next scalar; the literal may
     // span lines, tracking them, and an unterminated one becomes `:Error`.
+    // A line break is `\r\n`, `\n`, or a lone `\r`, counting once.
     if code == 34
       pos = pos + 1
       column = column + 1
       let terminated = false
       while pos < length
-        if source[pos] == 92
+        let current = source[pos]
+        if current == 92
+          // An escape consumes the backslash and one more scalar, clamped at
+          // the end so an unterminated literal cannot run past the source.
           pos = pos + 1
           column = column + 1
           if pos < length
-            if source[pos] == 10 || source[pos] == 13
+            let escaped = source[pos]
+            if escaped == 13 || escaped == 10
               line = line + 1
               column = 1
             else
@@ -106,18 +111,30 @@ verb lex(source) -> list
           end
           continue
         end
-        if source[pos] == 34
+        if current == 34
           pos = pos + 1
           column = column + 1
           terminated = true
           break
         end
-        if source[pos] == 10 || source[pos] == 13
+        if current == 13
           line = line + 1
           column = 1
-        else
-          column = column + 1
+          pos = pos + 1
+          if pos < length && source[pos] == 10
+            pos = pos + 1
+          end
+          continue
         end
+        if current == 10
+          if pos == 0 || source[pos - 1] != 13
+            line = line + 1
+          end
+          column = 1
+          pos = pos + 1
+          continue
+        end
+        column = column + 1
         pos = pos + 1
       end
       let kind = :Error
@@ -139,6 +156,23 @@ verb lex(source) -> list
           column = column + 1
           terminated = true
           break
+        end
+        if source[pos] == 13
+          line = line + 1
+          column = 1
+          pos = pos + 1
+          if pos < length && source[pos] == 10
+            pos = pos + 1
+          end
+          continue
+        end
+        if source[pos] == 10
+          if pos == 0 || source[pos - 1] != 13
+            line = line + 1
+          end
+          column = 1
+          pos = pos + 1
+          continue
         end
         pos = pos + 1
         column = column + 1
