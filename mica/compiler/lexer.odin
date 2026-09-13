@@ -150,7 +150,10 @@ lex :: proc(source: string, allocator := context.allocator) -> Lex_Result {
 			if source[pos^] == '\n' {
 				line^ += 1
 				column^ = 1
-			} else {
+			} else if source[pos^] & 0xc0 != 0x80 {
+				// Count columns in Unicode scalar values, not bytes, so a
+				// multi-byte character advances the column by one. UTF-8
+				// continuation bytes are 10xxxxxx.
 				column^ += 1
 			}
 			pos^ += 1
