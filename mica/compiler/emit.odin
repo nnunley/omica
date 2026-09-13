@@ -1888,11 +1888,57 @@ emit_relation_literal :: proc(emitter: ^Emitter, literal: Relation_Literal) -> (
 @(private)
 emit_list :: proc(emitter: ^Emitter, list: List_Literal) -> (int, bool) {
 	has_splice := false
+	splice_count := 0
 	for element in list.elements {
 		if _, is_splice := element^.(Splice); is_splice {
 			has_splice = true
-			break
+			splice_count += 1
 		}
+	}
+
+	// The append idiom `[@items, x]` (one splice, one value, splice first)
+	// lowers to an append rather than a concat. Concat rebuilds and copies the
+	// whole prefix every time, making a build-loop O(n^2); append reuses
+	// capacity.
+	append_splice := -1
+	append_value := -1
+	if splice_count == 1 && len(list.elements) == 2 {
+		first_is_splice := false
+		if _, is_splice := list.elements[0]^.(Splice); is_splice {
+			first_is_splice = true
+		}
+		if first_is_splice {
+			if _, second_is_splice := list.elements[1]^.(Splice); !second_is_splice {
+				append_splice = 0
+				append_value = 1
+			}
+		}
+	}
+	if append_splice >= 0 {
+		splice, _ := list.elements[append_splice]^.(Splice)
+		base, base_ok := emit_expr(emitter, splice.value)
+		if !base_ok {
+			return -1, false
+		}
+		item, item_ok := emit_operand(emitter, list.elements[append_value], list.elements[append_splice])
+		if !item_ok {
+			return -1, false
+		}
+		first := marshal_arguments(emitter, []int{base, item})
+		destination := alloc_register(emitter)
+		builtin := vm.builder_add_builtin(
+			emitter.builder,
+			v.symbol_intern("__list_append"),
+		)
+		vm.builder_emit(
+			emitter.builder,
+			.Builtin_Call,
+			0,
+			i32(destination),
+			builtin,
+			i32(first),
+		)
+		return destination, true
 	}
 
 	registers := make([dynamic]int, 0, len(list.elements), emitter.allocator)

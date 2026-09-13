@@ -32,8 +32,16 @@ Heap_Bytes :: struct {
 }
 
 // An immutable list value.
+//
+// `values` may have capacity beyond its length. That spare room is only valid
+// for an append performed through `value_list_append`, which owns the buffer:
+// any other holder of the same `Value` observes only `values[0..len]`.
+// `spare_owner` records which append last created the spare room, so an older
+// copy cannot reuse a tail a newer append has claimed.
 Heap_List :: struct {
-	values: []Value,
+	values:      []Value,
+	allocated:   int,
+	spare_owner: u64,
 }
 
 // A canonicalized map entry.
@@ -268,7 +276,71 @@ value_list :: proc(alloc: mem.Allocator, values: []Value) -> Value {
 	copy(owned, values)
 	header := new(Heap_List, alloc)
 	header.values = owned
+	header.allocated = len(owned)
 	return value_heap(.List, header)
+}
+
+// Creates a list value taking ownership of `values` without copying. `values`
+// must have come from `alloc` and must not be used or freed by the caller
+// afterwards. The header itself is still allocated.
+value_list_owned :: proc(alloc: mem.Allocator, values: []Value) -> Value {
+	header := new(Heap_List, alloc)
+	header.values = values
+	header.allocated = len(values)
+	return value_heap(.List, header)
+}
+
+// A token handed out per append that creates spare capacity. Only the header
+// holding the newest token may extend the buffer's tail.
+@(private)
+list_spare_counter: u64
+
+// Appends `item` to `base`, returning the resulting list. When `base` owns the
+// tail of a buffer with room, the append writes past its own length; otherwise
+// a fresh buffer with headroom is allocated and `base` is copied in. Either way
+// the result carries spare capacity, so building a list one item at a time is
+// linear rather than O(n^2).
+//
+// Soundness matches the string append: a list value observes only
+// `values[0..len]`, so bytes past the base's length are invisible through every
+// existing value, and only the token holder may write there.
+value_list_append :: proc(alloc: mem.Allocator, base: Value, item: Value) -> Value {
+	header, is_list := heap_header(base, .List, Heap_List)
+	if is_list && header.values != nil && header.spare_owner != 0 {
+		required := len(header.values) + 1
+		if required <= header.allocated {
+			full := ([^]Value)(raw_data(header.values))[:header.allocated]
+			full[len(header.values)] = item
+			header.spare_owner = 0
+			value := value_list_owned(alloc, full[:required])
+			result, _ := heap_header(value, .List, Heap_List)
+			result.allocated = header.allocated
+			list_spare_counter += 1
+			result.spare_owner = list_spare_counter
+			return value
+		}
+	}
+	required := 1
+	if is_list {
+		required += len(header.values)
+	}
+	capacity := required * 2
+	if capacity < 8 {
+		capacity = 8
+	}
+	buffer := make([]Value, capacity, alloc)
+	write := 0
+	if is_list {
+		copy(buffer, header.values)
+		write = len(header.values)
+	}
+	buffer[write] = item
+	value := value_list_owned(alloc, buffer[:required])
+	result, _ := heap_header(value, .List, Heap_List)
+	result.allocated = capacity
+	list_spare_counter += 1
+	result.spare_owner = list_spare_counter
+	return value
 }
 
 // Creates a map value from `entries`, sorting by key and keeping the last

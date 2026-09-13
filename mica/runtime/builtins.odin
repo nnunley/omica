@@ -60,6 +60,7 @@ runtime_builtins := [?]Builtin_Spec {
 	{"edit_distance", 2, builtin_edit_distance},
 	{"parse_ordinal", 1, builtin_parse_ordinal},
 	{"__list_concat", -1, builtin_list_concat},
+	{"__list_append", 2, builtin_list_append},
 	{"__list_slice", 3, builtin_list_slice},
 	{"__index_option", 2, builtin_index_option},
 	{"__len_option", 1, builtin_len_option},
@@ -2156,10 +2157,25 @@ builtin_sort :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	}
 	sorted := make([]v.Value, len(values), state.allocator)
 	copy(sorted, values)
-	slice.sort_by(sorted, proc(a, b: v.Value) -> bool {
-		return v.value_cmp(a, b) == .Less
-	})
-	return v.value_list(state.allocator, sorted), true
+	// Sort in place with a direct comparator. slice.sort_by takes a runtime
+	// function pointer, so smoothsort calls it indirectly on every
+	// comparison; a local comparator that the compiler can inline removes
+	// that indirection. The order is the canonical value ordering, so the
+	// result matches value_cmp.
+	sort_values(sorted)
+	return v.value_list_owned(state.allocator, sorted), true
+}
+
+// Sorts values by the canonical ordering. Kept as a named proc so the
+// comparator body is visible to the optimizer.
+@(private)
+sort_values :: proc(values: []v.Value) {
+	slice.sort_by(values, value_less)
+}
+
+@(private)
+value_less :: proc(a, b: v.Value) -> bool {
+	return v.value_cmp(a, b) == .Less
 }
 
 @(private)
@@ -2247,19 +2263,36 @@ builtin_index_option :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 }
 
 @(private)
+builtin_list_append :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	_, is_list := v.value_as_list(args[0])
+	if !is_list {
+		return builtin_error(state, "E_TYPE", "__list_append expects a list")
+	}
+	return v.value_list_append(state.allocator, args[0], args[1]), true
+}
+
+@(private)
 builtin_list_concat :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
-	values := make([dynamic]v.Value, 0, 8, state.allocator)
-	defer delete(values)
+	// Size the result once from the summed part lengths and fill it directly,
+	// then hand the buffer to the value: the previous version grew a dynamic
+	// array (reallocating and copying the growing prefix) and then value_list
+	// copied the whole result again.
+	total := 0
 	for part in args {
 		items, ok := v.value_as_list(part)
 		if !ok {
 			return builtin_error(state, "E_TYPE", "__list_concat expects lists")
 		}
-		for item in items {
-			append(&values, item)
-		}
+		total += len(items)
 	}
-	return v.value_list(state.allocator, values[:]), true
+	result := make([]v.Value, total, state.allocator)
+	write := 0
+	for part in args {
+		items, _ := v.value_as_list(part)
+		copy(result[write:], items)
+		write += len(items)
+	}
+	return v.value_list_owned(state.allocator, result), true
 }
 
 @(private)

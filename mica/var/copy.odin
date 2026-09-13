@@ -121,7 +121,12 @@ value_deep_free :: proc(alloc: mem.Allocator, value: Value) {
 			for item in header.values {
 				value_deep_free(alloc, item)
 			}
-			delete(header.values, alloc)
+			if header.values != nil {
+				// Free the full allocation; an appended list may reserve
+				// headroom beyond its visible length.
+				full := ([^]Value)(raw_data(header.values))[:header.allocated]
+				delete(full, alloc)
+			}
 			free(header, alloc)
 		}
 	case .Map:
