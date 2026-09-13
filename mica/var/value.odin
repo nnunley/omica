@@ -361,6 +361,21 @@ value_int_unchecked_pack :: proc(n: i64) -> Value {
 	return value_pack(.Int, u64(n))
 }
 
+// Decodes a float by payload only. Callers must have checked the tag.
+value_float_unchecked :: proc(v: Value) -> f32 {
+	return transmute(f32)u32(value_payload(v))
+}
+
+// Packs a float that is known to be finite, canonicalizing negative zero.
+// Callers must have verified finiteness (see `float_is_finite`).
+value_float_unchecked_pack :: proc(f: f32) -> Value {
+	canonical := f
+	if canonical == 0 {
+		canonical = 0
+	}
+	return value_pack(.Float, u64(transmute(u32)canonical))
+}
+
 // Returns the float payload, if this is a float.
 value_as_float :: proc(v: Value) -> (f32, bool) {
 	if value_tag(v) != .Float {
@@ -411,7 +426,6 @@ value_as_error_code :: proc(v: Value) -> (Symbol, bool) {
 
 // --- Numeric operations ----------------------------------------------------
 
-@(private)
 float_is_finite :: proc(f: f32) -> bool {
 	bits := transmute(u32)f
 	exponent := (bits >> 23) & 0xff

@@ -8,6 +8,7 @@ package vm
 
 import "base:intrinsics"
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
@@ -508,6 +509,66 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 					match = false
 				}
 				if match {
+					break
+				}
+			} else if v.value_tag(left) == .Float && v.value_tag(right) == .Float {
+				// Float operands: decode both and apply the operation on raw
+				// f32 bits, checking finiteness of the result. Arithmetic that
+				// overflows to inf/nan raises E_ARITH, so a non-finite result
+				// falls through to the general helper (which reports it).
+				// `done` marks a comparison, which writes its own result and
+				// needs no finiteness check; `match` marks an arithmetic op
+				// whose result must be finite.
+				done := false
+				match := true
+				l := v.value_float_unchecked(left)
+				r := v.value_float_unchecked(right)
+				result := f32(0)
+				switch Bin_Op(instr.flags) {
+				case .Add:
+					result = l + r
+				case .Sub:
+					result = l - r
+				case .Mul:
+					result = l * r
+				case .Div:
+					if r == 0 {
+						match = false
+					} else {
+						result = l / r
+					}
+				case .Rem:
+					if r == 0 {
+						match = false
+					} else {
+						result = l - math.trunc(l / r) * r
+					}
+				case .Lt:
+					state.registers[base + int(instr.a)] = v.value_bool(l < r)
+					done = true
+				case .Le:
+					state.registers[base + int(instr.a)] = v.value_bool(l <= r)
+					done = true
+				case .Gt:
+					state.registers[base + int(instr.a)] = v.value_bool(l > r)
+					done = true
+				case .Ge:
+					state.registers[base + int(instr.a)] = v.value_bool(l >= r)
+					done = true
+				case .Eq:
+					state.registers[base + int(instr.a)] = v.value_bool(l == r)
+					done = true
+				case .Ne:
+					state.registers[base + int(instr.a)] = v.value_bool(l != r)
+					done = true
+				case:
+					match = false
+				}
+				if done {
+					break
+				}
+				if match && v.float_is_finite(result) {
+					state.registers[base + int(instr.a)] = v.value_float_unchecked_pack(result)
 					break
 				}
 			}
