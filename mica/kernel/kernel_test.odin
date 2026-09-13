@@ -538,6 +538,77 @@ test_transitive_rule_derives_reachable :: proc(t: ^testing.T) {
 	delete(rows)
 }
 
+// A transaction that has staged no writes sees exactly its base snapshot's
+// derived facts, so reads must reuse the snapshot's already-materialized rows
+// rather than re-running the fixpoint. Read-only transactions are the common
+// case (every task begins one), and recomputing on each read made a derived
+// scan cost a full closure evaluation.
+@(test)
+test_read_only_transaction_reuses_snapshot_derived :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	edge := create_relation(&kernel, 1, "Edge", 2)
+	reach := create_relation(&kernel, 2, "Reach", 2)
+
+	from := v.symbol_intern("from")
+	to := v.symbol_intern("to")
+	mid := v.symbol_intern("mid")
+
+	base_rule := rule_new(
+		reach,
+		[]Term{term_var(from), term_var(to)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(edge, []Term{term_var(from), term_var(to)})),
+		},
+	)
+	recursive_rule := rule_new(
+		reach,
+		[]Term{term_var(from), term_var(to)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(edge, []Term{term_var(from), term_var(mid)})),
+			body_atom(atom_positive(reach, []Term{term_var(mid), term_var(to)})),
+		},
+	)
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(400), base_rule, "Reach(f,t) :- Edge(f,t).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+	snapshot, err = kernel_install_rule(&kernel, v.Identity(401), recursive_rule, "Reach(f,t) :- Edge(f,m), Reach(m,t).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	a := must_identity(1)
+	b := must_identity(2)
+	c := must_identity(3)
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, edge, tuple_of(a, b))
+	transaction_assert(&tx, edge, tuple_of(b, c))
+	commit_transaction(t, &tx)
+
+	// A fresh transaction with no staged writes must observe the derived facts
+	// and must alias the snapshot's rows instead of allocating its own.
+	reader := kernel_begin(&kernel)
+	defer transaction_destroy(&reader)
+	rows := transaction_rows(&reader, reach, 2)
+	testing.expect(t, has_tuple(rows[:], tuple_of(a, c)))
+	delete(rows)
+
+	base_rows := snapshot_derived_rows(reader.base, reach)
+	tx_rows := transaction_derived_rows(&reader, reach)
+	testing.expect(t, len(base_rows) > 0)
+	testing.expect(t, raw_data(base_rows) == raw_data(tx_rows))
+
+	// Staging a write invalidates the reuse and the transaction sees its own
+	// facts derived over the overlay.
+	transaction_assert(&reader, edge, tuple_of(a, c))
+	overlay_rows := transaction_rows(&reader, reach, 2)
+	testing.expect(t, has_tuple(overlay_rows[:], tuple_of(a, b)))
+	test_rows := transaction_derived_rows(&reader, reach)
+	testing.expect(t, raw_data(snapshot_derived_rows(reader.base, reach)) != raw_data(test_rows))
+	delete(overlay_rows)
+}
+
 @(test)
 test_stratified_negation_updates_with_facts :: proc(t: ^testing.T) {
 	kernel: Kernel

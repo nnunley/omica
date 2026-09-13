@@ -363,6 +363,17 @@ transaction_evaluate_derived :: proc(transaction: ^Transaction) -> Kernel_Error 
 		return .None
 	}
 
+	// A transaction that has staged no writes sees exactly its base snapshot's
+	// state, and that snapshot's derived rows were materialized when it was
+	// published. Reference them instead of re-running the fixpoint: read-only
+	// transactions are the common case (every task begins one), and recomputing
+	// made each read of a derived relation cost a full closure evaluation.
+	if len(transaction.writes) == 0 {
+		transaction.derived = transaction.base.derived
+		transaction.derived_valid = true
+		return .None
+	}
+
 	arena := new(virtual.Arena)
 	if err := virtual.arena_init_growing(arena); err != nil {
 		panic("failed to initialize rule evaluation arena")
