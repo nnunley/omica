@@ -11,6 +11,9 @@ expected failure as ordinary values.
 | Function                                   | Result                                               |
 | ------------------------------------------ | ---------------------------------------------------- |
 | `string_len(text)`                         | number of Unicode scalar values                      |
+| `len(text)`                                | number of Unicode scalar values                      |
+| `text[i]`                                  | Unicode scalar value at position `i`, as an integer  |
+| `for ch in text`                           | iterates Unicode scalar values                       |
 | `string_chars(text)`                       | list of one-character strings                        |
 | `string_slice(text, start, end)`           | end-exclusive character slice                        |
 | `string_from_chars(chars)`                 | string assembled from character strings              |
@@ -50,6 +53,17 @@ String positions count Unicode scalar values. An accented character such as `é`
 position regardless of its UTF-8 byte length. A letter followed by a combining accent occupies two
 positions. Use these operations for character-based text processing; a host that lays out text may
 group several scalars into one displayed character.
+
+Indexing, `len`, and `for` treat a string as a sequence of scalars. The value at a position is the
+scalar as an integer, which is what a scanner or parser compares and classifies; `string_chars` is
+the one-character-string form and `string_slice` materializes text:
+
+```mica,eval
+require "AéB"[0] == 65
+require "AéB"[1] == 233
+require len("AéB") == 3
+require string_slice("AéB", 1, 2) == "é"
+```
 
 `string_slice` uses an exclusive end position and accepts an empty interval. A list range such as
 `items[1..3]` includes position 3. Write the bounds for the operation being called:

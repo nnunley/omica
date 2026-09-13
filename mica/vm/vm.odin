@@ -693,10 +693,16 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 					length = len(relation.rows)
 					length_ok = true
 				}
+			case .String:
+				count, ok := v.string_scalar_count(collection)
+				if ok {
+					length = count
+					length_ok = true
+				}
 			case:
 			}
 			if !length_ok {
-				vm_fail(state, "E_TYPE", "len expects a list, map, or relation")
+				vm_fail(state, "E_TYPE", "len expects a list, map, relation, or string")
 				break
 			}
 			length_value, length_ok_value := v.value_int(i64(length))
@@ -1314,8 +1320,17 @@ vm_collection_key_at :: proc(state: ^VM, base: int, instr: Instruction) -> bool 
 		result, _ := v.value_int(index)
 		state.registers[base + int(instr.a)] = result
 
+	case .String:
+		count, _ := v.string_scalar_count(collection)
+		if int(index) >= count {
+			vm_fail(state, "E_INDEX", "collection index out of range")
+			return false
+		}
+		result, _ := v.value_int(index)
+		state.registers[base + int(instr.a)] = result
+
 	case:
-		vm_fail(state, "E_TYPE", "collection key iteration needs a list, map, or relation")
+		vm_fail(state, "E_TYPE", "collection key iteration needs a list, map, relation, or string")
 		return false
 	}
 	return true
@@ -1363,8 +1378,17 @@ vm_collection_value_at :: proc(state: ^VM, base: int, instr: Instruction) -> boo
 		}
 		state.registers[base + int(instr.a)] = v.value_map(state.allocator, entries)
 
+	case .String:
+		scalar, found := v.string_scalar_at(collection, int(index))
+		if !found {
+			vm_fail(state, "E_INDEX", "collection index out of range")
+			return false
+		}
+		result, _ := v.value_int(i64(scalar))
+		state.registers[base + int(instr.a)] = result
+
 	case:
-		vm_fail(state, "E_TYPE", "collection value iteration needs a list, map, or relation")
+		vm_fail(state, "E_TYPE", "collection value iteration needs a list, map, relation, or string")
 		return false
 	}
 	return true
@@ -1389,6 +1413,22 @@ vm_index :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 			return false
 		}
 		result = values[index]
+
+	case .String:
+		// A scalar position, not a byte: strings are sequences of Unicode
+		// scalar values. The value is an integer, which is what a scanner
+		// compares and classifies.
+		index, is_int := v.value_as_int(key)
+		if !is_int {
+			vm_fail(state, "E_TYPE", "string index is not an integer")
+			return false
+		}
+		scalar, found := v.string_scalar_at(collection, int(index))
+		if !found {
+			vm_fail(state, "E_INDEX", "string index out of range")
+			return false
+		}
+		result, _ = v.value_int(i64(scalar))
 
 	case .Map:
 		entries, _ := v.value_as_map(collection)
@@ -1453,7 +1493,7 @@ vm_index :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		}
 
 	case:
-		vm_fail(state, "E_TYPE", "index expects a list, map, or relation")
+		vm_fail(state, "E_TYPE", "index expects a list, map, relation, or string")
 		return false
 	}
 

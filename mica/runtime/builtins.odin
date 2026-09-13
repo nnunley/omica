@@ -1892,11 +1892,14 @@ builtin_is_frob :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 
 @(private)
 builtin_string_len :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
-	text, ok := string_argument(state, args, 0, "string_len")
-	if !ok {
+	if _, ok := v.value_as_string(args[0]); !ok {
 		return builtin_error(state, "E_TYPE", "string_len expects a string")
 	}
-	result, value_ok := v.value_int(i64(utf8.rune_count_in_string(text)))
+	count, count_ok := v.string_scalar_count(args[0])
+	if !count_ok {
+		return builtin_error(state, "E_TYPE", "string_len expects a string")
+	}
+	result, value_ok := v.value_int(i64(count))
 	if !value_ok {
 		return builtin_error(state, "E_RANGE", "string length is out of range")
 	}
@@ -1919,7 +1922,7 @@ builtin_string_chars :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 
 @(private)
 builtin_string_slice :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
-	text, ok := string_argument(state, args, 0, "string_slice")
+	text, ok := v.value_as_string(args[0])
 	if !ok {
 		return builtin_error(state, "E_TYPE", "string_slice expects a string")
 	}
@@ -1928,27 +1931,20 @@ builtin_string_slice :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 	if !start_ok || !end_ok {
 		return builtin_error(state, "E_TYPE", "string_slice expects integer positions")
 	}
-	char_len := utf8.rune_count_in_string(text)
+	char_len, count_ok := v.string_scalar_count(args[0])
+	if !count_ok {
+		return builtin_error(state, "E_TYPE", "string_slice expects a string")
+	}
 	if start < 0 || start > end || end > i64(char_len) {
 		return builtin_error(state, "E_INDEX", "string_slice bounds are invalid")
 	}
 
-	byte_start := len(text)
-	byte_end := len(text)
-	if end < i64(char_len) || start < i64(char_len) {
-		position := 0
-		for offset := 0; offset < len(text); {
-			if position == int(start) {
-				byte_start = offset
-			}
-			if position == int(end) {
-				byte_end = offset
-				break
-			}
-			_, size := utf8.decode_rune_in_string(text[offset:])
-			offset += size
-			position += 1
-		}
+	// A scalar range maps to a boundary-aligned byte range, so the slice can
+	// never split a scalar. ASCII and indexed strings locate in O(1)/O(stride)
+	// instead of walking from the start.
+	byte_start, byte_end, range_ok := v.string_byte_range(args[0], int(start), int(end))
+	if !range_ok {
+		return builtin_error(state, "E_INDEX", "string_slice bounds are invalid")
 	}
 	return v.value_string(state.allocator, text[byte_start:byte_end]), true
 }
@@ -2510,10 +2506,12 @@ builtin_index_or :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	default := args[2]
 
 	if entries, is_map := v.value_as_map(collection); is_map {
-		for entry in entries {
-			if v.value_eq(entry.key, index) {
-				return entry.value, true
-			}
+		// Entries are canonicalized sorted by key, so use the same cheap
+		// ordered probe as map indexing instead of a linear scan. Keyword
+		// tables make this the hot path for identifier lexing.
+		position, found := v.map_entry_index(entries, index)
+		if found {
+			return entries[position].value, true
 		}
 		return default, true
 	}

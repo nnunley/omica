@@ -104,6 +104,69 @@ test_builtin_string_surface :: proc(t: ^testing.T) {
 	testing.expect_value(t, text, "abc")
 }
 
+// A string is a sequence of Unicode scalar values for indexing, length, and
+// iteration, not of bytes. The value at a position is the scalar as an
+// integer, which is what a scanner classifies.
+@(test)
+test_run_string_scalar_scanning :: proc(t: ^testing.T) {
+	ctx := c.Compile_Context {
+		builtins   = make(map[string]bool),
+		relations  = make(map[string]u32),
+		identities = make(map[string]v.Value),
+	}
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+	install_builtin_names(&ctx)
+
+	// Scalar position, not byte offset: "héllo"[1] is 'é', the scalar 0xe9.
+	expect_int_builtin(t, &ctx, `"héllo"[1]`, 0xe9)
+	expect_int_builtin(t, &ctx, `"abc"[0]`, 'a')
+	expect_int_builtin(t, &ctx, `len("héllo")`, 5)
+	expect_int_builtin(t, &ctx, `string_len("héllo")`, 5)
+
+	// Slicing still works by scalar positions and cannot split a scalar.
+	expect_string_builtin(t, &ctx, `string_slice("héllo", 1, 2)`, "é")
+	expect_string_builtin(t, &ctx, `string_slice("héllo", 1, 3)`, "él")
+
+	// Iteration yields scalars in order.
+	expect_int_builtin(
+		t,
+		&ctx,
+		`begin
+  let text = "hé"
+  let total = 0
+  for scalar in text
+    total = total + scalar
+  end
+  total
+end`,
+		0x68 + 0xe9,
+	)
+
+	// The two-binding form pairs each scalar with its position.
+	expect_int_builtin(
+		t,
+		&ctx,
+		`begin
+  let text = "hé"
+  let total = 0
+  for position, scalar in text
+    if position == 1
+      total = total + scalar
+    end
+  end
+  total
+end`,
+		0xe9,
+	)
+
+	// Bounds are enforced like list indexing.
+	expect_builtin_error(t, &ctx, `"abc"[3]`, "E_INDEX")
+	expect_builtin_error(t, &ctx, `"abc"[-1]`, "E_INDEX")
+	expect_builtin_error(t, &ctx, `string_slice("abc", 0, 4)`, "E_INDEX")
+}
+
 @(private)
 expect_int_builtin :: proc(
 	t: ^testing.T,

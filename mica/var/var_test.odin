@@ -5,6 +5,7 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:testing"
+import "core:unicode/utf8"
 
 @(private)
 sym :: proc(name: string) -> Value {
@@ -1137,4 +1138,117 @@ test_value_deep_copy_frees_scratch :: proc(t: ^testing.T) {
 		"value_deep_copy leaked %d allocation(s)",
 		len(track.allocation_map),
 	)
+}
+
+// Scalar scanning is the lexer's hot path: ASCII strings map positions to
+// bytes directly, and long non-ASCII strings carry a sampled index so a
+// position lookup never walks the whole string.
+@(test)
+test_string_scalar_scanning :: proc(t: ^testing.T) {
+	arena := new(virtual.Arena)
+	if init_error := virtual.arena_init_growing(arena); init_error != nil {
+		panic("failed to initialize test arena")
+	}
+	defer {
+		virtual.arena_destroy(arena)
+		free(arena)
+	}
+	alloc := virtual.arena_allocator(arena)
+
+	// ASCII: scalar count equals byte count; positions are byte offsets.
+	ascii := value_string(alloc, "abc")
+	ascii_header, _ := heap_header(ascii, .String, Heap_String)
+	testing.expect(t, ascii_header.ascii)
+	count, count_ok := string_scalar_count(ascii)
+	testing.expect(t, count_ok)
+	testing.expect_value(t, count, 3)
+	for position in 0 ..< 3 {
+		scalar, found := string_scalar_at(ascii, position)
+		testing.expect(t, found)
+		testing.expect_value(t, rune(scalar), rune('a' + position))
+	}
+	_, past_end := string_scalar_at(ascii, 3)
+	testing.expect(t, !past_end)
+	_, negative := string_scalar_at(ascii, -1)
+	testing.expect(t, !negative)
+
+	// Multi-byte scalars: "é" is two bytes, so scalar and byte positions
+	// diverge. "héllo" is 5 scalars in 6 bytes.
+	mixed := value_string(alloc, "héllo")
+	mixed_count, mixed_ok := string_scalar_count(mixed)
+	testing.expect(t, mixed_ok)
+	testing.expect_value(t, mixed_count, 5)
+	mixed_header, _ := heap_header(mixed, .String, Heap_String)
+	testing.expect(t, !mixed_header.ascii)
+	expect_runes := "héllo"
+	scalar_index := 0
+	for expected in expect_runes {
+		scalar, found := string_scalar_at(mixed, scalar_index)
+		testing.expect(t, found)
+		testing.expect_value(t, rune(scalar), expected)
+		scalar_index += 1
+	}
+
+	// A scalar range maps to a boundary-aligned byte range.
+	start, end, range_ok := string_byte_range(mixed, 1, 2)
+	testing.expect(t, range_ok)
+	text, _ := value_as_string(mixed)
+	testing.expect_value(t, text[start:end], "é")
+
+	// Long non-ASCII strings take the sampled index path, which must agree
+	// with a linear scan at every position, including across sample
+	// boundaries (the stride is 32).
+	builder := strings.builder_make(alloc)
+	for index in 0 ..< 200 {
+		strings.write_rune(&builder, rune(0x00e9 + (index % 3)))
+	}
+	long := value_string(alloc, strings.to_string(builder))
+	long_header, _ := heap_header(long, .String, Heap_String)
+	testing.expect(t, !long_header.ascii)
+	testing.expect(t, long_header.index != nil)
+	long_count, _ := string_scalar_count(long)
+	testing.expect_value(t, long_count, 200)
+	long_text, _ := value_as_string(long)
+	byte_cursor := 0
+	for position in 0 ..< 200 {
+		scalar, found := string_scalar_at(long, position)
+		testing.expect(t, found)
+		expected, expected_size := utf8_decode_long(long_text, byte_cursor)
+		testing.expect_value(t, rune(scalar), expected)
+		byte_cursor += expected_size
+	}
+	// End position is a valid (empty) range.
+	tail_start, tail_end, tail_ok := string_byte_range(long, 200, 200)
+	testing.expect(t, tail_ok)
+	testing.expect_value(t, tail_start, len(long_text))
+	testing.expect_value(t, tail_end, len(long_text))
+
+	// A scalar count that is an exact multiple of the stride must still
+	// resolve the end position (the sampled table's final entry is the end
+	// offset, not sample zero).
+	exact_builder := strings.builder_make(alloc)
+	for index in 0 ..< 160 {
+		strings.write_rune(&exact_builder, rune(0x00e9 + (index % 3)))
+	}
+	exact := value_string(alloc, strings.to_string(exact_builder))
+	exact_count, _ := string_scalar_count(exact)
+	testing.expect_value(t, exact_count, 160)
+	exact_text, _ := value_as_string(exact)
+	end_offset, end_ok := string_byte_offset(exact, 160)
+	testing.expect(t, end_ok)
+	testing.expect_value(t, end_offset, len(exact_text))
+	last_scalar, last_ok := string_scalar_at(exact, 159)
+	testing.expect(t, last_ok)
+	last_start, last_start_ok := string_byte_offset(exact, 159)
+	testing.expect(t, last_start_ok)
+	last_expected, _ := utf8_decode_long(exact_text, last_start)
+	testing.expect_value(t, rune(last_scalar), last_expected)
+	_, past_end_ok := string_scalar_at(exact, 160)
+	testing.expect(t, !past_end_ok)
+}
+
+@(private)
+utf8_decode_long :: proc(text: string, offset: int) -> (rune, int) {
+	scalar, size := utf8.decode_rune_in_string(text[offset:])
+	return scalar, size
 }

@@ -9,6 +9,7 @@ package var
 
 import "core:mem"
 import "core:slice"
+import "core:unicode/utf8"
 
 // An immutable string value.
 //
@@ -18,12 +19,35 @@ import "core:slice"
 // appended bytes. `spare_owner` is a monotonically increasing token that
 // records which append created the spare room, so an older copy of the value
 // cannot reuse it after a newer append has claimed it.
+//
+// Strings are UTF-8. Their characters are Unicode scalar values, but UTF-8 is
+// variable-width, so mapping a scalar position to a byte offset is a scan.
+// `ascii` records that every byte is < 0x80, which makes the scalar count equal
+// the byte count and every scalar position equal a byte offset. For long
+// non-ASCII strings, `index` is a sampled offset table that bounds the scan to
+// `STRING_INDEX_STRIDE` scalars; it is built once at construction and never
+// mutated.
 Heap_String :: struct {
 	data:        []u8,
 	// Bytes allocated for `data`; `len(data)` may be smaller when the string
 	// was produced by `value_string_append`, which reserves headroom.
 	allocated:   int,
 	spare_owner: u64,
+	ascii:       bool,
+	index:       ^String_Index,
+}
+
+// Scalar positions between two samples. A sampled offset makes scalar lookup
+// O(stride) instead of O(n); the memory cost is four bytes per stride scalars
+// (about 12.5% for ASCII-sized scalars, far less than a full offset table).
+STRING_INDEX_STRIDE :: 32
+
+// A sampled scalar-offset table for a non-ASCII string. `offsets[k]` is the
+// byte offset of scalar `k * STRING_INDEX_STRIDE`; `count` is the total scalar
+// count.
+String_Index :: struct {
+	offsets: []u32,
+	count:   int,
 }
 
 // An immutable byte-string value.
@@ -114,6 +138,189 @@ bytes_to_string :: proc(data: []u8) -> string {
 	return transmute(string)data
 }
 
+// --- String scalar scanning ------------------------------------------------
+
+// Counts the Unicode scalar values in UTF-8 `data`. Invalid bytes (including
+// stray continuation bytes) count as one scalar each, matching the tolerant
+// decoding used everywhere else; see `string_scalar_count`.
+string_scalar_count_bytes :: proc(data: []u8) -> int {
+	count := 0
+	for offset := 0; offset < len(data); {
+		_, size := utf8.decode_rune_in_bytes(data[offset:])
+		if size <= 0 {
+			size = 1
+		}
+		offset += size
+		count += 1
+	}
+	return count
+}
+
+// Reports whether every byte is ASCII, which makes scalar positions equal byte
+// offsets.
+string_is_ascii :: proc(data: []u8) -> bool {
+	for byte in data {
+		if byte >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// Builds a sampled offset table for `data`, which must be non-ASCII and longer
+// than the index threshold. Sampling is on scalar positions, so `offsets[k]`
+// is the byte offset of scalar `k * STRING_INDEX_STRIDE`.
+string_index_build :: proc(alloc: mem.Allocator, data: []u8) -> ^String_Index {
+	count := string_scalar_count_bytes(data)
+	sample_count := (count + STRING_INDEX_STRIDE) / STRING_INDEX_STRIDE
+	offsets := make([]u32, sample_count, alloc)
+	scalar := 0
+	sample := 0
+	for offset := 0; offset < len(data); {
+		if scalar % STRING_INDEX_STRIDE == 0 {
+			offsets[sample] = u32(offset)
+			sample += 1
+		}
+		_, size := utf8.decode_rune_in_bytes(data[offset:])
+		if size <= 0 {
+			size = 1
+		}
+		offset += size
+		scalar += 1
+	}
+	index := new(String_Index, alloc)
+	index.offsets = offsets
+	index.count = count
+	// When the scalar count is an exact multiple of the stride, the loop stops
+	// before recording the end offset. Write it so a position equal to the
+	// count resolves to the end of the string rather than to sample zero.
+	if sample < sample_count {
+		offsets[sample] = u32(len(data))
+	}
+	return index
+}
+
+// Initializes the string descriptor for `data`. `ascii` is computed from the
+// bytes; a non-ASCII string longer than `STRING_INDEX_MIN` gets a sampled
+// offset table. The table is built once here, so no operation mutates the
+// header afterwards.
+@(private)
+string_describe :: proc(alloc: mem.Allocator, header: ^Heap_String) {
+	header.ascii = string_is_ascii(header.data)
+	if !header.ascii && len(header.data) >= STRING_INDEX_MIN {
+		header.index = string_index_build(alloc, header.data)
+	}
+}
+
+// Non-ASCII strings shorter than this scan instead of carrying an offset table:
+// four bytes per 32 scalars is not worth it below this size, and a bounded scan
+// is cheap.
+STRING_INDEX_MIN :: 128
+
+// Returns the number of Unicode scalar values in a string.
+string_scalar_count :: proc(v: Value) -> (int, bool) {
+	header, ok := heap_header(v, .String, Heap_String)
+	if !ok {
+		return 0, false
+	}
+	if header.ascii {
+		return len(header.data), true
+	}
+	if header.index != nil {
+		return header.index.count, true
+	}
+	return string_scalar_count_bytes(header.data), true
+}
+
+// Returns the byte offset of scalar position `position`, which must satisfy
+// `0 <= position <= scalar_count`. ASCII strings map positions directly; an
+// indexed string walks at most one stride from the nearest sample.
+string_byte_offset :: proc(v: Value, position: int) -> (int, bool) {
+	header, ok := heap_header(v, .String, Heap_String)
+	if !ok {
+		return 0, false
+	}
+	if header.ascii {
+		return position, true
+	}
+	if header.index != nil {
+		count := header.index.count
+		if position < 0 || position > count {
+			return 0, false
+		}
+		sample := position / STRING_INDEX_STRIDE
+		offset := int(header.index.offsets[sample])
+		scalar := sample * STRING_INDEX_STRIDE
+		for scalar < position {
+			_, size := utf8.decode_rune_in_bytes(header.data[offset:])
+			if size <= 0 {
+				size = 1
+			}
+			offset += size
+			scalar += 1
+		}
+		return offset, true
+	}
+	// No index: scan from the start. Bounded by STRING_INDEX_MIN for strings
+	// that were not indexed at construction.
+	count := 0
+	for offset := 0; offset < len(header.data); {
+		if count == position {
+			return offset, true
+		}
+		_, size := utf8.decode_rune_in_bytes(header.data[offset:])
+		if size <= 0 {
+			size = 1
+		}
+		offset += size
+		count += 1
+	}
+	if count == position {
+		return len(header.data), true
+	}
+	return 0, false
+}
+
+// Returns the Unicode scalar value at scalar position `position`.
+string_scalar_at :: proc(v: Value, position: int) -> (rune, bool) {
+	header, ok := heap_header(v, .String, Heap_String)
+	if !ok {
+		return 0, false
+	}
+	if header.ascii {
+		if position < 0 || position >= len(header.data) {
+			return 0, false
+		}
+		return rune(header.data[position]), true
+	}
+	offset, found := string_byte_offset(v, position)
+	if !found {
+		return 0, false
+	}
+	if offset >= len(header.data) {
+		return 0, false
+	}
+	scalar, size := utf8.decode_rune_in_bytes(header.data[offset:])
+	if size <= 0 {
+		return 0, false
+	}
+	return scalar, true
+}
+
+// Converts a scalar range to a byte range. Both positions must be valid
+// boundaries, so the resulting byte range never splits a scalar.
+string_byte_range :: proc(v: Value, start, end: int) -> (int, int, bool) {
+	byte_start, start_ok := string_byte_offset(v, start)
+	if !start_ok {
+		return 0, 0, false
+	}
+	byte_end, end_ok := string_byte_offset(v, end)
+	if !end_ok {
+		return 0, 0, false
+	}
+	return byte_start, byte_end, true
+}
+
 // --- Constructors ----------------------------------------------------------
 
 // Creates a string value by copying `s` into `alloc`.
@@ -122,6 +329,7 @@ value_string :: proc(alloc: mem.Allocator, s: string) -> Value {
 	copy(data, transmute([]u8)s)
 	header := new(Heap_String, alloc)
 	header.data = data
+	string_describe(alloc, header)
 	return value_heap(.String, header)
 }
 
@@ -134,10 +342,19 @@ string_spare_counter: u64
 // Creates a string value taking ownership of `data` without copying. `data`
 // must have come from `alloc` and must not be used or freed by the caller
 // afterwards. The header itself is still allocated.
-value_string_owned :: proc(alloc: mem.Allocator, data: []u8) -> Value {
+//
+// `desc` selects whether the ASCII flag and sampled index are computed for the
+// owned bytes. A builder that has already counted (append) passes false and
+// transfers the counts; a caller that hands over arbitrary bytes (concat,
+// join, codec) passes true. An undescribed value is never left observable: the
+// append path fills the counts before returning.
+value_string_owned :: proc(alloc: mem.Allocator, data: []u8, desc := true) -> Value {
 	header := new(Heap_String, alloc)
 	header.data = data
 	header.allocated = len(data)
+	if desc {
+		string_describe(alloc, header)
+	}
 	return value_heap(.String, header)
 }
 
@@ -152,6 +369,12 @@ value_string_owned :: proc(alloc: mem.Allocator, data: []u8) -> Value {
 // base's length are invisible through every existing value, and only the token
 // holder may write there, so an append can never change what another value
 // reads.
+//
+// The ASCII flag and scalar count are carried across, so a grow loop does not
+// rescan the prefix. The sampled index is not carried: maintaining it across
+// appends would mean rebuilding it per append, so an append result scans (it
+// is bounded by the index threshold, and the compiler's indexed strings come
+// from a single construction, not from repeated appends).
 value_string_append :: proc(alloc: mem.Allocator, base: Value, text: string) -> Value {
 	header, is_string := heap_header(base, .String, Heap_String)
 	if is_string && header.data != nil && header.spare_owner != 0 {
@@ -163,9 +386,10 @@ value_string_append :: proc(alloc: mem.Allocator, base: Value, text: string) -> 
 			copy(full[len(header.data):], transmute([]u8)text)
 			// The base is no longer the tail owner; the result is.
 			header.spare_owner = 0
-			value := value_string_owned(alloc, full[:required])
+			value := value_string_owned(alloc, full[:required], false)
 			result, _ := heap_header(value, .String, Heap_String)
 			result.allocated = header.allocated
+			result.ascii = header.ascii && string_is_ascii(transmute([]u8)text)
 			string_spare_counter += 1
 			result.spare_owner = string_spare_counter
 			return value
@@ -186,9 +410,10 @@ value_string_append :: proc(alloc: mem.Allocator, base: Value, text: string) -> 
 		write = len(header.data)
 	}
 	copy(buffer[write:], transmute([]u8)text)
-	value := value_string_owned(alloc, buffer[:required])
+	value := value_string_owned(alloc, buffer[:required], false)
 	result, _ := heap_header(value, .String, Heap_String)
 	result.allocated = capacity
+	result.ascii = (!is_string || header.ascii) && string_is_ascii(transmute([]u8)text)
 	string_spare_counter += 1
 	result.spare_owner = string_spare_counter
 	return value

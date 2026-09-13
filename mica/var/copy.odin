@@ -109,6 +109,12 @@ value_deep_free :: proc(alloc: mem.Allocator, value: Value) {
 				full := ([^]u8)(raw_data(header.data))[:header.allocated]
 				delete(full, alloc)
 			}
+			if header.index != nil {
+				// A long non-ASCII string carries a sampled offset table; a
+				// deep copy rebuilds its own, so free this one.
+				delete(header.index.offsets, alloc)
+				free(header.index, alloc)
+			}
 			free(header, alloc)
 		}
 	case .Bytes:
