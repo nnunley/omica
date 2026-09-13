@@ -1252,3 +1252,70 @@ utf8_decode_long :: proc(text: string, offset: int) -> (rune, int) {
 	scalar, size := utf8.decode_rune_in_string(text[offset:])
 	return scalar, size
 }
+
+// `string_span` advances over a run of member bytes; `string_find_any` stops at
+// the first member of a stop set. Both are `strspn`/`strcspn`, used by the
+// lexer to skip whole runs in one call.
+@(test)
+test_string_span_and_find_any :: proc(t: ^testing.T) {
+	arena := new(virtual.Arena)
+	if init_error := virtual.arena_init_growing(arena); init_error != nil {
+		panic("failed to initialize test arena")
+	}
+	defer {
+		virtual.arena_destroy(arena)
+		free(arena)
+	}
+	alloc := virtual.arena_allocator(arena)
+
+	text := value_string(alloc, "abc 123 !")
+	letters := "abcdefghijklmnopqrstuvwxyz"
+	digits := "0123456789"
+
+	// span: [0,3) letters, then space is not a member.
+	span_end, span_ok := string_span(text, 0, letters)
+	testing.expect(t, span_ok)
+	testing.expect_value(t, span_end, 3)
+	span_end, span_ok = string_span(text, 4, digits)
+	testing.expect(t, span_ok)
+	testing.expect_value(t, span_end, 7)
+	// A start on a non-member returns the start.
+	span_end, span_ok = string_span(text, 3, letters)
+	testing.expect(t, span_ok)
+	testing.expect_value(t, span_end, 3)
+	// A start at or beyond the end returns the scalar count.
+	span_end, span_ok = string_span(text, 10, letters)
+	testing.expect(t, span_ok)
+	testing.expect_value(t, span_end, 9)
+
+	// find_any is the complement: scan to the first stop byte.
+	found, found_ok := string_find_any(text, 0, " ")
+	testing.expect(t, found_ok)
+	testing.expect_value(t, found, 3)
+	found, found_ok = string_find_any(text, 3, " ")
+	testing.expect(t, found_ok)
+	testing.expect_value(t, found, 3)
+	found, found_ok = string_find_any(text, 4, " !")
+	testing.expect(t, found_ok)
+	testing.expect_value(t, found, 7)
+	// With no stop byte after the start, the scan returns the scalar count.
+	found, found_ok = string_find_any(text, 8, " ")
+	testing.expect(t, found_ok)
+	testing.expect_value(t, found, 9)
+
+	// Multi-byte input: a scalar at or above 0x80 is not an ASCII member, and
+	// positions are scalar positions.
+	mixed := value_string(alloc, "abcédef")
+	mixed_span, mixed_span_ok := string_span(mixed, 0, letters)
+	testing.expect(t, mixed_span_ok)
+	testing.expect_value(t, mixed_span, 3)
+	// `é` is a non-ASCII stop byte, so it is not a member of the set; the scan
+	// runs to the end. This is the documented ASCII-set limitation.
+	mixed_stop, mixed_stop_ok := string_find_any(mixed, 0, "é")
+	testing.expect(t, mixed_stop_ok)
+	testing.expect_value(t, mixed_stop, 7)
+	// After the é, letters resume.
+	mixed_span, mixed_span_ok = string_span(mixed, 4, letters)
+	testing.expect(t, mixed_span_ok)
+	testing.expect_value(t, mixed_span, 7)
+}

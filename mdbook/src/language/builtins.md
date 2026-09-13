@@ -14,6 +14,8 @@ expected failure as ordinary values.
 | `len(text)`                                | number of Unicode scalar values                      |
 | `text[i]`                                  | Unicode scalar value at position `i`, as an integer  |
 | `for ch in text`                           | iterates Unicode scalar values                       |
+| `string_span(text, start, set)`            | end position of the run of `set` bytes from `start` |
+| `string_find_any(text, start, stop)`       | position of the first `stop` byte from `start`      |
 | `string_chars(text)`                       | list of one-character strings                        |
 | `string_slice(text, start, end)`           | end-exclusive character slice                        |
 | `string_from_chars(chars)`                 | string assembled from character strings              |
@@ -78,6 +80,22 @@ require string_from_chars(["A", "é", "B"]) == "AéB"
 
 Bounds must satisfy `0 <= start <= end <= string_len(text)`. A slice outside the string raises
 `E_INDEX`. `string_from_chars` accepts strings containing exactly one scalar each.
+
+`string_span` and `string_find_any` scan runs of ASCII bytes in one call, which is how a scanner
+avoids an interpreted loop per character. `string_span` returns the scalar position where the run of
+bytes drawn from `set` ends; `string_find_any` returns the position of the first byte drawn from
+`stop`:
+
+```mica,eval
+require string_span("abc123", 0, "abcdefghijklmnopqrstuvwxyz") == 3
+require string_find_any("abc 123", 0, " ") == 3
+require string_find_any("no-break", 0, " ") == 8
+```
+
+`set` and `stop` are sets of ASCII bytes. A scalar at or above `U+0080` is never a member, so a run
+stops there; put another way, these operations cannot draw a non-ASCII scalar into or out of a set.
+Positions are scalar positions, and a `start` at or beyond the end returns the scalar count. Use
+them for syntax scanning; use `string_slice` and the scalar operations for general text.
 
 Use `string_concat` for a fixed set of pieces and `string_join` for a list separated by punctuation:
 

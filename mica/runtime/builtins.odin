@@ -47,6 +47,8 @@ runtime_builtins := [?]Builtin_Spec {
 	{"string_len", 1, builtin_string_len},
 	{"string_chars", 1, builtin_string_chars},
 	{"string_slice", 3, builtin_string_slice},
+	{"string_span", 3, builtin_string_span},
+	{"string_find_any", 3, builtin_string_find_any},
 	{"string_from_chars", 1, builtin_string_from_chars},
 	{"string_concat", -1, builtin_string_concat},
 	{"string_append", 2, builtin_string_append},
@@ -1918,6 +1920,54 @@ builtin_string_chars :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 		append(&values, v.value_string(state.allocator, string(buf[:size])))
 	}
 	return v.value_list(state.allocator, values[:]), true
+}
+
+@(private)
+builtin_string_span :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if _, ok := v.value_as_string(args[0]); !ok {
+		return builtin_error(state, "E_TYPE", "string_span expects a string")
+	}
+	start, start_ok := v.value_as_int(args[1])
+	if !start_ok {
+		return builtin_error(state, "E_TYPE", "string_span expects an integer start")
+	}
+	set, set_ok := v.value_as_string(args[2])
+	if !set_ok {
+		return builtin_error(state, "E_TYPE", "string_span expects a string of member bytes")
+	}
+	end, span_ok := v.string_span(args[0], int(start), set)
+	if !span_ok {
+		return builtin_error(state, "E_INDEX", "string_span start is out of range")
+	}
+	result, value_ok := v.value_int(i64(end))
+	if !value_ok {
+		return builtin_error(state, "E_RANGE", "string_span result is out of range")
+	}
+	return result, true
+}
+
+@(private)
+builtin_string_find_any :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if _, ok := v.value_as_string(args[0]); !ok {
+		return builtin_error(state, "E_TYPE", "string_find_any expects a string")
+	}
+	start, start_ok := v.value_as_int(args[1])
+	if !start_ok {
+		return builtin_error(state, "E_TYPE", "string_find_any expects an integer start")
+	}
+	stop, stop_ok := v.value_as_string(args[2])
+	if !stop_ok {
+		return builtin_error(state, "E_TYPE", "string_find_any expects a string of stop bytes")
+	}
+	found, find_ok := v.string_find_any(args[0], int(start), stop)
+	if !find_ok {
+		return builtin_error(state, "E_INDEX", "string_find_any start is out of range")
+	}
+	result, value_ok := v.value_int(i64(found))
+	if !value_ok {
+		return builtin_error(state, "E_RANGE", "string_find_any result is out of range")
+	}
+	return result, true
 }
 
 @(private)

@@ -321,6 +321,124 @@ string_byte_range :: proc(v: Value, start, end: int) -> (int, int, bool) {
 	return byte_start, byte_end, true
 }
 
+// Returns the scalar position at or after `start` where a run of scalars that
+// are all members of `set` ends. `set` is treated as a set of ASCII bytes; any
+// scalar at or above 0x80 is not a member, so a run stops there. This is the
+// classic `strspn`: a scanner can advance over a whole identifier, digit, or
+// whitespace run with one call instead of a per-scalar loop in the bytecode.
+//
+// `start` beyond the string yields the scalar count, so callers can advance
+// unconditionally. A non-string value or a `start` before zero reports false.
+string_span :: proc(v: Value, start: int, set: string) -> (int, bool) {
+	header, ok := heap_header(v, .String, Heap_String)
+	if !ok || start < 0 {
+		return 0, false
+	}
+	if start >= len(header.data) {
+		return string_scalar_count_direct(header), true
+	}
+	// Membership bitmap: one bit per ASCII byte, built once per call.
+	members: [4]u64
+	for byte in transmute([]u8)set {
+		if byte < 128 {
+			members[byte >> 6] |= u64(1) << (byte & 63)
+		}
+	}
+	is_member :: proc(members: [4]u64, byte: u8) -> bool {
+		return byte < 128 && members[byte >> 6] & (u64(1) << (byte & 63)) != 0
+	}
+
+	if header.ascii {
+		position := start
+		for position < len(header.data) && is_member(members, header.data[position]) {
+			position += 1
+		}
+		return position, true
+	}
+	// Walk scalars from `start`, stopping at the first that is not an ASCII
+	// member.
+	byte_offset, offset_ok := string_byte_offset(v, start)
+	if !offset_ok {
+		return 0, false
+	}
+	position := start
+	for byte_offset < len(header.data) {
+		byte := header.data[byte_offset]
+		if !is_member(members, byte) {
+			break
+		}
+		_, size := utf8.decode_rune_in_bytes(header.data[byte_offset:])
+		if size <= 0 {
+			size = 1
+		}
+		byte_offset += size
+		position += 1
+	}
+	return position, true
+}
+
+// Scalar count from an already-resolved header, without re-checking the tag.
+@(private)
+string_scalar_count_direct :: proc(header: ^Heap_String) -> int {
+	if header.ascii {
+		return len(header.data)
+	}
+	if header.index != nil {
+		return header.index.count
+	}
+	return string_scalar_count_bytes(header.data)
+}
+
+// Returns the scalar position of the first scalar at or after `start` that is a
+// member of `stop`, or the scalar count when none is. `stop` is a set of ASCII
+// bytes; a scalar at or above 0x80 is never a member, so a scan over text
+// containing multi-byte scalars walks them whole. This is the complement of
+// `string_span`.
+string_find_any :: proc(v: Value, start: int, stop: string) -> (int, bool) {
+	header, ok := heap_header(v, .String, Heap_String)
+	if !ok || start < 0 {
+		return 0, false
+	}
+	if start >= len(header.data) {
+		return string_scalar_count_direct(header), true
+	}
+	members: [4]u64
+	for byte in transmute([]u8)stop {
+		if byte < 128 {
+			members[byte >> 6] |= u64(1) << (byte & 63)
+		}
+	}
+	is_member :: proc(members: [4]u64, byte: u8) -> bool {
+		return byte < 128 && members[byte >> 6] & (u64(1) << (byte & 63)) != 0
+	}
+
+	if header.ascii {
+		position := start
+		for position < len(header.data) && !is_member(members, header.data[position]) {
+			position += 1
+		}
+		return position, true
+	}
+	byte_offset, offset_ok := string_byte_offset(v, start)
+	if !offset_ok {
+		return 0, false
+	}
+	position := start
+	for byte_offset < len(header.data) {
+		byte := header.data[byte_offset]
+		if is_member(members, byte) {
+			break
+		}
+		_, size := utf8.decode_rune_in_bytes(header.data[byte_offset:])
+		if size <= 0 {
+			size = 1
+		}
+		byte_offset += size
+		position += 1
+	}
+	return position, true
+}
+
 // --- Constructors ----------------------------------------------------------
 
 // Creates a string value by copying `s` into `alloc`.
