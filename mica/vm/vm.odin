@@ -9,6 +9,7 @@ package vm
 import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -157,6 +158,10 @@ VM :: struct {
 	// temp arena without bound.
 	scratch:           ^virtual.Arena,
 	scratch_allocator: mem.Allocator,
+	// Builtin dispatch table: program builtin index -> VM_Builtin index, or -1
+	// when the name is not registered. Resolved once at init so a builtin call
+	// does not scan the registration list.
+	builtin_index: []int,
 }
 
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
@@ -197,6 +202,8 @@ vm_destroy :: proc(state: ^VM) {
 		free(state.scratch, state.allocator)
 		state.scratch = nil
 	}
+	delete(state.builtin_index, state.allocator)
+	state.builtin_index = nil
 }
 
 // Writes a resume value into the register the suspended instruction named.
@@ -282,6 +289,29 @@ vm_register_builtin :: proc(
 ) -> int {
 	append(&state.builtins, VM_Builtin{name = name, argc = argc, run = run})
 	return len(state.builtins) - 1
+}
+
+// Resolves every program builtin name to a `state.builtins` index once. Builtin
+// calls then index directly instead of scanning the registration list. Call
+// after all builtins are registered; vm_builtin_call also calls it lazily.
+vm_resolve_builtins :: proc(state: ^VM) {
+	delete(state.builtin_index, state.allocator)
+	program := state.program
+	if program == nil || len(program.builtins) == 0 {
+		state.builtin_index = nil
+		return
+	}
+	table := make([]int, len(program.builtins), state.allocator)
+	for name, index in program.builtins {
+		table[index] = -1
+		for builtin, builtin_index in state.builtins {
+			if builtin.name == name {
+				table[index] = builtin_index
+				break
+			}
+		}
+	}
+	state.builtin_index = table
 }
 
 // Sets the relation read source and write transaction for relation
@@ -1208,18 +1238,28 @@ vm_index :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 
 	case .Map:
 		entries, _ := v.value_as_map(collection)
-		found := false
-		for entry in entries {
-			if v.value_eq(entry.key, key) {
-				result = entry.value
-				found = true
-				break
-			}
-		}
+		// Entries are canonicalized sorted by key (see value_map), so a
+		// binary search replaces a linear scan.
+		index, found := slice.binary_search_by(
+			entries,
+			key,
+			proc(entry: v.Map_Entry, key: v.Value) -> (slice.Ordering) {
+				switch v.value_cmp(entry.key, key) {
+				case .Less:
+					return .Less
+				case .Greater:
+					return .Greater
+				case .Equal:
+					return .Equal
+				}
+				return .Equal
+			},
+		)
 		if !found {
 			vm_fail(state, "E_KEY", "map key is not present")
 			return false
 		}
+		result = entries[index].value
 
 	case .Relation:
 		relation, _ := v.value_as_relation(collection)
@@ -1285,10 +1325,17 @@ vm_builtin_call :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		vm_fail(state, "E_PERMISSION", "builtin invoke denied")
 		return false
 	}
-	for builtin in state.builtins {
-		if builtin.name != name {
-			continue
-		}
+	// The index table is built at init; build it lazily if a host registered
+	// builtins after init (the table is stale only until the next call).
+	if state.builtin_index == nil && len(state.program.builtins) > 0 {
+		vm_resolve_builtins(state)
+	}
+	builtin_index := -1
+	if instr.b >= 0 && int(instr.b) < len(state.builtin_index) {
+		builtin_index = state.builtin_index[instr.b]
+	}
+	if builtin_index >= 0 && builtin_index < len(state.builtins) {
+		builtin := state.builtins[builtin_index]
 		argc := builtin.argc
 		if argc < 0 {
 			argc = int(instr.flags)

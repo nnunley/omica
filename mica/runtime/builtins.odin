@@ -162,6 +162,7 @@ register_runtime_builtins :: proc(state: ^vm.VM) {
 	for spec in runtime_builtins {
 		vm.vm_register_builtin(state, v.symbol_intern(spec.name), spec.argc, spec.run)
 	}
+	vm.vm_resolve_builtins(state)
 }
 
 @(private)

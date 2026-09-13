@@ -829,6 +829,66 @@ test_vm_build_relation_and_index :: proc(t: ^testing.T) {
 	testing.expect_value(t, state.result, must_identity(2))
 }
 
+// Map indexing must behave identically after the linear scan became a binary
+// search over the canonicalized (sorted) entries: hits, misses, and a map large
+// enough that a scan would be the wrong complexity.
+@(test)
+test_vm_map_index_semantics :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	entries := make([]v.Map_Entry, 256, context.temp_allocator)
+	for index in 0 ..< 256 {
+		key := must_int(i64(index))
+		value := must_int(i64(index * 10))
+		entries[index] = v.Map_Entry{key = key, value = value}
+	}
+	map_value := v.value_map(alloc, entries)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	map_constant := i32(builder_add_constant(&builder, map_value))
+	present_key := i32(builder_add_constant(&builder, must_int(200)))
+	missing_key := i32(builder_add_constant(&builder, must_int(999)))
+
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 4, true)
+	builder_emit(&builder, .Load_Const, 0, 0, map_constant, 0)
+	builder_emit(&builder, .Load_Const, 0, 1, present_key, 0)
+	builder_emit(&builder, .Index, 0, 2, 0, 1)
+	builder_emit(&builder, .Return, 0, 2, 0, 0)
+	builder_end_function(&builder)
+	program := builder_build(&builder, alloc)
+	testing.expect_value(t, program_validate(program), Program_Error.None)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect_value(t, state.result, must_int(2000))
+
+	// A missing key still fails with E_KEY.
+	builder_begin_function(&builder, v.symbol_intern("missing"), 0, 4, true)
+	builder_emit(&builder, .Load_Const, 0, 0, map_constant, 0)
+	builder_emit(&builder, .Load_Const, 0, 1, missing_key, 0)
+	builder_emit(&builder, .Index, 0, 2, 0, 1)
+	builder_emit(&builder, .Return, 0, 2, 0, 0)
+	builder_end_function(&builder)
+	missing_program := builder_build(&builder, alloc)
+
+	missing_state: VM
+	vm_init(&missing_state, missing_program, alloc)
+	defer vm_destroy(&missing_state)
+	testing.expect_value(t, vm_run(&missing_state), VM_Status.Failed)
+	error, error_ok := v.value_as_error(missing_state.error)
+	testing.expect(t, error_ok)
+	code, code_ok := v.symbol_name(error.code)
+	testing.expect(t, code_ok)
+	testing.expect_value(t, code, "E_KEY")
+}
+
 @(private)
 double_builtin :: proc(state: ^VM, args: []v.Value) -> (v.Value, bool) {
 	two, _ := v.value_int(2)
