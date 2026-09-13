@@ -143,10 +143,19 @@ def language_string_slice() -> int:
     return total
 
 
+# Built once so the measured call is the sort itself, not list construction.
+# Same generator as language_sort.mica, keeping values in a comparable range.
+SORT_SIZE = 8192
+SORT_INPUT = []
+_seed = 12345
+for _ in range(SORT_SIZE):
+    _seed = (_seed * 97 + 7919) % 100003
+    SORT_INPUT.append((_seed % 2001) - 1000)
+
+
 def language_sort() -> int:
-    """Sort a 512-element descending list."""
-    items = list(range(512, 0, -1))
-    return len(sorted(items))
+    """Sort a pre-built pseudo-random list (matches language_sort.mica)."""
+    return len(sorted(SORT_INPUT))
 
 
 def relation_scan_large() -> int:
