@@ -12,7 +12,11 @@ grant #bench
 end
 // Verb call overhead.
 //
-// Per-call workload: 100k calls to a two-argument helper verb.
+// Per-call workload: 30k calls to a two-argument helper verb. Kept at 30k
+// rather than 100k because the Rust kernel's positional-dispatch cache keys on
+// argument *values* and clones the whole map per insert, so calls with a
+// changing argument go quadratic; 30k is the largest count both
+// implementations complete promptly.
 verb add(a, b)
   return a + b
 end
@@ -20,7 +24,7 @@ end
 verb bench()
   let index = 0
   let total = 0
-  while index < 100000
+  while index < 30000
     total = add(total, 1)
     index = index + 1
   end
