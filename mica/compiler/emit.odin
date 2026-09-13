@@ -872,6 +872,11 @@ emit_list_scatter_binding :: proc(
 			)
 			declare_local(emitter, node.name, destination, is_const)
 
+		case Wildcard_Pattern:
+			// `_` discards this position but still consumes a slot, so a later
+			// element keeps its ordinal.
+			position += 1
+
 		case:
 			push_error(emitter, "unsupported list binding element")
 			return false
