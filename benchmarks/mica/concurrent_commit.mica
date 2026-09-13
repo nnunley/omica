@@ -1,0 +1,35 @@
+// Concurrent relation commits.
+//
+// Per-call workload: 8 spawned workers each perform 64 retract+assert
+// transactions on disjoint keys, then report completion through a mailbox
+// that the caller waits on. Measures parallel commit throughput.
+make_relation(:Work, 1)
+
+verb worker(sender, base, count)
+  let index = 0
+  while index < count
+    let key = base + index
+    retract Work(key)
+    assert Work(key)
+    index = index + 1
+  end
+  mailbox_send(sender, 1)
+end
+
+verb bench()
+  let box = mailbox()
+  let receiver = box[0]
+  let sender = box[1]
+  let worker_index = 0
+  while worker_index < 8
+    spawn :worker(sender: sender, base: worker_index * 100000, count: 64)
+    worker_index = worker_index + 1
+  end
+  let completed = 0
+  while completed < 8
+    mailbox_recv([receiver])
+    completed = completed + 1
+  end
+  mailbox_close(receiver)
+  return completed
+end

@@ -44,3 +44,6 @@ desktop.ini
 
 # mdBook build output
 mdbook/book/
+
+# Mica-source benchmark outputs
+benchmarks/results/

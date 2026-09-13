@@ -1,0 +1,29 @@
+// Sequential relation commit throughput.
+//
+// Per-call workload: one worker performs 256 retract+assert+commit
+// transactions, then reports through a mailbox the caller waits on. Divide
+// the reported per-call time by 256 for the per-commit cost. Using a worker
+// (rather than one call per commit) keeps task-dispatch overhead out of the
+// measured cost.
+make_relation(:BenchPoint, 1)
+assert BenchPoint(0)
+
+verb worker(sender, count)
+  let index = 0
+  while index < count
+    retract BenchPoint(0)
+    assert BenchPoint(0)
+    index = index + 1
+  end
+  mailbox_send(sender, 1)
+end
+
+verb bench()
+  let box = mailbox()
+  let receiver = box[0]
+  let sender = box[1]
+  spawn :worker(sender: sender, count: 256)
+  mailbox_recv([receiver])
+  mailbox_close(receiver)
+  return 256
+end

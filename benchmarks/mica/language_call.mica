@@ -1,0 +1,16 @@
+// Verb call overhead.
+//
+// Per-call workload: 100k calls to a two-argument helper verb.
+verb add(a, b)
+  return a + b
+end
+
+verb bench()
+  let index = 0
+  let total = 0
+  while index < 100000
+    total = add(total, 1)
+    index = index + 1
+  end
+  return total
+end

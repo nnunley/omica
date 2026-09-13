@@ -1,0 +1,12 @@
+// String building over a loop.
+//
+// Per-call workload: 1000 concatenations of a one-character string.
+verb bench()
+  let text = ""
+  let index = 0
+  while index < 1000
+    text = string_concat(text, "x")
+    index = index + 1
+  end
+  return string_len(text)
+end
