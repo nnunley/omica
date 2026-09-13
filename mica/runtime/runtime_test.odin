@@ -4331,3 +4331,260 @@ assert Out(1)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
+
+// Differential test for the Mica lexer (#80).
+//
+// Lexes each corpus file with the Odin lexer and with `apps/compiler/lex.mica`
+// and compares kind, text, scalar offset, line, and column token for token.
+// This is the conformance gate for the port: any divergence is either a lexer
+// bug or a deliberate difference that must be recorded.
+@(test)
+test_mica_lexer_matches_odin :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	lexer_path := corpus_relative("apps/compiler/lex.mica")
+	if lexer_path == "" {
+		testing.expect(t, false, "compiler lexer not found")
+		return
+	}
+
+	corpus := make([dynamic]string, 0, 64, context.temp_allocator)
+	append(
+		&corpus,
+		"apps/shared/string.mica",
+		"apps/mud/core.mica",
+		"apps/mud/command-parser.mica",
+		"apps/web/http-core.mica",
+		"apps/agent/tools.mica",
+		"apps/examples/equipment-service.mica",
+		"apps/agent/ui-compose.mica",
+		"benchmarks/mica/language_sort.mica",
+	)
+	// Extend the gate to every corpus file that exists, so the differential
+	// test covers the whole surface rather than a hand-picked sample.
+	corpus_root := corpus_relative_dir("apps")
+	if corpus_root != "" {
+		walker := os.walker_create_path(corpus_root)
+		defer os.walker_destroy(&walker)
+		for info in os.walker_walk(&walker) {
+			if _, walk_err := os.walker_error(&walker); walk_err != nil {
+				break
+			}
+			if info.type == .Regular && strings.has_suffix(info.name, ".mica") {
+				append(&corpus, strings.clone(info.fullpath, context.temp_allocator))
+			}
+		}
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(&kernel, []string{lexer_path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "lexer load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	_ = world_wait(world, world.entry)
+
+	compared := 0
+	for relative in corpus {
+		path := relative
+		if !os.is_file(path) {
+			path = corpus_relative(relative)
+		}
+		if path == "" {
+			continue
+		}		data, read_err := os.read_entire_file(path, context.temp_allocator)
+		if read_err != nil {
+			testing.expectf(t, false, "cannot read %s", path)
+			continue
+		}
+		source := string(data)
+
+		// Odin side.
+		odin_result := c.lex(source, context.temp_allocator)
+		defer c.lex_destroy(&odin_result, context.temp_allocator)
+
+		// Mica side.
+		source_value := v.value_string(context.temp_allocator, source)
+		outcome := world_call(world, "lex", []k.Role_Pair{{
+			role  = v.value_symbol(v.symbol_intern("source")),
+			value = source_value,
+		}})
+		if outcome.kind != .Complete {
+			testing.expectf(
+				t,
+				false,
+				"%s: Mica lex failed: %s",
+				relative,
+				outcome.message,
+			)
+			continue
+		}
+		mica_tokens, ok := v.value_as_list(outcome.value)
+		if !ok {
+			testing.expectf(t, false, "%s: Mica lex did not return a list", relative)
+			continue
+		}
+
+		if len(mica_tokens) != len(odin_result.tokens) {
+			testing.expectf(
+				t,
+				false,
+				"%s: token count %d (Mica) != %d (Odin)",
+				relative,
+				len(mica_tokens),
+				len(odin_result.tokens),
+			)
+			continue
+		}
+
+		mismatched := 0
+		ascii_source := true
+		for byte in transmute([]u8)source {
+			if byte >= 0x80 {
+				ascii_source = false
+				break
+			}
+		}
+		previous_offset := i64(-1)
+		for mica_token, index in mica_tokens {
+			entries, entries_ok := v.value_as_map(mica_token)
+			if !entries_ok {
+				testing.expectf(t, false, "%s: token %d is not a map", relative, index)
+				mismatched += 1
+				break
+			}
+			kind_value := map_get(entries, "kind")
+			text_value := map_get(entries, "text")
+			offset_value := map_get(entries, "offset")
+			line_value := map_get(entries, "line")
+			column_value := map_get(entries, "column")
+
+			odin_token := odin_result.tokens[index]
+			mica_kind, _ := v.value_as_symbol(kind_value)
+			odin_kind_name, _ := odin_token_kind_name(odin_token.kind)
+			mica_kind_name, _ := v.symbol_name(mica_kind)
+			mica_text, _ := v.value_as_string(text_value)
+			mica_offset, _ := v.value_as_int(offset_value)
+			mica_line, _ := v.value_as_int(line_value)
+			mica_column, _ := v.value_as_int(column_value)
+
+			// The Mica offset is a scalar position; the Odin offset is a byte
+			// offset. They are equal for ASCII sources and diverge by the
+			// extra bytes of each multi-byte scalar otherwise, so compare the
+			// offset exactly only for ASCII and validate the scalar offset
+			// through the source slice below.
+			offset_matches := !ascii_source || mica_offset == i64(odin_token.offset)
+			if mica_kind_name != odin_kind_name ||
+			   mica_text != odin_token.text ||
+			   !offset_matches ||
+			   mica_line != i64(odin_token.line) ||
+			   mica_column != i64(odin_token.column) {
+				if mismatched < 5 {
+					testing.expectf(
+						t,
+						false,
+						"%s token %d: Mica (%s %q %d:%d:%d) != Odin (%s %q %d:%d:%d)",
+						relative,
+						index,
+						mica_kind_name,
+						mica_text,
+						mica_offset,
+						mica_line,
+						mica_column,
+						odin_kind_name,
+						odin_token.text,
+						odin_token.offset,
+						odin_token.line,
+						odin_token.column,
+					)
+				}
+				mismatched += 1
+			}
+
+			// Independent invariant: the token's text is exactly the source
+			// scalar range at its offset, and offsets advance. This holds on
+			// non-ASCII input too, where byte and scalar positions diverge.
+			text_length, _ := v.string_scalar_count(text_value)
+			byte_start, byte_end, range_ok := v.string_byte_range(
+				source_value,
+				int(mica_offset),
+				int(mica_offset) + text_length,
+			)
+			if !range_ok || source[byte_start:byte_end] != mica_text {
+				if mismatched < 5 {
+					testing.expectf(
+						t,
+						false,
+						"%s token %d: text %q at scalar offset %d is not %q",
+						relative,
+						index,
+						mica_text,
+						mica_offset,
+						range_ok ? source[byte_start:byte_end] : "<invalid range>",
+					)
+				}
+				mismatched += 1
+			}
+			if mica_offset < previous_offset {
+				if mismatched < 5 {
+					testing.expectf(
+						t,
+						false,
+						"%s token %d: scalar offset %d moved backwards",
+						relative,
+						index,
+						mica_offset,
+					)
+				}
+				mismatched += 1
+			}
+			previous_offset = mica_offset
+		}
+		if mismatched == 0 {
+			compared += 1
+		}
+	}
+	testing.expectf(t, compared >= 40, "only %d corpus files compared", compared)
+}
+
+@(private)
+corpus_relative :: proc(relative: string) -> string {
+	candidates := []string{relative, fmt.aprintf("../%s", relative, allocator = context.temp_allocator), fmt.aprintf("../../%s", relative, allocator = context.temp_allocator)}
+	for candidate in candidates {
+		if os.is_file(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+@(private)
+corpus_relative_dir :: proc(relative: string) -> string {
+	candidates := []string{relative, fmt.aprintf("../%s", relative, allocator = context.temp_allocator), fmt.aprintf("../../%s", relative, allocator = context.temp_allocator)}
+	for candidate in candidates {
+		if os.is_dir(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+@(private)
+map_get :: proc(entries: []v.Map_Entry, name: string) -> v.Value {
+	key := v.value_symbol(v.symbol_intern(name))
+	for entry in entries {
+		if entry.key == key {
+			return entry.value
+		}
+	}
+	return v.Value(0)
+}
+
+@(private)
+odin_token_kind_name :: proc(kind: c.Token_Kind) -> (string, bool) {
+	return fmt.aprintf("%v", kind, allocator = context.temp_allocator), true
+}
