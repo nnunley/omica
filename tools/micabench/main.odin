@@ -24,6 +24,10 @@ import vm "../../mica/vm"
 DEFAULT_SAMPLES :: 15
 DEFAULT_BUDGET_MS :: 20
 DEFAULT_WORKERS :: 8
+// Minimum inner repeats per sample. On a busy machine a single call can absorb
+// a scheduling event and report 50% high; averaging over several calls makes a
+// sample robust to that. The budget raises this further when calls are fast.
+MIN_INNER :: 8
 
 main :: proc() {
 	samples := DEFAULT_SAMPLES
@@ -160,12 +164,17 @@ run_file :: proc(path: string, samples, budget_ms, workers: int) -> bool {
 	}
 
 	// Calibrate the inner repeat count so one sample spans ~budget_ms.
+	// A larger inner count averages out scheduling jitter; a single slow call
+	// otherwise skews a whole sample.
 	single := time_call(world)
-	inner := 1
+	inner := MIN_INNER
 	if single > 0 {
 		target := i64(time.Duration(budget_ms) * time.Millisecond)
 		if target > single {
-			inner = int(target / single)
+			computed := int(target / single)
+			if computed > inner {
+				inner = computed
+			}
 		}
 	}
 	if inner < 1 {

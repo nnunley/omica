@@ -29,7 +29,17 @@ run_odin() {
   : >"${out}"
   local file
   for file in "${corpus}"/*.mica; do
-    "${driver}" --samples "${samples}" --workers "${workers}" "${file}" | tee -a "${out}"
+    # MICA_BENCH_CPU pins to one core. That removes the 50%+ run-to-run
+    # variance seen on this machine when the process migrates cores, at the
+    # cost of distorting benches that use several workers (they are then
+    # measured on one core). Leave it unset for the default run, set it when
+    # comparing small deltas on single-threaded workloads.
+    if [[ -n "${MICA_BENCH_CPU:-}" ]]; then
+      taskset -c "${MICA_BENCH_CPU}" "${driver}" \
+        --samples "${samples}" --workers "${workers}" "${file}" | tee -a "${out}"
+    else
+      "${driver}" --samples "${samples}" --workers "${workers}" "${file}" | tee -a "${out}"
+    fi
   done
   echo "wrote ${out}"
 }
@@ -52,7 +62,8 @@ run_rust() {
       echo "skip $(basename "${file}") (not implemented in this runtime)"
       continue
     fi
-    "${driver}" bench --samples "${samples}" "${file}" | tee -a "${out}"
+    taskset -c "${MICA_BENCH_CPU}" "${driver}" bench --samples "${samples}" "${file}" \
+      | tee -a "${out}"
   done
   echo "wrote ${out}"
 }
@@ -60,7 +71,11 @@ run_rust() {
 run_python() {
   local driver="${repo_root}/benchmarks/reference/python_bench.py"
   local out="${results}/python.tsv"
-  python3 "${driver}" | tee "${out}"
+  if [[ -n "${MICA_BENCH_CPU:-}" ]]; then
+    taskset -c "${MICA_BENCH_CPU}" python3 "${driver}" | tee "${out}"
+  else
+    python3 "${driver}" | tee "${out}"
+  fi
   echo "wrote ${out}"
 }
 
