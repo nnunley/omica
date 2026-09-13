@@ -46,6 +46,12 @@ run_rust() {
   : >"${out}"
   local file
   for file in "${corpus}"/*.mica; do
+    # Skip corpus files a side does not implement (currently the Odin-only
+    # amortized string append) so a missing builtin does not abort the run.
+    if [[ "$(basename "${file}")" == "language_string_append.mica" ]]; then
+      echo "skip $(basename "${file}") (not implemented in this runtime)"
+      continue
+    fi
     "${driver}" bench --samples "${samples}" "${file}" | tee -a "${out}"
   done
   echo "wrote ${out}"

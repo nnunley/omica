@@ -19,6 +19,7 @@ import "core:time"
 
 import k "../../mica/kernel"
 import r "../../mica/runtime"
+import vm "../../mica/vm"
 
 DEFAULT_SAMPLES :: 15
 DEFAULT_BUDGET_MS :: 20
@@ -28,6 +29,7 @@ main :: proc() {
 	samples := DEFAULT_SAMPLES
 	budget_ms := DEFAULT_BUDGET_MS
 	workers := DEFAULT_WORKERS
+	disasm := false
 	paths: [dynamic]string
 	defer delete(paths)
 
@@ -36,6 +38,8 @@ main :: proc() {
 	for index < len(args) {
 		arg := args[index]
 		switch {
+		case arg == "--disasm":
+			disasm = true
 		case arg == "--samples":
 			index += 1
 			if index < len(args) {
@@ -69,6 +73,12 @@ main :: proc() {
 
 	reported := 0
 	for path in paths {
+		if disasm {
+			if disassemble_file(path) {
+				reported += 1
+			}
+			continue
+		}
 		if run_file(path, samples, budget_ms, workers) {
 			reported += 1
 		}
@@ -76,6 +86,27 @@ main :: proc() {
 	if reported == 0 {
 		os.exit(1)
 	}
+}
+
+// Prints the compiled program for a corpus file, for inspecting codegen.
+@(private)
+disassemble_file :: proc(path: string) -> bool {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := r.world_start(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		r.World_Config{workers = 1},
+	)
+	if !start.ok {
+		fmt.eprintf("FAIL %s: %s\n", path, start.message)
+		return false
+	}
+	defer r.world_destroy(world)
+	fmt.printf("%s\n", vm.program_disassemble(world.program, context.temp_allocator))
+	return true
 }
 
 @(private)
