@@ -1972,17 +1972,27 @@ builtin_string_from_chars :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 
 @(private)
 builtin_string_concat :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
-	builder: strings.Builder
-	strings.builder_init(&builder, state.allocator)
-	defer strings.builder_destroy(&builder)
+	// Size the buffer once from the summed part lengths, write the parts, then
+	// hand the buffer to the value without a second copy.
+	total := 0
 	for part in args {
 		text, ok := v.value_as_string(part)
 		if !ok {
 			return builtin_error(state, "E_TYPE", "string_concat expects strings")
 		}
-		strings.write_string(&builder, text)
+		total += len(text)
 	}
-	return v.value_string(state.allocator, strings.to_string(builder)), true
+	if total == 0 {
+		return v.value_string_owned(state.allocator, nil), true
+	}
+	buffer := make([]u8, total, state.allocator)
+	write := 0
+	for part in args {
+		text, _ := v.value_as_string(part)
+		copy(buffer[write:], transmute([]u8)text)
+		write += len(text)
+	}
+	return v.value_string_owned(state.allocator, buffer[:write]), true
 }
 
 @(private)
@@ -1995,20 +2005,30 @@ builtin_string_join :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	if !separator_ok {
 		return builtin_error(state, "E_TYPE", "string_join expects a string separator")
 	}
-	builder: strings.Builder
-	strings.builder_init(&builder, state.allocator)
-	defer strings.builder_destroy(&builder)
-	for part, index in parts {
+	// Size the buffer once, then hand it to the value without a second copy.
+	total := 0
+	if len(parts) > 1 {
+		total += len(separator) * (len(parts) - 1)
+	}
+	for part in parts {
 		text, part_ok := v.value_as_string(part)
 		if !part_ok {
 			return builtin_error(state, "E_TYPE", "string_join expects string elements")
 		}
-		if index > 0 {
-			strings.write_string(&builder, separator)
-		}
-		strings.write_string(&builder, text)
+		total += len(text)
 	}
-	return v.value_string(state.allocator, strings.to_string(builder)), true
+	buffer := make([]u8, total, state.allocator)
+	write := 0
+	for part, index in parts {
+		if index > 0 {
+			copy(buffer[write:], transmute([]u8)separator)
+			write += len(separator)
+		}
+		text, _ := v.value_as_string(part)
+		copy(buffer[write:], transmute([]u8)text)
+		write += len(text)
+	}
+	return v.value_string_owned(state.allocator, buffer), true
 }
 
 @(private)

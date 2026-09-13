@@ -106,6 +106,15 @@ value_string :: proc(alloc: mem.Allocator, s: string) -> Value {
 	return value_heap(.String, header)
 }
 
+// Creates a string value taking ownership of `data` without copying. `data`
+// must have come from `alloc` and must not be used or freed by the caller
+// afterwards. The header itself is still allocated.
+value_string_owned :: proc(alloc: mem.Allocator, data: []u8) -> Value {
+	header := new(Heap_String, alloc)
+	header.data = data
+	return value_heap(.String, header)
+}
+
 // Creates a byte-string value by copying `data` into `alloc`.
 value_bytes :: proc(alloc: mem.Allocator, data: []u8) -> Value {
 	owned := make([]u8, len(data), alloc)
