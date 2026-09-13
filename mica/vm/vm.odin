@@ -6,6 +6,7 @@
 // and builtin calls are added on top of this core.
 package vm
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
@@ -428,6 +429,88 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			state.registers[base + int(instr.a)] = state.registers[base + int(instr.b)]
 
 		case .Binary:
+			left := state.registers[base + int(instr.b)]
+			right := state.registers[base + int(instr.c)]
+			// Inline the packed-int case so the common arithmetic path does not
+			// call the large general helper; anything it does not handle falls
+			// through to vm_binary.
+			if v.value_tag(left) == .Int && v.value_tag(right) == .Int {
+				match := true
+				switch Bin_Op(instr.flags) {
+				case .Add:
+					l := v.value_int_unchecked(left)
+					r := v.value_int_unchecked(right)
+					sum, overflow := intrinsics.overflow_add(l, r)
+					if !overflow && sum >= v.INT_MIN && sum <= v.INT_MAX {
+						state.registers[base + int(instr.a)] = v.value_int_unchecked_pack(sum)
+					} else {
+						match = false
+					}
+				case .Sub:
+					l := v.value_int_unchecked(left)
+					r := v.value_int_unchecked(right)
+					diff, overflow := intrinsics.overflow_sub(l, r)
+					if !overflow && diff >= v.INT_MIN && diff <= v.INT_MAX {
+						state.registers[base + int(instr.a)] = v.value_int_unchecked_pack(diff)
+					} else {
+						match = false
+					}
+				case .Mul:
+					l := v.value_int_unchecked(left)
+					r := v.value_int_unchecked(right)
+					product, overflow := intrinsics.overflow_mul(l, r)
+					if !overflow && product >= v.INT_MIN && product <= v.INT_MAX {
+						state.registers[base + int(instr.a)] = v.value_int_unchecked_pack(product)
+					} else {
+						match = false
+					}
+				case .Lt:
+					state.registers[base + int(instr.a)] = v.value_bool(
+						v.value_int_unchecked(left) < v.value_int_unchecked(right),
+					)
+				case .Le:
+					state.registers[base + int(instr.a)] = v.value_bool(
+						v.value_int_unchecked(left) <= v.value_int_unchecked(right),
+					)
+				case .Gt:
+					state.registers[base + int(instr.a)] = v.value_bool(
+						v.value_int_unchecked(left) > v.value_int_unchecked(right),
+					)
+				case .Ge:
+					state.registers[base + int(instr.a)] = v.value_bool(
+						v.value_int_unchecked(left) >= v.value_int_unchecked(right),
+					)
+				case .Eq:
+					state.registers[base + int(instr.a)] = v.value_bool(
+						v.value_int_unchecked(left) == v.value_int_unchecked(right),
+					)
+				case .Ne:
+					state.registers[base + int(instr.a)] = v.value_bool(
+						v.value_int_unchecked(left) != v.value_int_unchecked(right),
+					)
+				case .Div:
+					l := v.value_int_unchecked(left)
+					r := v.value_int_unchecked(right)
+					if r != 0 && l % r == 0 {
+						state.registers[base + int(instr.a)] = v.value_int_unchecked_pack(l / r)
+					} else {
+						match = false
+					}
+				case .Rem:
+					l := v.value_int_unchecked(left)
+					r := v.value_int_unchecked(right)
+					if r != 0 {
+						state.registers[base + int(instr.a)] = v.value_int_unchecked_pack(l % r)
+					} else {
+						match = false
+					}
+				case:
+					match = false
+				}
+				if match {
+					break
+				}
+			}
 			if !vm_binary(state, base, instr) {
 				break
 			}

@@ -343,6 +343,24 @@ value_as_int :: proc(v: Value) -> (i64, bool) {
 	return (i64(value_payload(v) << 8)) >> 8, true
 }
 
+// Reports whether `v` is an integer, for fast paths that already hold the
+// packed word.
+value_is_int :: proc(v: Value) -> bool {
+	return value_tag(v) == .Int
+}
+
+// Unpacks an integer known to have the `Int` tag. Sign-extends the 56-bit
+// payload. Callers must have checked `value_is_int`.
+value_int_unchecked :: proc(v: Value) -> i64 {
+	return (i64(value_payload(v) << 8)) >> 8
+}
+
+// Packs an integer known to be in range, without re-checking. Callers must
+// have verified the range.
+value_int_unchecked_pack :: proc(n: i64) -> Value {
+	return value_pack(.Int, u64(n))
+}
+
 // Returns the float payload, if this is a float.
 value_as_float :: proc(v: Value) -> (f32, bool) {
 	if value_tag(v) != .Float {
