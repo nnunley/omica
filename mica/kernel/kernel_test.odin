@@ -11,6 +11,26 @@ must_int :: proc(n: i64) -> v.Value {
 	return value
 }
 
+// A parameter's packed position and mode must survive positions beyond one
+// byte. Regression: position was masked to 0xff, so 300 truncated to 44.
+@(test)
+test_dispatch_param_position_beyond_byte :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	modes := []int{PARAM_REQUIRED_MODE, PARAM_OPTIONAL_MODE, PARAM_REST_MODE}
+	for mode in modes {
+		packed, packed_ok := v.value_int(300 + i64(mode) * 65536)
+		testing.expect(t, packed_ok)
+		param := v.tuple_new(context.temp_allocator, []v.Value {
+			v.Value(0),
+			v.Value(0),
+			v.Value(0),
+			packed,
+		})
+		testing.expect_value(t, param_position(param), i64(300))
+		testing.expect_value(t, param_mode(param), mode)
+	}
+}
+
 @(private)
 must_identity :: proc(raw: u64) -> v.Value {
 	value, ok := v.value_identity_raw(raw)

@@ -133,7 +133,7 @@ install_methods :: proc(
 						method_value,
 						v.value_symbol(v.symbol_intern(param.name)),
 						restriction,
-						value_int_must(i64(position) + i64(mode) * 256),
+						value_int_must(i64(position) + i64(mode) * 65536),
 					}),
 				); err != k.Kernel_Error.None {
 					return method_install_error(env, verb.name, err)

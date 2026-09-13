@@ -69,7 +69,7 @@ param_mode :: proc(param: v.Tuple) -> int {
 	if !is_int || position < 0 {
 		return PARAM_REQUIRED_MODE
 	}
-	return int(position >> 8)
+	return int(position >> 16)
 }
 
 // The restriction meaning "a rest parameter": it absorbs trailing arguments
@@ -623,5 +623,5 @@ param_position :: proc(param: v.Tuple) -> i64 {
 	if !ok {
 		return i64(0x7fff_ffff_ffff_ffff)
 	}
-	return position & 0xff
+	return position & 0xffff
 }
