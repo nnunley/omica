@@ -67,6 +67,15 @@ Finally_Scope :: struct {
 	body:       []^Expr,
 }
 
+// A constant loaded once at function entry, with the register holding it.
+// Body emission reuses the register instead of re-emitting `Load_Const`, so a
+// literal inside a loop is loaded once rather than every iteration.
+@(private)
+Preloaded_Constant :: struct {
+	value:    v.Value,
+	register: int,
+}
+
 @(private)
 Emitter :: struct {
 	builder:       ^vm.Builder,
@@ -93,6 +102,10 @@ Emitter :: struct {
 	loop_depth: int,
 	empty_constant: int,
 	pending_functions: [dynamic]Pending_Function,
+	// Constants loaded once at function entry, reused by body emission. Cleared
+	// between functions. Registers here sit below every scope mark, so scope
+	// exit never reuses them.
+	preloaded: [dynamic]Preloaded_Constant,
 }
 
 // Compiles a parsed program into a VM program. `main` is the entry function;
@@ -128,6 +141,7 @@ compile_program :: proc(
 		continue_marks = make([dynamic]int),
 		active_finallys = make([dynamic]Finally_Scope),
 		pending_functions = make([dynamic]Pending_Function),
+		preloaded = make([dynamic]Preloaded_Constant),
 	}
 	defer {
 		delete(emitter.errors)
@@ -142,6 +156,7 @@ compile_program :: proc(
 		delete(emitter.continue_marks)
 		delete(emitter.active_finallys)
 		delete(emitter.pending_functions)
+		delete(emitter.preloaded)
 	}
 
 	// Reserve the entry and verb function slots before emitting bodies. fn
@@ -210,8 +225,11 @@ compile_program :: proc(
 		vm.builder_reopen_function(&builder, index)
 		emitter.next_register = len(verb.params)
 		emitter.max_register = emitter.next_register
-		scope_enter(&emitter)
+		clear(&emitter.preloaded)
 		clear(&emitter.role_params)
+		// Load the body's constants at function entry, below every scope mark.
+		preload_constants(&emitter, verb.body)
+		scope_enter(&emitter)
 		for param, param_index in verb.params {
 			emitter.role_params[param.name] = true
 			append(&emitter.locals, Local {
@@ -246,7 +264,7 @@ compile_program :: proc(
 		}
 		emitter.next_register = capture_count + len(pending.fn.params)
 		emitter.max_register = emitter.next_register
-		scope_enter(&emitter)
+		clear(&emitter.preloaded)
 		for param, param_index in pending.fn.params {
 			declare_local(
 				&emitter,
@@ -255,6 +273,12 @@ compile_program :: proc(
 				false,
 			)
 		}
+		if pending.fn.has_expression_body {
+			preload_expression(&emitter, pending.fn.expression_body)
+		} else {
+			preload_constants(&emitter, pending.fn.body)
+		}
+		scope_enter(&emitter)
 		return_register := -1
 		if pending.fn.has_expression_body {
 			register, has_value := emit_expr(&emitter, pending.fn.expression_body)
@@ -358,10 +382,43 @@ int_value :: proc(n: i64) -> v.Value {
 
 @(private)
 emit_constant :: proc(emitter: ^Emitter, value: v.Value) -> int {
+	// Reuse a constant loaded once at function entry rather than emitting a
+	// fresh Load_Const at the point of use; inside a loop that is once per
+	// function instead of once per iteration.
+	for entry in emitter.preloaded {
+		if entry.value == value {
+			return entry.register
+		}
+	}
 	constant := vm.builder_add_constant(emitter.builder, value)
 	register := alloc_register(emitter)
 	vm.builder_emit(emitter.builder, .Load_Const, 0, i32(register), i32(constant), 0)
 	return register
+}
+
+// Loads every literal the body references once, at the point where function
+// entry code is still being emitted, and records it for `emit_constant`.
+@(private)
+preload_constants :: proc(emitter: ^Emitter, body: []^Expr) {
+	found: [dynamic]v.Value
+	defer delete(found)
+	collect_block_literals(emitter, body, &found)
+	for value in found {
+		already := false
+		for entry in emitter.preloaded {
+			if entry.value == value {
+				already = true
+				break
+			}
+		}
+		if already {
+			continue
+		}
+		constant := vm.builder_add_constant(emitter.builder, value)
+		register := alloc_register(emitter)
+		vm.builder_emit(emitter.builder, .Load_Const, 0, i32(register), i32(constant), 0)
+		append(&emitter.preloaded, Preloaded_Constant{value = value, register = register})
+	}
 }
 
 @(private)
@@ -678,6 +735,13 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 
 	if !has_value {
 		value_register = alloc_register(emitter)
+	} else if !binding.is_const {
+		// A mutable binding must own its register. The value may be a shared
+		// preloaded constant (or a register reused within an expression), and a
+		// later assignment would otherwise overwrite that shared slot.
+		destination := alloc_register(emitter)
+		vm.builder_emit(emitter.builder, .Move, 0, i32(destination), i32(value_register), 0)
+		value_register = destination
 	}
 	declare_local(emitter, pattern.name, value_register, binding.is_const)
 	return value_register, true
@@ -992,6 +1056,181 @@ emit_assignment :: proc(emitter: ^Emitter, assignment: Assignment) -> (int, bool
 		vm.builder_emit(emitter.builder, .Move, 0, i32(register), i32(value_register), 0)
 	}
 	return register, true
+}
+
+// Collects the distinct constant values a function body will load. Only literal
+// nodes produce values; everything else is descended into structurally. Fn
+// bodies are skipped: they are emitted as separate functions with their own
+// preload pass.
+@(private)
+collect_literals :: proc(emitter: ^Emitter, expr: ^Expr, out: ^[dynamic]v.Value) {
+	if expr == nil {
+		return
+	}
+	#partial switch node in expr^ {
+	case Int_Literal:
+		if value, ok := strconv.parse_i64(node.text); ok {
+			if converted, converted_ok := v.value_int(value); converted_ok {
+				append(out, converted)
+			}
+		}
+	case Float_Literal:
+		if value, ok := strconv.parse_f64(node.text); ok {
+			if converted, converted_ok := v.value_float(f32(value)); converted_ok {
+				append(out, converted)
+			}
+		}
+	case String_Literal:
+		text := unquote_string(node.text, emitter.allocator)
+		append(out, v.value_string(emitter.allocator, text))
+	case Bool_Literal:
+		append(out, v.value_bool(node.value))
+	case Error_Code_Literal:
+		append(out, v.value_error_code(v.symbol_intern(node.name)))
+	case Symbol_Literal:
+		name := node.name
+		if strings.has_prefix(name, "\"") {
+			name = unquote_string(name, emitter.allocator)
+		}
+		append(out, v.value_symbol(v.symbol_intern(name)))
+	case Binary:
+		collect_literals(emitter, node.left, out)
+		collect_literals(emitter, node.right, out)
+	case Unary:
+		collect_literals(emitter, node.operand, out)
+	case Assignment:
+		collect_literals(emitter, node.value, out)
+	case Index:
+		collect_literals(emitter, node.collection, out)
+		collect_literals(emitter, node.key, out)
+	case Field:
+		collect_literals(emitter, node.receiver, out)
+	case Binding:
+		if node.has_value {
+			collect_literals(emitter, node.value, out)
+		}
+	case Call:
+		for argument in node.args {
+			collect_literals(emitter, argument.expr, out)
+		}
+	case Receiver_Call:
+		collect_literals(emitter, node.receiver, out)
+		for argument in node.args {
+			collect_literals(emitter, argument.expr, out)
+		}
+	case List_Literal:
+		for element in node.elements {
+			collect_literals(emitter, element, out)
+		}
+	case Map_Literal:
+		for entry in node.entries {
+			collect_literals(emitter, entry.key, out)
+			collect_literals(emitter, entry.value, out)
+		}
+	case Relation_Literal:
+		for heading in node.heading {
+			collect_literals(emitter, heading, out)
+		}
+		for row in node.rows {
+			collect_literals(emitter, row, out)
+		}
+	case Range_Literal:
+		collect_literals(emitter, node.start, out)
+		if node.has_end {
+			collect_literals(emitter, node.end, out)
+		}
+	case If:
+		for branch in node.branches {
+			collect_literals(emitter, branch.condition, out)
+			collect_block_literals(emitter, branch.body, out)
+		}
+		collect_block_literals(emitter, node.else_body, out)
+	case While:
+		collect_literals(emitter, node.condition, out)
+		collect_block_literals(emitter, node.body, out)
+	case For:
+		collect_literals(emitter, node.iterable, out)
+		collect_block_literals(emitter, node.body, out)
+	case Begin:
+		collect_block_literals(emitter, node.body, out)
+	case Try:
+		collect_block_literals(emitter, node.body, out)
+		for clause in node.catches {
+			collect_block_literals(emitter, clause.body, out)
+		}
+		collect_block_literals(emitter, node.finally_body, out)
+	case Match:
+		collect_literals(emitter, node.value, out)
+		for case_clause in node.cases {
+			if case_clause.has_guard {
+				collect_literals(emitter, case_clause.guard, out)
+			}
+			collect_block_literals(emitter, case_clause.body, out)
+		}
+	case Return:
+		if node.has_value {
+			collect_literals(emitter, node.value, out)
+		}
+	case Assert:
+		collect_literals(emitter, node.atom, out)
+	case Retract:
+		collect_literals(emitter, node.atom, out)
+	case Require:
+		collect_literals(emitter, node.condition, out)
+	case Raise:
+		for part in node.parts {
+			collect_literals(emitter, part, out)
+		}
+	case Spawn:
+		collect_literals(emitter, node.call, out)
+		if node.has_delay {
+			collect_literals(emitter, node.delay, out)
+		}
+	case Structural_Literal:
+		collect_literals(emitter, node.head, out)
+		for cell in node.cells {
+			collect_literals(emitter, cell.value, out)
+		}
+	case Dom_Element:
+		for child in node.children {
+			collect_literals(emitter, child, out)
+		}
+	case Name, Query_Variable, Wildcard, Splice, Identity_Literal, Dom_Text, Fn:
+		// No literal of our own: Identity_Literal resolves through the compile
+		// context, and Fn bodies are emitted as separate functions.
+	}
+}
+
+@(private)
+collect_block_literals :: proc(emitter: ^Emitter, body: []^Expr, out: ^[dynamic]v.Value) {
+	for expr in body {
+		collect_literals(emitter, expr, out)
+	}
+}
+
+// Loads every literal in a single expression once, for an expression-bodied
+// function.
+@(private)
+preload_expression :: proc(emitter: ^Emitter, expr: ^Expr) {
+	found: [dynamic]v.Value
+	defer delete(found)
+	collect_literals(emitter, expr, &found)
+	for value in found {
+		already := false
+		for entry in emitter.preloaded {
+			if entry.value == value {
+				already = true
+				break
+			}
+		}
+		if already {
+			continue
+		}
+		constant := vm.builder_add_constant(emitter.builder, value)
+		register := alloc_register(emitter)
+		vm.builder_emit(emitter.builder, .Load_Const, 0, i32(register), i32(constant), 0)
+		append(&emitter.preloaded, Preloaded_Constant{value = value, register = register})
+	}
 }
 
 // Reports whether an expression tree contains an assignment. Used to decide
