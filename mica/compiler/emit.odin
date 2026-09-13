@@ -1322,10 +1322,30 @@ emit_into :: proc(emitter: ^Emitter, expr: ^Expr, destination: int) -> (int, boo
 		)
 		return destination, true
 
+	case Index:
+		// Write the indexed value straight into the assignment target.
+		collection, collection_ok := emit_operand(emitter, node.collection, node.key)
+		if !collection_ok {
+			return -1, false
+		}
+		key, key_ok := emit_operand(emitter, node.key, node.collection)
+		if !key_ok {
+			return -1, false
+		}
+		vm.builder_emit(
+			emitter.builder,
+			.Index,
+			0,
+			i32(destination),
+			i32(collection),
+			i32(key),
+		)
+		return destination, true
+
 	case Int_Literal, Float_Literal, String_Literal, Bytes_Literal, Bool_Literal,
 	     Error_Code_Literal, Identity_Literal, Symbol_Literal, Name, Query_Variable,
 	     Wildcard, Splice, List_Literal, Relation_Literal, Map_Literal, Range_Literal,
-	     Binding, Assignment, Call, Receiver_Call, Index, Field, If, While, For, Begin,
+	     Binding, Assignment, Call, Receiver_Call, Field, If, While, For, Begin,
 	     Return, Break, Continue, Assert, Retract, Require, Raise, Match, Try, Spawn,
 	     Structural_Literal, Dom_Text, Dom_Element, Fn:
 		return emit_expr(emitter, expr)
@@ -3438,11 +3458,13 @@ emit_frob_payload :: proc(emitter: ^Emitter, frob: Structural_Literal) -> (int, 
 
 @(private)
 emit_index :: proc(emitter: ^Emitter, index: Index) -> (int, bool) {
-	collection, collection_ok := emit_expr(emitter, index.collection)
+	// Read a bare local directly from its register instead of copying it into
+	// a temporary: `items[slot]` needs no pre-move for either operand.
+	collection, collection_ok := emit_operand(emitter, index.collection, index.key)
 	if !collection_ok {
 		return -1, false
 	}
-	key, key_ok := emit_expr(emitter, index.key)
+	key, key_ok := emit_operand(emitter, index.key, index.collection)
 	if !key_ok {
 		return -1, false
 	}
