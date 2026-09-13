@@ -24,6 +24,10 @@
 
 make_identity(:lexer)
 
+// Lexes `source` and returns `[tokens, errors]`. Each token is a map with
+// `:kind`, `:text`, `:offset` (a scalar position), `:line`, and `:column`.
+// Each error is a map with `:message`, `:line`, and `:column`, matching the
+// Odin lexer's separate diagnostic list. Scatter the pair at the call site.
 verb lex(source) -> list
   // A keyword spelling table built for this run of the lexer. A chain of 31
   // string comparisons per identifier costs several times a single
@@ -42,6 +46,7 @@ verb lex(source) -> list
   }
 
   let tokens = []
+  let errors = []
   let pos = 0
   let line = 1
   let column = 1
@@ -140,6 +145,8 @@ verb lex(source) -> list
       let kind = :Error
       if terminated
         kind = :String
+      else
+        errors = [@errors, {:message -> "unterminated string", :line -> start_line, :column -> start_column}]
       end
       tokens = [@tokens, {:kind -> kind, :text -> string_slice(source, start, pos), :offset -> start, :line -> start_line, :column -> start_column}]
       continue
@@ -180,6 +187,8 @@ verb lex(source) -> list
       let kind = :Error
       if terminated
         kind = :Bytes
+      else
+        errors = [@errors, {:message -> "unterminated bytes literal", :line -> start_line, :column -> start_column}]
       end
       tokens = [@tokens, {:kind -> kind, :text -> string_slice(source, start, pos), :offset -> start, :line -> start_line, :column -> start_column}]
       continue
@@ -366,11 +375,22 @@ verb lex(source) -> list
       kind = :Membership
     end
 
+    // A stray ASCII scalar that began no token is a diagnostic. `&` alone is
+    // the only named case; non-ASCII is deliberately not diagnosed because it
+    // can appear as raw text inside DOM markup, matching the Odin lexer.
+    if kind == :Error && code < 128
+      let message = "unexpected character"
+      if code == 38
+        message = "unexpected '&'"
+      end
+      errors = [@errors, {:message -> message, :line -> start_line, :column -> start_column}]
+    end
+
     pos = pos + width
     column = column + width
     tokens = [@tokens, {:kind -> kind, :text -> string_slice(source, start, pos), :offset -> start, :line -> start_line, :column -> start_column}]
   end
 
   tokens = [@tokens, {:kind -> :Eof, :text -> "", :offset -> length, :line -> line, :column -> column}]
-  return tokens
+  return [tokens, errors]
 end

@@ -4349,23 +4349,14 @@ test_mica_lexer_matches_odin :: proc(t: ^testing.T) {
 	}
 
 	corpus := make([dynamic]string, 0, 64, context.temp_allocator)
-	append(
-		&corpus,
-		"apps/shared/string.mica",
-		"apps/mud/core.mica",
-		"apps/mud/command-parser.mica",
-		"apps/web/http-core.mica",
-		"apps/agent/tools.mica",
-		"apps/examples/equipment-service.mica",
-		"apps/agent/ui-compose.mica",
-		"benchmarks/mica/language_sort.mica",
-	)
-	// Extend the gate to every corpus file that exists, so the differential
-	// test covers the whole surface rather than a hand-picked sample.
-	corpus_root := corpus_relative_dir("apps")
-	if corpus_root != "" {
+	// Every `.mica` file under the app and benchmark trees, so the gate covers
+	// the whole source surface rather than a hand-picked sample.
+	for root in ([]string{"apps", "benchmarks"}) {
+		corpus_root := corpus_relative_dir(root)
+		if corpus_root == "" {
+			continue
+		}
 		walker := os.walker_create_path(corpus_root)
-		defer os.walker_destroy(&walker)
 		for info in os.walker_walk(&walker) {
 			if _, walk_err := os.walker_error(&walker); walk_err != nil {
 				break
@@ -4374,6 +4365,7 @@ test_mica_lexer_matches_odin :: proc(t: ^testing.T) {
 				append(&corpus, strings.clone(info.fullpath, context.temp_allocator))
 			}
 		}
+		os.walker_destroy(&walker)
 	}
 
 	kernel: k.Kernel
@@ -4406,7 +4398,7 @@ test_mica_lexer_matches_odin :: proc(t: ^testing.T) {
 			compared += 1
 		}
 	}
-	testing.expectf(t, compared >= 40, "only %d corpus files compared", compared)
+	testing.expectf(t, compared >= 50, "only %d corpus files compared", compared)
 }
 
 // The differential gate over hand-written edge cases: malformed input, every
@@ -4505,9 +4497,15 @@ mica_lexer_matches_odin :: proc(
 		testing.expectf(t, false, "%s: Mica lex failed: %s", label, outcome.message)
 		return false
 	}
-	mica_tokens, ok := v.value_as_list(outcome.value)
-	if !ok {
-		testing.expectf(t, false, "%s: Mica lex did not return a list", label)
+	mica_result, result_ok := v.value_as_list(outcome.value)
+	if !result_ok || len(mica_result) != 2 {
+		testing.expectf(t, false, "%s: Mica lex did not return [tokens, errors]", label)
+		return false
+	}
+	mica_tokens, tokens_ok := v.value_as_list(mica_result[0])
+	mica_errors, errors_ok := v.value_as_list(mica_result[1])
+	if !tokens_ok || !errors_ok {
+		testing.expectf(t, false, "%s: Mica lex result is not [list, list]", label)
 		return false
 	}
 	if len(mica_tokens) != len(odin_result.tokens) {
@@ -4520,6 +4518,47 @@ mica_lexer_matches_odin :: proc(
 			len(odin_result.tokens),
 		)
 		return false
+	}
+	// The diagnostics must agree too: message, line, and column, in order.
+	if len(mica_errors) != len(odin_result.errors) {
+		testing.expectf(
+			t,
+			false,
+			"%s: error count %d (Mica) != %d (Odin)",
+			label,
+			len(mica_errors),
+			len(odin_result.errors),
+		)
+		return false
+	}
+	for mica_error, index in mica_errors {
+		entries, entries_ok := v.value_as_map(mica_error)
+		if !entries_ok {
+			testing.expectf(t, false, "%s: error %d is not a map", label, index)
+			return false
+		}
+		message, _ := v.value_as_string(map_get(entries, "message"))
+		line, _ := v.value_as_int(map_get(entries, "line"))
+		column, _ := v.value_as_int(map_get(entries, "column"))
+		odin_error := odin_result.errors[index]
+		if message != odin_error.message ||
+		   line != i64(odin_error.line) ||
+		   column != i64(odin_error.column) {
+			testing.expectf(
+				t,
+				false,
+				"%s error %d: Mica (%q %d:%d) != Odin (%q %d:%d)",
+				label,
+				index,
+				message,
+				line,
+				column,
+				odin_error.message,
+				odin_error.line,
+				odin_error.column,
+			)
+			return false
+		}
 	}
 
 	mismatched := 0
