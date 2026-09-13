@@ -982,17 +982,121 @@ emit_assignment :: proc(emitter: ^Emitter, assignment: Assignment) -> (int, bool
 		return -1, false
 	}
 
-	value_register, has_value := emit_expr(emitter, assignment.value)
+	// Compute directly into the target register when the value is a simple
+	// operation, saving a temporary and a Move.
+	value_register, has_value := emit_into(emitter, assignment.value, register)
 	if !has_value {
 		return -1, false
 	}
-	vm.builder_emit(emitter.builder, .Move, 0, i32(register), i32(value_register), 0)
-	return value_register, true
+	if value_register != register {
+		vm.builder_emit(emitter.builder, .Move, 0, i32(register), i32(value_register), 0)
+	}
+	return register, true
+}
+
+// Reports whether an expression tree contains an assignment. Used to decide
+// whether a bare `Name` operand can be read directly from its own register:
+// if the sibling operand can write a local, the borrowed register could be
+// clobbered before the instruction executes.
+@(private)
+expr_has_assignment :: proc(expr: ^Expr) -> bool {
+	switch node in expr^ {
+	case Assignment:
+		return true
+	case Binary:
+		return expr_has_assignment(node.left) || expr_has_assignment(node.right)
+	case Unary:
+		return expr_has_assignment(node.operand)
+	case Index:
+		return expr_has_assignment(node.collection) || expr_has_assignment(node.key)
+	case Int_Literal, Float_Literal, String_Literal, Bytes_Literal, Bool_Literal,
+	     Error_Code_Literal, Identity_Literal, Symbol_Literal, Name, Query_Variable,
+	     Wildcard, Splice, List_Literal, Relation_Literal, Map_Literal, Range_Literal,
+	     Binding, Call, Receiver_Call, Field, If, While, For, Begin, Return, Break,
+	     Continue, Assert, Retract, Require, Raise, Match, Try, Spawn,
+	     Structural_Literal, Dom_Text, Dom_Element, Fn:
+		return false
+	}
+	return false
+}
+
+// Emits an expression for use as a read-only operand, returning the register
+// holding its value. A bare local name is read from its own register rather
+// than copied, which removes one `Move` per operand in ordinary arithmetic.
+@(private)
+emit_operand :: proc(emitter: ^Emitter, expr: ^Expr, sibling: ^Expr) -> (int, bool) {
+	if name, is_name := expr^.(Name); is_name {
+		if !expr_has_assignment(sibling) {
+			if register, _, found := resolve_local(emitter, join_name(name, emitter.allocator)); found {
+				return register, true
+			}
+		}
+	}
+	return emit_expr(emitter, expr)
+}
+
+// Emits `expr`, storing its result into `destination` when the expression is
+// a value-producing arithmetic or logical operation, so an assignment does not
+// need a temporary plus a `Move`. Returns (register, ok) where register holds
+// the value; it is `destination` when the direct form was used.
+@(private)
+emit_into :: proc(emitter: ^Emitter, expr: ^Expr, destination: int) -> (int, bool) {
+	switch node in expr^ {
+	case Binary:
+		if node.op == .And || node.op == .Or {
+			return emit_expr(emitter, expr)
+		}
+		left, has_left := emit_operand(emitter, node.left, node.right)
+		if !has_left {
+			return -1, false
+		}
+		right, has_right := emit_operand(emitter, node.right, node.left)
+		if !has_right {
+			return -1, false
+		}
+		vm.builder_emit(
+			emitter.builder,
+			.Binary,
+			u8(binary_op(node.op)),
+			i32(destination),
+			i32(left),
+			i32(right),
+		)
+		return destination, true
+
+	case Unary:
+		operand, has_operand := emit_operand(emitter, node.operand, node.operand)
+		if !has_operand {
+			return -1, false
+		}
+		op: vm.Un_Op = .Neg
+		if node.op == .Not {
+			op = .Not
+		}
+		vm.builder_emit(
+			emitter.builder,
+			.Unary,
+			u8(op),
+			i32(destination),
+			i32(operand),
+			0,
+		)
+		return destination, true
+
+	case Int_Literal, Float_Literal, String_Literal, Bytes_Literal, Bool_Literal,
+	     Error_Code_Literal, Identity_Literal, Symbol_Literal, Name, Query_Variable,
+	     Wildcard, Splice, List_Literal, Relation_Literal, Map_Literal, Range_Literal,
+	     Binding, Assignment, Call, Receiver_Call, Index, Field, If, While, For, Begin,
+	     Return, Break, Continue, Assert, Retract, Require, Raise, Match, Try, Spawn,
+	     Structural_Literal, Dom_Text, Dom_Element, Fn:
+		return emit_expr(emitter, expr)
+	}
+	return emit_expr(emitter, expr)
 }
 
 @(private)
 emit_unary :: proc(emitter: ^Emitter, unary: Unary) -> (int, bool) {
-	operand, has_operand := emit_expr(emitter, unary.operand)
+	operand, has_operand := emit_operand(emitter, unary.operand, unary.operand)
 	if !has_operand {
 		return -1, false
 	}
@@ -1011,11 +1115,11 @@ emit_binary :: proc(emitter: ^Emitter, binary: Binary) -> (int, bool) {
 		return emit_short_circuit(emitter, binary)
 	}
 
-	left, has_left := emit_expr(emitter, binary.left)
+	left, has_left := emit_operand(emitter, binary.left, binary.right)
 	if !has_left {
 		return -1, false
 	}
-	right, has_right := emit_expr(emitter, binary.right)
+	right, has_right := emit_operand(emitter, binary.right, binary.left)
 	if !has_right {
 		return -1, false
 	}
