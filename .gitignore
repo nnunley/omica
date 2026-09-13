@@ -47,3 +47,7 @@ mdbook/book/
 
 # Mica-source benchmark outputs
 benchmarks/results/
+
+# Python bytecode from the benchmark reference implementation
+__pycache__/
+*.pyc
