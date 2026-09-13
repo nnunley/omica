@@ -768,10 +768,11 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 			continue
 		}
 		if existing, found := world.env.unit_sources[name]; found {
-			world.env.unit_sources[name] = strings.concatenate(
-				[]string{existing, "\n\n", source},
-				allocator,
-			)
+			merged := strings.concatenate([]string{existing, "\n\n", source}, allocator)
+			// The old text is no longer referenced; free it instead of
+			// leaking one allocation per reused unit name.
+			delete(existing, allocator)
+			world.env.unit_sources[name] = merged
 		} else {
 			world.env.unit_sources[name] = strings.clone(source, allocator)
 		}

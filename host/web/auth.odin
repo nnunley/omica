@@ -67,6 +67,12 @@ auth_seed_user :: proc(auth: ^Auth, login, password: string, actor: v.Value) -> 
 		return false
 	}
 	sync.mutex_lock(&auth.lock)
+	if existing, found := auth.users[user.login]; found {
+		// Re-seeding a login replaces it; free the previous user rather than
+		// leaking it.
+		delete(existing.login, auth.allocator)
+		free(existing, auth.allocator)
+	}
 	auth.users[user.login] = user
 	sync.mutex_unlock(&auth.lock)
 	return true

@@ -133,6 +133,25 @@ test_auth_login_request :: proc(t: ^testing.T) {
 
 // Logout must revoke the token server-side. Regression (SEC3): the handler
 // only cleared the browser cookie, so a copied token stayed valid.
+// Re-seeding a login replaces the previous credentials (and frees them).
+@(test)
+test_auth_seed_user_reseeds :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	auth: Auth
+	auth_init(&auth, context.temp_allocator)
+	defer auth_destroy(&auth)
+	first, _ := v.value_identity_raw(0x2005)
+	second, _ := v.value_identity_raw(0x2006)
+	testing.expect(t, auth_seed_user(&auth, "frank", "first-pass", first))
+	testing.expect(t, auth_seed_user(&auth, "frank", "second-pass", second))
+
+	resolved, ok := auth_verify_user(&auth, "frank", "second-pass")
+	testing.expect(t, ok)
+	testing.expect_value(t, resolved, second)
+	_, old_ok := auth_verify_user(&auth, "frank", "first-pass")
+	testing.expect(t, !old_ok)
+}
+
 @(test)
 test_auth_logout_revokes_token :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
