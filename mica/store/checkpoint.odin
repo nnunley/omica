@@ -118,6 +118,9 @@ store_page_read :: proc(
 	if !found {
 		return nil, .Truncated
 	}
+	if entry.length < PAGE_HEADER_SIZE {
+		return nil, .Truncated
+	}
 	data := make([]u8, entry.length, context.temp_allocator)
 	defer delete(data, context.temp_allocator)
 	if _, seek_error := os.seek(store.pages_file, entry.offset, .Start); seek_error != nil {
@@ -127,7 +130,7 @@ store_page_read :: proc(
 	if read_error != nil || read != entry.length {
 		return nil, .Truncated
 	}
-	if data[0] != PAGE_MAGIC[0] || data[7] != PAGE_MAGIC[7] {
+	if string(data[:len(PAGE_MAGIC)]) != PAGE_MAGIC {
 		return nil, .Bad_Tag
 	}
 	payload_length := u32(data[20]) |
@@ -275,7 +278,7 @@ store_manifest_read :: proc(store: ^Store, path: string) -> (Manifest_Data, bool
 	if read_error != nil || read != int(size) {
 		return {}, false
 	}
-	if data[0] != MANIFEST_MAGIC[0] || data[7] != MANIFEST_MAGIC[7] {
+	if string(data[:len(MANIFEST_MAGIC)]) != MANIFEST_MAGIC {
 		return {}, false
 	}
 	reader := Codec_Reader{data = data, cursor = 12}

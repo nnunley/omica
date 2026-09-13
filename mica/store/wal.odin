@@ -79,6 +79,9 @@ wal_decode_metadata :: proc(
 	if arity_error != .None {
 		return {}, arity_error
 	}
+	if arity > 0xffff {
+		return {}, .Bad_Tag
+	}
 	argument_count, argument_error := codec_read_u32(reader)
 	if argument_error != .None {
 		return {}, argument_error
@@ -124,6 +127,9 @@ wal_decode_metadata :: proc(
 	if conflict_error != .None {
 		return {}, conflict_error
 	}
+	if conflict_byte > u8(k.Conflict_Kind.Event_Append) {
+		return {}, .Bad_Tag
+	}
 	key_count, key_error := codec_read_u32(reader)
 	if key_error != .None {
 		return {}, key_error
@@ -142,6 +148,9 @@ wal_decode_metadata :: proc(
 	durability_byte, durability_error := codec_read_u8(reader)
 	if durability_error != .None {
 		return {}, durability_error
+	}
+	if durability_byte > u8(k.Relation_Durability.Volatile) {
+		return {}, .Bad_Tag
 	}
 	return k.Relation_Metadata {
 			id = k.Relation_ID(id),
@@ -334,6 +343,13 @@ store_wal_open :: proc(store: ^Store, path: string) -> bool {
 	   data[5] != WAL_MAGIC[5] ||
 	   data[6] != WAL_MAGIC[6] ||
 	   data[7] != WAL_MAGIC[7] {
+		return false
+	}
+	stored_version := u32(data[8]) |
+		u32(data[9]) << 8 |
+		u32(data[10]) << 16 |
+		u32(data[11]) << 24
+	if stored_version != WAL_VERSION {
 		return false
 	}
 

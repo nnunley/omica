@@ -525,6 +525,37 @@ test_file_wal_short_header :: proc(t: ^testing.T) {
 	testing.expect(t, !store_failed(&store))
 }
 
+// A WAL written by an unknown format version is refused, not misread.
+@(test)
+test_file_wal_rejects_unknown_version :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_wal_version")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	testing.expect(t, os.make_directory_all(path, os.Permissions_Default) == nil)
+	wal_path, _ := filepath.join([]string{path, "wal"}, context.temp_allocator)
+	wal_file, open_error := os.open(wal_path, os.O_RDWR | os.O_CREATE)
+	testing.expect(t, open_error == nil)
+	if open_error == nil {
+		header: [WAL_HEADER_SIZE]u8
+		copy(header[:8], WAL_MAGIC)
+		header[8] = 2
+		written, write_error := os.write(wal_file, header[:])
+		testing.expect(t, write_error == nil && written == WAL_HEADER_SIZE)
+		os.close(wal_file)
+	}
+
+	store: Store
+	testing.expect(
+		t,
+		!store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+}
+
 @(test)
 test_file_wal_durability_none_does_not_sync :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
