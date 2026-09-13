@@ -30,12 +30,16 @@ tuple_arity :: proc(t: Tuple) -> int {
 	return len(transmute([]Value)t)
 }
 
-// Creates a tuple from selected positions of another tuple.
+// Creates a tuple from selected positions of another tuple. Positions beyond
+// the source yield the zero value rather than reading out of bounds.
 tuple_select :: proc(t: Tuple, alloc: mem.Allocator, positions: []u16) -> Tuple {
 	values := make([]Value, len(positions), alloc)
 	source := tuple_values(t)
 	for position, i in positions {
-		values[i] = source[int(position)]
+		index := int(position)
+		if index < len(source) {
+			values[i] = source[index]
+		}
 	}
 	return Tuple(values)
 }

@@ -195,6 +195,17 @@ test_tuple_operations :: proc(t: ^testing.T) {
 	testing.expect(t, !tuple_matches_bindings(row, bindings))
 }
 
+// A position beyond the tuple yields the zero value, not an out-of-bounds read.
+@(test)
+test_tuple_select_out_of_range :: proc(t: ^testing.T) {
+	row := tuple_new(context.temp_allocator, []Value{must_int(1), must_int(2)})
+	selected := tuple_select(row, context.temp_allocator, []u16{0, 5})
+	values := tuple_values(selected)
+	testing.expect_value(t, len(values), 2)
+	testing.expect(t, value_eq(values[0], must_int(1)))
+	testing.expect(t, value_eq(values[1], Value(0)))
+}
+
 @(test)
 test_map_canonicalization_keeps_last_duplicate :: proc(t: ^testing.T) {
 	one := must_int(1)

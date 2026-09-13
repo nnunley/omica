@@ -209,6 +209,13 @@ sync_dispatch_dom_event :: proc(
 		return true
 	}
 
+	// The client can mark an event as not requiring a re-render; its action
+	// is responsible for producing the resulting update.
+	if !event.refresh {
+		response.status = 202
+		return true
+	}
+
 	// Send the resulting view. A client behind the current revision gets a
 	// full snapshot; otherwise a delta.
 	view := sync_view_state(session, event.view_id)

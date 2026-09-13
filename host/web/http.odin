@@ -251,6 +251,10 @@ parse_http_version :: proc(version: string) -> (major, minor: int, ok: bool) {
 	if !major_ok || !minor_ok {
 		return 0, 0, false
 	}
+	// This host speaks HTTP/1.x only.
+	if major_value != 1 || (minor_value != 0 && minor_value != 1) {
+		return 0, 0, false
+	}
 	return major_value, minor_value, true
 }
 

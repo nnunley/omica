@@ -29,4 +29,16 @@ test_dom_event_decode :: proc(t: ^testing.T) {
 		testing.expect_value(t, event.fields[0].name, "text")
 		testing.expect_value(t, event.fields[0].value, "north")
 	}
+	testing.expect(t, event.refresh)
+
+	// refresh:false is honored; an absent flag defaults to true.
+	no_refresh := `{"type":"dom_event","session":"9","view":"21","revision":"1","signature":"12531108388691183","refresh":false,"event":"submit","target":"x","action":"a","fields":{}}`
+	flagged, flagged_ok := dom_event_decode(as_bytes(no_refresh), context.temp_allocator)
+	testing.expect(t, flagged_ok)
+	testing.expect(t, !flagged.refresh)
+
+	defaulted := `{"type":"dom_event","session":"9","view":"21","revision":"1","signature":"12531108388691183","event":"submit","target":"x","action":"a","fields":{}}`
+	default_event, default_ok := dom_event_decode(as_bytes(defaulted), context.temp_allocator)
+	testing.expect(t, default_ok)
+	testing.expect(t, default_event.refresh)
 }

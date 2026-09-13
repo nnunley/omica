@@ -39,6 +39,21 @@ test_http_write_chunk_terminator :: proc(t: ^testing.T) {
 	testing.expect_value(t, strings.to_string(builder), "0\r\n\r\n")
 }
 
+// Only HTTP/1.0 and HTTP/1.1 are accepted.
+@(test)
+test_http_rejects_unsupported_version :: proc(t: ^testing.T) {
+	parser: Http_Parser
+	http_parser_init(&parser)
+	defer http_parser_destroy(&parser)
+	_, state, parse_error := parse_request(
+		t,
+		&parser,
+		"GET / HTTP/2.0\r\nHost: a\r\n\r\n",
+	)
+	testing.expect_value(t, state, Http_Parse_State.Error)
+	testing.expect_value(t, parse_error.status, 505)
+}
+
 // Responses must not let a browser sniff an untyped body into another type.
 @(test)
 test_http_encode_security_headers :: proc(t: ^testing.T) {
