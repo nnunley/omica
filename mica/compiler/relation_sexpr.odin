@@ -11,6 +11,7 @@
 // an edge, or a scalar attribute otherwise. Repeated roles carry an ordinal.
 package compiler
 
+import "base:runtime"
 import "core:slice"
 import "core:strings"
 import v "../var"
@@ -41,28 +42,68 @@ Fact :: struct {
 	ordinal: i64,
 }
 
+// The physical column positions of the relational AST heading. A relation
+// value canonicalizes its heading by sorting symbols by id, so positions depend
+// on interning order and must be resolved rather than assumed.
+@(private)
+Rel_Columns :: struct {
+	node:    int,
+	role:    int,
+	target:  int,
+	ordinal: int,
+}
+
+@(private)
+rel_columns :: proc(rows: ^v.Relation_Value) -> (Rel_Columns, bool) {
+	columns := Rel_Columns{node = -1, role = -1, target = -1, ordinal = -1}
+	want_node := v.symbol_intern("node")
+	want_role := v.symbol_intern("role")
+	want_target := v.symbol_intern("target")
+	want_ordinal := v.symbol_intern("ordinal")
+	for symbol, index in rows.heading {
+		switch symbol {
+		case want_node:
+			columns.node = index
+		case want_role:
+			columns.role = index
+		case want_target:
+			columns.target = index
+		case want_ordinal:
+			columns.ordinal = index
+		}
+	}
+	if columns.node < 0 || columns.role < 0 || columns.target < 0 || columns.ordinal < 0 {
+		return columns, false
+	}
+	return columns, true
+}
+
 // Returns every fact for a node with a given role, sorted by ordinal.
 @(private)
 rel_facts :: proc(
 	rows: ^v.Relation_Value,
 	node: int,
 	role: v.Symbol,
-	allocator := context.temp_allocator,
+	allocator := context.allocator,
 ) -> []Fact {
 	out: [dynamic]Fact
 	out = make([dynamic]Fact, 0, 4, allocator)
+	columns, has_columns := rel_columns(rows)
+	if !has_columns {
+		return out[:]
+	}
 	for row in rows.rows {
 		cells := v.tuple_values(row)
 		if len(cells) != 4 {
 			continue
 		}
-		row_node, node_ok := v.value_as_int(cells[0])
-		row_role, role_ok := v.value_as_symbol(cells[1])
+		row_node, node_ok := v.value_as_int(cells[columns.node])
+		row_role, role_ok := v.value_as_symbol(cells[columns.role])
 		if !node_ok || !role_ok || int(row_node) != node || row_role != role {
 			continue
 		}
-		ordinal, _ := v.value_as_int(cells[3])
-		append(&out, Fact{role = row_role, target = cells[2], ordinal = ordinal})
+		ordinal, _ := v.value_as_int(cells[columns.ordinal])
+		append(&out, Fact{role = row_role, target = cells[columns.target], ordinal = ordinal})
 	}
 	slice.sort_by(out[:], proc(a, b: Fact) -> bool { return a.ordinal < b.ordinal })
 	return out[:]
@@ -74,7 +115,7 @@ rel_target :: proc(
 	rows: ^v.Relation_Value,
 	node: int,
 	role: v.Symbol,
-	allocator := context.temp_allocator,
+	allocator := context.allocator,
 ) -> (v.Value, bool) {
 	facts := rel_facts(rows, node, role, allocator)
 	if len(facts) == 0 {
