@@ -103,7 +103,12 @@ value_deep_free :: proc(alloc: mem.Allocator, value: Value) {
 	#partial switch value_kind(value) {
 	case .String:
 		if header, ok := heap_header(value, .String, Heap_String); ok {
-			delete(header.data, alloc)
+			if header.data != nil {
+				// Free the full allocation, not just the visible prefix; an
+				// appended string may have reserved headroom.
+				full := ([^]u8)(raw_data(header.data))[:header.allocated]
+				delete(full, alloc)
+			}
 			free(header, alloc)
 		}
 	case .Bytes:

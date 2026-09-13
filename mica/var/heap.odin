@@ -11,8 +11,19 @@ import "core:mem"
 import "core:slice"
 
 // An immutable string value.
+//
+// `data` may have capacity beyond its length. That spare room is only valid
+// for an append that is performed through `value_string_append`, which owns
+// the buffer: any other holder of the same `Value` must not observe the
+// appended bytes. `spare_owner` is a monotonically increasing token that
+// records which append created the spare room, so an older copy of the value
+// cannot reuse it after a newer append has claimed it.
 Heap_String :: struct {
-	data: []u8,
+	data:        []u8,
+	// Bytes allocated for `data`; `len(data)` may be smaller when the string
+	// was produced by `value_string_append`, which reserves headroom.
+	allocated:   int,
+	spare_owner: u64,
 }
 
 // An immutable byte-string value.
@@ -106,13 +117,73 @@ value_string :: proc(alloc: mem.Allocator, s: string) -> Value {
 	return value_heap(.String, header)
 }
 
+// A token handed out per append that creates spare capacity. Only the header
+// holding the newest token may extend the buffer's tail; every append hands the
+// token to its result and clears it on the base.
+@(private)
+string_spare_counter: u64
+
 // Creates a string value taking ownership of `data` without copying. `data`
 // must have come from `alloc` and must not be used or freed by the caller
 // afterwards. The header itself is still allocated.
 value_string_owned :: proc(alloc: mem.Allocator, data: []u8) -> Value {
 	header := new(Heap_String, alloc)
 	header.data = data
+	header.allocated = len(data)
 	return value_heap(.String, header)
+}
+
+// Appends `text` to `base`, returning the resulting string. When `base` owns
+// the tail of a buffer with room, the append writes past its own length; the
+// base's header loses the tail token and the result gains it. Otherwise a
+// fresh buffer with headroom is allocated and the base is copied in. Either
+// way the result carries spare capacity, so growing a string one piece at a
+// time is linear rather than O(n^2).
+//
+// Soundness: a string value observes only `data[0..len]`. The bytes past the
+// base's length are invisible through every existing value, and only the token
+// holder may write there, so an append can never change what another value
+// reads.
+value_string_append :: proc(alloc: mem.Allocator, base: Value, text: string) -> Value {
+	header, is_string := heap_header(base, .String, Heap_String)
+	if is_string && header.data != nil && header.spare_owner != 0 {
+		required := len(header.data) + len(text)
+		if required <= header.allocated {
+			// Rebuild the full allocation view from the pointer; the header's
+			// own `data` only exposes the visible prefix.
+			full := ([^]u8)(raw_data(header.data))[:header.allocated]
+			copy(full[len(header.data):], transmute([]u8)text)
+			// The base is no longer the tail owner; the result is.
+			header.spare_owner = 0
+			value := value_string_owned(alloc, full[:required])
+			result, _ := heap_header(value, .String, Heap_String)
+			result.allocated = header.allocated
+			string_spare_counter += 1
+			result.spare_owner = string_spare_counter
+			return value
+		}
+	}
+	required := len(text)
+	if is_string {
+		required += len(header.data)
+	}
+	capacity := required * 2
+	if capacity < 16 {
+		capacity = 16
+	}
+	buffer := make([]u8, capacity, alloc)
+	write := 0
+	if is_string {
+		copy(buffer, header.data)
+		write = len(header.data)
+	}
+	copy(buffer[write:], transmute([]u8)text)
+	value := value_string_owned(alloc, buffer[:required])
+	result, _ := heap_header(value, .String, Heap_String)
+	result.allocated = capacity
+	string_spare_counter += 1
+	result.spare_owner = string_spare_counter
+	return value
 }
 
 // Creates a byte-string value by copying `data` into `alloc`.

@@ -49,6 +49,7 @@ runtime_builtins := [?]Builtin_Spec {
 	{"string_slice", 3, builtin_string_slice},
 	{"string_from_chars", 1, builtin_string_from_chars},
 	{"string_concat", -1, builtin_string_concat},
+	{"string_append", 2, builtin_string_append},
 	{"string_join", 2, builtin_string_join},
 	{"string_starts_with", 2, builtin_string_starts_with},
 	{"string_contains", 2, builtin_string_contains},
@@ -1993,6 +1994,19 @@ builtin_string_concat :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 		write += len(text)
 	}
 	return v.value_string_owned(state.allocator, buffer[:write]), true
+}
+
+@(private)
+builtin_string_append :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	base, base_ok := v.value_as_string(args[0])
+	if !base_ok {
+		return builtin_error(state, "E_TYPE", "string_append expects a string")
+	}
+	text, text_ok := v.value_as_string(args[1])
+	if !text_ok {
+		return builtin_error(state, "E_TYPE", "string_append expects a string")
+	}
+	return v.value_string_append(state.allocator, args[0], text), true
 }
 
 @(private)

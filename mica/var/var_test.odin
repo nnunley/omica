@@ -172,9 +172,57 @@ test_explicit_numeric_conversions :: proc(t: ^testing.T) {
 	testing.expect(t, value_eq(high_edge, must_int((i64(1) << 55) - (i64(1) << 32))))
 }
 
+// Appending must reuse capacity so repeated growth is linear, and an append
+// must never change the bytes another holder of the base value can see.
 @(test)
-test_tuple_operations :: proc(t: ^testing.T) {
-	one := must_int(1)
+test_string_append_reuses_capacity_and_preserves_aliases :: proc(t: ^testing.T) {
+	arena := new(virtual.Arena)
+	if init_error := virtual.arena_init_growing(arena); init_error != nil {
+		panic("failed to initialize test arena")
+	}
+	defer {
+		virtual.arena_destroy(arena)
+		free(arena)
+	}
+	alloc := virtual.arena_allocator(arena)
+
+	text := value_string(alloc, "a")
+	base := text
+	// One append may allocate with headroom; subsequent appends of a growing
+	// string must not allocate every time.
+	first_header, _ := heap_header(base, .String, Heap_String)
+	first_allocation := first_header.allocated
+
+	grown := value_string_append(alloc, text, "b")
+	header, header_ok := heap_header(grown, .String, Heap_String)
+	testing.expect(t, header_ok)
+	// An aliased copy of the original must still read only "a".
+	original, _ := value_as_string(text)
+	testing.expect_value(t, original, "a")
+	grown_text, _ := value_as_string(grown)
+	testing.expect_value(t, grown_text, "ab")
+	testing.expect(t, header.allocated > first_allocation)
+
+	// Growing again reuses the same buffer rather than allocating.
+	buffer_before := raw_data(header.data)
+	grown_twice := value_string_append(alloc, grown, "c")
+	twice_header, _ := heap_header(grown_twice, .String, Heap_String)
+	twice_text, _ := value_as_string(grown_twice)
+	testing.expect_value(t, twice_text, "abc")
+	testing.expect(t, raw_data(twice_header.data) == buffer_before)
+
+	// The earlier value still reads its own prefix.
+	grown_text_again, _ := value_as_string(grown)
+	testing.expect_value(t, grown_text_again, "ab")
+
+	// A non-string base is rejected by producing a fresh string.
+	fresh := value_string_append(alloc, must_int(1), "x")
+	fresh_text, _ := value_as_string(fresh)
+	testing.expect_value(t, fresh_text, "x")
+}
+
+@(test)
+test_tuple_operations :: proc(t: ^testing.T) {	one := must_int(1)
 	two := must_int(2)
 	row := tuple_new(context.temp_allocator, []Value{one, two})
 	testing.expect_value(t, tuple_arity(row), 2)

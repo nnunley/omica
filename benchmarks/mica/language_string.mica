@@ -11,12 +11,15 @@ grant #bench
 end
 // String building over a loop.
 //
-// Per-call workload: 1000 concatenations of a one-character string.
+// Per-call workload: 1000 appends of a one-character string. Uses
+// string_append, the amortized primitive: it reuses buffer capacity, so the
+// loop is linear. (string_concat rebuilds and copies each time, which is
+// O(n^2) for a growing prefix; that path is still exercised elsewhere.)
 verb bench()
   let text = ""
   let index = 0
   while index < 1000
-    text = string_concat(text, "x")
+    text = string_append(text, "x")
     index = index + 1
   end
   return string_len(text)
