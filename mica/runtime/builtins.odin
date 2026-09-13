@@ -2155,15 +2155,163 @@ builtin_sort :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	if !ok {
 		return builtin_error(state, "E_TYPE", "sort expects a list")
 	}
+	// Homogeneous-int lists are the common case and sort far faster as raw
+	// i64: the tagged comparator decodes two tags plus two payloads and calls
+	// value_cmp per comparison, and slice.sort_by reaches it through a
+	// function pointer. Canonical order for ints is numeric order, so an
+	// i64 sort is equivalent.
+	if values != nil && all_values_are_int(values) {
+		numbers := make([]i64, len(values), state.allocator)
+		for value, index in values {
+			numbers[index] = v.value_int_unchecked(value)
+		}
+		// Sort the raw integers with a direct comparison sort: both core
+		// sorts reach the comparator through a function pointer (and
+		// smoothsort is comparison-heavy besides), which dominated an
+		// all-integer sort.
+		sort_i64(numbers)
+		result := make([]v.Value, len(numbers), state.allocator)
+		for number, index in numbers {
+			result[index] = v.value_int_unchecked_pack(number)
+		}
+		delete(numbers, state.allocator)
+		return v.value_list_owned(state.allocator, result), true
+	}
 	sorted := make([]v.Value, len(values), state.allocator)
 	copy(sorted, values)
-	// Sort in place with a direct comparator. slice.sort_by takes a runtime
-	// function pointer, so smoothsort calls it indirectly on every
-	// comparison; a local comparator that the compiler can inline removes
-	// that indirection. The order is the canonical value ordering, so the
-	// result matches value_cmp.
+	// Mixed-kind lists fall back to the canonical comparator. slice.sort_by
+	// reaches it through a function pointer, so this path stays relatively
+	// slow; the named comparator at least avoids allocating a capture for
+	// the inline closure form. Canonical order is value_cmp's order.
 	sort_values(sorted)
 	return v.value_list_owned(state.allocator, sorted), true
+}
+
+@(private)
+all_values_are_int :: proc(values: []v.Value) -> bool {
+	for value in values {
+		if v.value_tag(value) != .Int {
+			return false
+		}
+	}
+	return true
+}
+
+// Sorts a slice of integers: median-of-three quicksort with insertion sort for
+// small ranges, falling back to heapsort past a depth limit (introsort). No
+// function pointers, so every comparison is a direct integer compare.
+@(private)
+sort_i64 :: proc(values: []i64) {
+	INSERTION_LIMIT :: 12
+	if len(values) < 2 {
+		return
+	}
+	// Introsort depth bound: 2 * floor(log2(n)), so quicksort degenerating on
+	// adversarial input falls back to heapsort rather than recursing deeply.
+	depth: u32 = 0
+	remaining := len(values)
+	for remaining > 1 {
+		remaining >>= 1
+		depth += 2
+	}
+	intro_sort_i64(values, 0, len(values) - 1, depth, INSERTION_LIMIT)
+}
+
+@(private)
+intro_sort_i64 :: proc(values: []i64, low, high: int, depth: u32, insertion_limit: int) {
+	if high <= low {
+		return
+	}
+	if high - low < insertion_limit {
+		insertion_sort_i64(values, low, high)
+		return
+	}
+	if depth == 0 {
+		heap_sort_i64(values, low, high)
+		return
+	}
+	// Hoare partitioning: `pivot` is the last index of the lower partition, so
+	// the recursions are (low, pivot) and (pivot + 1, high). Using
+	// (low, pivot - 1) would drop the pivot's own partition.
+	pivot := partition_i64(values, low, high)
+	intro_sort_i64(values, low, pivot, depth - 1, insertion_limit)
+	intro_sort_i64(values, pivot + 1, high, depth - 1, insertion_limit)
+}
+
+@(private)
+insertion_sort_i64 :: proc(values: []i64, low, high: int) {
+	for index in low + 1 ..= high {
+		current := values[index]
+		position := index
+		for position > low && values[position - 1] > current {
+			values[position] = values[position - 1]
+			position -= 1
+		}
+		values[position] = current
+	}
+}
+
+@(private)
+partition_i64 :: proc(values: []i64, low, high: int) -> int {
+	// Median of three, then Hoare-style partitioning around the pivot value.
+	mid := low + (high - low) / 2
+	if values[mid] < values[low] {
+		values[low], values[mid] = values[mid], values[low]
+	}
+	if values[high] < values[low] {
+		values[low], values[high] = values[high], values[low]
+	}
+	if values[high] < values[mid] {
+		values[mid], values[high] = values[high], values[mid]
+	}
+	pivot := values[mid]
+	left := low
+	right := high
+	for {
+		for values[left] < pivot {
+			left += 1
+		}
+		for values[right] > pivot {
+			right -= 1
+		}
+		if left >= right {
+			return right
+		}
+		values[left], values[right] = values[right], values[left]
+		left += 1
+		right -= 1
+	}
+}
+
+@(private)
+heap_sort_i64 :: proc(values: []i64, low, high: int) {
+	count := high - low + 1
+	for start := count / 2 - 1; start >= 0; start -= 1 {
+		sift_down_i64(values, low, start, count)
+	}
+	for end := count - 1; end > 0; end -= 1 {
+		values[low], values[low + end] = values[low + end], values[low]
+		sift_down_i64(values, low, 0, end)
+	}
+}
+
+@(private)
+sift_down_i64 :: proc(values: []i64, base, start, count: int) {
+	root := start
+	for {
+		child := 2 * root + 1
+		if child >= count {
+			return
+		}
+		if child + 1 < count && values[base + child] < values[base + child + 1] {
+			child += 1
+		}
+		if values[base + root] >= values[base + child] {
+			return
+		}
+		values[base + root], values[base + child] = values[base + child], values[base + root]
+		root = child
+	}
 }
 
 // Sorts values by the canonical ordering. Kept as a named proc so the

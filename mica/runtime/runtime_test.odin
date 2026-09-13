@@ -178,6 +178,58 @@ expect_builtin_error :: proc(
 }
 
 @(test)
+test_sort_i64 :: proc(t: ^testing.T) {
+	// The int sort is hand-rolled, so exercise the partitioning path (above the
+	// insertion threshold), the degenerate orders, and duplicates directly.
+	SIZES :: []int{0, 1, 2, 3, 12, 13, 100, 511, 512, 1000, 8192}
+	for size in SIZES {
+		values := make([]i64, size)
+		seed: i64 = 12345
+		for &value in values {
+			// Keep the generator inside the 56-bit Mica integer range.
+			seed = (seed * 97 + 7919) % 100003
+			value = (seed % 2001) - 1000
+		}
+		sort_i64(values)
+		for index in 1 ..< len(values) {
+			testing.expectf(
+				t,
+				values[index - 1] <= values[index],
+				"size %d: values[%d]=%d > values[%d]=%d",
+				size,
+				index - 1,
+				values[index - 1],
+				index,
+				values[index],
+			)
+		}
+		delete(values)
+	}
+
+	ascending := make([]i64, 300)
+	descending := make([]i64, 300)
+	equal := make([]i64, 200)
+	for _, index in ascending {
+		ascending[index] = i64(index)
+		descending[index] = i64(300 - index)
+	}
+	for &value in equal {
+		value = 7
+	}
+	sort_i64(ascending)
+	sort_i64(descending)
+	sort_i64(equal)
+	for index in 1 ..< len(ascending) {
+		testing.expect(t, ascending[index - 1] <= ascending[index])
+		testing.expect(t, descending[index - 1] <= descending[index])
+	}
+	testing.expect(t, equal[0] == 7 && equal[len(equal) - 1] == 7)
+	delete(ascending)
+	delete(descending)
+	delete(equal)
+}
+
+@(test)
 test_scalar_builtins :: proc(t: ^testing.T) {
 	ctx := c.Compile_Context {
 		builtins   = make(map[string]bool),
