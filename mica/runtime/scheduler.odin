@@ -67,8 +67,21 @@ Scheduler :: struct {
 	allocator: mem.Allocator,
 
 	lock: sync.Mutex,
+	// Signals runnable work to the worker pool. Only ever signalled, never
+	// broadcast: one worker is enough to make progress (a worker drains the
+	// ready queue before parking again), and broadcasting woke every parked
+	// worker on every submit and completion (measured at 141k context switches
+	// versus 36k for the same work with one worker).
 	cond: sync.Cond,
-	stop: bool,
+	// Signals the timer thread that a timer was added or removed. Kept apart
+	// from `cond` so a worker wakeup can never be consumed by the timer, which
+	// would re-park and leave the work unpicked.
+	timer_cond: sync.Cond,
+	// Signals task completion to waiters. Separate from `cond` so a worker
+	// wakeup can never be consumed by a waiter (which would re-park) and vice
+	// versa; without that split `cond` had to be broadcast everywhere.
+	done_cond: sync.Cond,
+	stop:      bool,
 
 	ready:   [dynamic]Task_ID,
 	timers:  [dynamic]Timer_Entry,
@@ -142,6 +155,8 @@ scheduler_shutdown :: proc(scheduler: ^Scheduler) {
 	sync.mutex_lock(&scheduler.lock)
 	scheduler.stop = true
 	sync.cond_broadcast(&scheduler.cond)
+	sync.cond_broadcast(&scheduler.timer_cond)
+	sync.cond_broadcast(&scheduler.done_cond)
 	sync.mutex_unlock(&scheduler.lock)
 
 	for worker in scheduler.threads {
@@ -194,7 +209,7 @@ scheduler_submit_task :: proc(
 	} else {
 		append(&scheduler.ready, id)
 	}
-	sync.cond_broadcast(&scheduler.cond)
+	sync.cond_signal(&scheduler.cond)
 	sync.mutex_unlock(&scheduler.lock)
 	return id
 }
@@ -217,7 +232,7 @@ scheduler_cancel :: proc(scheduler: ^Scheduler, id: Task_ID) -> Task_Outcome {
 		scheduler_remove_mailbox_waiter_locked(scheduler, id)
 		entry.result = task_cancel(entry.task)
 		entry.done = true
-		sync.cond_broadcast(&scheduler.cond)
+		sync.cond_broadcast(&scheduler.done_cond)
 	}
 	result := entry.result
 	sync.mutex_unlock(&scheduler.lock)
@@ -242,7 +257,7 @@ scheduler_resume :: proc(scheduler: ^Scheduler, id: Task_ID, value: v.Value) -> 
 	entry.has_pending = true
 	entry.pending_value = value
 	append(&scheduler.ready, id)
-	sync.cond_broadcast(&scheduler.cond)
+	sync.cond_signal(&scheduler.cond)
 	sync.mutex_unlock(&scheduler.lock)
 	return true
 }
@@ -394,7 +409,7 @@ scheduler_mailbox_send :: proc(
 	}
 	append(&box.messages, value)
 	scheduler_wake_mailbox_locked(scheduler, box)
-	sync.cond_broadcast(&scheduler.cond)
+	sync.cond_signal(&scheduler.cond)
 	sync.mutex_unlock(&scheduler.lock)
 	return true
 }
@@ -435,7 +450,7 @@ scheduler_mailbox_deliver_subscription :: proc(
 	}
 	append(&box.messages, overflow ? marker : message)
 	scheduler_wake_mailbox_locked(scheduler, box)
-	sync.cond_broadcast(&scheduler.cond)
+	sync.cond_signal(&scheduler.cond)
 	return true, overflow
 }
 
@@ -459,7 +474,7 @@ scheduler_mailbox_replace_subscription :: proc(
 	subscription_messages_remove_locked(box, capability)
 	append(&box.messages, value)
 	scheduler_wake_mailbox_locked(scheduler, box)
-	sync.cond_broadcast(&scheduler.cond)
+	sync.cond_signal(&scheduler.cond)
 	return true
 }
 
@@ -678,7 +693,7 @@ scheduler_park_mailbox_locked :: proc(
 		entry.pending_value = v.value_list(scheduler.allocator, queued[:])
 		entry.has_pending = true
 		append(&scheduler.ready, id)
-		sync.cond_broadcast(&scheduler.cond)
+	sync.cond_signal(&scheduler.cond)
 		delete(queued)
 		return
 	}
@@ -748,7 +763,7 @@ scheduler_wait :: proc(scheduler: ^Scheduler, id: Task_ID) -> Task_Outcome {
 		if entry.done {
 			return entry.result
 		}
-		sync.cond_wait(&scheduler.cond, &scheduler.lock)
+		sync.cond_wait(&scheduler.done_cond, &scheduler.lock)
 	}
 }
 
@@ -874,7 +889,7 @@ scheduler_wait_quiescent :: proc(scheduler: ^Scheduler) {
 		if !running && len(scheduler.ready) == 0 {
 			break
 		}
-		sync.cond_wait(&scheduler.cond, &scheduler.lock)
+		sync.cond_wait(&scheduler.done_cond, &scheduler.lock)
 	}
 	sync.mutex_unlock(&scheduler.lock)
 }
@@ -891,6 +906,7 @@ scheduler_push_timer :: proc(scheduler: ^Scheduler, entry: Timer_Entry) {
 	append(&scheduler.timers, Timer_Entry{})
 	copy(scheduler.timers[insert + 1:], scheduler.timers[insert:])
 	scheduler.timers[insert] = entry
+	sync.cond_signal(&scheduler.timer_cond)
 }
 
 // Why a dispatch submission failed.
@@ -1111,7 +1127,10 @@ scheduler_worker_proc :: proc(data: rawptr) {
 			outcome = task_cancel(task)
 		}
 		scheduler_finish_locked(scheduler, id, entry, outcome)
-		sync.cond_broadcast(&scheduler.cond)
+		// Task completion makes a worker idle or a task runnable, so both
+		// kinds of waiter (completion and quiescence) must be woken.
+		sync.cond_broadcast(&scheduler.done_cond)
+		sync.cond_signal(&scheduler.cond)
 		sync.mutex_unlock(&scheduler.lock)
 	}
 }
@@ -1128,7 +1147,7 @@ scheduler_timer_proc :: proc(data: rawptr) {
 
 		now := time.tick_now()
 		if len(scheduler.timers) == 0 {
-			sync.cond_wait(&scheduler.cond, &scheduler.lock)
+			sync.cond_wait(&scheduler.timer_cond, &scheduler.lock)
 			sync.mutex_unlock(&scheduler.lock)
 			continue
 		}
@@ -1136,7 +1155,7 @@ scheduler_timer_proc :: proc(data: rawptr) {
 		next := scheduler.timers[0]
 		if time.tick_diff(now, next.deadline) > 0 {
 			sync.cond_wait_with_timeout(
-				&scheduler.cond,
+				&scheduler.timer_cond,
 				&scheduler.lock,
 				time.tick_diff(now, next.deadline),
 			)
@@ -1147,7 +1166,8 @@ scheduler_timer_proc :: proc(data: rawptr) {
 		// Remove the timer we selected, not the last (unsorted pop) entry.
 		ordered_remove(&scheduler.timers, 0)
 		scheduler_timer_fire_locked(scheduler, next)
-		sync.cond_broadcast(&scheduler.cond)
+		sync.cond_signal(&scheduler.cond)
+		sync.cond_broadcast(&scheduler.done_cond)
 		sync.mutex_unlock(&scheduler.lock)
 	}
 }
