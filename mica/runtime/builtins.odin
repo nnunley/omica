@@ -1974,8 +1974,8 @@ builtin_string_from_chars :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 
 @(private)
 builtin_string_concat :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
-	// Size the buffer once from the summed part lengths, write the parts, then
-	// hand the buffer to the value without a second copy.
+	// Validate every part and total the length before allocating anything, so
+	// a bad argument is reported without a partial result.
 	total := 0
 	for part in args {
 		text, ok := v.value_as_string(part)
@@ -1987,14 +1987,24 @@ builtin_string_concat :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 	if total == 0 {
 		return v.value_string_owned(state.allocator, nil), true
 	}
-	buffer := make([]u8, total, state.allocator)
-	write := 0
-	for part in args {
-		text, _ := v.value_as_string(part)
-		copy(buffer[write:], transmute([]u8)text)
-		write += len(text)
+	if len(args) == 1 {
+		text, _ := v.value_as_string(args[0])
+		return v.value_string(state.allocator, text), true
 	}
-	return v.value_string_owned(state.allocator, buffer[:write]), true
+
+	// Grow the result through the append primitive rather than sizing an exact
+	// buffer and copying every part. When the accumulator owns the tail of a
+	// buffer with room, the next part is written past its visible prefix, so
+	// the common self-concat idiom `s = string_concat(s, x)` is linear instead
+	// of O(n^2). This mirrors CPython, which resizes an unshared left operand
+	// in place. Parts are appended left to right, so the bytes are identical to
+	// a single exact-sized copy; the result carries spare capacity.
+	parts := make([]string, len(args) - 1, context.temp_allocator)
+	for index in 1 ..< len(args) {
+		text, _ := v.value_as_string(args[index])
+		parts[index - 1] = text
+	}
+	return v.value_string_concat(state.allocator, args[0], parts), true
 }
 
 @(private)

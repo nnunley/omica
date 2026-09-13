@@ -194,6 +194,21 @@ value_string_append :: proc(alloc: mem.Allocator, base: Value, text: string) -> 
 	return value
 }
 
+// Concatenates `base` with each part in order. Growth goes through
+// `value_string_append`, so when the accumulator owns the tail of a buffer with
+// room the next part is written past its visible prefix instead of rebuilding
+// the whole string. Repeated concatenation (`s = concat(s, x)`) is therefore
+// linear rather than O(n^2), matching an in-place append of an unshared string.
+// The bytes are identical to a single exact-sized copy; the result carries
+// spare capacity.
+value_string_concat :: proc(alloc: mem.Allocator, base: Value, parts: []string) -> Value {
+	result := base
+	for part in parts {
+		result = value_string_append(alloc, result, part)
+	}
+	return result
+}
+
 // Creates a byte-string value by copying `data` into `alloc`.
 value_bytes :: proc(alloc: mem.Allocator, data: []u8) -> Value {
 	owned := make([]u8, len(data), alloc)

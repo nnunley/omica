@@ -221,6 +221,42 @@ test_string_append_reuses_capacity_and_preserves_aliases :: proc(t: ^testing.T) 
 	testing.expect_value(t, fresh_text, "x")
 }
 
+// Concatenating repeatedly must reuse the accumulator's buffer rather than
+// rebuild it each time, and earlier values must keep reading their own prefix.
+@(test)
+test_string_concat_reuses_capacity_and_preserves_aliases :: proc(t: ^testing.T) {
+	arena := new(virtual.Arena)
+	if init_error := virtual.arena_init_growing(arena); init_error != nil {
+		panic("failed to initialize test arena")
+	}
+	defer {
+		virtual.arena_destroy(arena)
+		free(arena)
+	}
+	alloc := virtual.arena_allocator(arena)
+
+	base := value_string(alloc, "a")
+	first := value_string_concat(alloc, base, []string{"b"})
+	first_text, _ := value_as_string(first)
+	testing.expect_value(t, first_text, "ab")
+	// The original still reads only its own prefix.
+	base_text, _ := value_as_string(base)
+	testing.expect_value(t, base_text, "a")
+
+	// A second concat onto the accumulator reuses the same buffer.
+	first_header, _ := heap_header(first, .String, Heap_String)
+	buffer := raw_data(first_header.data)
+	second := value_string_concat(alloc, first, []string{"c", "d"})
+	second_text, _ := value_as_string(second)
+	testing.expect_value(t, second_text, "abcd")
+	second_header, _ := heap_header(second, .String, Heap_String)
+	testing.expect(t, raw_data(second_header.data) == buffer)
+
+	// The intermediate value is unchanged.
+	first_text_again, _ := value_as_string(first)
+	testing.expect_value(t, first_text_again, "ab")
+}
+
 @(test)
 test_tuple_operations :: proc(t: ^testing.T) {	one := must_int(1)
 	two := must_int(2)
