@@ -179,12 +179,12 @@ rel_write_params :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, nod
 		strings.write_string(builder, " (param ")
 		rel_atom(builder, rel_str(rows, int(param), "name"))
 		strings.write_byte(builder, ' ')
-		switch rel_symbol_name(rel_kind(rows, int(param))) {
-		case "Required":
+		switch rel_symbol_name(rel_kind_of(rows, int(param), "mode")) {
+		case "req":
 			strings.write_string(builder, "req")
-		case "Optional":
+		case "opt":
 			strings.write_string(builder, "opt")
-		case "Rest":
+		case "rest":
 			strings.write_string(builder, "rest")
 		case:
 		}
@@ -193,7 +193,7 @@ rel_write_params :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, nod
 			rel_write_node(builder, rows, restrict)
 			strings.write_byte(builder, ')')
 		}
-		if kind_text, ok := rel_target(rows, int(param), v.symbol_intern("kind-annotation")); ok {
+		if kind_text, ok := rel_target(rows, int(param), v.symbol_intern("annotation")); ok {
 			text, _ := v.value_as_string(kind_text)
 			strings.write_string(builder, " (kind ")
 			rel_atom(builder, text)
@@ -328,12 +328,12 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		strings.write_string(builder, "(grant-item ")
 		principal, _ := rel_child(rows, node, "principal")
 		rel_write_node(builder, rows, principal)
-		strings.write_string(builder, rel_bool(rows, node, "is-role") ? " role" : " principal")
+		strings.write_string(builder, rel_bool(rows, node, "role_principal") ? " role" : " principal")
 		section_facts := rel_facts(rows, node, v.symbol_intern("section"))
 		for fact in section_facts {
 			section, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (section ")
-			strings.write_string(builder, rel_symbol_name(rel_kind(rows, int(section))))
+			strings.write_string(builder, rel_symbol_name(rel_kind_of(rows, int(section), "section_kind")))
 			entry_facts := rel_facts(rows, int(section), v.symbol_intern("entry"))
 			for entry_fact in entry_facts {
 				entry, _ := v.value_as_int(entry_fact.target)
@@ -364,7 +364,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		strings.write_string(builder, rel_bool(rows, node, "value") ? "(bool true)" : "(bool false)")
 	case "Error_Code_Literal":
 		strings.write_string(builder, "(error-code ")
-		rel_atom(builder, rel_str(rows, node, "name"))
+		rel_atom(builder, rel_str(rows, node, "text"))
 		strings.write_byte(builder, ')')
 	case "Identity_Literal":
 		strings.write_string(builder, "(identity ")
@@ -423,7 +423,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		start, _ := rel_child(rows, node, "start")
 		rel_write_node(builder, rows, start)
 		strings.write_byte(builder, ' ')
-		if end, ok := rel_child(rows, node, "end"); ok {
+		if end, ok := rel_child(rows, node, "range_end"); ok {
 			rel_write_node(builder, rows, end)
 		} else {
 			strings.write_byte(builder, '_')
@@ -431,14 +431,14 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		strings.write_byte(builder, ')')
 	case "Binding":
 		strings.write_string(builder, "(binding ")
-		strings.write_string(builder, rel_bool(rows, node, "is-const") ? "const" : "let")
-		if rel_bool(rows, node, "is-exactly") {
+		strings.write_string(builder, rel_bool(rows, node, "is_const") ? "const" : "let")
+		if rel_bool(rows, node, "is_exactly") {
 			strings.write_string(builder, " exactly")
 		}
 		strings.write_byte(builder, ' ')
 		pattern, _ := rel_child(rows, node, "pattern")
 		rel_write_pattern(builder, rows, pattern)
-		if kind_text, ok := rel_target(rows, node, v.symbol_intern("kind-annotation")); ok {
+		if kind_text, ok := rel_target(rows, node, v.symbol_intern("annotation")); ok {
 			text, _ := v.value_as_string(kind_text)
 			strings.write_string(builder, " (kind ")
 			rel_atom(builder, text)
@@ -452,7 +452,13 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		strings.write_byte(builder, ')')
 	case "Unary":
 		strings.write_string(builder, "(unary ")
-		strings.write_string(builder, rel_symbol_name(rel_kind_of(rows, node, "op")))
+		op_name := rel_symbol_name(rel_kind_of(rows, node, "op"))
+		// `not` is a keyword and cannot be a symbol spelling, so the parser
+		// emits `:not_op`; the canonical rendering is `not`.
+		if op_name == "not_op" {
+			op_name = "not"
+		}
+		strings.write_string(builder, op_name)
 		strings.write_byte(builder, ' ')
 		operand, _ := rel_child(rows, node, "operand")
 		rel_write_node(builder, rows, operand)
@@ -515,9 +521,9 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 			rel_write_body(builder, rows, int(branch), "body")
 			strings.write_byte(builder, ')')
 		}
-		if rel_bool(rows, node, "has-else") {
+		if rel_bool(rows, node, "has_else") {
 			strings.write_string(builder, " (else")
-			rel_write_body(builder, rows, node, "else")
+			rel_write_body(builder, rows, node, "else_body")
 			strings.write_byte(builder, ')')
 		}
 		strings.write_byte(builder, ')')
@@ -531,9 +537,10 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		strings.write_string(builder, "(for (names")
 		name_facts := rel_facts(rows, node, v.symbol_intern("name"))
 		for fact in name_facts {
+			name_node, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (name ")
-			rel_atom(builder, rel_str(rows, int(fact.target), "name"))
-			kind_text := rel_str(rows, int(fact.target), "kind")
+			rel_atom(builder, rel_str(rows, int(name_node), "name"))
+			kind_text := rel_str(rows, int(name_node), "annotation")
 			if kind_text != "" {
 				strings.write_byte(builder, ' ')
 				rel_atom(builder, kind_text)
@@ -589,7 +596,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 			strings.write_string(builder, " (")
 			pattern, _ := rel_child(rows, int(case_node), "pattern")
 			rel_write_pattern(builder, rows, pattern)
-			if rel_bool(rows, int(case_node), "has-guard") {
+			if rel_bool(rows, int(case_node), "has_guard") {
 				strings.write_string(builder, " (guard ")
 				guard, _ := rel_child(rows, int(case_node), "guard")
 				rel_write_node(builder, rows, guard)
@@ -602,17 +609,17 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 	case "Try":
 		strings.write_string(builder, "(try")
 		rel_write_body(builder, rows, node, "body")
-		catch_facts := rel_facts(rows, node, v.symbol_intern("catch"))
+		catch_facts := rel_facts(rows, node, v.symbol_intern("catch_clause"))
 		for fact in catch_facts {
 			clause, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (catch ")
-			if rel_bool(rows, int(clause), "has-code") {
+			if rel_bool(rows, int(clause), "has_code") {
 				rel_atom(builder, rel_str(rows, int(clause), "code"))
 			} else {
 				strings.write_byte(builder, '_')
 			}
 			strings.write_byte(builder, ' ')
-			if rel_bool(rows, int(clause), "has-name") {
+			if rel_bool(rows, int(clause), "has_name") {
 				rel_atom(builder, rel_str(rows, int(clause), "name"))
 			} else {
 				strings.write_byte(builder, '_')
@@ -620,9 +627,9 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 			rel_write_body(builder, rows, int(clause), "body")
 			strings.write_byte(builder, ')')
 		}
-		if rel_bool(rows, node, "has-finally") {
+		if rel_bool(rows, node, "has_finally") {
 			strings.write_string(builder, " (finally")
-			rel_write_body(builder, rows, node, "finally")
+			rel_write_body(builder, rows, node, "finally_body")
 			strings.write_byte(builder, ')')
 		}
 		strings.write_byte(builder, ')')
@@ -630,7 +637,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		strings.write_string(builder, "(spawn ")
 		call, _ := rel_child(rows, node, "call")
 		rel_write_node(builder, rows, call)
-		if rel_bool(rows, node, "has-delay") {
+		if rel_bool(rows, node, "has_delay") {
 			strings.write_string(builder, " (after ")
 			delay, _ := rel_child(rows, node, "delay")
 			rel_write_node(builder, rows, delay)
@@ -677,15 +684,15 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 			}
 			strings.write_byte(builder, ')')
 		}
-		strings.write_string(builder, rel_bool(rows, node, "self-closing") ? " self" : " paired")
+		strings.write_string(builder, rel_bool(rows, node, "self_closing") ? " self" : " paired")
 		rel_write_body(builder, rows, node, "child")
 		strings.write_byte(builder, ')')
 	case "Fn":
 		strings.write_string(builder, "(fn ")
 		rel_write_params(builder, rows, node)
-		if rel_bool(rows, node, "has-expression-body") {
+		if rel_bool(rows, node, "has_expression_body") {
 			strings.write_string(builder, " (=> ")
-			body, _ := rel_child(rows, node, "expression-body")
+			body, _ := rel_child(rows, node, "expression_body")
 			rel_write_node(builder, rows, body)
 			strings.write_byte(builder, ')')
 		} else {

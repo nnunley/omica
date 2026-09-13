@@ -4703,3 +4703,151 @@ map_get :: proc(entries: []v.Map_Entry, name: string) -> v.Value {
 odin_token_kind_name :: proc(kind: c.Token_Kind) -> (string, bool) {
 	return fmt.aprintf("%v", kind, allocator = context.temp_allocator), true
 }
+
+// Differential test for the Mica parser (#79).
+//
+// Parses each corpus file with the Odin parser and with `apps/compiler/parse.mica`
+// and compares a canonical S-expression rendering of the two ASTs. The Odin AST
+// is rendered by `ast_sexpr`; the Mica relational AST by `relation_ast_sexpr`.
+// Both renderers live in Odin, so a match means the Mica parser produced the
+// same tree.
+@(test)
+test_mica_parser_matches_odin :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	lexer_path := corpus_relative("apps/compiler/lex.mica")
+	parser_path := corpus_relative("apps/compiler/parse.mica")
+	if lexer_path == "" || parser_path == "" {
+		testing.expect(t, false, "compiler parser files not found")
+		return
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		[]string{lexer_path, parser_path},
+		context.temp_allocator,
+	)
+	testing.expectf(t, start.ok, "parser load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	_ = world_wait(world, world.entry)
+
+	cases := [?]struct {
+		name: string,
+		text: string,
+	} {
+		{"empty", ""},
+		{"int", "1"},
+		{"add", "1 + 2"},
+		{"precedence", "1 + 2 * 3"},
+		{"binding", "let x = 1"},
+		{"const", "const y = 2"},
+		{"call", "f(1, 2)"},
+		{"name", "foo/bar"},
+		{"symbol", ":name"},
+		{"identity", "#x"},
+		{"string", "\"abc\""},
+		{"list", "[1, 2, 3]"},
+		{"map", "{:a -> 1}"},
+		{"compare", "a < b"},
+		{"index", "xs[0]"},
+		{"field", "x.name"},
+		{"unary", "-x"},
+		{"not", "not x"},
+		{"if", "if x\n  y\nend"},
+		{"ifelse", "if x\n  y\nelse\n  z\nend"},
+		{"while", "while x\n  y\nend"},
+		{"for", "for i in xs\n  y\nend"},
+		{"begin", "begin\n  x\nend"},
+		{"return", "return 1"},
+		{"assignment", "x = 1"},
+		{"verb", "verb f(a, b)\n  return a\nend"},
+		{"query", "Point(?x, ?y)"},
+	}
+
+	for entry in cases {
+		mica_parser_matches_odin(t, world, entry.name, entry.text)
+	}
+
+	// The corpus gate: every .mica file under apps and benchmarks.
+	corpus := make([dynamic]string, 0, 64, context.temp_allocator)
+	for root in ([]string{"apps", "benchmarks"}) {
+		corpus_root := corpus_relative_dir(root)
+		if corpus_root == "" {
+			continue
+		}
+		walker := os.walker_create_path(corpus_root)
+		for info in os.walker_walk(&walker) {
+			if _, walk_err := os.walker_error(&walker); walk_err != nil {
+				break
+			}
+			if info.type == .Regular && strings.has_suffix(info.name, ".mica") {
+				append(&corpus, strings.clone(info.fullpath, context.temp_allocator))
+			}
+		}
+		os.walker_destroy(&walker)
+	}
+	compared := 0
+	for path in corpus {
+		data, read_err := os.read_entire_file(path, context.temp_allocator)
+		if read_err != nil {
+			continue
+		}
+		if mica_parser_matches_odin(t, world, path, string(data)) {
+			compared += 1
+		}
+	}
+	testing.expectf(t, compared >= 40, "only %d corpus files parsed identically", compared)
+}
+
+// Parses `source` with both parsers and compares the canonical renderings.
+@(private)
+mica_parser_matches_odin :: proc(
+	t: ^testing.T,
+	world: ^World,
+	label: string,
+	source: string,
+) -> bool {
+	odin_ast, odin_errors := c.parse_program(source, context.temp_allocator)
+	odin_rendered := c.ast_sexpr(odin_ast, context.temp_allocator)
+
+	outcome := world_call(world, "parse", []k.Role_Pair{{
+		role  = v.value_symbol(v.symbol_intern("source")),
+		value = v.value_string(context.temp_allocator, source),
+	}})
+	if outcome.kind != .Complete {
+		testing.expectf(t, false, "%s: Mica parse failed: %s", label, outcome.message)
+		return false
+	}
+	result, result_ok := v.value_as_map(outcome.value)
+	if !result_ok {
+		testing.expectf(t, false, "%s: parse did not return a map", label)
+		return false
+	}
+	root_value, _ := v.value_as_int(map_get(result, "root"))
+	nodes := map_get(result, "nodes")
+	mica_rendered := c.relation_ast_sexpr(int(root_value), nodes, context.temp_allocator)
+
+	mica_errors, _ := v.value_as_list(map_get(result, "errors"))
+	if len(mica_errors) != len(odin_errors) {
+		testing.expectf(
+			t,
+			false,
+			"%s: error count %d (Mica) != %d (Odin)",
+			label,
+			len(mica_errors),
+			len(odin_errors),
+		)
+		return false
+	}
+	if mica_rendered != odin_rendered {
+		testing.expectf(t, false, "%s:\n  mica: %s\n  odin: %s", label, mica_rendered, odin_rendered)
+		return false
+	}
+	return true
+}
