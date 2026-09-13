@@ -609,6 +609,50 @@ test_read_only_transaction_reuses_snapshot_derived :: proc(t: ^testing.T) {
 	delete(overlay_rows)
 }
 
+// A bound leading column must return exactly the rows with that prefix, across
+// chunk boundaries, and none for a missing prefix. This exercises the
+// binary-search path that replaced a linear walk of the whole chunk.
+@(test)
+test_prefix_scan_across_chunk_boundaries :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	point := create_relation(&kernel, 1, "Point", 2)
+
+	tx := kernel_begin(&kernel)
+	// 300 distinct keys span three 128-row chunks.
+	for key in 0 ..< 300 {
+		transaction_assert(&tx, point, tuple_of(must_int(i64(key)), must_int(i64(key) * 2)))
+	}
+	commit_transaction(t, &tx)
+
+	// A duplicate of the last key in the first chunk, so that prefix has rows
+	// on both sides of a chunk boundary.
+	tx2 := kernel_begin(&kernel)
+	transaction_assert(&tx2, point, tuple_of(must_int(127), must_int(1)))
+	commit_transaction(t, &tx2)
+
+	scan_key :: proc(kernel: ^Kernel, relation: Relation_ID, key: i64) -> [dynamic]v.Tuple {
+		bindings := make([]v.Binding, 2, context.temp_allocator)
+		bindings[0] = v.binding_of(must_int(key))
+		rows := make([dynamic]v.Tuple, 0, 4, context.temp_allocator)
+		kernel_scan_into(kernel, relation, bindings, &rows)
+		return rows
+	}
+
+	for key in ([]int{0, 1, 127, 128, 129, 255, 256, 299}) {
+		rows := scan_key(&kernel, point, i64(key))
+		want := key == 127 ? 2 : 1
+		testing.expectf(t, len(rows) == want, "key %d: got %d rows, want %d", key, len(rows), want)
+	}
+
+	for key in ([]int{-1, 300, 1000}) {
+		rows := scan_key(&kernel, point, i64(key))
+		testing.expectf(t, len(rows) == 0, "missing key %d: got %d rows, want 0", key, len(rows))
+	}
+}
+
 @(test)
 test_stratified_negation_updates_with_facts :: proc(t: ^testing.T) {
 	kernel: Kernel

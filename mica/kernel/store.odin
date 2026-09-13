@@ -599,7 +599,26 @@ relation_block_visit :: proc(
 			) == .Greater {
 				break
 			}
-			for row in chunk.tuples {
+			// Rows are stored in primary (full-tuple) order, so the leading
+			// prefix is sorted within the chunk too. Binary-search the first
+			// row whose prefix is not less than the binding, then visit only
+			// the rows sharing that prefix. Without this, a single-row probe
+			// walked the whole chunk, making a nested-loop join O(rows^2 / 128).
+			lo := 0
+			hi := len(chunk.tuples)
+			for lo < hi {
+				mid := lo + (hi - lo) / 2
+				if compare_primary_prefix(chunk.tuples[mid], bindings, primary_count) == .Less {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			for row_index in lo ..< len(chunk.tuples) {
+				row := chunk.tuples[row_index]
+				if compare_primary_prefix(row, bindings, primary_count) == .Greater {
+					break
+				}
 				if v.tuple_matches_bindings(row, bindings) {
 					if !visit(user, row) {
 						return
