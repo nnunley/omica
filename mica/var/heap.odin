@@ -195,6 +195,73 @@ value_bytes :: proc(alloc: mem.Allocator, data: []u8) -> Value {
 	return value_heap(.Bytes, header)
 }
 
+/// Map size at or below which the exact scan is used instead of the binary
+/// search. The scan is O(n) with a cheap comparison; the binary search is
+/// O(log n) but runs the recursive canonical comparator per probe. The
+/// crossover measured between 8 and 16 entries.
+MAP_EXACT_SCAN_LIMIT :: 12
+
+// Returns the entry index for `key`, using a cheap exact comparison for the
+// common key kinds and falling back to the canonical ordering only when the
+// cheap comparison cannot decide. Entries are canonicalized sorted by key (see
+// `value_map`), so a binary search is valid.
+map_entry_index :: proc(entries: []Map_Entry, key: Value) -> (int, bool) {
+	if len(entries) == 0 {
+		return 0, false
+	}
+	// Fast path for a small map: a scan with the cheap payload comparison
+	// avoids the recursive comparator on every binary-search probe. Above the
+	// limit the linear scan loses, so the search is used.
+	key_kind := value_kind(key)
+	if len(entries) <= MAP_EXACT_SCAN_LIMIT && map_key_kind_is_exact(key_kind) {
+		all_same_kind := true
+		for entry in entries {
+			if value_kind(entry.key) != key_kind {
+				all_same_kind = false
+				break
+			}
+		}
+		if all_same_kind {
+			for entry, index in entries {
+				if value_eq(entry.key, key) {
+					return index, true
+				}
+			}
+			return 0, false
+		}
+	}
+	index, found := slice.binary_search_by(
+		entries,
+		key,
+		proc(entry: Map_Entry, key: Value) -> (slice.Ordering) {
+			switch value_cmp(entry.key, key) {
+			case .Less:
+				return .Less
+			case .Greater:
+				return .Greater
+			case .Equal:
+				return .Equal
+			}
+			return .Equal
+		},
+	)
+	return index, found
+}
+
+// Reports whether this kind's equality is a payload comparison (see
+// `value_eq`), so an exact scan can be used instead of the ordered comparator.
+// Floats are excluded: their equality needs canonicalization care.
+@(private)
+map_key_kind_is_exact :: proc(kind: Value_Kind) -> bool {
+	switch kind {
+	case .Symbol, .Int, .Identity, .Error_Code, .Bool, .Capability, .Function:
+		return true
+	case .Float, .String, .Bytes, .List, .Map, .Range, .Error, .Frob, .Relation:
+		return false
+	}
+	return false
+}
+
 // Creates a list value by copying `values` into `alloc`.
 value_list :: proc(alloc: mem.Allocator, values: []Value) -> Value {
 	owned := make([]Value, len(values), alloc)

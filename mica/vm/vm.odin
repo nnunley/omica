@@ -1387,23 +1387,12 @@ vm_index :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 
 	case .Map:
 		entries, _ := v.value_as_map(collection)
-		// Entries are canonicalized sorted by key (see value_map), so a
-		// binary search replaces a linear scan.
-		index, found := slice.binary_search_by(
-			entries,
-			key,
-			proc(entry: v.Map_Entry, key: v.Value) -> (slice.Ordering) {
-				switch v.value_cmp(entry.key, key) {
-				case .Less:
-					return .Less
-				case .Greater:
-					return .Greater
-				case .Equal:
-					return .Equal
-				}
-				return .Equal
-			},
-		)
+		// Probe with a cheap exact-key comparison first: for the common key
+		// kinds (symbols, ints, strings, identities) equality is a tag plus a
+		// payload/bytes comparison, which avoids the recursive canonical
+		// comparison the binary search comparator performs per probe. Fall
+		// back to the canonical comparison only for keys it cannot answer.
+		index, found := v.map_entry_index(entries, key)
 		if !found {
 			vm_fail(state, "E_KEY", "map key is not present")
 			return false
