@@ -754,7 +754,8 @@ function reconcileNode(current, node) {
     return current;
 }
 
-function applyAttributes(element, attrs) {
+// Exported for tests.
+export function applyAttributes(element, attrs) {
     const wanted = new Set();
     for (const [name, value] of Object.entries(attrs)) {
         validateAttributeName(name);
@@ -762,8 +763,15 @@ function applyAttributes(element, attrs) {
         applySingleAttribute(element, name, value);
     }
 
-    for (const name of SUPPORTED_ATTRIBUTES) {
-        if (!wanted.has(name) && element.hasAttribute(name)) {
+    // Remove every supported attribute the snapshot does not set. Walking the
+    // element's own names (rather than the fixed list) also clears custom
+    // data-*/aria-* attributes dropped from the new snapshot. `id` and `class`
+    // are reconciled separately by the caller.
+    for (const name of element.getAttributeNames()) {
+        if (name === "id" || name === "class") {
+            continue;
+        }
+        if (!wanted.has(name) && isSupportedAttribute(name)) {
             removeSingleAttribute(element, name);
         }
     }

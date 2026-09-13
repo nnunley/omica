@@ -3,9 +3,42 @@
 // Run with: node --test host/web/sync-client.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveSyncEndpoints } from "./sync-client.js";
+import { resolveSyncEndpoints, applyAttributes } from "./sync-client.js";
 
 const params = (search) => new URLSearchParams(search);
+
+// Minimal element stub for attribute reconciliation.
+function fakeElement() {
+    const attrs = new Map();
+    return {
+        attrs,
+        getAttribute: (name) => (attrs.has(name) ? attrs.get(name) : null),
+        setAttribute: (name, value) => attrs.set(name, String(value)),
+        hasAttribute: (name) => attrs.has(name),
+        removeAttribute: (name) => attrs.delete(name),
+        getAttributeNames: () => [...attrs.keys()],
+    };
+}
+
+test("reconcile drops custom attributes removed from the snapshot", () => {
+    const element = fakeElement();
+    applyAttributes(element, { "data-custom": "one", "aria-label": "x" });
+    assert.equal(element.attrs.get("data-custom"), "one");
+    assert.equal(element.attrs.get("aria-label"), "x");
+
+    applyAttributes(element, {});
+    assert.equal(element.attrs.has("data-custom"), false);
+    assert.equal(element.attrs.has("aria-label"), false);
+});
+
+test("reconcile keeps wanted attributes and leaves unmanaged ones alone", () => {
+    const element = fakeElement();
+    applyAttributes(element, { "data-custom": "one" });
+    element.attrs.set("style", "color:red");
+    applyAttributes(element, { "data-custom": "two" });
+    assert.equal(element.attrs.get("data-custom"), "two");
+    assert.equal(element.attrs.get("style"), "color:red");
+});
 
 test("production ignores query endpoint overrides", () => {
     const endpoints = resolveSyncEndpoints(
