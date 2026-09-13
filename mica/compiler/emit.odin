@@ -1733,8 +1733,15 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 
 	argument_registers := make([dynamic]int, 0, len(call.args), emitter.allocator)
 	defer delete(argument_registers)
-	for argument in call.args {
-		register, has_value := emit_expr(emitter, argument.expr)
+	for argument, argument_index in call.args {
+		// Read a bare local from its own register rather than copying it into
+		// a temporary first; marshal_arguments then only emits a Move when the
+		// register is not already in the argument range.
+		sibling := argument.expr
+		if argument_index + 1 < len(call.args) {
+			sibling = call.args[argument_index + 1].expr
+		}
+		register, has_value := emit_operand(emitter, argument.expr, sibling)
 		if !has_value {
 			return -1, false
 		}

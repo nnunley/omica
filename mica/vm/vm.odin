@@ -595,13 +595,18 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 			callee := program.functions[instr.b]
 			argument_count := int(instr.flags)
-			args := make([]v.Value, argument_count, state.scratch_allocator)
-			for index in 0 ..< argument_count {
-				args[index] = state.registers[base + int(instr.c) + index]
-			}
 			callee_base := len(state.registers)
 			resize(&state.registers, callee_base + callee.register_count)
-			if !vm_bind_params(state, callee, args, callee_base) {
+			// Bind from the caller's register window directly: materializing
+			// an args slice allocated from scratch memory and copied it on
+			// every call, and the common case is a straight register copy.
+			if !vm_bind_params_range(
+				state,
+				callee,
+				base + int(instr.c),
+				argument_count,
+				callee_base,
+			) {
 				break
 			}
 			append(&state.frames, Frame {
@@ -2167,6 +2172,53 @@ vm_none_value :: proc(state: ^VM) -> v.Value {
 // Binds call arguments into a callee's parameter registers, applying optional
 // defaults and packing a rest parameter. `param_base` is the register where
 // parameters start (after any captures).
+// Binds parameters from a caller register range. Equivalent to collecting
+// `count` values starting at `source_base` into a slice and calling
+// `vm_bind_params`, without the slice or the copy for the common no-rest case.
+vm_bind_params_range :: proc(
+	state: ^VM,
+	callee: Function,
+	source_base: int,
+	count: int,
+	param_base: int,
+) -> bool {
+	program := state.program
+	required := int(callee.required_count)
+	non_rest := callee.param_count
+	if callee.has_rest {
+		non_rest -= 1
+	}
+	if count < required || (!callee.has_rest && count > non_rest) {
+		vm_fail(state, "E_ARITY", "wrong number of arguments for function call")
+		return false
+	}
+	for index in 0 ..< non_rest {
+		value: v.Value
+		if index < count {
+			value = state.registers[source_base + index]
+		} else if callee.defaults != nil &&
+		   index < len(callee.defaults) &&
+		   callee.defaults[index] >= 0 {
+			value = program.constants[callee.defaults[index]]
+		} else {
+			value = vm_none_value(state)
+		}
+		state.registers[param_base + index] = value
+	}
+	if callee.has_rest {
+		rest_count := count - non_rest
+		if rest_count < 0 {
+			rest_count = 0
+		}
+		rest := make([]v.Value, rest_count, state.scratch_allocator)
+		for index in 0 ..< rest_count {
+			rest[index] = state.registers[source_base + non_rest + index]
+		}
+		state.registers[param_base + non_rest] = v.value_list(state.allocator, rest)
+	}
+	return true
+}
+
 @(private)
 vm_bind_params :: proc(
 	state: ^VM,
