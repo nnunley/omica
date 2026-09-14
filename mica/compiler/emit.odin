@@ -3916,6 +3916,62 @@ emit_while :: proc(emitter: ^Emitter, loop: While) -> (int, bool) {
 }
 
 @(private)
+// Binds map-pattern entries of a for-loop header against an already-fetched
+// item register. Binding leaves declare like let-bindings; literal leaves
+// compare for equality and skip the item on mismatch, collecting skip jumps
+// for the caller to patch at the increment block. Anything else is a
+// compile error: nested patterns stay in let-bindings.
+emit_for_map_filter :: proc(
+	emitter: ^Emitter,
+	pattern: Map_Pattern,
+	item_register: int,
+	skip_patches: ^[dynamic]int,
+) -> bool {
+	for entry in pattern.entries {
+		key_name := pattern_key_name(entry, emitter.allocator)
+		symbol_register := emit_constant(
+			emitter,
+			v.value_symbol(v.symbol_intern(key_name)),
+		)
+		column := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Index,
+			0,
+			i32(column),
+			i32(item_register),
+			i32(symbol_register),
+		)
+		#partial switch leaf in entry.pattern^ {
+		case Binding_Pattern:
+			declare_local(emitter, leaf.name, column, false)
+		case Literal_Pattern:
+			expected, expected_ok := emit_expr(emitter, leaf.value)
+			if !expected_ok {
+				return false
+			}
+			match := alloc_register(emitter)
+			vm.builder_emit(
+				emitter.builder,
+				.Binary,
+				u8(vm.Bin_Op.Eq),
+				i32(match),
+				i32(column),
+				i32(expected),
+			)
+			match_jump := emit_instruction(emitter, .Branch, 0, match, 0, 0)
+			skip_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+			patch_jump(emitter, match_jump, current_offset(emitter))
+			append(skip_patches, skip_jump)
+		case:
+			push_error(emitter, "for map patterns need names or literals")
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
 emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 	if loop.pattern == nil && len(loop.names) != 1 && len(loop.names) != 2 {
 		push_error(emitter, "for loops take one or two bindings")
@@ -3941,6 +3997,10 @@ emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 	vm.builder_emit(emitter.builder, .Len, 0, i32(length_register), i32(iterable), 0)
 
 	break_mark := len(emitter.break_patches)
+	// Literal cells in a for-map-pattern skip non-matching items. Their
+	// jumps collect here and land on the increment block with `continue`.
+	skip_patches: [dynamic]int
+	defer delete(skip_patches)
 	loop_start := current_offset(emitter)
 	append(&emitter.continue_marks, len(emitter.continue_patches))
 
@@ -3989,7 +4049,11 @@ emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 			i32(iterable),
 			i32(index_register),
 		)
-		if _, bound := emit_pattern_value(
+		if map_filter, is_map_filter := loop.pattern^.(Map_Pattern); is_map_filter {
+			if !emit_for_map_filter(emitter, map_filter, item_register, &skip_patches) {
+				return -1, false
+			}
+		} else if _, bound := emit_pattern_value(
 			emitter,
 			loop.pattern,
 			item_register,
@@ -4020,6 +4084,9 @@ emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 	// increment block rather than the loop condition.
 	increment_start := current_offset(emitter)
 	patch_loop_continues(emitter, increment_start)
+	for skip in skip_patches {
+		patch_jump(emitter, skip, increment_start)
+	}
 
 	one_register := emit_constant(emitter, int_value(1))
 	vm.builder_emit(

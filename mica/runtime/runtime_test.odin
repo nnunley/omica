@@ -4139,6 +4139,66 @@ end
 }
 
 @(test)
+test_query_value_filter :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb qfilter()
+  let rows = __relation_literal([:node, :role], [[1, :kind], [2, :other], [1, :other]])
+  let found = []
+  for {node -> 1, role -> r} in rows
+    found = [@found, r]
+  end
+  return len(found) == 2 && found[0] == :kind && found[1] == :other
+end
+
+verb qempty()
+  let rows = __relation_literal([:node, :role], [[1, :kind]])
+  let found = []
+  for {node -> 9, role -> r} in rows
+    found = [@found, r]
+  end
+  return len(found) == 0
+end
+
+verb qbind()
+  let rows = __relation_literal([:node, :role], [[1, :kind], [2, :other]])
+  let found = []
+  for {node -> n, role -> r} in rows
+    found = [@found, n]
+  end
+  return len(found) == 2 && found[0] == 1 && found[1] == 2
+end
+`
+	path, path_ok := write_temp_source(t, "mica_query_value_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	names := []string{"qfilter", "qempty", "qbind"}
+	for name in names {
+		outcome := world_call(world, name, nil)
+		testing.expectf(t, outcome.kind == .Complete, "%s failed: %s", name, outcome.message)
+		if outcome.kind != .Complete {
+			continue
+		}
+		flag, flag_ok := v.value_as_bool(outcome.value)
+		testing.expectf(t, flag_ok && flag, "%s returned false", name)
+	}
+}
+
+@(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:Kept, 1)

@@ -103,8 +103,17 @@ end
 
 Patterns bind against the same item the single-name form would receive, so
 `for {work} in ...` is shorthand for binding the row map and projecting its
-columns. Anything but a list, map, or wildcard pattern in the header is a
-compile error. The number and shape of the bindings determine what
+columns. Map entries also accept literals, which filter: only items whose
+column equals every literal are visited.
+
+```mica
+for {node -> 1, role -> r} in rows
+  emit(r)
+end
+```
+
+Anything but a name or a literal in a `for` map pattern is a compile error.
+The number and shape of the bindings determine what
 each iteration receives:
 
 | Iterable             | One binding | Two bindings                  |
