@@ -3665,6 +3665,120 @@ assert Marker(#alice, :seed)
 }
 
 @(test)
+test_run_boot_resolves_program_bytes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:Marker, 2)
+
+verb mark(who)
+  assert Marker(who, :marked)
+end
+assert Marker(#alice, :seed)
+`
+	path, path_ok := write_temp_source(t, "mica_boot_artifact_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	directory, directory_error := os.temp_dir(context.temp_allocator)
+	if directory_error != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	store_path, join_error := filepath.join(
+		[]string{directory, "mica_boot_artifact"},
+		context.temp_allocator,
+	)
+	if join_error != nil {
+		return
+	}
+	os.remove_all(store_path)
+	defer os.remove_all(store_path)
+
+	// First world: load from source, then retract every UnitSource row so a
+	// boot cannot recompile; only the program artifact can supply the code.
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		world, start := world_start(
+			&kernel,
+			[]string{path},
+			context.temp_allocator,
+			World_Config{store_path = store_path},
+		)
+		testing.expectf(t, start.ok, "load failed: %s", start.message)
+		if start.ok {
+			entry := world_wait(world, world.entry)
+			testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+			unit_rows: [dynamic]v.Tuple
+			k.kernel_scan_into(
+				&kernel,
+				k.SYSTEM_UNIT_SOURCE_ID,
+				[]v.Binding{{}, {}, {}},
+				&unit_rows,
+			)
+			testing.expect(t, len(unit_rows) >= 1)
+			tx := k.kernel_begin(&kernel)
+			for row in unit_rows {
+				testing.expect_value(
+					t,
+					k.transaction_retract(&tx, k.SYSTEM_UNIT_SOURCE_ID, row),
+					k.Kernel_Error.None,
+				)
+			}
+			delete(unit_rows)
+			committed, commit_err := k.transaction_commit(&tx)
+			testing.expect_value(t, commit_err, k.Kernel_Error.None)
+			k.snapshot_release(committed)
+			k.transaction_destroy(&tx)
+
+			testing.expect(t, world_checkpoint(world))
+			world_destroy(world)
+		}
+		k.kernel_destroy(&kernel)
+	}
+
+	// Second world: boot from the store with no source paths and no stored
+	// sources. Dispatch must resolve through the artifact.
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		nil,
+		context.temp_allocator,
+		World_Config{store_path = store_path},
+	)
+	testing.expectf(t, start.ok, "boot failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	testing.expect(t, len(world.sources) == 0)
+
+	alice, has_alice := world.ctx.identities["alice"]
+	testing.expect(t, has_alice)
+	outcome := world_call(world, "mark", []k.Role_Pair{{
+		role  = v.value_symbol(v.symbol_intern("who")),
+		value = alice,
+	}})
+	testing.expectf(t, outcome.kind == .Complete, "call failed: %s", outcome.message)
+
+	// Boot resolves; it never backfills a second row.
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(
+		&kernel,
+		k.SYSTEM_PROGRAM_BYTES_ID,
+		[]v.Binding{{}, {}},
+		&rows,
+	)
+	testing.expect_value(t, len(rows), 1)
+}
+
+@(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:Kept, 1)

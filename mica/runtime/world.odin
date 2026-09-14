@@ -685,9 +685,11 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 }
 
 // Boots a world from an attached store: replay the kernel, rebuild the compile
-// context from durable reflection facts, recompile the persisted unit sources,
-// restore rules, and start the scheduler. The entry task is not submitted
-// because every top-level expression already ran in the original world.
+// context from durable reflection facts, resolve the program from its
+// artifact (recompiling persisted unit sources only when no artifact is
+// stored), restore rules, and start the scheduler. The entry task is not
+// submitted because every top-level expression already ran in the original
+// world.
 @(private)
 world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_Result {
 	allocator := world.allocator
@@ -808,31 +810,12 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 		world.env.principal = actor_value
 	}
 
-	// Recompile the same concatenated sources; function indices must match the
-	// persisted MethodProgram facts.
-	items: [dynamic]c.Item
-	defer delete(items)
-	for source in world.sources {
-		ast, parse_errors := c.parse_program(source, allocator)
-		if len(parse_errors) > 0 {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"cannot reparse stored source: %s",
-				parse_errors[0].message,
-				allocator = allocator,
-			)}
-		}
-		for item in ast.items {
-			append(&items, item)
-		}
+	// Resolve the program from its artifact when present, so boot does not
+	// recompile sources; otherwise recompile as before.
+	program_result := world_boot_program(world, store)
+	if !program_result.ok {
+		return program_result
 	}
-	program_ast := c.Program_AST {
-		items = items[:],
-	}
-	compiled := c.compile_program(&program_ast, &world.ctx, allocator)
-	if len(compiled.errors) > 0 {
-		return Run_Result{ok = false, message = compiled.errors[0].message}
-	}
-	world.program = compiled.program
 
 	rule_result := restore_rules(world)
 	if !rule_result.ok {
@@ -864,6 +847,76 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	if config.actor != "" {
 		world.env.enforce_authority = true
 	}
+	return Run_Result{ok = true, message = "loaded"}
+}
+
+// Resolves the boot program. A store carrying ProgramBytes rows decodes
+// and validates the artifact, skipping source recompilation entirely.
+// Stores without artifacts (including pre-artifact stores) recompile the
+// persisted unit sources as before and backfill the row so the next boot
+// resolves through the artifact.
+@(private)
+world_boot_program :: proc(world: ^World, store: ^s.Store) -> Run_Result {
+	allocator := world.allocator
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(world.kernel, k.SYSTEM_PROGRAM_BYTES_ID, []v.Binding{{}, {}}, &rows)
+	if len(rows) == 0 {
+		// Recompile the same concatenated sources; function indices must
+		// match the persisted MethodProgram facts.
+		items: [dynamic]c.Item
+		defer delete(items)
+		for source in world.sources {
+			ast, parse_errors := c.parse_program(source, allocator)
+			if len(parse_errors) > 0 {
+				return Run_Result{ok = false, message = fmt.aprintf(
+					"cannot reparse stored source: %s",
+					parse_errors[0].message,
+					allocator = allocator,
+				)}
+			}
+			for item in ast.items {
+				append(&items, item)
+			}
+		}
+		program_ast := c.Program_AST {
+			items = items[:],
+		}
+		compiled := c.compile_program(&program_ast, &world.ctx, allocator)
+		if len(compiled.errors) > 0 {
+			return Run_Result{ok = false, message = compiled.errors[0].message}
+		}
+		world.program = compiled.program
+		return assert_program_bytes(&world.env, world.program)
+	}
+	if len(rows) > 1 {
+		return Run_Result{ok = false, message = fmt.aprintf(
+			"multiple program artifacts: expected one, found %d",
+			len(rows),
+			allocator = allocator,
+		)}
+	}
+	artifact, artifact_ok := v.value_as_bytes(v.tuple_values(rows[0])[1])
+	if !artifact_ok {
+		return Run_Result{ok = false, message = "program artifact is not bytes"}
+	}
+	program, decode_error := vm.program_from_bytes(artifact, allocator)
+	if decode_error != .None {
+		return Run_Result{ok = false, message = fmt.aprintf(
+			"cannot decode program artifact: %v",
+			decode_error,
+			allocator = allocator,
+		)}
+	}
+	if validation := vm.program_validate(program); validation != .None {
+		vm.program_destroy(program, allocator)
+		return Run_Result{ok = false, message = fmt.aprintf(
+			"program artifact failed validation: %v",
+			validation,
+			allocator = allocator,
+		)}
+	}
+	world.program = program
 	return Run_Result{ok = true, message = "loaded"}
 }
 
