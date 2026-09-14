@@ -4574,6 +4574,91 @@ assert Point(2, 20)
 	testing.expectf(t, len(relation.rows) == 2, "expected two rows, got %d", len(relation.rows))
 }
 
+// The strongest self-hosting check before the full bootstrap: the Mica
+// emitter must accept the language the compiler is written in. Each compiler
+// source compiles to a program that decodes and validates.
+@(test)
+test_mica_emitter_compiles_compiler :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(
+		&kernel,
+		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
+		context.temp_allocator,
+	)
+	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	sources := []string{
+		"apps/compiler/lex.mica",
+		"apps/compiler/parse.mica",
+		"apps/compiler/emit.mica",
+	}
+	for path in sources {
+		source, read_err := os.read_entire_file_from_path(path, context.temp_allocator)
+		if read_err != nil {
+			testing.expectf(t, false, "cannot read %s", path)
+			continue
+		}
+		outcome := world_call(world, "emit_source", []k.Role_Pair{{
+			role  = v.value_symbol(v.symbol_intern("source")),
+			value = v.value_string(context.temp_allocator, string(source)),
+		}})
+		if outcome.kind != .Complete {
+			testing.expectf(t, false, "%s: emit_source failed: %s", path, outcome.message)
+			continue
+		}
+		fields, fields_ok := v.value_as_map(outcome.value)
+		if !fields_ok {
+			testing.expectf(t, false, "%s: emit_source did not return a map", path)
+			continue
+		}
+		ok, _ := v.value_as_bool(map_get(fields, "ok"))
+		if !ok {
+			message := "?"
+			if list, list_ok := v.value_as_list(map_get(fields, "errors")); list_ok && len(list) > 0 {
+				if s, s_ok := v.value_as_string(list[0]); s_ok {
+					message = s
+				}
+			}
+			testing.expectf(t, false, "%s: emitter errors: %s", path, message)
+			continue
+		}
+		artifact, artifact_ok := v.value_as_bytes(map_get(fields, "bytes"))
+		if !artifact_ok {
+			testing.expectf(t, false, "%s: emitted no bytes", path)
+			continue
+		}
+		program, decode_error := vm.program_from_bytes(artifact, alloc)
+		if decode_error != .None {
+			testing.expectf(t, false, "%s: decode %v", path, decode_error)
+			continue
+		}
+		testing.expectf(
+			t,
+			vm.program_validate(program) == vm.Program_Error.None,
+			"%s: invalid program",
+			path,
+		)
+	}
+}
+
 @(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)

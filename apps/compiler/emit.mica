@@ -1987,28 +1987,119 @@ end
 
 verb emit_binding(rows, node, state)
   let [found_pattern, pattern] = ast_attr(rows, node, :pattern)
-  if !found_pattern || ast_kind(rows, pattern) != :Binding_Pattern
-    return emit_error(state, "a pattern needs a later slice")
+  if !found_pattern
+    return emit_error(state, "a binding is missing its pattern")
   end
-  let [found_binding_name, binding_name] = ast_attr(rows, pattern, :name)
   let [found_rhs, rhs] = ast_attr(rows, node, :value)
-  if !found_binding_name || !found_rhs
-    return emit_error(state, "a binding is missing its name or value")
+  if !found_rhs
+    return emit_error(state, "a binding is missing its value")
   end
   let [rhs_reg, after_rhs] = emit_expr(rows, rhs, state)
   state = after_rhs
-  let [dst, after_reg] = alloc_register(state)
-  state = after_reg
-  let [_, after_move] = emit_instruction(state, :Move, 0, dst, rhs_reg, 0)
-  state = after_move
-  state = declare_local(state, binding_name, dst)
-  return [dst, state]
+
+  let pattern_kind = ast_kind(rows, pattern)
+  if pattern_kind == :Binding_Pattern
+    let [found_binding_name, binding_name] = ast_attr(rows, pattern, :name)
+    if !found_binding_name
+      return emit_error(state, "a binding pattern is missing its name")
+    end
+    // A mutable binding owns its register: the value may be a shared
+    // preloaded constant, and a later assignment would overwrite that slot.
+    let [dst, after_reg] = alloc_register(state)
+    state = after_reg
+    let [_, after_move] = emit_instruction(state, :Move, 0, dst, rhs_reg, 0)
+    state = after_move
+    state = declare_local(state, binding_name, dst)
+    return [dst, state]
+  end
+  if pattern_kind == :List_Pattern
+    state = bind_list_scatter(rows, pattern, rhs_reg, state)
+    return [rhs_reg, state]
+  end
+  if pattern_kind == :Map_Pattern
+    state = bind_map_pattern(rows, pattern, rhs_reg, state)
+    return [rhs_reg, state]
+  end
+  if pattern_kind == :Wildcard_Pattern
+    return [rhs_reg, state]
+  end
+  return emit_error(state, "a pattern needs a later slice")
+end
+
+// Scatters a list binding's elements by position. Unlike the for-header
+// helper, a binding may not use a wildcard to skip a slot; `_` is a binding
+// name here, matching the Odin emitter.
+verb bind_list_scatter(rows, pattern, value_reg, state)
+  let elements = ast_children(rows, pattern, :element)
+  let position = 0
+  for element in elements
+    let element_kind = ast_kind(rows, element)
+    if element_kind == :Binding_Pattern
+      let [found_name, binding_name] = ast_attr(rows, element, :name)
+      let [index_reg, after_index] = load_constant(state, position)
+      state = after_index
+      let [column, after_column] = alloc_register(state)
+      state = after_column
+      let [_, after_index_op] = emit_instruction(
+        state, :Index, 0, column, value_reg, index_reg,
+      )
+      state = after_index_op
+      if found_name
+        state = declare_local(state, binding_name, column)
+      end
+    elseif element_kind == :Wildcard_Pattern
+      // `_` discards this position but still consumes a slot, so a later
+      // element keeps its ordinal.
+    else
+      return emit_error(state, "a list binding needs names")[1]
+    end
+    position = position + 1
+  end
+  return state
 end
 
 verb emit_assignment(rows, node, state)
   let [found_target, target] = ast_attr(rows, node, :target)
   let [found_rhs, rhs] = ast_attr(rows, node, :value)
-  if !found_target || !found_rhs || ast_kind(rows, target) != :Name
+  if !found_target || !found_rhs
+    return emit_error(state, "an assignment is missing its target or value")
+  end
+  let target_kind = ast_kind(rows, target)
+
+  // `collection[key] = value` replaces the element and rebinds the name, since
+  // Mica values are immutable.
+  if target_kind == :Index
+    let [found_collection, collection_node] = ast_attr(rows, target, :collection)
+    let [found_key, key_node] = ast_attr(rows, target, :key)
+    if !found_collection || !found_key || ast_kind(rows, collection_node) != :Name
+      return emit_error(state, "indexed assignment requires a named collection")
+    end
+    let [named, collection_name] = single_name(rows, collection_node)
+    if !named
+      return emit_error(state, "a qualified collection needs a later slice")
+    end
+    let [found, collection] = resolve_local(state, collection_name)
+    if !found
+      return emit_error(state, "assignment to an unknown collection")
+    end
+    let [key_reg, after_key] = emit_expr(rows, key_node, state)
+    state = after_key
+    let [value_reg, after_value] = emit_expr(rows, rhs, state)
+    state = after_value
+    let [first, after_marshal] = marshal_arguments(state, [collection, key_reg, value_reg])
+    state = after_marshal
+    let [builtin, after_builtin] = add_builtin(state, "__set_index")
+    state = after_builtin
+    let [destination, after_destination] = alloc_register(state)
+    state = after_destination
+    let [_, after_call] = emit_instruction(state, :Builtin_Call, 3, destination, builtin, first)
+    state = after_call
+    let [_, after_move] = emit_instruction(state, :Move, 0, collection, destination, 0)
+    state = after_move
+    return [destination, state]
+  end
+
+  if target_kind != :Name
     return emit_error(state, "an assignment target needs a later slice")
   end
   let [named, binding_name] = single_name(rows, target)
