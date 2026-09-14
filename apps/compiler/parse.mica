@@ -32,6 +32,16 @@ verb parse(source) -> map
   return {:root -> root, :nodes -> nodes, :errors -> done[4]}
 end
 
+// Same parse, but the fact rows stay a plain list of
+// [node, role, target, ordinal] lists for consumers (like emit.mica) that
+// scan facts without relation operations.
+verb parse_rows(source) -> map
+  let [tokens, lex_errors] = lex(source)
+  let state = [tokens, 0, 1, [], lex_errors, source]
+  let [root, done] = parse_program(state)
+  return {:root -> root, :rows -> done[3], :errors -> done[4]}
+end
+
 // --- State accessors ---------------------------------------------------------
 
 verb tok(state)

@@ -70,6 +70,8 @@ runtime_builtins := [?]Builtin_Spec {
 	{"to_symbol", 1, builtin_to_symbol},
 	{"to_float", 1, builtin_to_float},
 	{"to_int", 1, builtin_to_int},
+	{"parse_int", 1, builtin_parse_int},
+	{"parse_float", 1, builtin_parse_float},
 	{"map_pairs", 1, builtin_map_pairs},
 	{"index_or", 3, builtin_index_or},
 	{"url_encode_component", 1, builtin_url_encode_component},
@@ -3676,6 +3678,63 @@ builtin_to_int :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		return builtin_error(state, "E_TYPE", "to_int expects an exactly integral numeric value")
 	}
 	return converted, true
+}
+
+// Parses a decimal integer spelling (optional leading `-`). Anything else,
+// including out-of-range values, raises E_INVARG.
+@(private)
+builtin_parse_int :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	text, ok := string_argument(state, args, 0, "parse_int")
+	if !ok {
+		return builtin_error(state, "E_TYPE", "parse_int expects a string")
+	}
+	digits := text
+	negative := false
+	if strings.has_prefix(digits, "-") {
+		negative = true
+		digits = digits[1:]
+	}
+	if len(digits) == 0 {
+		return builtin_error(state, "E_INVARG", "parse_int found no digits")
+	}
+	parsed := i64(0)
+	for byte in transmute([]u8)digits {
+		if byte < '0' || byte > '9' {
+			return builtin_error(state, "E_INVARG", "parse_int found no digits")
+		}
+		digit := i64(byte - '0')
+		if parsed > (max(i64) - digit) / 10 {
+			return builtin_error(state, "E_INVARG", "parse_int is out of range")
+		}
+		parsed = parsed * 10 + digit
+	}
+	if negative {
+		parsed = -parsed
+	}
+	value, value_ok := v.value_int(parsed)
+	if !value_ok {
+		return builtin_error(state, "E_INVARG", "parse_int is out of range")
+	}
+	return value, true
+}
+
+// Parses a decimal float spelling as the lexer produces it. Anything else
+// raises E_INVARG.
+@(private)
+builtin_parse_float :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	text, ok := string_argument(state, args, 0, "parse_float")
+	if !ok {
+		return builtin_error(state, "E_TYPE", "parse_float expects a string")
+	}
+	parsed, parsed_ok := strconv.parse_f32(text)
+	if !parsed_ok {
+		return builtin_error(state, "E_INVARG", "parse_float found no float")
+	}
+	value, value_ok := v.value_float(parsed)
+	if !value_ok {
+		return builtin_error(state, "E_INVARG", "parse_float is out of range")
+	}
+	return value, true
 }
 
 // --- URL components --------------------------------------------------------

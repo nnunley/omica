@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:strings"
 import "core:os"
 import "core:mem"
+import "core:mem/virtual"
 import "core:path/filepath"
 import "core:testing"
 import "core:time"
@@ -4196,6 +4197,125 @@ end
 		flag, flag_ok := v.value_as_bool(outcome.value)
 		testing.expectf(t, flag_ok && flag, "%s returned false", name)
 	}
+}
+
+@(test)
+test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
+		context.temp_allocator,
+	)
+	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	cases := [?]string {
+		"1 + 2 * 3",
+		"let x = 1 + 2 * 3\nlet y = x - 1\ny",
+		"let x = 10\nx = x + 1\nx",
+		"return 2 + 3",
+		"1.5 + 2.5",
+		"true",
+	}
+	for source in cases {
+		if !mica_emitter_matches_odin(t, world, source, alloc) {
+			testing.expectf(t, false, "emitter mismatch for %q", source)
+		}
+	}
+}
+
+// Compiles `source` with both emitters, runs both programs, and compares
+// the results.
+@(private)
+mica_emitter_matches_odin :: proc(
+	t: ^testing.T,
+	world: ^World,
+	source: string,
+	alloc: mem.Allocator,
+) -> bool {
+	// Odin baseline: parse, compile with a bare context, run.
+	ast, parse_errors := c.parse_program(source, context.temp_allocator)
+	if len(parse_errors) > 0 {
+		testing.expectf(t, false, "odin parse failed for %q", source)
+		return false
+	}
+	ctx := c.Compile_Context {
+		builtins   = make(map[string]bool, context.temp_allocator),
+		relations  = make(map[string]u32, context.temp_allocator),
+		identities = make(map[string]v.Value, context.temp_allocator),
+	}
+	compiled := c.compile_program(ast, &ctx, context.temp_allocator)
+	if len(compiled.errors) > 0 {
+		testing.expectf(t, false, "odin compile failed for %q", source)
+		return false
+	}
+	odin_state: vm.VM
+	vm.vm_init(&odin_state, compiled.program, alloc)
+	defer vm.vm_destroy(&odin_state)
+	if vm.vm_run(&odin_state) != .Halted {
+		testing.expectf(t, false, "odin program did not halt for %q", source)
+		return false
+	}
+
+	// Mica path: emit to bytes through the world, decode, run.
+	outcome := world_call(world, "emit_source", []k.Role_Pair{{
+		role  = v.value_symbol(v.symbol_intern("source")),
+		value = v.value_string(context.temp_allocator, source),
+	}})
+	if outcome.kind != .Complete {
+		testing.expectf(t, false, "emit_source failed for %q: %s", source, outcome.message)
+		return false
+	}
+	result, result_ok := v.value_as_map(outcome.value)
+	if !result_ok {
+		testing.expectf(t, false, "emit_source did not return a map for %q", source)
+		return false
+	}
+	ok_value := map_get(result, "ok")
+	ok, _ := v.value_as_bool(ok_value)
+	if !ok {
+		testing.expectf(t, false, "emitter errors for %q", source)
+		return false
+	}
+	artifact, artifact_ok := v.value_as_bytes(map_get(result, "bytes"))
+	if !artifact_ok {
+		testing.expectf(t, false, "emit_source returned no bytes for %q", source)
+		return false
+	}
+	program, decode_error := vm.program_from_bytes(artifact, alloc)
+	if decode_error != .None {
+		testing.expectf(t, false, "assembled bytes do not decode for %q", source)
+		return false
+	}
+	if vm.program_validate(program) != .None {
+		testing.expectf(t, false, "assembled program is invalid for %q", source)
+		return false
+	}
+	mica_state: vm.VM
+	vm.vm_init(&mica_state, program, alloc)
+	defer vm.vm_destroy(&mica_state)
+	if vm.vm_run(&mica_state) != .Halted {
+		testing.expectf(t, false, "mica program did not halt for %q", source)
+		return false
+	}
+	return v.value_eq(odin_state.result, mica_state.result)
 }
 
 @(test)

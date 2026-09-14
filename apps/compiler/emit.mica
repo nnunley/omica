@@ -1,0 +1,364 @@
+// Mica emitter, written in Mica.
+//
+// Stage three of the self-hosting path (#81). Consumes relational AST row
+// lists `[node, role, target, ordinal]` (see `parse_rows` in parse.mica) and
+// produces an `assemble` description map. State is
+// `[code, constants, scopes, next_reg, errors]` threaded through every
+// helper, each returning `[result, state]`, mirroring parse.mica.
+//
+// Slice one covers top-level expressions: int, float, and bool literals,
+// arithmetic (`+`, `-`, `*`, `/`), `return`, assignment, and `let`/`const`
+// bindings. Anything else records an error naming the unsupported node.
+// Roles that need source-text decoding (strings), control flow, calls, and
+// patterns arrive in later slices.
+//
+// Naming follows the parse.mica rules: no local spells a lowercase keyword
+// or a keyword identifier, so suffixed names (`left_reg`, `binding_name`)
+// throughout.
+
+make_identity(:emitter)
+
+// --- Entry -------------------------------------------------------------------
+
+// Compiles `source` all the way to artifact bytes, returning
+// `{:ok -> true, :bytes -> bytes}` or `{:ok -> false, :errors -> [...]}`.
+verb emit_source(source) -> map
+  let parsed = parse_rows(source)
+  if len(parsed[:errors]) > 0
+    return {:ok -> false, :errors -> parsed[:errors]}
+  end
+  let program = emit_program(parsed[:rows], parsed[:root])
+  if len(program[:errors]) > 0
+    return {:ok -> false, :errors -> program[:errors]}
+  end
+  return {:ok -> true, :bytes -> assemble(program)}
+end
+
+// Lowers fact rows for the program `root` to an assemble description. The
+// description carries `:errors` alongside the sections; `assemble` ignores
+// unknown keys, so the map feeds it directly.
+verb emit_program(rows, root) -> map
+  let state = [[], [], [[]], 0, []]
+  let items = ast_children(rows, root, :item)
+  if len(items) == 0
+    state[4] = [@state[4], "a program needs at least one item"]
+    return describe(state, 0)
+  end
+  let last_reg = 0
+  for item in items
+    if ast_kind(rows, item) != :ExprItem
+      state[4] = [@state[4], "only top-level expressions emit yet"]
+      continue
+    end
+    let [found, expr] = ast_attr(rows, item, :expr)
+    if !found
+      state[4] = [@state[4], "an item is missing its expression"]
+      continue
+    end
+    let [reg, after_expr] = emit_expr(rows, expr, state)
+    state = after_expr
+    last_reg = reg
+  end
+  let [_, after_return] = emit_instruction(state, :Return, 0, last_reg, 0, 0)
+  state = after_return
+  return describe(state, last_reg)
+end
+
+// Builds the assemble description map from finished emitter state.
+verb describe(state, last_reg)
+  let code = state[0]
+  let constants = state[1]
+  let next_reg = state[3]
+  let errors = state[4]
+  let main_fn = {:name -> "main", :code_offset -> 0, :code_len -> len(code),
+                 :registers -> next_reg, :params -> 0, :required -> 0,
+                 :rest -> false, :defaults -> []}
+  return {:entry -> 0, :code -> code, :constants -> constants,
+          :functions -> [main_fn], :patterns -> [], :shapes -> [],
+          :specs -> [], :builtins -> [], :errors -> errors}
+end
+
+// --- Fact queries ------------------------------------------------------------
+
+// The :kind target of a node, or :Unknown.
+verb ast_kind(rows, node_id)
+  for row in rows
+    if row[0] == node_id && row[1] == :kind
+      return row[2]
+    end
+  end
+  return :Unknown
+end
+
+// The first target for (node, role) as [found, target].
+verb ast_attr(rows, node_id, role)
+  for row in rows
+    if row[0] == node_id && row[1] == role
+      return [true, row[2]]
+    end
+  end
+  return [false, 0]
+end
+
+// Every target for (node, role), ordered by ordinal.
+verb ast_children(rows, node_id, role)
+  let count = 0
+  for row in rows
+    if row[0] == node_id && row[1] == role
+      count = count + 1
+    end
+  end
+  let targets = []
+  let ordinal = 0
+  while ordinal < count
+    for row in rows
+      if row[0] == node_id && row[1] == role && row[3] == ordinal
+        targets = [@targets, row[2]]
+      end
+    end
+    ordinal = ordinal + 1
+  end
+  return targets
+end
+
+// --- State helpers -----------------------------------------------------------
+
+// Appends an instruction map, returning [offset, state].
+verb emit_instruction(state, op_sym, flags, a, b, c)
+  let offset = len(state[0])
+  state[0] = [@state[0], {:op -> op_sym, :flags -> flags, :a -> a, :b -> b, :c -> c}]
+  return [offset, state]
+end
+
+// Appends a constant value, returning [index, state]. No deduplication;
+// indices stay fresh by construction.
+verb emit_constant(state, const_value)
+  let index = len(state[1])
+  state[1] = [@state[1], const_value]
+  return [index, state]
+end
+
+// Reserves the next register, returning [register, state]. Registers never
+// reuse in this slice; scope exit does not reclaim.
+verb alloc_register(state)
+  let reg = state[3]
+  state[3] = reg + 1
+  return [reg, state]
+end
+
+// Records an emitter error, returning [0, state] as a dummy register.
+verb emit_error(state, message)
+  state[4] = [@state[4], message]
+  return [0, state]
+end
+
+// Declares `binding_name` at `reg` in the innermost scope.
+verb declare_local(state, binding_name, reg)
+  let scopes = state[2]
+  let top = scopes[len(scopes) - 1]
+  top = [@top, [binding_name, reg]]
+  scopes[len(scopes) - 1] = top
+  state[2] = scopes
+  return state
+end
+
+// Resolves a name from the innermost scope outward as [found, register].
+verb resolve_local(state, binding_name)
+  let scopes = state[2]
+  let depth = len(scopes) - 1
+  while depth >= 0
+    let scope = scopes[depth]
+    let index = len(scope) - 1
+    while index >= 0
+      if scope[index][0] == binding_name
+        return [true, scope[index][1]]
+      end
+      index = index - 1
+    end
+    depth = depth - 1
+  end
+  return [false, 0]
+end
+
+// --- Expressions -------------------------------------------------------------
+
+// Emits an expression, returning [result register, state].
+verb emit_expr(rows, node, state)
+  let kind = ast_kind(rows, node)
+  if kind == :Int_Literal
+    return emit_int_literal(rows, node, state)
+  end
+  if kind == :Float_Literal
+    return emit_float_literal(rows, node, state)
+  end
+  if kind == :Bool_Literal
+    return emit_bool_literal(rows, node, state)
+  end
+  if kind == :Name
+    return emit_name(rows, node, state)
+  end
+  if kind == :Binary
+    return emit_binary(rows, node, state)
+  end
+  if kind == :Binding
+    return emit_binding(rows, node, state)
+  end
+  if kind == :Assignment
+    return emit_assignment(rows, node, state)
+  end
+  if kind == :Return
+    return emit_return(rows, node, state)
+  end
+  return emit_error(state, "an expression needs a later slice")
+end
+
+verb emit_int_literal(rows, node, state)
+  let [found, text] = ast_attr(rows, node, :text)
+  if !found
+    return emit_error(state, "an int literal is missing its text")
+  end
+  let [index, after_const] = emit_constant(state, parse_int(text))
+  state = after_const
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Load_Const, 0, dst, index, 0)
+  state = after_emit
+  return [dst, state]
+end
+
+verb emit_float_literal(rows, node, state)
+  let [found, text] = ast_attr(rows, node, :text)
+  if !found
+    return emit_error(state, "a float literal is missing its text")
+  end
+  let [index, after_const] = emit_constant(state, parse_float(text))
+  state = after_const
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Load_Const, 0, dst, index, 0)
+  state = after_emit
+  return [dst, state]
+end
+
+verb emit_bool_literal(rows, node, state)
+  let [found, flag] = ast_attr(rows, node, :value)
+  if !found
+    return emit_error(state, "a bool literal is missing its value")
+  end
+  let [index, after_const] = emit_constant(state, flag)
+  state = after_const
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Load_Const, 0, dst, index, 0)
+  state = after_emit
+  return [dst, state]
+end
+
+// A bare name evaluates to its register; no copy.
+verb emit_name(rows, node, state)
+  let [named, binding_name] = single_name(rows, node)
+  if !named
+    return emit_error(state, "a qualified name needs a later slice")
+  end
+  let [found, reg] = resolve_local(state, binding_name)
+  if !found
+    return emit_error(state, "an unknown name needs a later slice")
+  end
+  return [reg, state]
+end
+
+// The single-part name text of a :Name node as [ok, text].
+verb single_name(rows, node)
+  let parts = ast_children(rows, node, :part)
+  if len(parts) != 1
+    return [false, ""]
+  end
+  return [true, parts[0]]
+end
+
+verb emit_binary(rows, node, state)
+  let [found_op, op_sym] = ast_attr(rows, node, :op)
+  let flag = -1
+  if found_op && op_sym == :add
+    flag = 0
+  end
+  if found_op && op_sym == :sub
+    flag = 1
+  end
+  if found_op && op_sym == :mul
+    flag = 2
+  end
+  if found_op && op_sym == :div
+    flag = 3
+  end
+  if flag < 0
+    return emit_error(state, "an operator needs a later slice")
+  end
+  let [found_left, left_node] = ast_attr(rows, node, :left)
+  let [found_right, right_node] = ast_attr(rows, node, :right)
+  if !found_left || !found_right
+    return emit_error(state, "a binary operator is missing an operand")
+  end
+  let [left_reg, after_left] = emit_expr(rows, left_node, state)
+  state = after_left
+  let [right_reg, after_right] = emit_expr(rows, right_node, state)
+  state = after_right
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Binary, flag, dst, left_reg, right_reg)
+  state = after_emit
+  return [dst, state]
+end
+
+verb emit_binding(rows, node, state)
+  let [found_pattern, pattern] = ast_attr(rows, node, :pattern)
+  if !found_pattern || ast_kind(rows, pattern) != :Binding_Pattern
+    return emit_error(state, "a pattern needs a later slice")
+  end
+  let [found_binding_name, binding_name] = ast_attr(rows, pattern, :name)
+  let [found_rhs, rhs] = ast_attr(rows, node, :value)
+  if !found_binding_name || !found_rhs
+    return emit_error(state, "a binding is missing its name or value")
+  end
+  let [rhs_reg, after_rhs] = emit_expr(rows, rhs, state)
+  state = after_rhs
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_move] = emit_instruction(state, :Move, 0, dst, rhs_reg, 0)
+  state = after_move
+  state = declare_local(state, binding_name, dst)
+  return [dst, state]
+end
+
+verb emit_assignment(rows, node, state)
+  let [found_target, target] = ast_attr(rows, node, :target)
+  let [found_rhs, rhs] = ast_attr(rows, node, :value)
+  if !found_target || !found_rhs || ast_kind(rows, target) != :Name
+    return emit_error(state, "an assignment target needs a later slice")
+  end
+  let [named, binding_name] = single_name(rows, target)
+  if !named
+    return emit_error(state, "a qualified target needs a later slice")
+  end
+  let [found, reg] = resolve_local(state, binding_name)
+  if !found
+    return emit_error(state, "an unknown target needs a later slice")
+  end
+  let [rhs_reg, after_rhs] = emit_expr(rows, rhs, state)
+  state = after_rhs
+  let [_, after_move] = emit_instruction(state, :Move, 0, reg, rhs_reg, 0)
+  state = after_move
+  return [reg, state]
+end
+
+verb emit_return(rows, node, state)
+  let [found, result_node] = ast_attr(rows, node, :value)
+  if !found
+    return emit_error(state, "a bare return needs a later slice")
+  end
+  let [result_reg, after_result] = emit_expr(rows, result_node, state)
+  state = after_result
+  let [_, after_emit] = emit_instruction(state, :Return, 0, result_reg, 0, 0)
+  state = after_emit
+  return [result_reg, state]
+end
