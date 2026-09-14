@@ -4,6 +4,7 @@
 // strings are indexed by Unicode scalar position, not bytes.
 package mica_runtime
 
+import "core:encoding/base64"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -103,6 +104,7 @@ runtime_builtins := [?]Builtin_Spec {
 	{"rules", 1, builtin_rules},
 	{"__is_builtin", 1, builtin_is_builtin},
 	{"__identity", 1, builtin_named_identity},
+	{"__bytes", 1, builtin_bytes_literal},
 	{"describe_rule", 1, builtin_describe_rule},
 	{"fileout", 1, builtin_fileout},
 	{"fileout_rules", -1, builtin_fileout_rules},
@@ -1449,6 +1451,29 @@ rule_active_builtin :: proc(
 }
 
 
+
+// Decodes a base64url byte literal (`b"3q2-7w=="`) at execution time. The
+// Mica emitter has no base64 facility, so emitted code calls this.
+@(private)
+builtin_bytes_literal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 1 {
+		return builtin_error(state, "E_INVARG", "__bytes expects a literal")
+	}
+	text, is_string := v.value_as_string(args[0])
+	if !is_string || len(text) < 3 || text[0] != 'b' || text[1] != '"' || text[len(text) - 1] != '"' {
+		return builtin_error(state, "E_INVARG", "__bytes expects a byte literal")
+	}
+	decoded, decode_err := base64.decode(
+		text[2:len(text) - 1],
+		base64.DEC_URL_TABLE,
+		nil,
+		state.allocator,
+	)
+	if decode_err != nil {
+		return builtin_error(state, "E_INVARG", "byte literal is not valid base64url")
+	}
+	return v.value_bytes(state.allocator, decoded), true
+}
 
 // Resolves a named identity (`#alice`) at execution time against the running
 // world. The Mica emitter cannot resolve identity literals while emitting: it

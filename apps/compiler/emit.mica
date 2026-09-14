@@ -215,6 +215,139 @@ verb param_arity(rows, params)
   return [required, has_rest]
 end
 
+// `a..b` builds a range value; `a.._` is open-ended, so the end register
+// echoes the start and the flags bit is clear.
+verb emit_range(rows, node, state)
+  let [found_start, start_node] = ast_attr(rows, node, :start)
+  if !found_start
+    return emit_error(state, "a range is missing its start")
+  end
+  let [start, after_start] = emit_expr(rows, start_node, state)
+  state = after_start
+  let [found_end, end_node] = ast_attr(rows, node, :range_end)
+  let end_reg = start
+  if found_end
+    let [emitted, after_end] = emit_expr(rows, end_node, state)
+    state = after_end
+    end_reg = emitted
+  end
+  let flags = 0
+  if found_end
+    flags = 1
+  end
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_emit] = emit_instruction(state, :Build_Range, flags, dst, start, end_reg)
+  state = after_emit
+  return [dst, state]
+end
+
+// `receiver:selector(args)` dispatches on the receiver plus any named roles.
+verb emit_receiver_call(rows, node, state)
+  let [found_receiver, receiver_node] = ast_attr(rows, node, :receiver)
+  let [found_selector, selector_name] = ast_attr(rows, node, :selector)
+  if !found_receiver || !found_selector
+    return emit_error(state, "a receiver call is missing its receiver or selector")
+  end
+  let [receiver, after_receiver] = emit_expr(rows, receiver_node, state)
+  state = after_receiver
+  let args = ast_children(rows, node, :arg)
+
+  // Named roles mean a Dispatch carrying the receiver as a "receiver" role.
+  let any_role = false
+  for arg in args
+    let [found_role, _] = ast_attr(rows, arg, :role)
+    if found_role
+      any_role = true
+      break
+    end
+  end
+  if any_role
+    let roles = []
+    roles = [@roles, {:role -> "receiver", :register -> receiver}]
+    for arg in args
+      let [found_role, role_name] = ast_attr(rows, arg, :role)
+      let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+      if !found_role || !found_expr
+        return emit_error(state, "receiver dispatch cannot mix named and positional arguments")
+      end
+      let [arg_reg, after_arg] = emit_expr(rows, arg_expr, state)
+      state = after_arg
+      roles = [@roles, {:role -> role_name, :register -> arg_reg}]
+    end
+    let spec_index = len(state[15])
+    state[15] = [@state[15], {:selector -> selector_name, :roles -> roles}]
+    let [dst, after_dst] = alloc_register(state)
+    state = after_dst
+    let [_, after_dispatch] = emit_instruction(state, :Dispatch, 0, dst, spec_index, 0)
+    state = after_dispatch
+    return [dst, state]
+  end
+
+  // Positional: the receiver is the first argument.
+  let registers = [receiver]
+  for arg in args
+    let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+    if !found_expr
+      return emit_error(state, "a receiver call argument is missing its expression")
+    end
+    let [arg_reg, after_arg] = emit_expr(rows, arg_expr, state)
+    state = after_arg
+    registers = [@registers, arg_reg]
+  end
+  let [first, after_marshal] = marshal_arguments(state, registers)
+  state = after_marshal
+  let [selector, after_selector] = load_constant(state, to_symbol(selector_name))
+  state = after_selector
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_dispatch] = emit_instruction(
+    state, :Positional_Dispatch, len(registers), dst, selector, first,
+  )
+  state = after_dispatch
+  return [dst, state]
+end
+
+// `[:a, :b] {[1, 2]}` builds a relation value through __relation_literal,
+// which takes a heading list and a rows list.
+verb emit_relation_literal(rows, node, state)
+  let heading_nodes = ast_children(rows, node, :heading)
+  let [heading, after_heading] = emit_list_of_nodes(rows, heading_nodes, state)
+  state = after_heading
+  let row_nodes = ast_children(rows, node, :row)
+  let [rows_reg, after_rows] = emit_list_of_nodes(rows, row_nodes, state)
+  state = after_rows
+  let [first, after_marshal] = marshal_arguments(state, [heading, rows_reg])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "__relation_literal")
+  state = after_builtin
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_call] = emit_instruction(state, :Builtin_Call, 2, dst, builtin, first)
+  state = after_call
+  return [dst, state]
+end
+
+// `b"..."` is a base64url-encoded byte string. Decoding happens at execution
+// time via __bytes, since the Mica emitter has no base64 facility of its own.
+verb emit_bytes_literal(rows, node, state)
+  let [found, text] = ast_attr(rows, node, :text)
+  if !found
+    return emit_error(state, "a byte literal is missing its text")
+  end
+  let [text_reg, after_text] = load_constant(state, text)
+  state = after_text
+  let [first, after_marshal] = marshal_arguments(state, [text_reg])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "__bytes")
+  state = after_builtin
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_call] = emit_instruction(state, :Builtin_Call, 1, dst, builtin, first)
+  state = after_call
+  return [dst, state]
+end
+
 // A named recursive `fn f(...)`: emits Make_Self_Function, which supplies the
 // function's own value as its last capture so the body can call itself.
 verb emit_self_fn(rows, node, self_name, state)
@@ -746,6 +879,18 @@ verb emit_expr(rows, node, state)
   end
   if kind == :Fn
     return emit_fn_literal(rows, node, state)
+  end
+  if kind == :Bytes_Literal
+    return emit_bytes_literal(rows, node, state)
+  end
+  if kind == :Range_Literal
+    return emit_range(rows, node, state)
+  end
+  if kind == :Receiver_Call
+    return emit_receiver_call(rows, node, state)
+  end
+  if kind == :Relation_Literal
+    return emit_relation_literal(rows, node, state)
   end
   if kind == :Dom_Element
     return emit_dom_element(rows, node, state)

@@ -4287,7 +4287,10 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"let x = 10\nlet f = fn() => x\nf()",
 		"let f = fn(n)\n n * n\nend\nf(6)",
 		"let make = fn(base) => fn(v) => base + v\nlet add10 = make(10)\nadd10(7)",
-		"let fact = fn f(n) => if n < 2\n 1\nelse\n n * f(n - 1)\nend\nfact(5)",	}
+		"let fact = fn f(n) => if n < 2\n 1\nelse\n n * f(n - 1)\nend\nfact(5)",
+		"b\"YWJj\"",
+		"1..5",
+		"[:x, :y] {[1, 2], [3, 4]}",	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {
 			testing.expectf(t, false, "emitter mismatch for %q", source)
