@@ -4272,6 +4272,9 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"verb classify(n)\n if n < 0\n  \"neg\"\n elseif n == 0\n  \"zero\"\n else\n  \"pos\"\n end\nend\nclassify(-3)",
 		"len([1, 2, 3, 4])",
 		"verb size(xs)\n len(xs)\nend\nsize([7, 8])",
+		"let xs = [1, 2]\n[@xs, 3]",
+		"let a = [1]\nlet b = [2]\n[@a, @b]",
+		"let xs = []\nlet i = 0\nwhile i < 5\n xs = [@xs, i]\n i = i + 1\nend\nlen(xs)",
 	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {
@@ -4308,6 +4311,7 @@ mica_emitter_matches_odin :: proc(
 	odin_state: vm.VM
 	vm.vm_init(&odin_state, compiled.program, alloc)
 	defer vm.vm_destroy(&odin_state)
+	register_runtime_builtins(&odin_state)
 	if vm.vm_run(&odin_state) != .Halted {
 		testing.expectf(t, false, "odin program did not halt for %q", source)
 		return false
@@ -4350,6 +4354,7 @@ mica_emitter_matches_odin :: proc(
 	mica_state: vm.VM
 	vm.vm_init(&mica_state, program, alloc)
 	defer vm.vm_destroy(&mica_state)
+	register_runtime_builtins(&mica_state)
 	if vm.vm_run(&mica_state) != .Halted {
 		testing.expectf(t, false, "mica program did not halt for %q", source)
 		return false

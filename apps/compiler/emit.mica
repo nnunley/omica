@@ -497,7 +497,7 @@ verb emit_expr(rows, node, state)
   if kind == :Return
     return emit_return(rows, node, state)
   end
-  return emit_error(state, "an expression needs a later slice")
+  return emit_error(state, string_concat("unsupported expression: ", to_literal(ast_kind(rows, node))))
 end
 
 verb emit_int_literal(rows, node, state)
@@ -751,17 +751,103 @@ end
 
 verb emit_list_literal(rows, node, state)
   let elements = ast_children(rows, node, :element)
+  let has_splice = list_has_splice(rows, elements)
+  let splice_count = list_splice_count(rows, elements)
+
+  // The append idiom `[@items, x]` (one splice, one value, splice first)
+  // lowers to __list_append rather than a concat. Concat rebuilds and copies
+  // the whole prefix, making a build-loop quadratic; append reuses capacity.
+  if splice_count == 1 && len(elements) == 2 && ast_kind(rows, elements[0]) == :Splice
+    let splice = elements[0]
+    let [found_spliced, spliced_node] = ast_attr(rows, splice, :value)
+    if found_spliced && ast_kind(rows, elements[1]) != :Splice
+      let [base, after_base] = emit_expr(rows, spliced_node, state)
+      state = after_base
+      let [item, after_item] = emit_expr(rows, elements[1], state)
+      state = after_item
+      let [first, after_marshal] = marshal_arguments(state, [base, item])
+      state = after_marshal
+      let [builtin, after_builtin] = add_builtin(state, "__list_append")
+      state = after_builtin
+      let [dst, after_reg] = alloc_register(state)
+      state = after_reg
+      let [_, after_emit] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, first)
+      state = after_emit
+      return [dst, state]
+    end
+  end
+
   let registers = []
   for element in elements
-    let [reg, after_element] = emit_expr(rows, element, state)
-    state = after_element
-    registers = [@registers, reg]
+    if ast_kind(rows, element) == :Splice
+      let [found_spliced, spliced_node] = ast_attr(rows, element, :value)
+      if !found_spliced
+        return emit_error(state, "a splice is missing its value")
+      end
+      let [reg, after_expr] = emit_expr(rows, spliced_node, state)
+      state = after_expr
+      registers = [@registers, reg]
+      continue
+    end
+    let [reg, after_expr] = emit_expr(rows, element, state)
+    state = after_expr
+    if has_splice
+      let [wrapped, after_wrap] = emit_singleton_list(state, reg)
+      state = after_wrap
+      registers = [@registers, wrapped]
+    else
+      registers = [@registers, reg]
+    end
   end
+
+  if has_splice
+    let [first, after_marshal] = marshal_arguments(state, registers)
+    state = after_marshal
+    let [builtin, after_builtin] = add_builtin(state, "__list_concat")
+    state = after_builtin
+    let [dst, after_reg] = alloc_register(state)
+    state = after_reg
+    let [_, after_emit] = emit_instruction(
+      state, :Builtin_Call, len(registers), dst, builtin, first,
+    )
+    state = after_emit
+    return [dst, state]
+  end
+
   let [first, after_marshal] = marshal_arguments(state, registers)
   state = after_marshal
   let [dst, after_reg] = alloc_register(state)
   state = after_reg
   let [_, after_emit] = emit_instruction(state, :Build_List, 0, dst, first, len(registers))
+  state = after_emit
+  return [dst, state]
+end
+
+verb list_has_splice(rows, elements)
+  for element in elements
+    if ast_kind(rows, element) == :Splice
+      return true
+    end
+  end
+  return false
+end
+
+verb list_splice_count(rows, elements)
+  let count = 0
+  for element in elements
+    if ast_kind(rows, element) == :Splice
+      count = count + 1
+    end
+  end
+  return count
+end
+
+// Builds a one-element list holding `reg`, returning [register, state]. Used
+// to mix a plain value into a concat that also has splices.
+verb emit_singleton_list(state, reg)
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Build_List, 0, dst, reg, 1)
   state = after_emit
   return [dst, state]
 end
