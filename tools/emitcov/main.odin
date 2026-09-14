@@ -8,6 +8,7 @@ import "core:strings"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
 import v "../../mica/var"
+import vm "../../mica/vm"
 
 main :: proc() {
 	dir := "benchmarks/mica"
@@ -56,8 +57,22 @@ main :: proc() {
 			fields, _ := v.value_as_map(outcome.value)
 			ok_value := map_get(fields, "ok")
 			if flag, flag_ok := v.value_as_bool(ok_value); flag_ok && flag {
-				fmt.printf("ok   %s\n", entry.name)
-				ok += 1
+				// Decode and validate the artifact so "ok" means the emitted
+				// program is well-formed, not merely that emission returned.
+				artifact, artifact_ok := v.value_as_bytes(map_get(fields, "bytes"))
+				if !artifact_ok {
+					fmt.printf("FAIL %s: emitted no bytes\n", entry.name)
+					failed += 1
+				} else if program, decode_error := vm.program_from_bytes(artifact, context.allocator); decode_error != .None {
+					fmt.printf("FAIL %s: decode %v\n", entry.name, decode_error)
+					failed += 1
+				} else if validation := vm.program_validate(program); validation != .None {
+					fmt.printf("FAIL %s: invalid %v\n", entry.name, validation)
+					failed += 1
+				} else {
+					fmt.printf("ok   %s\n", entry.name)
+					ok += 1
+				}
 			} else {
 				errs := map_get(fields, "errors")
 				message := "?"

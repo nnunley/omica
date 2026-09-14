@@ -455,6 +455,9 @@ verb emit_expr(rows, node, state)
   if kind == :List_Literal
     return emit_list_literal(rows, node, state)
   end
+  if kind == :Comprehension
+    return emit_comprehension(rows, node, state)
+  end
   if kind == :Map_Literal
     return emit_map_literal(rows, node, state)
   end
@@ -858,6 +861,217 @@ verb emit_singleton_list(state, reg)
   return [dst, state]
 end
 
+// A comprehension `[body for pattern in iterable if cond sort key]` builds a
+// list by iterating the source, optionally filtering, appending `body` (or a
+// [key, body] pair when a sort key is given), then optionally sorting.
+verb emit_comprehension(rows, node, state)
+  let [found_iterable, iterable_node] = ast_attr(rows, node, :iterable)
+  let [found_body, body_node] = ast_attr(rows, node, :body)
+  let [found_pattern, pattern_node] = ast_attr(rows, node, :pattern)
+  if !found_iterable || !found_body || !found_pattern
+    return emit_error(state, "a comprehension is missing a clause")
+  end
+  let [iterable, after_iterable] = emit_expr(rows, iterable_node, state)
+  state = after_iterable
+
+  let [accumulator, after_accumulator] = alloc_register(state)
+  state = after_accumulator
+  let [_, after_build] = emit_instruction(state, :Build_List, 0, accumulator, 0, 0)
+  state = after_build
+
+  state[9] = state[9] + 1
+  let loop_depth = state[9]
+  let break_mark = len(state[6])
+
+  state = scope_enter(state)
+  let [index_reg, after_index] = alloc_register(state)
+  state = after_index
+  let [zero_reg, after_zero_const] = load_constant(state, 0)
+  state = after_zero_const
+  let [_, after_zero] = emit_instruction(state, :Move, 0, index_reg, zero_reg, 0)
+  state = after_zero
+  let [length_reg, after_length] = alloc_register(state)
+  state = after_length
+  let [_, after_len] = emit_instruction(state, :Len, 0, length_reg, iterable, 0)
+  state = after_len
+
+  let loop_start = current_offset(state)
+  state[8] = [@state[8], len(state[7])]
+  let [condition_reg, after_condition] = alloc_register(state)
+  state = after_condition
+  let [_, after_lt] = emit_instruction(state, :Binary, 7, condition_reg, index_reg, length_reg)
+  state = after_lt
+  let [body_jump, after_body_jump] = emit_jump(state, :Branch, 0, condition_reg)
+  state = after_body_jump
+  let [exit_jump, after_exit_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_exit_jump
+  state = patch_jump(state, body_jump, current_offset(state))
+
+  let [item_reg, after_item] = alloc_register(state)
+  state = after_item
+  let [_, after_item_at] = emit_instruction(state, :Collection_Value_At, 0, item_reg, iterable, index_reg)
+  state = after_item_at
+  state = scope_enter(state)
+  state = bind_for_pattern(rows, pattern_node, item_reg, state)
+
+  let [found_condition, condition_node] = ast_attr(rows, node, :condition)
+  if found_condition
+    let [keep, after_keep] = emit_expr(rows, condition_node, state)
+    state = after_keep
+    let [enter_jump, after_enter_jump] = emit_jump(state, :Branch, 0, keep)
+    state = after_enter_jump
+    let [skip_jump, after_skip_jump] = emit_jump(state, :Jump, 0, 0)
+    state = after_skip_jump
+    state = patch_jump(state, enter_jump, current_offset(state))
+    state = emit_comprehension_append(rows, node, body_node, accumulator, state)
+    state = patch_jump(state, skip_jump, current_offset(state))
+  else
+    state = emit_comprehension_append(rows, node, body_node, accumulator, state)
+  end
+  state = scope_leave(state)
+
+  let increment_start = current_offset(state)
+  state = patch_loop_continues(state, increment_start)
+  let [one_reg, after_one] = load_constant(state, 1)
+  state = after_one
+  let [_, after_inc] = emit_instruction(state, :Binary, 0, index_reg, index_reg, one_reg)
+  state = after_inc
+  let [back_jump, after_back] = emit_jump(state, :Jump, 0, 0)
+  state = after_back
+  state = patch_jump(state, back_jump, loop_start)
+  state = patch_jump(state, exit_jump, current_offset(state))
+  state = patch_loop_breaks(state, break_mark)
+  state = scope_leave(state)
+  state[9] = loop_depth - 1
+
+  // Without a sort clause the accumulator is the result.
+  let [found_sort, _] = ast_attr(rows, node, :sort_bare)
+  let [found_key, key_node] = ast_attr(rows, node, :key)
+  if !found_sort && !found_key
+    return [accumulator, state]
+  end
+
+  // `sort` sorts the accumulator, which holds [key, body] pairs when a key
+  // was given. `sort key` sorts pairs then projects the body at index 1.
+  let [sorted, after_sorted] = call_builtin_one(state, "sort", accumulator)
+  state = after_sorted
+  if !found_key
+    return [sorted, state]
+  end
+  let [projected, after_projected] = project_sorted_bodies(state, sorted)
+  return [projected, after_projected]
+end
+
+// Appends the comprehension's `body` to `accumulator`, as `[key, body]` when
+// the comprehension has a sort key and as `body` otherwise.
+verb emit_comprehension_append(rows, node, body_node, accumulator, state)
+  let [found_key, key_node] = ast_attr(rows, node, :key)
+  let element = 0
+  if found_key
+    let [key_reg, after_key] = emit_expr(rows, key_node, state)
+    state = after_key
+    let [body_reg, after_body] = emit_expr(rows, body_node, state)
+    state = after_body
+    let [first, after_marshal] = marshal_arguments(state, [key_reg, body_reg])
+    state = after_marshal
+    let [pair, after_pair] = alloc_register(state)
+    state = after_pair
+    let [_, after_build] = emit_instruction(state, :Build_List, 0, pair, first, 2)
+    state = after_build
+    element = pair
+  else
+    let [body_reg, after_body] = emit_expr(rows, body_node, state)
+    state = after_body
+    element = body_reg
+  end
+  let [first, after_marshal] = marshal_arguments(state, [accumulator, element])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "__list_append")
+  state = after_builtin
+  let [destination, after_destination] = alloc_register(state)
+  state = after_destination
+  let [_, after_append] = emit_instruction(state, :Builtin_Call, 0, destination, builtin, first)
+  state = after_append
+  let [_, after_move] = emit_instruction(state, :Move, 0, accumulator, destination, 0)
+  state = after_move
+  return state
+end
+
+// Calls a one-argument builtin, returning [result register, state].
+verb call_builtin_one(state, builtin_name, argument)
+  let [first, after_marshal] = marshal_arguments(state, [argument])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, builtin_name)
+  state = after_builtin
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, first)
+  state = after_emit
+  return [dst, state]
+end
+
+// Projects element 1 of every [key, body] pair in `sorted`, returning
+// [register, state]. This is the tail of `sort key`.
+verb project_sorted_bodies(state, sorted)
+  let [projected, after_projected] = alloc_register(state)
+  state = after_projected
+  let [_, after_build] = emit_instruction(state, :Build_List, 0, projected, 0, 0)
+  state = after_build
+  let [one_reg, after_one] = load_constant(state, 1)
+  state = after_one
+  let [index_reg, after_index] = alloc_register(state)
+  state = after_index
+  let [_, after_zero] = emit_instruction(state, :Move, 0, index_reg, one_reg, 0)
+  state = after_zero
+  // Start from zero, not one; reload the zero constant for the loop start.
+  let [zero_reg, after_zero_const] = load_constant(state, 0)
+  state = after_zero_const
+  let [_, after_start] = emit_instruction(state, :Move, 0, index_reg, zero_reg, 0)
+  state = after_start
+
+  let [length_reg, after_length] = alloc_register(state)
+  state = after_length
+  let [_, after_len] = emit_instruction(state, :Len, 0, length_reg, sorted, 0)
+  state = after_len
+
+  let loop_start = current_offset(state)
+  let [condition_reg, after_condition] = alloc_register(state)
+  state = after_condition
+  let [_, after_lt] = emit_instruction(state, :Binary, 7, condition_reg, index_reg, length_reg)
+  state = after_lt
+  let [body_jump, after_body_jump] = emit_jump(state, :Branch, 0, condition_reg)
+  state = after_body_jump
+  let [exit_jump, after_exit_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_exit_jump
+  state = patch_jump(state, body_jump, current_offset(state))
+
+  let [pair_reg, after_pair] = alloc_register(state)
+  state = after_pair
+  let [_, after_pair_at] = emit_instruction(state, :Collection_Value_At, 0, pair_reg, sorted, index_reg)
+  state = after_pair_at
+  let [element_reg, after_element] = alloc_register(state)
+  state = after_element
+  let [_, after_index] = emit_instruction(state, :Index, 0, element_reg, pair_reg, one_reg)
+  state = after_index
+  let [first, after_marshal] = marshal_arguments(state, [projected, element_reg])
+  state = after_marshal
+  let [append_builtin, after_builtin] = add_builtin(state, "__list_append")
+  state = after_builtin
+  let [next, after_next] = alloc_register(state)
+  state = after_next
+  let [_, after_append] = emit_instruction(state, :Builtin_Call, 0, next, append_builtin, first)
+  state = after_append
+  let [_, after_move] = emit_instruction(state, :Move, 0, projected, next, 0)
+  state = after_move
+  let [_, after_inc] = emit_instruction(state, :Binary, 0, index_reg, index_reg, one_reg)
+  state = after_inc
+  let [back_jump, after_back] = emit_jump(state, :Jump, 0, 0)
+  state = after_back
+  state = patch_jump(state, back_jump, loop_start)
+  state = patch_jump(state, exit_jump, current_offset(state))
+  return [projected, state]
+end
+
 verb emit_map_literal(rows, node, state)
   let entries = ast_children(rows, node, :entry)
   let registers = []
@@ -1038,7 +1252,9 @@ verb emit_for(rows, node, state)
     return emit_error(state, "a for loop is missing its iterable")
   end
   let names = ast_children(rows, node, :name)
-  if len(names) != 1 && len(names) != 2
+  let patterns = ast_children(rows, node, :pattern)
+  let has_pattern = len(patterns) == 1
+  if !has_pattern && len(names) != 1 && len(names) != 2
     return emit_error(state, "a for loop needs one or two names")
   end
 
@@ -1082,7 +1298,9 @@ verb emit_for(rows, node, state)
   state = after_item
   let [_, after_value_at] = emit_instruction(state, :Collection_Value_At, 0, item_reg, iterable, index_reg)
   state = after_value_at
-  if len(names) == 2
+  if has_pattern
+    state = bind_for_pattern(rows, patterns[0], item_reg, state)
+  elseif len(names) == 2
     let [key_reg, after_key] = alloc_register(state)
     state = after_key
     let [_, after_key_at] = emit_instruction(state, :Collection_Key_At, 0, key_reg, iterable, index_reg)
@@ -1129,6 +1347,90 @@ verb declare_name(rows, name_node, reg, state)
     return state
   end
   return declare_local(state, binding_name, reg)
+end
+
+// Binds a for-header destructuring pattern against the item in `value_reg`.
+// A list pattern scatters by position, a map pattern projects named columns,
+// and a wildcard discards the item.
+verb bind_for_pattern(rows, pattern, value_reg, state)
+  let kind = ast_kind(rows, pattern)
+  if kind == :Wildcard_Pattern
+    return state
+  end
+  if kind == :Binding_Pattern
+    let [found_name, binding_name] = ast_attr(rows, pattern, :name)
+    if found_name
+      return declare_local(state, binding_name, value_reg)
+    end
+    return state
+  end
+  if kind == :List_Pattern
+    return bind_list_pattern(rows, pattern, value_reg, state)
+  end
+  if kind == :Map_Pattern
+    return bind_map_pattern(rows, pattern, value_reg, state)
+  end
+  return emit_error(state, "a for loop pattern must be a list, map, or wildcard")[1]
+end
+
+// Scatters a list pattern's binding elements by position. A wildcard element
+// still consumes a slot.
+verb bind_list_pattern(rows, pattern, value_reg, state)
+  let elements = ast_children(rows, pattern, :element)
+  let position = 0
+  for element in elements
+    let element_kind = ast_kind(rows, element)
+    if element_kind == :Binding_Pattern
+      let [found_name, binding_name] = ast_attr(rows, element, :name)
+      let [index_reg, after_index] = load_constant(state, position)
+      state = after_index
+      let [column, after_column] = alloc_register(state)
+      state = after_column
+      let [_, after_index_op] = emit_instruction(
+        state, :Index, 0, column, value_reg, index_reg,
+      )
+      state = after_index_op
+      if found_name
+        state = declare_local(state, binding_name, column)
+      end
+    elseif element_kind == :Wildcard_Pattern
+      // Consumes the slot with no binding.
+    else
+      state = emit_error(state, "a for list pattern needs names or wildcards")[1]
+    end
+    position = position + 1
+  end
+  return state
+end
+
+// Projects a map pattern's named columns, indexing each binding by its key
+// symbol. `{work}` binds column :work.
+verb bind_map_pattern(rows, pattern, value_reg, state)
+  let entries = ast_children(rows, pattern, :entry)
+  for entry in entries
+    let [found_key, key_node] = ast_attr(rows, entry, :key)
+    if !found_key
+      return emit_error(state, "a map pattern entry is missing its key")[1]
+    end
+    let [found_key_name, key_name] = ast_attr(rows, key_node, :name)
+    if !found_key_name
+      return emit_error(state, "a map pattern key is missing its name")[1]
+    end
+    let [key_reg, after_key] = load_constant(state, to_symbol(key_name))
+    state = after_key
+    let [column, after_column] = alloc_register(state)
+    state = after_column
+    let [_, after_index] = emit_instruction(state, :Index, 0, column, value_reg, key_reg)
+    state = after_index
+    let [found_pattern, binding] = ast_attr(rows, entry, :pattern)
+    if found_pattern && ast_kind(rows, binding) == :Binding_Pattern
+      let [found_name, binding_name] = ast_attr(rows, binding, :name)
+      if found_name
+        state = declare_local(state, binding_name, column)
+      end
+    end
+  end
+  return state
 end
 
 // Patches every `continue` recorded for the innermost active loop to `target`

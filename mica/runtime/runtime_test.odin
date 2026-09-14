@@ -4274,7 +4274,14 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"verb size(xs)\n len(xs)\nend\nsize([7, 8])",
 		"let xs = [1, 2]\n[@xs, 3]",
 		"let a = [1]\nlet b = [2]\n[@a, @b]",
-		"let xs = []\nlet i = 0\nwhile i < 5\n xs = [@xs, i]\n i = i + 1\nend\nlen(xs)",	}
+		"let xs = []\nlet i = 0\nwhile i < 5\n xs = [@xs, i]\n i = i + 1\nend\nlen(xs)",
+		"let total = 0\nfor [a, b] in [[1, 2], [3, 4]]\n total = total + a + b\nend\ntotal",
+		"let total = 0\nfor _ in [1, 2, 3]\n total = total + 1\nend\ntotal",
+		"[x + 1 for x in [1, 2, 3]]",
+		"[n for n in [1, 2, 3, 4] if n == 2]",
+		"[n for n in [3, 1, 2] sort]",
+		"[pair[1] for pair in [[1, \"b\"], [0, \"a\"]] sort pair[0]]",
+		"[a + b for [a, b] in [[1, 2], [3, 4]]]",	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {
 			testing.expectf(t, false, "emitter mismatch for %q", source)
