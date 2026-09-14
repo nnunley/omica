@@ -51,3 +51,10 @@ benchmarks/results/
 # Python bytecode from the benchmark reference implementation
 __pycache__/
 *.pyc
+
+# Common Lisp build artifacts (editor integrations under editors/)
+*.fasl
+*.lx64fsl
+*.dx64fsl
+*.ufsl
+.qlot/
