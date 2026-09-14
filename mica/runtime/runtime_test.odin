@@ -3779,6 +3779,203 @@ assert Marker(#alice, :seed)
 }
 
 @(test)
+test_run_artifact_boot_matches_recompile_boot :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:Log, 2)
+
+verb ping(who)
+  assert Log(who, :pinged)
+  return 1
+end
+
+verb ping(who, marker)
+  assert Log(who, marker)
+  return 2
+end
+
+verb echo(who)
+  return who
+end
+
+assert Log(#alice, :seed)
+`
+	path, path_ok := write_temp_source(t, "mica_boot_equivalence_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	directory, directory_error := os.temp_dir(context.temp_allocator)
+	if directory_error != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	artifact_store, join_error := filepath.join(
+		[]string{directory, "mica_boot_equiv_artifact"},
+		context.temp_allocator,
+	)
+	recompile_store, rejoin_error := filepath.join(
+		[]string{directory, "mica_boot_equiv_recompile"},
+		context.temp_allocator,
+	)
+	if join_error != nil || rejoin_error != nil {
+		return
+	}
+	os.remove_all(artifact_store)
+	defer os.remove_all(artifact_store)
+	os.remove_all(recompile_store)
+	defer os.remove_all(recompile_store)
+
+	testing.expect(t, boot_equivalence_load(t, path, artifact_store, false))
+	testing.expect(t, boot_equivalence_load(t, path, recompile_store, true))
+
+	artifact_values, artifact_rows, artifact_ok := boot_equivalence_boot(t, artifact_store)
+	recompile_values, recompile_rows, recompile_ok := boot_equivalence_boot(
+		t,
+		recompile_store,
+	)
+	testing.expect(t, artifact_ok && recompile_ok)
+	if !artifact_ok || !recompile_ok {
+		return
+	}
+	for index in 0 ..< 3 {
+		testing.expectf(
+			t,
+			v.value_eq(artifact_values[index], recompile_values[index]),
+			"result %d differs between boots",
+			index,
+		)
+	}
+	testing.expect_value(t, artifact_rows, recompile_rows)
+	testing.expect_value(t, artifact_rows, 3)
+}
+
+// Runs the call script against a booted world, returning the three result
+// values plus the Log row count for comparison.
+@(private)
+boot_equivalence_exercise :: proc(
+	t: ^testing.T,
+	world: ^World,
+	kernel: ^k.Kernel,
+	alice: v.Value,
+) -> (
+	[3]v.Value,
+	int,
+	bool,
+) {
+	who_role := v.value_symbol(v.symbol_intern("who"))
+	marker_role := v.value_symbol(v.symbol_intern("marker"))
+	loud := v.value_symbol(v.symbol_intern("loud"))
+
+	first := world_call(world, "ping", []k.Role_Pair{{role = who_role, value = alice}})
+	if first.kind != .Complete {
+		return {}, 0, false
+	}
+	second := world_call(world, "ping", []k.Role_Pair {
+		{role = who_role, value = alice},
+		{role = marker_role, value = loud},
+	})
+	if second.kind != .Complete {
+		return {}, 0, false
+	}
+	third := world_call(world, "echo", []k.Role_Pair{{role = who_role, value = alice}})
+	if third.kind != .Complete {
+		return {}, 0, false
+	}
+
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	metadata, found := k.snapshot_relation_metadata_named(
+		kernel.current,
+		v.symbol_intern("Log"),
+	)
+	if !found {
+		return {}, 0, false
+	}
+	bindings := make([]v.Binding, metadata.arity, context.temp_allocator)
+	k.kernel_scan_into(kernel, metadata.id, bindings, &rows)
+	return [3]v.Value{first.value, second.value, third.value}, len(rows), true
+}
+
+// Loads the fixture into store_path; when strip is set the ProgramBytes
+// rows are retracted first, so the later boot takes the legacy recompile
+// path instead of the artifact path.
+@(private)
+boot_equivalence_load :: proc(t: ^testing.T, path, store_path: string, strip: bool) -> bool {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		World_Config{store_path = store_path},
+	)
+	if !start.ok {
+		testing.expectf(t, false, "load failed: %s", start.message)
+		return false
+	}
+	entry := world_wait(world, world.entry)
+	ok := entry.kind == .Complete
+	if ok && strip {
+		artifact_rows: [dynamic]v.Tuple
+		k.kernel_scan_into(
+			&kernel,
+			k.SYSTEM_PROGRAM_BYTES_ID,
+			[]v.Binding{{}, {}},
+			&artifact_rows,
+		)
+		tx := k.kernel_begin(&kernel)
+		for row in artifact_rows {
+			if k.transaction_retract(&tx, k.SYSTEM_PROGRAM_BYTES_ID, row) !=
+			   k.Kernel_Error.None {
+				ok = false
+			}
+		}
+		delete(artifact_rows)
+		committed, commit_err := k.transaction_commit(&tx)
+		k.snapshot_release(committed)
+		k.transaction_destroy(&tx)
+		ok = ok && commit_err == k.Kernel_Error.None
+	}
+	ok = ok && world_checkpoint(world)
+	world_destroy(world)
+	return ok
+}
+
+// Boots store_path sourceless and exercises it.
+@(private)
+boot_equivalence_boot :: proc(
+	t: ^testing.T,
+	store_path: string,
+) -> (
+	[3]v.Value,
+	int,
+	bool,
+) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		nil,
+		context.temp_allocator,
+		World_Config{store_path = store_path},
+	)
+	if !start.ok {
+		testing.expectf(t, false, "boot failed: %s", start.message)
+		return {}, 0, false
+	}
+	defer world_destroy(world)
+	alice, has_alice := world.ctx.identities["alice"]
+	if !has_alice {
+		return {}, 0, false
+	}
+	return boot_equivalence_exercise(t, world, &kernel, alice)
+}
+
+@(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:Kept, 1)
