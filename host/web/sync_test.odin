@@ -701,6 +701,7 @@ end
 	nl := fmt.aprintf(
 		"POST /sync/input HTTP/1.1\r\nHost: a\r\nContent-Length: %d\r\n\r\n",
 		len(need_bytes),
+		allocator = context.temp_allocator,
 	)
 	send_text(nc, nl)
 	send_all(nc, need_bytes[:])
@@ -723,6 +724,7 @@ end
 	el := fmt.aprintf(
 		"POST /sync/input HTTP/1.1\r\nHost: a\r\nContent-Length: %d\r\n\r\n",
 		len(eb),
+		allocator = context.temp_allocator,
 	)
 	send_text(ec, el)
 	send_all(ec, eb[:])
