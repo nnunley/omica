@@ -4255,6 +4255,14 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"{:a -> 7}[:a]",
 		"let xs = [4, 5]\nxs[0] + xs[1]",
 		"let m = {:k -> 9}\nm[:k]",
+		"if 1 < 2\n  10\nelse\n  20\nend",
+		"if 2 < 1\n 10\nend",
+		"if false\n 1\nelseif true\n 2\nelse\n 3\nend",
+		"let n = 0\nlet i = 0\nwhile i < 5\n n = n + i\n i = i + 1\nend\nn",
+		"let n = 0\nlet i = 0\nwhile i < 10\n i = i + 1\n if i == 3\n  break\n end\n n = n + 1\nend\nn",
+		"let n = 0\nlet i = 0\nwhile i < 5\n i = i + 1\n if i == 2\n  continue\n end\n n = n + i\nend\nn",
+		"begin\n 1\n 2\n 3\nend",
+		"let x = 4\nif x > 3\n \"big\"\nelse\n \"small\"\nend",
 	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {

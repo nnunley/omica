@@ -3,8 +3,11 @@
 // Stage three of the self-hosting path (#81). Consumes relational AST row
 // lists `[node, role, target, ordinal]` (see `parse_rows` in parse.mica) and
 // produces an `assemble` description map. State is
-// `[code, constants, scopes, next_reg, errors]` threaded through every
-// helper, each returning `[result, state]`, mirroring parse.mica.
+// `[code, constants, scopes, next_reg, errors, builtins, break_patches,
+// continue_patches, continue_marks, loop_depth, max_reg]`, threaded through
+// every helper, each returning `[result, state]`, mirroring parse.mica.
+// `scopes` is a stack of `[register_mark, locals]` and `locals` holds
+// `[name, register]` pairs.
 //
 // Slice one covers top-level expressions: int, float, and bool literals,
 // arithmetic (`+`, `-`, `*`, `/`), `return`, assignment, and `let`/`const`
@@ -42,7 +45,7 @@ end
 // description carries `:errors` alongside the sections; `assemble` ignores
 // unknown keys, so the map feeds it directly.
 verb emit_program(rows, root) -> map
-  let state = [[], [], [[]], 0, [], []]
+  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0]
   let items = ast_children(rows, root, :item)
   if len(items) == 0
     state[4] = [@state[4], "a program needs at least one item"]
@@ -72,7 +75,7 @@ end
 verb describe(state, last_reg)
   let code = state[0]
   let constants = state[1]
-  let next_reg = state[3]
+  let next_reg = state[10]
   let errors = state[4]
   let builtins = state[5]
   let main_fn = {:name -> "main", :code_offset -> 0, :code_len -> len(code),
@@ -126,6 +129,51 @@ verb ast_children(rows, node_id, role)
   return targets
 end
 
+// The current instruction count: the next instruction's offset.
+verb current_offset(state)
+  return len(state[0])
+end
+
+// Appends a jump whose target is filled in later, returning [offset, state].
+verb emit_jump(state, op_sym, flags, a)
+  let [offset, after_emit] = emit_instruction(state, op_sym, flags, a, 0, 0)
+  return [offset, after_emit]
+end
+
+// Sets the target of a placeholder jump. Offsets are relative to the
+// instruction after the jump, matching the VM's `ip += b`.
+verb patch_jump(state, at, target)
+  let code = state[0]
+  let instruction = code[at]
+  instruction[:b] = target - (at + 1)
+  code[at] = instruction
+  state[0] = code
+  return state
+end
+
+// --- Scope helpers -----------------------------------------------------------
+
+// Begins a scope: later register allocations and local declarations are
+// discarded when the matching scope_leave runs. A scope is
+// `[register_mark, locals]`, where `locals` holds `[name, register]` pairs.
+verb scope_enter(state)
+  let scopes = state[2]
+  scopes = [@scopes, [state[3], []]]
+  state[2] = scopes
+  return state
+end
+
+verb scope_leave(state)
+  let scopes = state[2]
+  if len(scopes) == 0
+    return state
+  end
+  let mark = scopes[len(scopes) - 1][0]
+  state[3] = mark
+  state[2] = __list_slice(scopes, 0, len(scopes) - 1)
+  return state
+end
+
 // --- State helpers -----------------------------------------------------------
 
 // Appends an instruction map, returning [offset, state].
@@ -148,6 +196,9 @@ end
 verb alloc_register(state)
   let reg = state[3]
   state[3] = reg + 1
+  if state[3] > state[10]
+    state[10] = state[3]
+  end
   return [reg, state]
 end
 
@@ -196,7 +247,9 @@ end
 verb declare_local(state, binding_name, reg)
   let scopes = state[2]
   let top = scopes[len(scopes) - 1]
-  top = [@top, [binding_name, reg]]
+  let locals = top[1]
+  locals = [@locals, [binding_name, reg]]
+  top[1] = locals
   scopes[len(scopes) - 1] = top
   state[2] = scopes
   return state
@@ -207,11 +260,11 @@ verb resolve_local(state, binding_name)
   let scopes = state[2]
   let depth = len(scopes) - 1
   while depth >= 0
-    let scope = scopes[depth]
-    let index = len(scope) - 1
+    let locals = scopes[depth][1]
+    let index = len(locals) - 1
     while index >= 0
-      if scope[index][0] == binding_name
-        return [true, scope[index][1]]
+      if locals[index][0] == binding_name
+        return [true, locals[index][1]]
       end
       index = index - 1
     end
@@ -266,6 +319,21 @@ verb emit_expr(rows, node, state)
   end
   if kind == :Field
     return emit_field(rows, node, state)
+  end
+  if kind == :If
+    return emit_if(rows, node, state)
+  end
+  if kind == :While
+    return emit_while(rows, node, state)
+  end
+  if kind == :Begin
+    return emit_begin(rows, node, state)
+  end
+  if kind == :Break
+    return emit_break(state)
+  end
+  if kind == :Continue
+    return emit_continue(state)
   end
   if kind == :Binding
     return emit_binding(rows, node, state)
@@ -608,6 +676,196 @@ verb emit_field(rows, node, state)
   let [_, after_emit] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, first)
   state = after_emit
   return [dst, state]
+end
+
+// --- Control flow ------------------------------------------------------------
+
+// Emits `if`/`elseif`/`else`. Each branch tests its condition, jumps past the
+// rest on a match, and leaves its body's last value in the shared result
+// register.
+verb emit_if(rows, node, state)
+  let [result, after_reg] = alloc_register(state)
+  state = after_reg
+  let branches = ast_children(rows, node, :branch)
+  let end_patches = []
+  let previous_skip = -1
+  for branch in branches
+    if previous_skip >= 0
+      state = patch_jump(state, previous_skip, current_offset(state))
+    end
+    let [found_condition, condition_node] = ast_attr(rows, branch, :condition)
+    if !found_condition
+      return emit_error(state, "an if branch is missing its condition")
+    end
+    let [condition_reg, after_condition] = emit_expr(rows, condition_node, state)
+    state = after_condition
+    let [branch_jump, after_branch_jump] = emit_jump(state, :Branch, 0, condition_reg)
+    state = after_branch_jump
+    let [skip_jump, after_skip] = emit_jump(state, :Jump, 0, 0)
+    state = after_skip
+    state = patch_jump(state, branch_jump, current_offset(state))
+
+    state = scope_enter(state)
+    let body = ast_children(rows, branch, :body)
+    let [body_reg, body_has_value, after_body] = emit_block(rows, body, state)
+    state = after_body
+    state = scope_leave(state)
+    if body_has_value
+      let [_, after_move] = emit_instruction(state, :Move, 0, result, body_reg, 0)
+      state = after_move
+    end
+    let [end_jump, after_end_jump] = emit_jump(state, :Jump, 0, 0)
+    state = after_end_jump
+    end_patches = [@end_patches, end_jump]
+    previous_skip = skip_jump
+  end
+  if previous_skip >= 0
+    state = patch_jump(state, previous_skip, current_offset(state))
+  end
+
+  let [found_else, _] = ast_attr(rows, node, :has_else)
+  if found_else
+    state = scope_enter(state)
+    let else_body = ast_children(rows, node, :else_body)
+    let [else_reg, else_has_value, after_else] = emit_block(rows, else_body, state)
+    state = after_else
+    state = scope_leave(state)
+    if else_has_value
+      let [_, after_move] = emit_instruction(state, :Move, 0, result, else_reg, 0)
+      state = after_move
+    end
+  end
+  for patch in end_patches
+    state = patch_jump(state, patch, current_offset(state))
+  end
+  return [result, state]
+end
+
+// Emits `while`: test the condition at the top, run the body, jump back.
+verb emit_while(rows, node, state)
+  let [result, after_reg] = alloc_register(state)
+  state = after_reg
+  let break_mark = len(state[6])
+  state[9] = state[9] + 1
+  let loop_depth = state[9]
+
+  let loop_start = current_offset(state)
+  state[8] = [@state[8], len(state[7])]
+
+  let [found_condition, condition_node] = ast_attr(rows, node, :condition)
+  if !found_condition
+    return emit_error(state, "a while loop is missing its condition")
+  end
+  let [condition_reg, after_condition] = emit_expr(rows, condition_node, state)
+  state = after_condition
+  let [body_jump, after_body_jump] = emit_jump(state, :Branch, 0, condition_reg)
+  state = after_body_jump
+  let [exit_jump, after_exit_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_exit_jump
+  state = patch_jump(state, body_jump, current_offset(state))
+
+  state = scope_enter(state)
+  let body = ast_children(rows, node, :body)
+  let [body_reg, body_has_value, after_body] = emit_block(rows, body, state)
+  state = after_body
+  state = scope_leave(state)
+  if body_has_value
+    let [_, after_move] = emit_instruction(state, :Move, 0, result, body_reg, 0)
+    state = after_move
+  end
+
+  let [back_jump, after_back_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_back_jump
+  state = patch_jump(state, back_jump, loop_start)
+
+  state = patch_loop_continues(state, loop_start)
+  state = patch_jump(state, exit_jump, current_offset(state))
+  state = patch_loop_breaks(state, break_mark)
+  state[9] = loop_depth - 1
+  return [result, state]
+end
+
+// Patches every `continue` recorded for the innermost active loop to `target`
+// and pops its mark.
+verb patch_loop_continues(state, target)
+  let marks = state[8]
+  let mark = marks[len(marks) - 1]
+  let patches = state[7]
+  let index = mark
+  while index < len(patches)
+    state = patch_jump(state, patches[index], target)
+    index = index + 1
+  end
+  state[7] = __list_slice(patches, 0, mark)
+  state[8] = __list_slice(marks, 0, len(marks) - 1)
+  return state
+end
+
+// Patches every `break` recorded since `mark` to the current offset and drops
+// them.
+verb patch_loop_breaks(state, mark)
+  let patches = state[6]
+  let index = mark
+  while index < len(patches)
+    state = patch_jump(state, patches[index], current_offset(state))
+    index = index + 1
+  end
+  state[6] = __list_slice(patches, 0, mark)
+  return state
+end
+
+verb emit_begin(rows, node, state)
+  let body = ast_children(rows, node, :body)
+  let [last_reg, _, after_body] = emit_block(rows, body, state)
+  return [last_reg, after_body]
+end
+
+verb emit_break(state)
+  if state[9] == 0
+    return emit_error(state, "break outside a loop")
+  end
+  let [offset, after_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_jump
+  state[6] = [@state[6], offset]
+  return [-1, state]
+end
+
+verb emit_continue(state)
+  if len(state[8]) == 0
+    return emit_error(state, "continue outside a loop")
+  end
+  let [offset, after_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_jump
+  state[7] = [@state[7], offset]
+  return [-1, state]
+end
+
+// Emits a body of expressions in order, tracking the last value-producing
+// expression. Returns [last register, has value, state]. The register is only
+// meaningful when `has value` is true.
+verb emit_block(rows, body, state)
+  let last_reg = -1
+  let has_value = false
+  for expression in body
+    let [reg, expression_has_value, after_expr] = emit_expr_value(rows, expression, state)
+    state = after_expr
+    if expression_has_value
+      last_reg = reg
+      has_value = true
+    end
+  end
+  return [last_reg, has_value, state]
+end
+
+// Wraps emit_expr so a statement that produces no value (break, continue, a
+// bare return) is distinguishable. emit_expr signals "no value" by returning
+// register -1 with the second element still true, so this reads the register.
+verb emit_expr_value(rows, node, state)
+  let [reg, after_expr] = emit_expr(rows, node, state)
+  if reg < 0
+    return [-1, false, after_expr]
+  end
+  return [reg, true, after_expr]
 end
 
 verb emit_binding(rows, node, state)
