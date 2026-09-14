@@ -2209,7 +2209,7 @@ verb emit_match_fail_test(test, state)
   let [skip, after_skip] = emit_jump(state, :Jump, 0, 0)
   state = after_skip
   let stack = state[16]
-  let top = __list_slice(stack, 0, len(stack) - 1)
+  let top = stack[len(stack) - 1]
   top = [@top, skip]
   stack = [@__list_slice(stack, 0, len(stack) - 1), top]
   state[16] = stack
