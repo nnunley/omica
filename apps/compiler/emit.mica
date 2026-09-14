@@ -45,16 +45,44 @@ end
 // description carries `:errors` alongside the sections; `assemble` ignores
 // unknown keys, so the map feeds it directly.
 verb emit_program(rows, root) -> map
-  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0]
+  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0]
   let items = ast_children(rows, root, :item)
   if len(items) == 0
     state[4] = [@state[4], "a program needs at least one item"]
     return describe(state, 0)
   end
+
+  // Reserve every verb slot before emitting any body, so a call can name a
+  // verb declared later in the file (including forward references and
+  // recursion).
+  let main_desc = {:name -> "main", :code_offset -> 0, :code_len -> 0,
+                   :registers -> 0, :params -> 0, :required -> 0,
+                   :rest -> false, :defaults -> []}
+  state[11] = [@state[11], main_desc]
+  for item in items
+    if ast_kind(rows, item) != :VerbItem
+      continue
+    end
+    let [found_name, verb_name] = ast_attr(rows, item, :name)
+    if !found_name
+      state[4] = [@state[4], "a verb is missing its name"]
+      continue
+    end
+    let params = ast_children(rows, item, :param)
+    let [slot, after_slot] = reserve_verb(rows, params, state)
+    state = after_slot
+    let table = state[12]
+    table[verb_name] = slot
+    state[12] = table
+  end
+
+  // Emit the entry function: top-level expressions in order, returning the
+  // last value.
+  state = function_enter(state, 0)
   let last_reg = 0
+  let saw_value = false
   for item in items
     if ast_kind(rows, item) != :ExprItem
-      state[4] = [@state[4], "only top-level expressions emit yet"]
       continue
     end
     let [found, expr] = ast_attr(rows, item, :expr)
@@ -65,24 +93,140 @@ verb emit_program(rows, root) -> map
     let [reg, after_expr] = emit_expr(rows, expr, state)
     state = after_expr
     last_reg = reg
+    saw_value = true
+  end
+  if !saw_value
+    let [zero_reg, after_zero] = load_constant(state, empty_relation_value())
+    state = after_zero
+    last_reg = zero_reg
   end
   let [_, after_return] = emit_instruction(state, :Return, 0, last_reg, 0, 0)
   state = after_return
+  state = function_leave(state)
+
+  // Emit each verb body. A verb's parameters occupy the first registers of
+  // its frame; the body returns its last value.
+  for item in items
+    if ast_kind(rows, item) != :VerbItem
+      continue
+    end
+    let [found_name, verb_name] = ast_attr(rows, item, :name)
+    if !found_name
+      continue
+    end
+    let [found_slot, slot] = find_function(state, verb_name)
+    if !found_slot
+      continue
+    end
+    let params = ast_children(rows, item, :param)
+    state = function_enter(state, slot)
+    state[3] = len(params)
+    state[10] = len(params)
+    let param_index = 0
+    for param in params
+      let [found_param_name, param_name] = ast_attr(rows, param, :name)
+      if found_param_name
+        state = declare_local(state, param_name, param_index)
+      end
+      param_index = param_index + 1
+    end
+    let body = ast_children(rows, item, :body)
+    let [body_reg, body_has_value, after_body] = emit_block(rows, body, state)
+    state = after_body
+    let return_reg = body_reg
+    if !body_has_value
+      let [zero_reg, after_zero] = load_constant(state, empty_relation_value())
+      state = after_zero
+      return_reg = zero_reg
+    end
+    let [_, after_return] = emit_instruction(state, :Return, 0, return_reg, 0, 0)
+    state = after_return
+    state = function_leave(state)
+  end
+
   return describe(state, last_reg)
+end
+
+// The empty-relation constant used for a valueless function result.
+verb empty_relation_value()
+  return []
+end
+
+// Reserves a function slot for a verb's parameters, returning [index, state].
+// Parameter metadata (required count, rest flag) is recorded now; the body is
+// emitted later.
+verb reserve_verb(rows, params, state)
+  let index = len(state[11])
+  let required = 0
+  let has_rest = false
+  let seen_optional = false
+  for param in params
+    let [found_mode, mode] = ast_attr(rows, param, :mode)
+    if !found_mode || mode == :req
+      if !seen_optional && !has_rest
+        required = required + 1
+      end
+    elseif mode == :rest
+      has_rest = true
+    else
+      seen_optional = true
+    end
+  end
+  let desc = {:name -> "", :code_offset -> 0, :code_len -> 0,
+              :registers -> 0, :params -> len(params), :required -> required,
+              :rest -> has_rest, :defaults -> []}
+  state[11] = [@state[11], desc]
+  return [index, state]
+end
+
+// Looks up a reserved function by name as [found, index].
+verb find_function(state, function_name)
+  let table = state[12]
+  if index_or(table, function_name, -1) >= 0
+    return [true, table[function_name]]
+  end
+  return [false, -1]
+end
+
+// Begins emitting a function: selects the slot, records its code offset, and
+// resets the register and scope bookkeeping.
+verb function_enter(state, index)
+  state[13] = index
+  let functions = state[11]
+  let desc = functions[index]
+  desc[:code_offset] = current_offset(state)
+  functions[index] = desc
+  state[11] = functions
+  state[3] = 0
+  state[10] = 0
+  state[2] = [[0, []]]
+  state[9] = 0
+  state[6] = []
+  state[7] = []
+  state[8] = []
+  return state
+end
+
+// Finishes a function: records its code length and register count.
+verb function_leave(state)
+  let functions = state[11]
+  let index = state[13]
+  let desc = functions[index]
+  desc[:code_len] = current_offset(state) - desc[:code_offset]
+  desc[:registers] = state[10]
+  functions[index] = desc
+  state[11] = functions
+  return state
 end
 
 // Builds the assemble description map from finished emitter state.
 verb describe(state, last_reg)
   let code = state[0]
   let constants = state[1]
-  let next_reg = state[10]
   let errors = state[4]
   let builtins = state[5]
-  let main_fn = {:name -> "main", :code_offset -> 0, :code_len -> len(code),
-                 :registers -> next_reg, :params -> 0, :required -> 0,
-                 :rest -> false, :defaults -> []}
   return {:entry -> 0, :code -> code, :constants -> constants,
-          :functions -> [main_fn], :patterns -> [], :shapes -> [],
+          :functions -> state[11], :patterns -> [], :shapes -> [],
           :specs -> [], :builtins -> builtins, :errors -> errors}
 end
 
@@ -316,6 +460,9 @@ verb emit_expr(rows, node, state)
   end
   if kind == :Index
     return emit_index(rows, node, state)
+  end
+  if kind == :Call
+    return emit_call(rows, node, state)
   end
   if kind == :Field
     return emit_field(rows, node, state)
@@ -991,6 +1138,90 @@ verb emit_expr_value(rows, node, state)
     return [-1, false, after_expr]
   end
   return [reg, true, after_expr]
+end
+
+// A call to a reserved verb, or to a registered builtin. Builtin names are
+// recognized by the runtime table, so anything not a known verb falls
+// through to Builtin_Call.
+verb emit_call(rows, node, state)
+  let [found_callee, callee_node] = ast_attr(rows, node, :callee)
+  if !found_callee || ast_kind(rows, callee_node) != :Name
+    return emit_error(state, "a computed callee needs a later slice")
+  end
+  let [named, callee_name] = single_name(rows, callee_node)
+  if !named
+    return emit_error(state, "a qualified callee needs a later slice")
+  end
+  let args = ast_children(rows, node, :arg)
+
+  // `len` is a compiler-recognized form rather than a runtime builtin.
+  if callee_name == "len"
+    if len(args) != 1
+      return emit_error(state, "len expects one argument")
+    end
+    let [found_expr, arg_expr] = ast_attr(rows, args[0], :expr)
+    if !found_expr
+      return emit_error(state, "a call argument is missing its expression")
+    end
+    let [operand, after_operand] = emit_expr(rows, arg_expr, state)
+    state = after_operand
+    let [dst, after_reg] = alloc_register(state)
+    state = after_reg
+    let [_, after_emit] = emit_instruction(state, :Len, 0, dst, operand, 0)
+    state = after_emit
+    return [dst, state]
+  end
+
+  let [found_function, function_index] = find_function(state, callee_name)
+  if found_function
+    let registers = []
+    for arg in args
+      let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+      if !found_expr
+        return emit_error(state, "a call argument is missing its expression")
+      end
+      let [arg_reg, after_arg] = emit_expr(rows, arg_expr, state)
+      state = after_arg
+      registers = [@registers, arg_reg]
+    end
+    let [first, after_marshal] = marshal_arguments(state, registers)
+    state = after_marshal
+    let [dst, after_reg] = alloc_register(state)
+    state = after_reg
+    let [_, after_emit] = emit_instruction(
+      state, :Call, len(registers), dst, function_index, first,
+    )
+    state = after_emit
+    return [dst, state]
+  end
+
+  return emit_builtin_call(rows, args, callee_name, state)
+end
+
+// A call to a runtime builtin: marshal the arguments and emit Builtin_Call
+// with the builtin's slot in the program's builtin table.
+verb emit_builtin_call(rows, args, callee_name, state)
+  let registers = []
+  for arg in args
+    let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+    if !found_expr
+      return emit_error(state, "a call argument is missing its expression")
+    end
+    let [arg_reg, after_arg] = emit_expr(rows, arg_expr, state)
+    state = after_arg
+    registers = [@registers, arg_reg]
+  end
+  let [first, after_marshal] = marshal_arguments(state, registers)
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, callee_name)
+  state = after_builtin
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(
+    state, :Builtin_Call, len(registers), dst, builtin, first,
+  )
+  state = after_emit
+  return [dst, state]
 end
 
 verb emit_binding(rows, node, state)

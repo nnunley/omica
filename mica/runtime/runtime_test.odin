@@ -4266,6 +4266,12 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"let n = 0\nfor v in [10, 20, 30]\n n = n + v\nend\nn",
 		"let n = 0\nfor v, i in [10, 20, 30]\n n = n + i\nend\nn",
 		"let n = 0\nfor v in [1, 2, 3, 4]\n if v == 3\n  break\n end\n n = n + v\nend\nn",
+		"verb double(x)\n x * 2\nend\ndouble(21)",
+		"verb add(a, b)\n a + b\nend\nadd(1, 2) * add(3, 4)",
+		"verb fact(n)\n if n < 2\n  1\n else\n  n * fact(n - 1)\n end\nend\nfact(5)",
+		"verb classify(n)\n if n < 0\n  \"neg\"\n elseif n == 0\n  \"zero\"\n else\n  \"pos\"\n end\nend\nclassify(-3)",
+		"len([1, 2, 3, 4])",
+		"verb size(xs)\n len(xs)\nend\nsize([7, 8])",
 	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {
