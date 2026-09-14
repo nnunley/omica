@@ -545,6 +545,9 @@ verb emit_expr(rows, node, state)
   if kind == :Spawn
     return emit_spawn(rows, node, state)
   end
+  if kind == :Try
+    return emit_try(rows, node, state)
+  end
   if kind == :Dom_Element
     return emit_dom_element(rows, node, state)
   end
@@ -1627,12 +1630,204 @@ verb emit_require(rows, node, state)
   return [dst, state]
 end
 
+// `try ... catch ... finally ... end`. A Push_Handler installs a catch
+// target; the body runs; on normal completion the handler pops and the result
+// jumps past every catch. On error the VM transfers to the innermost catch
+// whose code matches (or the first with no code), binding the error when the
+// clause names one. With no match the error re-raises. A finally body runs on
+// every exit path.
+verb emit_try(rows, node, state)
+  let [result, after_result] = alloc_register(state)
+  state = after_result
+  let [error_register, after_error] = alloc_register(state)
+  state = after_error
+  let [empty_reg, after_empty] = load_constant(state, empty_relation_value())
+  state = after_empty
+  let [_, after_init] = emit_instruction(state, :Move, 0, error_register, empty_reg, 0)
+  state = after_init
+
+  let [handler_push, after_handler_push] = emit_instruction(state, :Push_Handler, 0, 0, error_register, 0)
+  state = after_handler_push
+  let [has_finally, _] = ast_attr(rows, node, :has_finally)
+  let finally_push = -1
+  if has_finally
+    let [push, after_push] = emit_instruction(state, :Push_Finally, 0, 0, 0, 0)
+    state = after_push
+    finally_push = push
+  end
+
+  state = scope_enter(state)
+  let body = ast_children(rows, node, :body)
+  let [body_reg, body_has_value, after_body] = emit_block(rows, body, state)
+  state = after_body
+  state = scope_leave(state)
+  if body_has_value
+    let [_, after_move] = emit_instruction(state, :Move, 0, result, body_reg, 0)
+    state = after_move
+  end
+  let [_, after_pop] = emit_instruction(state, :Pop_Handler, 0, 0, 0, 0)
+  state = after_pop
+  if has_finally
+    let [_, after_finally_pop] = emit_instruction(state, :Pop_Handler, 0, 0, 0, 0)
+    state = after_finally_pop
+  end
+  let [normal_jump, after_normal_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_normal_jump
+
+  state = patch_handler_target(state, handler_push, current_offset(state))
+
+  let body_jumps = []
+  let catch_finally_pushes = []
+  let previous_false = -1
+  let catches = ast_children(rows, node, :catch_clause)
+  for clause in catches
+    if previous_false >= 0
+      state = patch_jump(state, previous_false, current_offset(state))
+      previous_false = -1
+    end
+    state = scope_enter(state)
+    let [has_code, clause_code] = ast_attr(rows, clause, :code)
+    let test = 0
+    if has_code
+      let [actual, after_actual] = emit_error_code_field(error_register, state)
+      state = after_actual
+      let [expected, after_expected] = load_constant(state, from_literal(clause_code)[:value])
+      state = after_expected
+      let [test_reg, after_test] = alloc_register(state)
+      state = after_test
+      let [_, after_eq] = emit_instruction(state, :Binary, 5, test_reg, actual, expected)
+      state = after_eq
+      test = test_reg
+    else
+      let [true_reg, after_true] = load_constant(state, true)
+      state = after_true
+      test = true_reg
+    end
+
+    let [branch, after_branch] = emit_jump(state, :Branch, 0, test)
+    state = after_branch
+    let [skip_all, after_skip_all] = emit_jump(state, :Jump, 0, 0)
+    state = after_skip_all
+    previous_false = skip_all
+    state = patch_jump(state, branch, current_offset(state))
+
+    let [has_name, clause_name] = ast_attr(rows, clause, :name)
+    if has_name
+      let [binding, after_binding] = alloc_register(state)
+      state = after_binding
+      let [_, after_move] = emit_instruction(state, :Move, 0, binding, error_register, 0)
+      state = after_move
+      state = declare_local(state, clause_name, binding)
+    end
+    if has_finally
+      let [push, after_push] = emit_instruction(state, :Push_Finally, 1, 0, 0, 0)
+      state = after_push
+      catch_finally_pushes = [@catch_finally_pushes, push]
+    end
+    let clause_body = ast_children(rows, clause, :body)
+    let [clause_reg, clause_has_value, after_clause] = emit_block(rows, clause_body, state)
+    state = after_clause
+    if has_finally
+      let [_, after_catch_pop] = emit_instruction(state, :Pop_Handler, 0, 0, 0, 0)
+      state = after_catch_pop
+    end
+    state = scope_leave(state)
+    if clause_has_value
+      let [_, after_move] = emit_instruction(state, :Move, 0, result, clause_reg, 0)
+      state = after_move
+    end
+    let [clause_jump, after_clause_jump] = emit_jump(state, :Jump, 0, 0)
+    state = after_clause_jump
+    body_jumps = [@body_jumps, clause_jump]
+  end
+
+  // No clause matched: run finally, then re-raise.
+  if previous_false >= 0
+    state = patch_jump(state, previous_false, current_offset(state))
+  end
+  if has_finally
+    let finally_body = ast_children(rows, node, :finally_body)
+    state = emit_guarded_finally(rows, finally_body, result, state)
+  end
+  let [_, after_reraise] = emit_instruction(state, :Raise, 0, error_register, -1, -1)
+  state = after_reraise
+
+  let finally_target = current_offset(state)
+  state = patch_jump(state, normal_jump, finally_target)
+  for jump in body_jumps
+    state = patch_jump(state, jump, finally_target)
+  end
+  for push in catch_finally_pushes
+    state = patch_handler_target(state, push, finally_target)
+  end
+  if has_finally
+    if finally_push >= 0
+      state = patch_handler_target(state, finally_push, finally_target)
+    end
+    let finally_body = ast_children(rows, node, :finally_body)
+    state = emit_guarded_finally(rows, finally_body, result, state)
+    let [_, after_resume] = emit_instruction(state, :Resume_Return, 0, 0, 0, 0)
+    state = after_resume
+  end
+  return [result, state]
+end
+
+// Reads `error.code` from `error_reg`, returning [register, state].
+verb emit_error_code_field(error_reg, state)
+  let [symbol_reg, after_symbol] = load_constant(state, to_symbol("code"))
+  state = after_symbol
+  let [first, after_marshal] = marshal_arguments(state, [error_reg, symbol_reg])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "__get_field")
+  state = after_builtin
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_call] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, first)
+  state = after_call
+  return [dst, state]
+end
+
+// Runs a finally body while guarding against it raising: an error from the
+// finally is caught and re-raised after the pop.
+verb emit_guarded_finally(rows, body, result, state)
+  let [guard_error, after_guard_error] = alloc_register(state)
+  state = after_guard_error
+  let [guard_push, after_guard_push] = emit_instruction(state, :Push_Handler, 0, 0, guard_error, 0)
+  state = after_guard_push
+  state = scope_enter(state)
+  let [finally_reg, finally_has_value, after_finally] = emit_block(rows, body, state)
+  state = after_finally
+  state = scope_leave(state)
+  if finally_has_value
+    let [_, after_move] = emit_instruction(state, :Move, 0, result, finally_reg, 0)
+    state = after_move
+  end
+  let [_, after_pop] = emit_instruction(state, :Pop_Handler, 0, 0, 0, 0)
+  state = after_pop
+  let [skip_jump, after_skip] = emit_jump(state, :Jump, 0, 0)
+  state = after_skip
+  state = patch_handler_target(state, guard_push, current_offset(state))
+  let [_, after_raise] = emit_instruction(state, :Raise, 0, guard_error, -1, -1)
+  state = after_raise
+  state = patch_jump(state, skip_jump, current_offset(state))
+  return state
+end
+
+// Sets the absolute catch/finally target of a Push_Handler or Push_Finally.
+verb patch_handler_target(state, at, target)
+  let code = state[0]
+  let instruction = code[at]
+  instruction[:a] = target
+  code[at] = instruction
+  state[0] = code
+  return state
+end
+
 verb emit_begin(rows, node, state)
   let body = ast_children(rows, node, :body)
   let [last_reg, _, after_body] = emit_block(rows, body, state)
   return [last_reg, after_body]
 end
-
 verb emit_break(state)
   if state[9] == 0
     return emit_error(state, "break outside a loop")
@@ -2570,23 +2765,18 @@ end
 
 // Builds a list from positional structural cells, returning [register, state].
 verb emit_frob_list_payload(rows, cells, state)
-  let registers = []
+  // Collect each cell's value node and build the list through the shared
+  // helper, so a splice cell (`#tag<[@xs, y]>`) concatenates rather than
+  // being treated as one element.
+  let values = []
   for cell in cells
     let [found_value, value_node] = ast_attr(rows, cell, :value)
     if !found_value
       return [0, emit_error(state, "a structural cell is missing its value")[1]]
     end
-    let [value_reg, after_value] = emit_expr(rows, value_node, state)
-    state = after_value
-    registers = [@registers, value_reg]
+    values = [@values, value_node]
   end
-  let [first, after_marshal] = marshal_arguments(state, registers)
-  state = after_marshal
-  let [dst, after_dst] = alloc_register(state)
-  state = after_dst
-  let [_, after_build] = emit_instruction(state, :Build_List, 0, dst, first, len(cells))
-  state = after_build
-  return [dst, state]
+  return emit_list_of_nodes(rows, values, state)
 end
 
 verb emit_mailbox_recv(rows, args, state)
