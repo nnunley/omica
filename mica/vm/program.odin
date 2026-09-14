@@ -367,6 +367,39 @@ builder_add_dispatch_spec :: proc(
 	return i32(len(builder.dispatch_specs) - 1)
 }
 
+// Adds a function with an explicit code range and signature, copying
+// defaults. Returns the function index. Used by assemble, where the code
+// layout is fixed before functions are described (unlike the streaming
+// begin/emit/end path the compiler uses).
+builder_add_function :: proc(
+	builder: ^Builder,
+	name: v.Symbol,
+	code_offset: int,
+	code_len: int,
+	register_count: int,
+	param_count: int,
+	required_count: u16,
+	has_rest: bool,
+	defaults: []i32,
+) -> int {
+	owned: []i32
+	if len(defaults) > 0 {
+		owned = make([]i32, len(defaults), builder.allocator)
+		copy(owned, defaults)
+	}
+	append(&builder.functions, Function {
+		name           = name,
+		code_offset    = code_offset,
+		code_len       = code_len,
+		register_count = register_count,
+		param_count    = param_count,
+		required_count = required_count,
+		has_rest       = has_rest,
+		defaults       = owned,
+	})
+	return len(builder.functions) - 1
+}
+
 builder_add_constant :: proc(builder: ^Builder, value: v.Value) -> int {
 	append(&builder.constants, value)
 	return len(builder.constants) - 1

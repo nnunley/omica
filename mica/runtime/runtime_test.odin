@@ -3976,6 +3976,99 @@ boot_equivalence_boot :: proc(
 }
 
 @(test)
+test_assemble_description_round_trip :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb build()
+  return assemble({:entry -> 0,
+    :code -> [{:op -> :Load_Const, :flags -> 0, :a -> 0, :b -> 0, :c -> 0},
+              {:op -> :Return, :flags -> 0, :a -> 0, :b -> 0, :c -> 0}],
+    :constants -> [41, "seven", true],
+    :functions -> [{:name -> "main", :code_offset -> 0, :code_len -> 2, :registers -> 1,
+                    :params -> 0, :required -> 0, :rest -> false, :defaults -> []}],
+    :patterns -> [{:relation -> 99, :columns -> [:x, :y],
+                   :cells -> [{:kind -> :Const, :operand -> 0}, {:kind -> :Bind, :operand -> 0},
+                              {:kind -> :Output, :operand -> 1}, {:kind -> :Wildcard, :operand -> -1}]}],
+    :shapes -> [[:a, :b]],
+    :specs -> [{:selector -> :go, :roles -> [{:role -> :x, :register -> 0}]}],
+    :builtins -> [:len]})
+end
+
+verb build_no_entry()
+  return assemble({:code -> []})
+end
+
+verb build_bad_op()
+  return assemble({:entry -> 0,
+    :code -> [{:op -> :Nope, :flags -> 0, :a -> 0, :b -> 0, :c -> 0}]})
+end
+
+verb build_bad_entry()
+  return assemble({:entry -> 5})
+end
+`
+	path, path_ok := write_temp_source(t, "mica_assemble_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	outcome := world_call(world, "build", nil)
+	testing.expectf(t, outcome.kind == .Complete, "assemble failed: %s", outcome.message)
+	if outcome.kind != .Complete {
+		return
+	}
+	artifact, artifact_ok := v.value_as_bytes(outcome.value)
+	testing.expect(t, artifact_ok)
+	if !artifact_ok {
+		return
+	}
+	program, decode_error := vm.program_from_bytes(artifact, context.temp_allocator)
+	testing.expect_value(t, decode_error, vm.Artifact_Error.None)
+	if program == nil {
+		return
+	}
+	testing.expect_value(t, vm.program_validate(program), vm.Program_Error.None)
+	testing.expect_value(t, program.entry, 0)
+	testing.expect_value(t, len(program.code), 2)
+	testing.expect_value(t, len(program.constants), 3)
+	testing.expect_value(t, len(program.functions), 1)
+	testing.expect_value(t, len(program.patterns), 1)
+	testing.expect_value(t, len(program.relation_shapes), 1)
+	testing.expect_value(t, len(program.dispatch_specs), 1)
+	testing.expect_value(t, len(program.builtins), 1)
+	testing.expect(t, program.dispatch_method_selector_relation != 0)
+	if first, ok := v.value_as_int(program.constants[0]); ok {
+		testing.expect_value(t, first, i64(41))
+	} else {
+		testing.expect(t, false, "first constant did not decode as an int")
+	}
+
+	// Malformed descriptions fail the call instead of producing bytes.
+	bad_names := []string{"build_no_entry", "build_bad_op", "build_bad_entry"}
+	for name in bad_names {
+		failed := world_call(world, name, nil)
+		testing.expectf(
+			t,
+			failed.kind != .Complete,
+			"%s unexpectedly succeeded",
+			name,
+		)
+	}
+}
+
+@(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:Kept, 1)

@@ -105,6 +105,7 @@ runtime_builtins := [?]Builtin_Spec {
 	{"tasks", 0, builtin_tasks},
 	{"log", -1, builtin_log},
 	{"__relation_literal", 2, builtin_relation_literal},
+	{"assemble", 1, builtin_assemble},
 	{"project", -1, builtin_project},
 	{"union", 2, builtin_union},
 	{"difference", 2, builtin_difference},
@@ -2660,6 +2661,555 @@ builtin_relation_literal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bo
 		return builtin_error(state, "E_INVARG", "relation literal shape is invalid")
 	}
 	return result, true
+}
+
+// Assembles a program description value into artifact bytes (#81).
+//
+// The description is a map with an `:entry` integer plus optional `:header`,
+// `:code`, `:constants`, `:functions`, `:patterns`, `:shapes`, `:specs`, and
+// `:builtins` lists; missing sections default to empty. Opcodes and pattern
+// cell kinds are symbols (`:Load_Const`, `:Const`) resolved by name, and
+// names accept strings or symbols. The header is four dispatch relation ids
+// defaulting to the running program's. The result feeds ProgramBytes rows
+// and the boot resolver directly.
+@(private)
+builtin_assemble :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	entries, is_map := v.value_as_map(args[0])
+	if !is_map {
+		return builtin_error(state, "E_TYPE", "assemble expects a description map")
+	}
+	builder: vm.Builder
+	vm.builder_init(&builder, context.temp_allocator)
+	defer vm.builder_destroy(&builder)
+
+	entry_value, has_entry := assemble_map_get(entries, "entry")
+	entry, entry_ok := assemble_int(entry_value)
+	if !has_entry || !entry_ok {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			"assemble description needs an :entry integer",
+		)
+	}
+	builder.entry = entry
+
+	if header_value, has_header := assemble_map_get(entries, "header"); has_header {
+		header_values, header_is_list := v.value_as_list(header_value)
+		if !header_is_list || len(header_values) != 4 {
+			return builtin_error(
+				state,
+				"E_INVARG",
+				"assemble :header must be four relation ids",
+			)
+		}
+		header: [4]u32
+		for value, index in header_values {
+			id, id_ok := assemble_int(value)
+			if !id_ok || i64(id) > i64(max(u32)) {
+				return builtin_error(
+					state,
+					"E_INVARG",
+					"assemble :header ids must fit u32",
+				)
+			}
+			header[index] = u32(id)
+		}
+		builder.dispatch_method_selector_relation = header[0]
+		builder.dispatch_param_relation = header[1]
+		builder.dispatch_delegates_relation = header[2]
+		builder.dispatch_method_program_relation = header[3]
+	} else if state.program != nil {
+		builder.dispatch_method_selector_relation =
+			state.program.dispatch_method_selector_relation
+		builder.dispatch_param_relation = state.program.dispatch_param_relation
+		builder.dispatch_delegates_relation = state.program.dispatch_delegates_relation
+		builder.dispatch_method_program_relation =
+			state.program.dispatch_method_program_relation
+	}
+
+	if code_value, has_code := assemble_map_get(entries, "code"); has_code {
+		code_values, code_is_list := v.value_as_list(code_value)
+		if !code_is_list {
+			return builtin_error(state, "E_TYPE", "assemble :code must be a list")
+		}
+		for item in code_values {
+			if !assemble_instruction(&builder, item) {
+				return builtin_error(
+					state,
+					"E_INVARG",
+					"assemble :code entries need :op, :flags, :a, :b, :c",
+				)
+			}
+		}
+	}
+
+	if constant_value, has_constants := assemble_map_get(entries, "constants"); has_constants {
+		constant_values, constants_is_list := v.value_as_list(constant_value)
+		if !constants_is_list {
+			return builtin_error(state, "E_TYPE", "assemble :constants must be a list")
+		}
+		for constant in constant_values {
+			vm.builder_add_constant(&builder, constant)
+		}
+	}
+
+	if function_value, has_functions := assemble_map_get(entries, "functions"); has_functions {
+		function_values, functions_is_list := v.value_as_list(function_value)
+		if !functions_is_list {
+			return builtin_error(state, "E_TYPE", "assemble :functions must be a list")
+		}
+		for item in function_values {
+			if !assemble_function(&builder, item) {
+				return builtin_error(
+					state,
+					"E_INVARG",
+					"assemble :functions need :name, :code_offset, :code_len, :registers, :params",
+				)
+			}
+		}
+	}
+
+	if pattern_value, has_patterns := assemble_map_get(entries, "patterns"); has_patterns {
+		pattern_values, patterns_is_list := v.value_as_list(pattern_value)
+		if !patterns_is_list {
+			return builtin_error(state, "E_TYPE", "assemble :patterns must be a list")
+		}
+		for item in pattern_values {
+			if !assemble_pattern(&builder, item) {
+				return builtin_error(
+					state,
+					"E_INVARG",
+					"assemble :patterns need :relation, :columns, :cells",
+				)
+			}
+		}
+	}
+
+	if shape_value, has_shapes := assemble_map_get(entries, "shapes"); has_shapes {
+		shape_values, shapes_is_list := v.value_as_list(shape_value)
+		if !shapes_is_list {
+			return builtin_error(state, "E_TYPE", "assemble :shapes must be a list")
+		}
+		for item in shape_values {
+			columns, columns_ok := v.value_as_list(item)
+			if !columns_ok {
+				return builtin_error(
+					state,
+					"E_TYPE",
+					"assemble :shapes entries must be symbol lists",
+				)
+			}
+			heading := make([]v.Symbol, len(columns), context.temp_allocator)
+			for column, index in columns {
+				symbol, symbol_ok := assemble_name(column)
+				if !symbol_ok {
+					return builtin_error(
+						state,
+						"E_TYPE",
+						"assemble :shapes entries must be symbol lists",
+					)
+				}
+				heading[index] = v.symbol_intern(symbol)
+			}
+			vm.builder_add_relation_shape(&builder, heading)
+		}
+	}
+
+	if spec_value, has_specs := assemble_map_get(entries, "specs"); has_specs {
+		spec_values, specs_is_list := v.value_as_list(spec_value)
+		if !specs_is_list {
+			return builtin_error(state, "E_TYPE", "assemble :specs must be a list")
+		}
+		for item in spec_values {
+			if !assemble_spec(&builder, item) {
+				return builtin_error(
+					state,
+					"E_INVARG",
+					"assemble :specs need :selector and :roles",
+				)
+			}
+		}
+	}
+
+	if builtin_value, has_builtins := assemble_map_get(entries, "builtins"); has_builtins {
+		builtin_values, builtins_is_list := v.value_as_list(builtin_value)
+		if !builtins_is_list {
+			return builtin_error(state, "E_TYPE", "assemble :builtins must be a list")
+		}
+		for item in builtin_values {
+			name, name_ok := assemble_name(item)
+			if !name_ok {
+				return builtin_error(
+					state,
+					"E_TYPE",
+					"assemble :builtins must be names",
+				)
+			}
+			vm.builder_add_builtin(&builder, v.symbol_intern(name))
+		}
+	}
+
+	program := vm.builder_build(&builder, context.temp_allocator)
+	defer vm.program_destroy(program, context.temp_allocator)
+	if validation := vm.program_validate(program); validation != .None {
+		return builtin_error(state, "E_INVARG", fmt.aprintf(
+			"assembled program failed validation: %v",
+			validation,
+			allocator = context.temp_allocator,
+		))
+	}
+	bytes: [dynamic]u8
+	defer delete(bytes)
+	if artifact_error := vm.program_to_bytes(program, &bytes); artifact_error != .None {
+		return builtin_error(state, "E_INVARG", fmt.aprintf(
+			"assembled program does not encode: %v",
+			artifact_error,
+			allocator = context.temp_allocator,
+		))
+	}
+	return v.value_bytes(state.allocator, bytes[:]), true
+}
+
+// Looks up a description map entry by field name.
+@(private)
+assemble_map_get :: proc(entries: []v.Map_Entry, name: string) -> (v.Value, bool) {
+	key := v.value_symbol(v.symbol_intern(name))
+	for entry in entries {
+		if v.value_eq(entry.key, key) {
+			return entry.value, true
+		}
+	}
+	return v.Value(0), false
+}
+
+// Reads a non-negative integer field.
+@(private)
+assemble_int :: proc(value: v.Value) -> (int, bool) {
+	number, is_int := v.value_as_int(value)
+	if !is_int || number < 0 {
+		return 0, false
+	}
+	return int(number), true
+}
+
+// Reads a name field spelled as a string or a symbol.
+@(private)
+assemble_name :: proc(value: v.Value) -> (string, bool) {
+	if text, is_string := v.value_as_string(value); is_string {
+		return text, true
+	}
+	if symbol, is_symbol := v.value_as_symbol(value); is_symbol {
+		return v.symbol_name(symbol)
+	}
+	return "", false
+}
+
+// Resolves an opcode symbol to its Op by spelling.
+@(private)
+assemble_op :: proc(value: v.Value) -> (vm.Op, bool) {
+	name, name_ok := assemble_name(value)
+	if !name_ok {
+		return vm.Op.Load_Const, false
+	}
+	switch name {
+	case "Load_Const":
+		return vm.Op.Load_Const, true
+	case "Move":
+		return vm.Op.Move, true
+	case "Binary":
+		return vm.Op.Binary, true
+	case "Unary":
+		return vm.Op.Unary, true
+	case "Branch":
+		return vm.Op.Branch, true
+	case "Jump":
+		return vm.Op.Jump, true
+	case "Call":
+		return vm.Op.Call, true
+	case "Return":
+		return vm.Op.Return, true
+	case "Build_List":
+		return vm.Op.Build_List, true
+	case "Build_Map":
+		return vm.Op.Build_Map, true
+	case "Build_Range":
+		return vm.Op.Build_Range, true
+	case "Len":
+		return vm.Op.Len, true
+	case "Scan_Collect":
+		return vm.Op.Scan_Collect, true
+	case "Scan_Exists":
+		return vm.Op.Scan_Exists, true
+	case "Scan_First":
+		return vm.Op.Scan_First, true
+	case "Assert":
+		return vm.Op.Assert, true
+	case "Retract":
+		return vm.Op.Retract, true
+	case "Retract_Where":
+		return vm.Op.Retract_Where, true
+	case "Build_Relation":
+		return vm.Op.Build_Relation, true
+	case "Index":
+		return vm.Op.Index, true
+	case "Collection_Key_At":
+		return vm.Op.Collection_Key_At, true
+	case "Collection_Value_At":
+		return vm.Op.Collection_Value_At, true
+	case "Builtin_Call":
+		return vm.Op.Builtin_Call, true
+	case "Commit":
+		return vm.Op.Commit, true
+	case "Is_Truthy":
+		return vm.Op.Is_Truthy, true
+	case "Scan_One":
+		return vm.Op.Scan_One, true
+	case "Dispatch":
+		return vm.Op.Dispatch, true
+	case "Yield":
+		return vm.Op.Yield, true
+	case "Sleep":
+		return vm.Op.Sleep, true
+	case "Spawn":
+		return vm.Op.Spawn, true
+	case "Raise":
+		return vm.Op.Raise, true
+	case "Dynamic_Dispatch":
+		return vm.Op.Dynamic_Dispatch, true
+	case "Positional_Dispatch":
+		return vm.Op.Positional_Dispatch, true
+	case "Mailbox_Recv":
+		return vm.Op.Mailbox_Recv, true
+	case "External_Request":
+		return vm.Op.External_Request, true
+	case "Read":
+		return vm.Op.Read, true
+	case "Push_Handler":
+		return vm.Op.Push_Handler, true
+	case "Push_Finally":
+		return vm.Op.Push_Finally, true
+	case "Pop_Handler":
+		return vm.Op.Pop_Handler, true
+	case "Resume_Return":
+		return vm.Op.Resume_Return, true
+	case "Make_Function":
+		return vm.Op.Make_Function, true
+	case "Make_Self_Function":
+		return vm.Op.Make_Self_Function, true
+	case "Call_Value":
+		return vm.Op.Call_Value, true
+	case "Call_Splice":
+		return vm.Op.Call_Splice, true
+	case "Builtin_Call_Splice":
+		return vm.Op.Builtin_Call_Splice, true
+	case "Call_Value_Splice":
+		return vm.Op.Call_Value_Splice, true
+	}
+	return vm.Op.Load_Const, false
+}
+
+// Emits one description-map instruction into the builder.
+@(private)
+assemble_instruction :: proc(builder: ^vm.Builder, item: v.Value) -> bool {
+	fields, is_map := v.value_as_map(item)
+	if !is_map {
+		return false
+	}
+	op_value, has_op := assemble_map_get(fields, "op")
+	op, op_ok := assemble_op(op_value)
+	flags_value, has_flags := assemble_map_get(fields, "flags")
+	a_value, has_a := assemble_map_get(fields, "a")
+	b_value, has_b := assemble_map_get(fields, "b")
+	c_value, has_c := assemble_map_get(fields, "c")
+	flags, flags_ok := assemble_int(flags_value)
+	a, a_ok := assemble_i32(a_value)
+	b, b_ok := assemble_i32(b_value)
+	c, c_ok := assemble_i32(c_value)
+	if !has_op || !op_ok || !has_flags || !flags_ok || flags > int(max(u8)) {
+		return false
+	}
+	if !has_a || !a_ok || !has_b || !b_ok || !has_c || !c_ok {
+		return false
+	}
+	vm.builder_emit(builder, op, u8(flags), a, b, c)
+	return true
+}
+
+// Reads a signed 32-bit operand, covering sentinel values like -1.
+@(private)
+assemble_i32 :: proc(value: v.Value) -> (i32, bool) {
+	number, is_int := v.value_as_int(value)
+	if !is_int || number < i64(min(i32)) || number > i64(max(i32)) {
+		return 0, false
+	}
+	return i32(number), true
+}
+
+// Adds one function description to the builder.
+@(private)
+assemble_function :: proc(builder: ^vm.Builder, item: v.Value) -> bool {
+	fields, is_map := v.value_as_map(item)
+	if !is_map {
+		return false
+	}
+	name_value, has_name := assemble_map_get(fields, "name")
+	name, name_ok := assemble_name(name_value)
+	offset_value, has_offset := assemble_map_get(fields, "code_offset")
+	code_offset, offset_ok := assemble_int(offset_value)
+	length_value, has_length := assemble_map_get(fields, "code_len")
+	code_len, length_ok := assemble_int(length_value)
+	registers_value, has_registers := assemble_map_get(fields, "registers")
+	registers, registers_ok := assemble_int(registers_value)
+	params_value, has_params := assemble_map_get(fields, "params")
+	params, params_ok := assemble_int(params_value)
+	if !has_name || !name_ok || !has_offset || !offset_ok || !has_length || !length_ok {
+		return false
+	}
+	if !has_registers || !registers_ok || !has_params || !params_ok {
+		return false
+	}
+	required := 0
+	if required_value, has_required := assemble_map_get(fields, "required"); has_required {
+		required_value, required_ok := assemble_int(required_value)
+		if !required_ok || required_value > int(max(u16)) {
+			return false
+		}
+		required = required_value
+	}
+	rest := false
+	if rest_value, has_rest := assemble_map_get(fields, "rest"); has_rest {
+		rest_flag, rest_ok := v.value_as_bool(rest_value)
+		if !rest_ok {
+			return false
+		}
+		rest = rest_flag
+	}
+	defaults: []i32
+	if defaults_value, has_defaults := assemble_map_get(fields, "defaults"); has_defaults {
+		default_values, defaults_is_list := v.value_as_list(defaults_value)
+		if !defaults_is_list {
+			return false
+		}
+		owned := make([]i32, len(default_values), context.temp_allocator)
+		for default, index in default_values {
+			operand, operand_ok := assemble_i32(default)
+			if !operand_ok {
+				return false
+			}
+			owned[index] = operand
+		}
+		defaults = owned
+	}
+	vm.builder_add_function(
+		builder,
+		v.symbol_intern(name),
+		code_offset,
+		code_len,
+		registers,
+		params,
+		u16(required),
+		rest,
+		defaults,
+	)
+	return true
+}
+
+// Adds one scan pattern description to the builder.
+@(private)
+assemble_pattern :: proc(builder: ^vm.Builder, item: v.Value) -> bool {
+	fields, is_map := v.value_as_map(item)
+	if !is_map {
+		return false
+	}
+	relation_value, has_relation := assemble_map_get(fields, "relation")
+	relation, relation_ok := assemble_int(relation_value)
+	columns_value, has_columns := assemble_map_get(fields, "columns")
+	columns, columns_ok := v.value_as_list(columns_value)
+	cells_value, has_cells := assemble_map_get(fields, "cells")
+	cells, cells_ok := v.value_as_list(cells_value)
+	if !has_relation || !relation_ok || i64(relation) > i64(max(u32)) {
+		return false
+	}
+	if !has_columns || !columns_ok || !has_cells || !cells_ok {
+		return false
+	}
+	names := make([]v.Symbol, len(columns), context.temp_allocator)
+	for column, index in columns {
+		name, name_ok := assemble_name(column)
+		if !name_ok {
+			return false
+		}
+		names[index] = v.symbol_intern(name)
+	}
+	pattern_cells := make([]vm.Pattern_Cell, len(cells), context.temp_allocator)
+	for cell, index in cells {
+		cell_fields, cell_is_map := v.value_as_map(cell)
+		if !cell_is_map {
+			return false
+		}
+		kind_value, has_kind := assemble_map_get(cell_fields, "kind")
+		kind_name, kind_name_ok := assemble_name(kind_value)
+		kind := vm.Pattern_Cell_Kind.Wildcard
+		if !has_kind || !kind_name_ok {
+			return false
+		}
+		switch kind_name {
+		case "Const":
+			kind = vm.Pattern_Cell_Kind.Const
+		case "Bind":
+			kind = vm.Pattern_Cell_Kind.Bind
+		case "Output":
+			kind = vm.Pattern_Cell_Kind.Output
+		case "Wildcard":
+			kind = vm.Pattern_Cell_Kind.Wildcard
+		case:
+			return false
+		}
+		operand_value, has_operand := assemble_map_get(cell_fields, "operand")
+		operand, operand_ok := assemble_i32(operand_value)
+		if !has_operand || !operand_ok {
+			return false
+		}
+		pattern_cells[index] = vm.Pattern_Cell{kind = kind, operand = operand}
+	}
+	vm.builder_add_pattern(builder, u32(relation), names, pattern_cells)
+	return true
+}
+
+// Adds one dispatch spec description to the builder.
+@(private)
+assemble_spec :: proc(builder: ^vm.Builder, item: v.Value) -> bool {
+	fields, is_map := v.value_as_map(item)
+	if !is_map {
+		return false
+	}
+	selector_value, has_selector := assemble_map_get(fields, "selector")
+	selector, selector_ok := assemble_name(selector_value)
+	roles_value, has_roles := assemble_map_get(fields, "roles")
+	roles, roles_ok := v.value_as_list(roles_value)
+	if !has_selector || !selector_ok || !has_roles || !roles_ok {
+		return false
+	}
+	assembled := make([]vm.Dispatch_Role, len(roles), context.temp_allocator)
+	for role, index in roles {
+		role_fields, role_is_map := v.value_as_map(role)
+		if !role_is_map {
+			return false
+		}
+		name_value, has_name := assemble_map_get(role_fields, "role")
+		name, name_ok := assemble_name(name_value)
+		register_value, has_register := assemble_map_get(role_fields, "register")
+		register, register_ok := assemble_i32(register_value)
+		if !has_name || !name_ok || !has_register || !register_ok {
+			return false
+		}
+		assembled[index] = vm.Dispatch_Role {
+			role     = v.symbol_intern(name),
+			register = register,
+		}
+	}
+	vm.builder_add_dispatch_spec(builder, v.symbol_intern(selector), assembled)
+	return true
 }
 
 @(private)
