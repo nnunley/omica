@@ -4790,6 +4790,201 @@ conformance_run :: proc(
 	return bench.value, true
 }
 
+// The bootstrap: the Mica-emitted compiler must compile a target whose
+// program behaves like the Odin-compiled compiler's program. This is compile
+// plus execute, not just decode: the emitted compiler is installed as the
+// world's program and used to emit a second program, which then runs.
+@(test)
+test_mica_emitted_compiler_bootstraps :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	target := `make_relation(:Point, 1)
+verb bench()
+  assert Point(3)
+  assert Point(7)
+  let total = 0
+  for row in Point(?x)
+    total = total + row[:x]
+  end
+  let doubled = [n * 2 for n in [1, 2, 3] if n != 2]
+  total + len(doubled)
+end
+`
+	// Stage 1: the Odin-compiled compiler emits the target.
+	odin_artifact, odin_ok := compiler_emit(t, target, nil, alloc)
+	testing.expectf(t, odin_ok, "odin-compiled compiler could not emit the target")
+	if !odin_ok {
+		return
+	}
+	// Emit the compiler itself with the Mica emitter.
+	compiler_source, read_ok := read_compiler_sources(
+		t,
+		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
+		alloc,
+	)
+	if !read_ok {
+		return
+	}
+	compiler_artifact, compiler_ok := compiler_emit(t, compiler_source, nil, alloc)
+	testing.expectf(t, compiler_ok, "Mica emitter could not emit the compiler")
+	if !compiler_ok {
+		return
+	}
+	// Stage 2: the Mica-emitted compiler emits the same target.
+	self_artifact, self_ok := compiler_emit(t, target, compiler_artifact, alloc)
+	testing.expectf(t, self_ok, "Mica-emitted compiler could not emit the target")
+	if !self_ok {
+		return
+	}
+	// Both artifacts must run to the same result.
+	odin_result, odin_ran := run_target(t, target, odin_artifact, alloc)
+	self_result, self_ran := run_target(t, target, self_artifact, alloc)
+	testing.expect(t, odin_ran && self_ran, "a bootstrap artifact did not run")
+	if !odin_ran || !self_ran {
+		return
+	}
+	testing.expectf(
+		t,
+		v.value_eq(odin_result, self_result),
+		"bootstrap results differ (odin %s, mica %s)",
+		v.value_to_string(odin_result, context.temp_allocator),
+		v.value_to_string(self_result, context.temp_allocator),
+	)
+}
+
+@(private)
+read_compiler_sources :: proc(
+	t: ^testing.T,
+	paths: []string,
+	alloc: mem.Allocator,
+) -> (string, bool) {
+	builder: strings.Builder
+	strings.builder_init(&builder, alloc)
+	defer strings.builder_destroy(&builder)
+	for path in paths {
+		data, read_err := os.read_entire_file_from_path(path, alloc)
+		if read_err != nil {
+			testing.expectf(t, false, "cannot read %s", path)
+			return "", false
+		}
+		strings.write_string(&builder, "\n")
+		strings.write_string(&builder, string(data))
+	}
+	return strings.to_string(builder), true
+}
+
+// Loads the compiler into a world and emits `source`. A non-nil `replace`
+// swaps the world's program first, so the call runs the Mica-emitted compiler.
+@(private)
+compiler_emit :: proc(
+	t: ^testing.T,
+	source: string,
+	replace: []u8,
+	alloc: mem.Allocator,
+) -> ([]u8, bool) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
+		context.temp_allocator,
+	)
+	if !start.ok {
+		testing.expectf(t, false, "compiler load failed: %s", start.message)
+		return nil, false
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	if entry.kind != .Complete {
+		return nil, false
+	}
+	if replace != nil {
+		program, decode_error := vm.program_from_bytes(replace, alloc)
+		if decode_error != .None {
+			return nil, false
+		}
+		if vm.program_validate(program) != .None {
+			return nil, false
+		}
+		vm.program_destroy(world.program, world.allocator)
+		world.program = program
+	}
+	outcome := world_call(world, "emit_source", []k.Role_Pair{{
+		role  = v.value_symbol(v.symbol_intern("source")),
+		value = v.value_string(context.temp_allocator, source),
+	}})
+	if outcome.kind != .Complete {
+		return nil, false
+	}
+	fields, fields_ok := v.value_as_map(outcome.value)
+	if !fields_ok {
+		return nil, false
+	}
+	ok, _ := v.value_as_bool(map_get(fields, "ok"))
+	if !ok {
+		return nil, false
+	}
+	artifact, artifact_ok := v.value_as_bytes(map_get(fields, "bytes"))
+	if !artifact_ok {
+		return nil, false
+	}
+	owned := make([]u8, len(artifact), alloc)
+	copy(owned, artifact)
+	return owned, true
+}
+
+// Loads `target` (for its relations and methods), swaps in `artifact`, and
+// runs bench.
+@(private)
+run_target :: proc(
+	t: ^testing.T,
+	target: string,
+	artifact: []u8,
+	alloc: mem.Allocator,
+) -> (v.Value, bool) {
+	path, path_ok := write_temp_source(t, "mica_bootstrap_target.mica", target)
+	if !path_ok {
+		return v.Value(0), false
+	}
+	defer os.remove(path)
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	if !start.ok {
+		testing.expectf(t, false, "target load failed: %s", start.message)
+		return v.Value(0), false
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	if entry.kind != .Complete {
+		return v.Value(0), false
+	}
+	program, decode_error := vm.program_from_bytes(artifact, alloc)
+	if decode_error != .None {
+		return v.Value(0), false
+	}
+	if vm.program_validate(program) != .None {
+		return v.Value(0), false
+	}
+	vm.program_destroy(world.program, world.allocator)
+	world.program = program
+	bench := world_call(world, "bench", nil)
+	if bench.kind != .Complete {
+		testing.expectf(t, false, "target bench: %s", bench.message)
+		return v.Value(0), false
+	}
+	return bench.value, true
+}
+
 @(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
