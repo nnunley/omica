@@ -7,6 +7,7 @@ package web
 
 import "base:runtime"
 import "core:mem"
+import "core:mem/virtual"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -71,8 +72,11 @@ web_server_init :: proc(
 	if listen_err != nil {
 		return false, "cannot listen on the bind address"
 	}
-	// Non-blocking accept lets `web_server_stop` wake the acceptor by closing
-	// the listener.
+	// Non-blocking accept lets `web_server_stop` wake the acceptor by
+	// shutting the listener down. The listener is closed by
+	// `web_server_destroy`, after the acceptor has been joined: closing it
+	// in `web_server_stop` would free the fd while the acceptor may still
+	// call accept, and a reused fd could steal another server's client.
 	_ = net.set_blocking(listener, false)
 	server.listener = listener
 	return true, ""
@@ -120,7 +124,7 @@ web_server_reap_connections :: proc(server: ^Web_Server) {
 	delete(done)
 }
 
-// Accepts connections until `web_server_stop` closes the listener. Each
+// Accepts connections until `web_server_stop` shuts the listener down. Each
 // connection runs on its own thread.
 web_server_run :: proc(server: ^Web_Server) {
 	for {
@@ -174,11 +178,17 @@ web_server_run :: proc(server: ^Web_Server) {
 
 // Stops the acceptor, unblocks active connections, and joins every connection
 // thread. Must be called once after `web_server_run` is running or has failed.
+//
+// The listener is shut down, not closed: the acceptor may still be inside
+// `accept_tcp`, and closing the fd would let an unrelated socket reuse the
+// number, so the acceptor could steal another server's client and shut it
+// down. Call `web_server_destroy` after the acceptor has been joined to
+// release the listener.
 web_server_stop :: proc(server: ^Web_Server) {
 	sync.mutex_lock(&server.lock)
 	server.stopping = true
 	sync.mutex_unlock(&server.lock)
-	net.close(server.listener)
+	net.shutdown(server.listener, .Both)
 
 	// Take ownership of the connection set under the lock, then unblock and
 	// join outside it. This prevents concurrent traversal/mutation.
@@ -202,9 +212,27 @@ web_server_stop :: proc(server: ^Web_Server) {
 	delete(drained)
 }
 
+// Releases the listener. Call once, after `web_server_stop` and after the
+// thread running `web_server_run` has been joined, so no accept can be
+// in flight when the fd is closed and reused.
+web_server_destroy :: proc(server: ^Web_Server) {
+	net.close(server.listener)
+	delete(server.connections)
+}
+
 @(private)
 web_connection_worker :: proc(data: rawptr) {
 	context = runtime.default_context()
+	// Give this connection its own temporary scratch arena. Request parsing,
+	// response building, and SSE framing allocate heavily from
+	// `context.temp_allocator`; a private arena keeps each connection's
+	// scratch independent of every other thread and releases it when the
+	// connection ends.
+	temp_arena: virtual.Arena
+	if err := virtual.arena_init_growing(&temp_arena); err == nil {
+		context.temp_allocator = virtual.arena_allocator(&temp_arena)
+		defer virtual.arena_destroy(&temp_arena)
+	}
 	connection := (^Web_Connection)(data)
 	web_connection_serve(connection)
 	sync.mutex_lock(&connection.server.lock)

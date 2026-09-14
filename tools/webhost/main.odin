@@ -165,6 +165,9 @@ main :: proc() {
 		thread.join(watcher)
 		thread.destroy(watcher)
 	}
+	// The run loop has returned, so no accept is in flight and the listener
+	// fd can be closed without risking reuse by another socket.
+	web.web_server_destroy(&server)
 	// The acceptor and every connection thread are stopped. Retire the sync
 	// pump before the deferred world_destroy tears down the runtime it reads.
 	if world != nil {

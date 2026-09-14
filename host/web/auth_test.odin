@@ -1,5 +1,6 @@
 package web
 
+import "base:runtime"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -219,7 +220,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := r.world_start(&kernel, []string{path}, runtime.default_allocator(), r.World_Config{workers = 1})
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -229,7 +230,7 @@ end
 	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
 
 	host: Sync_Host
-	sync_host_init(&host, world)
+	sync_host_init(&host, world, runtime.default_allocator())
 	defer sync_host_destroy(&host)
 
 	alice, found := world.ctx.identities["alice"]

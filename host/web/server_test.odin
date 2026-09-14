@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:strings"
+import "core:strconv"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -18,7 +19,16 @@ server_run_worker :: proc(data: rawptr) {
 
 @(private)
 start_server :: proc(t: ^testing.T, server: ^Web_Server, routes: ^Routes) -> ^thread.Thread {
-	ok, message := web_server_init(server, "127.0.0.1:0", routes_handle, routes)
+	// Cross-thread state: the acceptor appends to `server.connections` while
+	// connection threads grow response builders from `server.allocator`, so
+	// it must be the thread-safe heap, not the test's rollback allocator.
+	ok, message := web_server_init(
+		server,
+		"127.0.0.1:0",
+		routes_handle,
+		routes,
+		allocator = runtime.default_allocator(),
+	)
 	if !ok {
 		testing.expectf(t, false, "server init failed: %s", message)
 		return nil
@@ -38,25 +48,82 @@ dial_server :: proc(t: ^testing.T, server: ^Web_Server) -> net.TCP_Socket {
 
 @(private)
 send_text :: proc(socket: net.TCP_Socket, text: string) {
-	_, _ = net.send_tcp(socket, transmute([]byte)text)
+	send_all(socket, transmute([]byte)text)
 }
 
-// Reads until the peer closes or the receive timeout fires.
+// Writes every byte; a single `send_tcp` may send only part of the buffer,
+// which would leave the server waiting for the rest while the test waits for
+// a response.
 @(private)
-read_response :: proc(socket: net.TCP_Socket) -> []u8 {
+send_all :: proc(socket: net.TCP_Socket, bytes: []byte) {
+	sent := 0
+	for sent < len(bytes) {
+		count, send_err := net.send_tcp(socket, bytes[sent:])
+		if send_err != .None || count <= 0 {
+			return
+		}
+		sent += count
+	}
+}
+
+// Reads exactly one HTTP response. Every response the server writes carries a
+// `Content-Length`, so the read ends when the header block and the declared
+// body have both arrived, regardless of how the bytes are chunked over the
+// socket or how slowly the server thread is scheduled.
+//
+// The connection is keep-alive, so the peer does not close after the response
+// and a receive timeout cannot mark the end. Waiting on Content-Length rather
+// than on a timeout is what makes this deterministic: a receive timeout before
+// any bytes (or before the body completes) just continues until the outer
+// deadline, instead of returning a short or empty response.
+@(private)
+	read_response :: proc(socket: net.TCP_Socket) -> []u8 {
 	bytes: [dynamic]u8
 	chunk: [4096]u8
 	start := time.tick_now()
+	header_end := -1
+	expected := -1
 	for time.tick_since(start) < 2 * time.Second {
 		read, recv_err := net.recv_tcp(socket, chunk[:])
 		if read > 0 {
 			append(&bytes, ..chunk[:read])
+			if header_end < 0 {
+				if index := strings.index(string(bytes[:]), "\r\n\r\n"); index >= 0 {
+					header_end = index + 4
+					expected = content_length_of(string(bytes[:header_end])) + header_end
+				}
+			}
+			if header_end >= 0 && expected >= 0 && len(bytes) >= expected {
+				break
+			}
+			continue
 		}
-		if read == 0 || recv_err != .None {
+		if recv_err == .None && read == 0 {
 			break
 		}
+		if recv_err == .Would_Block || recv_err == .Timeout || recv_err == .Interrupted {
+			continue
+		}
+		break
 	}
 	return bytes[:]
+}
+
+// Parses the Content-Length from a header block, or -1 when absent.
+@(private)
+content_length_of :: proc(headers: string) -> int {
+	lower := strings.to_lower(headers, context.temp_allocator)
+	for line in strings.split_lines_iterator(&lower) {
+		trimmed := strings.trim_space(line)
+		if !strings.has_prefix(trimmed, "content-length:") {
+			continue
+		}
+		value := strings.trim_space(trimmed[len("content-length:"):])
+		if parsed, ok := strconv.parse_int(value); ok {
+			return parsed
+		}
+	}
+	return -1
 }
 
 @(test)
@@ -82,6 +149,7 @@ test_server_healthz :: proc(t: ^testing.T) {
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }
 
 @(test)
@@ -111,6 +179,7 @@ test_server_keep_alive :: proc(t: ^testing.T) {
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }
 
 @(test)
@@ -158,6 +227,7 @@ test_server_static_sync_client :: proc(t: ^testing.T) {
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }
 
 @(test)
@@ -188,6 +258,7 @@ test_server_rejects_chunked :: proc(t: ^testing.T) {
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }
 
 @(test)
@@ -215,6 +286,7 @@ test_server_method_not_allowed :: proc(t: ^testing.T) {
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }
 
 // Completed connections must be reclaimed during operation, not only at
@@ -252,4 +324,5 @@ test_server_reaps_completed_connections :: proc(t: ^testing.T) {
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }

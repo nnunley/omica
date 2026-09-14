@@ -724,6 +724,13 @@ store_durable_version_hook :: proc(user: rawptr) -> u64 {
 
 @(private)
 store_writer_proc :: proc(data: rawptr) {
+	// Private temporary scratch arena; keeps the writer's temporaries off
+	// every other thread's temporary state.
+	temp_arena: virtual.Arena
+	if err := virtual.arena_init_growing(&temp_arena); err == nil {
+		context.temp_allocator = virtual.arena_allocator(&temp_arena)
+		defer virtual.arena_destroy(&temp_arena)
+	}
 	store := (^Store)(data)
 	batch: [dynamic]Queue_Entry
 	batch = make([dynamic]Queue_Entry, store.allocator)

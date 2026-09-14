@@ -11,6 +11,7 @@ package mica_runtime
 
 import "core:fmt"
 import "core:mem"
+import "core:mem/virtual"
 import "core:slice"
 import "core:sync"
 import "core:thread"
@@ -116,6 +117,9 @@ scheduler_init :: proc(
 	worker_count := max(config.workers, 1)
 	for _ in 0 ..< worker_count {
 		worker := thread.create_and_start_with_data(scheduler, scheduler_worker_proc)
+		if worker == nil {
+			fmt.eprintf("SCHED worker thread create failed\n")
+		}
 		append(&scheduler.threads, worker)
 	}
 	scheduler.timer = thread.create_and_start_with_data(scheduler, scheduler_timer_proc)
@@ -1053,6 +1057,15 @@ scheduler_spawn_child :: proc(scheduler: ^Scheduler, parent: ^Task) -> Task_ID {
 
 @(private)
 scheduler_worker_proc :: proc(data: rawptr) {
+	// A private temporary scratch arena for this worker. Task execution
+	// allocates temporaries through `context.temp_allocator`; a dedicated
+	// arena keeps each worker's scratch independent and releases it when the
+	// worker stops.
+	temp_arena: virtual.Arena
+	if err := virtual.arena_init_growing(&temp_arena); err == nil {
+		context.temp_allocator = virtual.arena_allocator(&temp_arena)
+		defer virtual.arena_destroy(&temp_arena)
+	}
 	scheduler := (^Scheduler)(data)
 	for {
 		sync.mutex_lock(&scheduler.lock)
@@ -1137,6 +1150,12 @@ scheduler_worker_proc :: proc(data: rawptr) {
 
 @(private)
 scheduler_timer_proc :: proc(data: rawptr) {
+	// Private temporary scratch arena; see `scheduler_worker_proc`.
+	temp_arena: virtual.Arena
+	if err := virtual.arena_init_growing(&temp_arena); err == nil {
+		context.temp_allocator = virtual.arena_allocator(&temp_arena)
+		defer virtual.arena_destroy(&temp_arena)
+	}
 	scheduler := (^Scheduler)(data)
 	for {
 		sync.mutex_lock(&scheduler.lock)

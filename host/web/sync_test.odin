@@ -1,5 +1,6 @@
 package web
 
+import "base:runtime"
 import "core:fmt"
 import "core:net"
 import "core:os"
@@ -111,7 +112,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := r.world_start(&kernel, []string{path}, runtime.default_allocator(), r.World_Config{workers = 1})
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -121,11 +122,17 @@ end
 	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
 
 	host: Sync_Fixture_Host
-	sync_host_init(&host.sync, world)
+	sync_host_init(&host.sync, world, runtime.default_allocator())
 	defer sync_host_destroy(&host.sync)
 
 	server: Web_Server
-	ok, message := web_server_init(&server, "127.0.0.1:0", sync_fixture_handler, &host)
+	ok, message := web_server_init(
+		&server,
+		"127.0.0.1:0",
+		sync_fixture_handler,
+		&host,
+		allocator = runtime.default_allocator(),
+	)
 	testing.expectf(t, ok, "server init failed: %s", message)
 	if !ok {
 		return
@@ -169,7 +176,7 @@ end
 		allocator = context.temp_allocator,
 	)
 	send_text(input_client, request_line)
-	_, _ = net.send_tcp(input_client, bytes[:])
+	send_all(input_client, bytes[:])
 	input_response := read_response(input_client)
 	defer delete(input_response)
 	testing.expectf(
@@ -195,6 +202,7 @@ end
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }
 
 // A Need_View that arrives before the SSE stream connects must still create
@@ -217,7 +225,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := r.world_start(&kernel, []string{path}, runtime.default_allocator(), r.World_Config{workers = 1})
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -227,7 +235,7 @@ end
 	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
 
 	host: Sync_Host
-	sync_host_init(&host, world)
+	sync_host_init(&host, world, runtime.default_allocator())
 	defer sync_host_destroy(&host)
 
 	envelope := Sync_Envelope {
@@ -268,7 +276,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := r.world_start(&kernel, []string{path}, runtime.default_allocator(), r.World_Config{workers = 1})
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -278,16 +286,22 @@ end
 	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
 
 	host: Sync_Fixture_Host
-	sync_host_init(&host.sync, world)
+	sync_host_init(&host.sync, world, runtime.default_allocator())
 	defer sync_host_destroy(&host.sync)
-	auth_init(&host.auth, context.temp_allocator)
+	auth_init(&host.auth, runtime.default_allocator())
 	defer auth_destroy(&host.auth)
 	actor, _ := v.value_identity_raw(0x3001)
 	testing.expect(t, auth_seed_user(&host.auth, "erin", "erin-pass", actor))
 	token := auth_create_session(&host.auth, actor)
 
 	server: Web_Server
-	ok, message := web_server_init(&server, "127.0.0.1:0", sync_fixture_handler, &host)
+	ok, message := web_server_init(
+		&server,
+		"127.0.0.1:0",
+		sync_fixture_handler,
+		&host,
+		allocator = runtime.default_allocator(),
+	)
 	testing.expectf(t, ok, "server init failed: %s", message)
 	if !ok {
 		return
@@ -334,6 +348,7 @@ end
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }
 
 @(test)
@@ -369,7 +384,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := r.world_start(&kernel, []string{path}, runtime.default_allocator(), r.World_Config{workers = 1})
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -379,7 +394,7 @@ end
 	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
 
 	host: Sync_Fixture_Host
-	sync_host_init(&host.sync, world)
+	sync_host_init(&host.sync, world, runtime.default_allocator())
 	defer sync_host_destroy(&host.sync)
 
 	probe_session := sync_host_ensure_session(&host.sync, 77)
@@ -399,7 +414,13 @@ end
 	)
 
 	server: Web_Server
-	ok, message := web_server_init(&server, "127.0.0.1:0", sync_fixture_handler, &host)
+	ok, message := web_server_init(
+		&server,
+		"127.0.0.1:0",
+		sync_fixture_handler,
+		&host,
+		allocator = runtime.default_allocator(),
+	)
 	testing.expectf(t, ok, "server init failed: %s", message)
 	if !ok {
 		return
@@ -430,7 +451,7 @@ end
 		allocator = context.temp_allocator,
 	)
 	send_text(input_client, request_line)
-	_, _ = net.send_tcp(input_client, bytes[:])
+	send_all(input_client, bytes[:])
 	input_result := read_response(input_client)
 	defer delete(input_result)
 	testing.expectf(
@@ -473,6 +494,7 @@ end
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }
 
 @(test)
@@ -503,7 +525,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := r.world_start(&kernel, []string{path}, runtime.default_allocator(), r.World_Config{workers = 1})
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -513,11 +535,17 @@ end
 	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
 
 	host: Sync_Fixture_Host
-	sync_host_init(&host.sync, world)
+	sync_host_init(&host.sync, world, runtime.default_allocator())
 	defer sync_host_destroy(&host.sync)
 
 	server: Web_Server
-	ok, message := web_server_init(&server, "127.0.0.1:0", sync_fixture_handler, &host)
+	ok, message := web_server_init(
+		&server,
+		"127.0.0.1:0",
+		sync_fixture_handler,
+		&host,
+		allocator = runtime.default_allocator(),
+	)
 	testing.expectf(t, ok, "server init failed: %s", message)
 	if !ok {
 		return
@@ -548,7 +576,7 @@ end
 		allocator = context.temp_allocator,
 	)
 	send_text(input_client, request_line)
-	_, _ = net.send_tcp(input_client, need_bytes[:])
+	send_all(input_client, need_bytes[:])
 	need_response := read_response(input_client)
 	defer delete(need_response)
 	testing.expectf(
@@ -579,7 +607,7 @@ end
 	)
 	event_client := dial_server(t, &server)
 	send_text(event_client, event_line)
-	_, _ = net.send_tcp(event_client, event_bytes[:])
+	send_all(event_client, event_bytes[:])
 	event_response := read_response(event_client)
 	defer delete(event_response)
 	testing.expectf(
@@ -604,6 +632,7 @@ end
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }
 
 // A DOM event that fails to dispatch must not be acknowledged as 202.
@@ -624,7 +653,7 @@ end
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := r.world_start(&kernel, []string{path}, runtime.default_allocator(), r.World_Config{workers = 1})
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -634,11 +663,17 @@ end
 	testing.expect_value(t, entry.kind, r.Task_Outcome_Kind.Complete)
 
 	host: Sync_Fixture_Host
-	sync_host_init(&host.sync, world)
+	sync_host_init(&host.sync, world, runtime.default_allocator())
 	defer sync_host_destroy(&host.sync)
 
 	server: Web_Server
-	ok, message := web_server_init(&server, "127.0.0.1:0", sync_fixture_handler, &host)
+	ok, message := web_server_init(
+		&server,
+		"127.0.0.1:0",
+		sync_fixture_handler,
+		&host,
+		allocator = runtime.default_allocator(),
+	)
 	testing.expectf(t, ok, "server init failed: %s", message)
 	if !ok {
 		return
@@ -668,7 +703,7 @@ end
 		len(need_bytes),
 	)
 	send_text(nc, nl)
-	_, _ = net.send_tcp(nc, need_bytes[:])
+	send_all(nc, need_bytes[:])
 	nr := read_response(nc)
 	delete(nr)
 
@@ -690,7 +725,7 @@ end
 		len(eb),
 	)
 	send_text(ec, el)
-	_, _ = net.send_tcp(ec, eb[:])
+	send_all(ec, eb[:])
 	er := read_response(ec)
 	defer delete(er)
 	testing.expectf(
@@ -706,4 +741,5 @@ end
 	web_server_stop(&server)
 	thread.join(run_thread)
 	thread.destroy(run_thread)
+	web_server_destroy(&server)
 }

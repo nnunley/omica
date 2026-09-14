@@ -1,5 +1,6 @@
 package web
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:testing"
@@ -66,7 +67,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := r.world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := r.world_start(&kernel, []string{path}, runtime.default_allocator(), r.World_Config{workers = 1})
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
