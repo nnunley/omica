@@ -3199,7 +3199,22 @@ assemble_pattern :: proc(builder: ^vm.Builder, item: v.Value) -> bool {
 	columns, columns_ok := v.value_as_list(columns_value)
 	cells_value, has_cells := assemble_map_get(fields, "cells")
 	cells, cells_ok := v.value_as_list(cells_value)
-	if !has_relation || !relation_ok || i64(relation) > i64(max(u32)) {
+	// A pattern may name its relation instead of giving an id; the name is
+	// resolved at scan time against the live snapshot. `:relation` then
+	// defaults to zero, the unresolved marker.
+	name_value, has_name := assemble_map_get(fields, "name")
+	relation_name := v.Symbol(0)
+	if has_name {
+		name_text, name_text_ok := assemble_name(name_value)
+		if !name_text_ok {
+			return false
+		}
+		relation_name = v.symbol_intern(name_text)
+	}
+	if !has_relation && !has_name {
+		return false
+	}
+	if has_relation && (!relation_ok || i64(relation) > i64(max(u32))) {
 		return false
 	}
 	if !has_columns || !columns_ok || !has_cells || !cells_ok {
@@ -3244,7 +3259,7 @@ assemble_pattern :: proc(builder: ^vm.Builder, item: v.Value) -> bool {
 		}
 		pattern_cells[index] = vm.Pattern_Cell{kind = kind, operand = operand}
 	}
-	vm.builder_add_pattern(builder, u32(relation), names, pattern_cells)
+	vm.builder_add_pattern(builder, u32(relation), relation_name, names, pattern_cells)
 	return true
 }
 

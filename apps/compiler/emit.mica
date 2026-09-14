@@ -45,7 +45,7 @@ end
 // description carries `:errors` alongside the sections; `assemble` ignores
 // unknown keys, so the map feeds it directly.
 verb emit_program(rows, root) -> map
-  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0]
+  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, []]
   let items = ast_children(rows, root, :item)
   if len(items) == 0
     state[4] = [@state[4], "a program needs at least one item"]
@@ -226,7 +226,7 @@ verb describe(state, last_reg)
   let errors = state[4]
   let builtins = state[5]
   return {:entry -> 0, :code -> code, :constants -> constants,
-          :functions -> state[11], :patterns -> [], :shapes -> [],
+          :functions -> state[11], :patterns -> state[14], :shapes -> [],
           :specs -> [], :builtins -> builtins, :errors -> errors}
 end
 
@@ -1287,7 +1287,81 @@ verb emit_call(rows, node, state)
     return [dst, state]
   end
 
+  // A call carrying a query variable or wildcard is a relation scan. Query
+  // variables are not valid anywhere else, so this cannot shadow a builtin.
+  if call_has_query(rows, args)
+    return emit_relation_query(rows, callee_name, args, state)
+  end
+
   return emit_builtin_call(rows, args, callee_name, state)
+end
+
+// Reports whether any argument is a query variable or wildcard, which marks
+// the call as a relation scan rather than a function or builtin call.
+verb call_has_query(rows, args)
+  for arg in args
+    let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+    if !found_expr
+      continue
+    end
+    let kind = ast_kind(rows, arg_expr)
+    if kind == :Query_Variable || kind == :Wildcard
+      return true
+    end
+  end
+  return false
+end
+
+// Emits a relation scan against the named relation, resolving the name at
+// scan time. Named query variables become output columns; wildcards match
+// anything; any other expression is a bound value that must equal the cell.
+// A scan with no output columns is a predicate test returning a boolean.
+verb emit_relation_query(rows, relation_name, args, state)
+  let column_names = []
+  let cells = []
+  let has_output = false
+  let index = 0
+  for arg in args
+    let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+    if !found_expr
+      return emit_error(state, "a query argument is missing its expression")
+    end
+    let kind = ast_kind(rows, arg_expr)
+    if kind == :Query_Variable
+      let [found_name, variable_name] = ast_attr(rows, arg_expr, :name)
+      if !found_name
+        return emit_error(state, "a query variable is missing its name")
+      end
+      let [reg, after_reg] = alloc_register(state)
+      state = after_reg
+      column_names = [@column_names, to_symbol(variable_name)]
+      cells = [@cells, {:kind -> :Output, :operand -> reg}]
+      has_output = true
+    elseif kind == :Wildcard
+      column_names = [@column_names, generated_column(index)]
+      cells = [@cells, {:kind -> :Wildcard, :operand -> 0}]
+    else
+      let [reg, after_reg] = emit_expr(rows, arg_expr, state)
+      state = after_reg
+      column_names = [@column_names, generated_column(index)]
+      cells = [@cells, {:kind -> :Bind, :operand -> reg}]
+    end
+    index = index + 1
+  end
+
+  let pattern_index = len(state[14])
+  let pattern = {:name -> relation_name, :columns -> column_names, :cells -> cells}
+  state[14] = [@state[14], pattern]
+
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let op = :Scan_Exists
+  if has_output
+    op = :Scan_Collect
+  end
+  let [_, after_emit] = emit_instruction(state, op, 0, dst, pattern_index, 0)
+  state = after_emit
+  return [dst, state]
 end
 
 // A call to a runtime builtin: marshal the arguments and emit Builtin_Call

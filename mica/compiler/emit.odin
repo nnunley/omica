@@ -4226,7 +4226,7 @@ emit_retract_where :: proc(
 		}
 		cells[index] = vm.Pattern_Cell{kind = .Bind, operand = i32(register)}
 	}
-	pattern := vm.builder_add_pattern(emitter.builder, relation, column_names, cells)
+	pattern := vm.builder_add_pattern(emitter.builder, relation, 0, column_names, cells)
 	destination := alloc_register(emitter)
 	vm.builder_emit(
 		emitter.builder,
@@ -4418,7 +4418,7 @@ emit_relation_query :: proc(emitter: ^Emitter, relation: u32, call: Call) -> (in
 			break
 		}
 	}
-	pattern := vm.builder_add_pattern(emitter.builder, relation, names, cells)
+	pattern := vm.builder_add_pattern(emitter.builder, relation, 0, names, cells)
 	destination := alloc_register(emitter)
 	vm.builder_emit(
 		emitter.builder,
@@ -4444,7 +4444,7 @@ emit_map_pattern_binding :: proc(
 			if !cells_ok {
 				return -1, false
 			}
-			builder_pattern := vm.builder_add_pattern(emitter.builder, relation, names, cells)
+			builder_pattern := vm.builder_add_pattern(emitter.builder, relation, 0, names, cells)
 			result := alloc_register(emitter)
 			op: vm.Op = binding.is_exactly ? .Scan_One : .Scan_First
 			vm.builder_emit(emitter.builder, op, 0, i32(result), builder_pattern, 0)

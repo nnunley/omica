@@ -36,7 +36,7 @@ import v "../var"
 ARTIFACT_MAGIC :: "MICAPO10"
 // Artifact layout version. Bump when the section layout changes; old bytes
 // must fail with Bad_Version, never misdecode.
-ARTIFACT_VERSION :: u32(1)
+ARTIFACT_VERSION :: u32(2)
 
 Artifact_Error :: enum {
 	None,
@@ -143,6 +143,13 @@ program_to_bytes :: proc(program: ^Program, out: ^[dynamic]u8) -> Artifact_Error
 	}
 	for pattern in program.patterns {
 		ab_u32(out, pattern.relation)
+		// Only an unresolved pattern carries a name; a resolved one already
+		// has its id, and serializing the zero symbol would be ambiguous.
+		if pattern.relation == 0 {
+			if error := ab_symbol(out, pattern.relation_name); error != .None {
+				return error
+			}
+		}
 		if error := ab_symbols(out, pattern.column_names); error != .None {
 			return error
 		}
@@ -308,11 +315,19 @@ program_from_bytes :: proc(data: []u8, allocator: mem.Allocator) -> (^Program, A
 	}
 	for _ in 0 ..< pattern_count {
 		relation, relation_ok := ar_u32(&reader)
-		names, names_ok := ar_symbol_list(&reader, allocator)
-		if !relation_ok || !names_ok {
-			if names_ok {
-				delete(names, allocator)
+		if !relation_ok {
+			return nil, .Bad_Value
+		}
+		relation_name := v.Symbol(0)
+		if relation == 0 {
+			name, name_ok := ar_symbol(&reader)
+			if !name_ok {
+				return nil, .Bad_Value
 			}
+			relation_name = name
+		}
+		names, names_ok := ar_symbol_list(&reader, allocator)
+		if !names_ok {
 			return nil, .Bad_Value
 		}
 		cell_count, cell_count_err := ar_count(&reader, 5)
@@ -337,9 +352,10 @@ program_from_bytes :: proc(data: []u8, allocator: mem.Allocator) -> (^Program, A
 			return nil, .Bad_Value
 		}
 		append(&builder.patterns, Scan_Pattern {
-			relation     = relation,
-			column_names = names,
-			cells        = cells,
+			relation      = relation,
+			relation_name = relation_name,
+			column_names  = names,
+			cells         = cells,
 		})
 	}
 

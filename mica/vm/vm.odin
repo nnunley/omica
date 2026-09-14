@@ -1562,6 +1562,34 @@ vm_pattern_bindings :: proc(
 }
 
 @(private)
+// Resolves a scan pattern's relation to a kernel id. A nonzero `relation` is
+// already resolved. A zero id resolves `relation_name` against the live
+// snapshot, which lets an assembled artifact name its relations rather than
+// bake ids that vary between worlds.
+vm_resolve_pattern_relation :: proc(
+	state: ^VM,
+	pattern: Scan_Pattern,
+) -> (k.Relation_ID, bool) {
+	if pattern.relation != 0 {
+		return k.Relation_ID(pattern.relation), true
+	}
+	snapshot := state.source.snapshot
+	if snapshot == nil && state.source.transaction != nil {
+		snapshot = state.source.transaction.base
+	}
+	if snapshot == nil {
+		vm_fail(state, "E_NO_SOURCE", "relation scan has no snapshot to resolve a name")
+		return 0, false
+	}
+	metadata, found := k.snapshot_relation_metadata_named(snapshot, pattern.relation_name)
+	if !found {
+		vm_fail(state, "E_UNKNOWN_RELATION", "relation scan names an unknown relation")
+		return 0, false
+	}
+	return metadata.id, true
+}
+
+@(private)
 vm_scan_rows :: proc(
 	state: ^VM,
 	base: int,
@@ -1572,12 +1600,16 @@ vm_scan_rows :: proc(
 		vm_fail(state, "E_NO_SOURCE", "relation scan has no source")
 		return false
 	}
-	if !k.authority_can_read(state.authority, k.Relation_ID(pattern.relation)) {
+	relation, resolved := vm_resolve_pattern_relation(state, pattern)
+	if !resolved {
+		return false
+	}
+	if !k.authority_can_read(state.authority, relation) {
 		vm_fail(state, "E_PERMISSION", "relation read denied")
 		return false
 	}
 	bindings := vm_pattern_bindings(state, base, pattern, state.scratch_allocator)
-	k.relation_source_scan_into(state.source, k.Relation_ID(pattern.relation), bindings, out)
+	k.relation_source_scan_into(state.source, relation, bindings, out)
 	return true
 }
 
@@ -1658,7 +1690,11 @@ vm_scan_first :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		return false
 	}
 	pattern := state.program.patterns[instr.b]
-	if !k.authority_can_read(state.authority, k.Relation_ID(pattern.relation)) {
+	relation, resolved := vm_resolve_pattern_relation(state, pattern)
+	if !resolved {
+		return false
+	}
+	if !k.authority_can_read(state.authority, relation) {
 		vm_fail(state, "E_PERMISSION", "relation read denied")
 		return false
 	}
@@ -1668,7 +1704,7 @@ vm_scan_first :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		base    = base,
 		pattern = &pattern,
 	}
-	k.relation_source_visit(state.source, k.Relation_ID(pattern.relation), bindings, first_binding_visit, &ctx)
+	k.relation_source_visit(state.source, relation, bindings, first_binding_visit, &ctx)
 	state.registers[base + int(instr.a)] = v.value_bool(ctx.found)
 	return true
 }
@@ -1970,7 +2006,11 @@ vm_retract_where :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		return false
 	}
 	pattern := state.program.patterns[instr.b]
-	if !k.authority_can_write(state.authority, k.Relation_ID(pattern.relation)) {
+	relation, resolved := vm_resolve_pattern_relation(state, pattern)
+	if !resolved {
+		return false
+	}
+	if !k.authority_can_write(state.authority, relation) {
 		vm_fail(state, "E_PERMISSION", "relation write denied")
 		return false
 	}
@@ -1980,11 +2020,7 @@ vm_retract_where :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		return false
 	}
 	for row in rows {
-		err := k.transaction_retract(
-			state.transaction,
-			k.Relation_ID(pattern.relation),
-			row,
-		)
+		err := k.transaction_retract(state.transaction, relation, row)
 		if err != .None {
 			vm_fail(state, kernel_error_code(err), "relation retract failed")
 			return false

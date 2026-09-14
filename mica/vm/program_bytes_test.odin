@@ -44,6 +44,7 @@ artifact_fixture :: proc(builder: ^Builder) {
 	builder_add_pattern(
 		builder,
 		99,
+		0,
 		[]v.Symbol{v.symbol_intern("x"), v.symbol_intern("y")},
 		[]Pattern_Cell{
 			{kind = .Const, operand = i32(int_index)},
@@ -192,7 +193,7 @@ test_artifact_rejects_corrupt :: proc(t: ^testing.T) {
 			"bad version",
 			proc(original: []u8) -> []u8 {
 				mutated := slice_clone(original)
-				mutated[8] = 2
+				mutated[8] = u8(ARTIFACT_VERSION + 1)
 				return mutated
 			},
 			.Bad_Version,

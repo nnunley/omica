@@ -4274,8 +4274,7 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"verb size(xs)\n len(xs)\nend\nsize([7, 8])",
 		"let xs = [1, 2]\n[@xs, 3]",
 		"let a = [1]\nlet b = [2]\n[@a, @b]",
-		"let xs = []\nlet i = 0\nwhile i < 5\n xs = [@xs, i]\n i = i + 1\nend\nlen(xs)",
-	}
+		"let xs = []\nlet i = 0\nwhile i < 5\n xs = [@xs, i]\n i = i + 1\nend\nlen(xs)",	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {
 			testing.expectf(t, false, "emitter mismatch for %q", source)
@@ -4467,6 +4466,105 @@ test_mica_emitter_relation_write :: proc(t: ^testing.T) {
 	k.transaction_destroy(&tx)
 
 	expect_relation_rows(t, &kernel, "Point", 1)
+}
+
+@(test)
+test_mica_emitter_relation_query :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	declaration := `make_relation(:Point, 2)
+assert Point(1, 10)
+assert Point(2, 20)
+`
+	declaration_path, declaration_ok := write_temp_source(
+		t,
+		"mica_emitter_query_decl.mica",
+		declaration,
+	)
+	if !declaration_ok {
+		return
+	}
+	defer os.remove(declaration_path)
+
+	world, start := world_start(
+		&kernel,
+		[]string{
+			"apps/compiler/lex.mica",
+			"apps/compiler/parse.mica",
+			"apps/compiler/emit.mica",
+			declaration_path,
+		},
+		context.temp_allocator,
+	)
+	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	outcome := world_call(world, "emit_source", []k.Role_Pair{{
+		role  = v.value_symbol(v.symbol_intern("source")),
+		value = v.value_string(context.temp_allocator, "Point(?x, ?y)"),
+	}})
+	testing.expectf(t, outcome.kind == .Complete, "emit_source failed: %s", outcome.message)
+	if outcome.kind != .Complete {
+		return
+	}
+	fields, fields_ok := v.value_as_map(outcome.value)
+	testing.expect(t, fields_ok)
+	if !fields_ok {
+		return
+	}
+	ok, _ := v.value_as_bool(map_get(fields, "ok"))
+	testing.expect(t, ok, "emitter reported an error for the query")
+	if !ok {
+		return
+	}
+	artifact, artifact_ok := v.value_as_bytes(map_get(fields, "bytes"))
+	testing.expect(t, artifact_ok)
+	if !artifact_ok {
+		return
+	}
+	program, decode_error := vm.program_from_bytes(artifact, alloc)
+	testing.expect_value(t, decode_error, vm.Artifact_Error.None)
+	if program == nil {
+		return
+	}
+	testing.expect_value(t, vm.program_validate(program), vm.Program_Error.None)
+
+	tx := k.kernel_begin(&kernel)
+	relation_source := k.Relation_Source{transaction = &tx, use_stored_derived = true}
+	state: vm.VM
+	vm.vm_init(&state, program, alloc)
+	defer vm.vm_destroy(&state)
+	register_runtime_builtins(&state)
+	state.user = &world.env
+	vm.vm_set_workspace(&state, &relation_source, &tx)
+	if vm.vm_run(&state) != .Halted {
+		testing.expect(t, false, "mica query program did not halt")
+		return
+	}
+	k.transaction_destroy(&tx)
+
+	relation, relation_ok := v.value_as_relation(state.result)
+	testing.expect(t, relation_ok)
+	if !relation_ok {
+		return
+	}
+	testing.expectf(t, len(relation.rows) == 2, "expected two rows, got %d", len(relation.rows))
 }
 
 @(test)

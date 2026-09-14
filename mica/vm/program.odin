@@ -156,10 +156,17 @@ Pattern_Cell :: struct {
 
 // A relation scan pattern. Column names head the relation value produced by
 // Scan_Collect.
+//
+// `relation` is the resolved kernel id. When it is zero the scan resolves
+// `relation_name` against the live snapshot instead: user relations start at
+// id 1 and system relations at 0x7fff_fe00, so zero is never a valid id.
+// Name resolution lets an assembled artifact stay valid across worlds whose
+// relation ids differ.
 Scan_Pattern :: struct {
-	relation:     u32,
-	column_names: []v.Symbol,
-	cells:        []Pattern_Cell,
+	relation:      u32,
+	relation_name: v.Symbol,
+	column_names:  []v.Symbol,
+	cells:         []Pattern_Cell,
 }
 
 // The heading of a relation value built at runtime.
@@ -334,10 +341,12 @@ builder_add_builtin :: proc(builder: ^Builder, name: v.Symbol) -> i32 {
 	return i32(len(builder.builtins) - 1)
 }
 
-// Adds a scan pattern, copying its slices. Returns the pattern index.
+// Adds a scan pattern, copying its slices. Returns the pattern index. Pass a
+// zero `relation` with a `relation_name` to defer resolution to scan time.
 builder_add_pattern :: proc(
 	builder: ^Builder,
 	relation: u32,
+	relation_name: v.Symbol,
 	column_names: []v.Symbol,
 	cells: []Pattern_Cell,
 ) -> i32 {
@@ -346,11 +355,29 @@ builder_add_pattern :: proc(
 	pattern_cells := make([]Pattern_Cell, len(cells), builder.allocator)
 	copy(pattern_cells, cells)
 	append(&builder.patterns, Scan_Pattern {
-		relation     = relation,
-		column_names = names,
-		cells        = pattern_cells,
+		relation      = relation,
+		relation_name = relation_name,
+		column_names  = names,
+		cells         = pattern_cells,
 	})
 	return i32(len(builder.patterns) - 1)
+}
+
+// Adds a name-resolved scan pattern: the relation name is interned and the
+// id left zero, so the scan resolves it against the live snapshot.
+builder_add_named_pattern :: proc(
+	builder: ^Builder,
+	relation_name: string,
+	column_names: []v.Symbol,
+	cells: []Pattern_Cell,
+) -> i32 {
+	return builder_add_pattern(
+		builder,
+		0,
+		v.symbol_intern(relation_name),
+		column_names,
+		cells,
+	)
 }
 
 builder_add_dispatch_spec :: proc(
@@ -472,9 +499,10 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 		cells := make([]Pattern_Cell, len(pattern.cells), alloc)
 		copy(cells, pattern.cells)
 		program.patterns[i] = Scan_Pattern {
-			relation     = pattern.relation,
-			column_names = names,
-			cells        = cells,
+			relation      = pattern.relation,
+			relation_name = pattern.relation_name,
+			column_names  = names,
+			cells         = cells,
 		}
 	}
 	for shape, i in builder.relation_shapes {

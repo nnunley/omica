@@ -525,6 +525,7 @@ test_vm_scan_collect_and_len :: proc(t: ^testing.T) {
 	pattern := builder_add_pattern(
 		&builder,
 		u32(relation),
+		0,
 		[]v.Symbol{owner, item},
 		[]Pattern_Cell{{kind = .Output}, {kind = .Output}},
 	)
@@ -571,6 +572,7 @@ test_vm_scan_first_binds_register :: proc(t: ^testing.T) {
 	pattern := builder_add_pattern(
 		&builder,
 		u32(relation),
+		0,
 		[]v.Symbol{owner, item},
 		[]Pattern_Cell{{kind = .Output, operand = 0}, {kind = .Const, operand = lamp_constant}},
 	)
@@ -620,6 +622,7 @@ test_vm_scan_first_denies_unauthorized :: proc(t: ^testing.T) {
 	pattern := builder_add_pattern(
 		&builder,
 		u32(relation),
+		0,
 		[]v.Symbol{owner, item},
 		[]Pattern_Cell{{kind = .Output, operand = 0}, {kind = .Const, operand = lamp_constant}},
 	)
@@ -761,6 +764,7 @@ test_vm_retract_where :: proc(t: ^testing.T) {
 	pattern := builder_add_pattern(
 		&builder,
 		u32(relation),
+		0,
 		[]v.Symbol{owner, item},
 		[]Pattern_Cell{{kind = .Const, operand = alice_constant}, {kind = .Wildcard}},
 	)
