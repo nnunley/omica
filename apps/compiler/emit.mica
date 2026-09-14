@@ -45,7 +45,7 @@ end
 // description carries `:errors` alongside the sections; `assemble` ignores
 // unknown keys, so the map feeds it directly.
 verb emit_program(rows, root) -> map
-  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, []]
+  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, [], []]
   let items = ast_children(rows, root, :item)
   if len(items) == 0
     state[4] = [@state[4], "a program needs at least one item"]
@@ -227,7 +227,7 @@ verb describe(state, last_reg)
   let builtins = state[5]
   return {:entry -> 0, :code -> code, :constants -> constants,
           :functions -> state[11], :patterns -> state[14], :shapes -> [],
-          :specs -> [], :builtins -> builtins, :errors -> errors}
+          :specs -> state[15], :builtins -> builtins, :errors -> errors}
 end
 
 // --- Fact queries ------------------------------------------------------------
@@ -496,6 +496,9 @@ verb emit_expr(rows, node, state)
   end
   if kind == :Retract
     return emit_relation_write(rows, node, false, state)
+  end
+  if kind == :Spawn
+    return emit_spawn(rows, node, state)
   end
   if kind == :Binding
     return emit_binding(rows, node, state)
@@ -1589,6 +1592,11 @@ verb emit_call(rows, node, state)
     return [dst, state]
   end
 
+  // `mailbox_recv` is a VM op rather than a runtime builtin: it suspends.
+  if callee_name == "mailbox_recv"
+    return emit_mailbox_recv(rows, args, state)
+  end
+
   // A call carrying a query variable or wildcard is a relation scan. Query
   // variables are not valid anywhere else, so this cannot shadow a builtin.
   if call_has_query(rows, args)
@@ -1758,6 +1766,91 @@ verb emit_relation_write(rows, node, assert_write, state)
   let [dst, after_reg] = alloc_register(state)
   state = after_reg
   let [_, after_emit] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, first)
+  state = after_emit
+  return [dst, state]
+end
+
+// `mailbox_recv([receivers])` or `mailbox_recv([receivers], timeout)` suspends
+// until a message arrives. Lowers to the Mailbox_Recv op.
+verb emit_mailbox_recv(rows, args, state)
+  if len(args) < 1 || len(args) > 2
+    return emit_error(state, "mailbox_recv expects a receiver list and optional timeout")
+  end
+  let [found_receivers, receivers_node] = ast_attr(rows, args[0], :expr)
+  if !found_receivers
+    return emit_error(state, "mailbox_recv is missing its receiver list")
+  end
+  let [receivers, after_receivers] = emit_expr(rows, receivers_node, state)
+  state = after_receivers
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  if len(args) == 2
+    let [found_timeout, timeout_node] = ast_attr(rows, args[1], :expr)
+    if !found_timeout
+      return emit_error(state, "mailbox_recv is missing its timeout")
+    end
+    let [timeout, after_timeout] = emit_expr(rows, timeout_node, state)
+    state = after_timeout
+    let [_, after_emit] = emit_instruction(state, :Mailbox_Recv, 1, dst, receivers, timeout)
+    state = after_emit
+  else
+    let [_, after_emit] = emit_instruction(state, :Mailbox_Recv, 0, dst, receivers, 0)
+    state = after_emit
+  end
+  return [dst, state]
+end
+
+// `spawn :verb(role: value, ...) [after millis]` starts the selected verb in
+// a new task. Arguments must be named by role, since dispatch selects the
+// method by selector and role set. Lowers to a Spawn instruction carrying a
+// dispatch spec index.
+verb emit_spawn(rows, node, state)
+  let [found_call, call_node] = ast_attr(rows, node, :call)
+  if !found_call || ast_kind(rows, call_node) != :Call
+    return emit_error(state, "spawn target must be a symbol call")
+  end
+  let [found_callee, callee_node] = ast_attr(rows, call_node, :callee)
+  if !found_callee || ast_kind(rows, callee_node) != :Symbol_Literal
+    return emit_error(state, "spawn target must use a symbol selector like :verb(...)")
+  end
+  let [found_selector, selector_name] = ast_attr(rows, callee_node, :name)
+  if !found_selector
+    return emit_error(state, "a spawn selector is missing its name")
+  end
+
+  let args = ast_children(rows, call_node, :arg)
+  let roles = []
+  for arg in args
+    let [found_role, role_name] = ast_attr(rows, arg, :role)
+    if !found_role
+      return emit_error(state, "spawn arguments must use explicit role names")
+    end
+    let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+    if !found_expr
+      return emit_error(state, "a spawn argument is missing its expression")
+    end
+    let [arg_reg, after_arg] = emit_expr(rows, arg_expr, state)
+    state = after_arg
+    roles = [@roles, {:role -> role_name, :register -> arg_reg}]
+  end
+  let spec_index = len(state[15])
+  state[15] = [@state[15], {:selector -> selector_name, :roles -> roles}]
+
+  let flags = 0
+  let delay_reg = 0
+  let [found_delay, _] = ast_attr(rows, node, :has_delay)
+  if found_delay
+    let [found_delay_node, delay_node] = ast_attr(rows, node, :delay)
+    if found_delay_node
+      let [delay, after_delay] = emit_expr(rows, delay_node, state)
+      state = after_delay
+      flags = 1
+      delay_reg = delay
+    end
+  end
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Spawn, flags, dst, spec_index, delay_reg)
   state = after_emit
   return [dst, state]
 end
