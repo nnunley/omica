@@ -118,6 +118,7 @@ rel_target :: proc(
 	allocator := context.allocator,
 ) -> (v.Value, bool) {
 	facts := rel_facts(rows, node, role, allocator)
+	defer delete(facts)
 	if len(facts) == 0 {
 		return v.Value(0), false
 	}
@@ -204,6 +205,7 @@ rel_atom :: proc(builder: ^strings.Builder, text: string) {
 @(private)
 rel_write_body :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node: int, role: string) {
 	facts := rel_facts(rows, node, v.symbol_intern(role))
+	defer delete(facts)
 	for fact in facts {
 		child, _ := v.value_as_int(fact.target)
 		strings.write_byte(builder, ' ')
@@ -215,6 +217,7 @@ rel_write_body :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 rel_write_params :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node: int) {
 	strings.write_string(builder, "(params")
 	facts := rel_facts(rows, node, v.symbol_intern("param"))
+	defer delete(facts)
 	for fact in facts {
 		param, _ := v.value_as_int(fact.target)
 		strings.write_string(builder, " (param ")
@@ -253,6 +256,7 @@ rel_write_params :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, nod
 @(private)
 rel_write_args :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node: int) {
 	facts := rel_facts(rows, node, v.symbol_intern("arg"))
+	defer delete(facts)
 	for fact in facts {
 		arg, _ := v.value_as_int(fact.target)
 		strings.write_string(builder, " (arg ")
@@ -297,6 +301,7 @@ rel_write_pattern :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, no
 	case "List_Pattern":
 		strings.write_string(builder, "(list-patt")
 		facts := rel_facts(rows, node, v.symbol_intern("element"))
+		defer delete(facts)
 		for fact in facts {
 			element, _ := v.value_as_int(fact.target)
 			strings.write_byte(builder, ' ')
@@ -306,6 +311,7 @@ rel_write_pattern :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, no
 	case "Map_Pattern":
 		strings.write_string(builder, "(map-patt")
 		facts := rel_facts(rows, node, v.symbol_intern("entry"))
+		defer delete(facts)
 		for fact in facts {
 			entry, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (entry ")
@@ -322,6 +328,7 @@ rel_write_pattern :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, no
 		strings.write_string(builder, "(call-patt ")
 		rel_atom(builder, rel_str(rows, node, "name"))
 		facts := rel_facts(rows, node, v.symbol_intern("arg"))
+		defer delete(facts)
 		for fact in facts {
 			argument, _ := v.value_as_int(fact.target)
 			strings.write_byte(builder, ' ')
@@ -371,6 +378,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		rel_write_node(builder, rows, principal)
 		strings.write_string(builder, rel_bool(rows, node, "role_principal") ? " role" : " principal")
 		section_facts := rel_facts(rows, node, v.symbol_intern("section"))
+		defer delete(section_facts)
 		for fact in section_facts {
 			section, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (section ")
@@ -381,6 +389,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 				strings.write_byte(builder, ' ')
 				rel_write_node(builder, rows, int(entry))
 			}
+			delete(entry_facts)
 			strings.write_byte(builder, ')')
 		}
 		strings.write_byte(builder, ')')
@@ -418,6 +427,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 	case "Name":
 		strings.write_string(builder, "(name")
 		facts := rel_facts(rows, node, v.symbol_intern("part"))
+		defer delete(facts)
 		for fact in facts {
 			text, _ := v.value_as_string(fact.target)
 			strings.write_byte(builder, ' ')
@@ -471,6 +481,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 	case "Map_Literal":
 		strings.write_string(builder, "(map")
 		facts := rel_facts(rows, node, v.symbol_intern("entry"))
+		defer delete(facts)
 		for fact in facts {
 			entry, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (")
@@ -577,6 +588,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 	case "If":
 		strings.write_string(builder, "(if")
 		branch_facts := rel_facts(rows, node, v.symbol_intern("branch"))
+		defer delete(branch_facts)
 		for fact in branch_facts {
 			branch, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (")
@@ -604,6 +616,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		// allocates through rel_facts, so skipping it keeps legacy files
 		// at their previous allocation count.
 		name_facts := rel_facts(rows, node, v.symbol_intern("name"))
+		defer delete(name_facts)
 		if len(name_facts) > 0 {
 			strings.write_string(builder, "(names")
 			for fact in name_facts {
@@ -668,6 +681,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		value, _ := rel_child(rows, node, "value")
 		rel_write_node(builder, rows, value)
 		case_facts := rel_facts(rows, node, v.symbol_intern("case"))
+		defer delete(case_facts)
 		for fact in case_facts {
 			case_node, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (")
@@ -687,6 +701,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		strings.write_string(builder, "(try")
 		rel_write_body(builder, rows, node, "body")
 		catch_facts := rel_facts(rows, node, v.symbol_intern("catch_clause"))
+		defer delete(catch_facts)
 		for fact in catch_facts {
 			clause, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (catch ")
@@ -727,6 +742,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		rel_write_node(builder, rows, head)
 		strings.write_string(builder, rel_bool(rows, node, "named") ? " named" : " positional")
 		cell_facts := rel_facts(rows, node, v.symbol_intern("cell"))
+		defer delete(cell_facts)
 		for fact in cell_facts {
 			cell, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (")
@@ -749,6 +765,7 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		strings.write_string(builder, "(dom-element ")
 		rel_atom(builder, rel_str(rows, node, "tag"))
 		attr_facts := rel_facts(rows, node, v.symbol_intern("attribute"))
+		defer delete(attr_facts)
 		for fact in attr_facts {
 			attribute, _ := v.value_as_int(fact.target)
 			strings.write_string(builder, " (attr ")
