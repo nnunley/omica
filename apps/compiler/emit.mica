@@ -44,8 +44,11 @@ end
 // Lowers fact rows for the program `root` to an assemble description. The
 // description carries `:errors` alongside the sections; `assemble` ignores
 // unknown keys, so the map feeds it directly.
-verb emit_program(rows, root) -> map
+verb emit_program(raw_rows, root) -> map
   let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, [], []]
+  // Sort facts by node id once so every lookup can binary search instead of
+  // scanning. Row order is not otherwise observable here.
+  let rows = sort_ast_rows(raw_rows)
   let items = ast_children(rows, root, :item)
   if len(items) == 0
     state[4] = [@state[4], "a program needs at least one item"]
@@ -232,41 +235,83 @@ end
 
 // --- Fact queries ------------------------------------------------------------
 
+// Sorts AST rows by node id, then role, target, and ordinal. Node ids are
+// dense but a node's rows are not contiguous in emission order (a parent's
+// facts follow its children's), so a one-time sort lets every lookup binary
+// search a node's block instead of scanning all rows. Without this, emission
+// is quadratic in node count, which a 70 KB source cannot survive.
+verb sort_ast_rows(rows)
+  return sort(rows)
+end
+
+// The first row index whose node id is `node_id`, or the insertion point when
+// absent. Rows must be sorted by node id. Mica integer division is exact, so
+// the midpoint forces an even numerator rather than writing `(low + high) / 2`.
+verb lower_bound(rows, node_id)
+  let low = 0
+  let high = len(rows)
+  while low < high
+    let sum = low + high
+    let mid = (sum - (sum % 2)) / 2
+    if rows[mid][0] < node_id
+      low = mid + 1
+    else
+      high = mid
+    end
+  end
+  return low
+end
+
 // The :kind target of a node, or :Unknown.
 verb ast_kind(rows, node_id)
-  for row in rows
-    if row[0] == node_id && row[1] == :kind
-      return row[2]
+  let index = lower_bound(rows, node_id)
+  while index < len(rows) && rows[index][0] == node_id
+    if rows[index][1] == :kind
+      return rows[index][2]
     end
+    index = index + 1
   end
   return :Unknown
 end
 
 // The first target for (node, role) as [found, target].
 verb ast_attr(rows, node_id, role)
-  for row in rows
-    if row[0] == node_id && row[1] == role
-      return [true, row[2]]
+  let index = lower_bound(rows, node_id)
+  while index < len(rows) && rows[index][0] == node_id
+    if rows[index][1] == role
+      return [true, rows[index][2]]
     end
+    index = index + 1
   end
   return [false, 0]
 end
 
-// Every target for (node, role), ordered by ordinal.
+// Every target for (node, role), ordered by ordinal. The node's block is
+// small, so scanning it once per ordinal is cheap.
 verb ast_children(rows, node_id, role)
+  let start = lower_bound(rows, node_id)
+  let finish = start
+  while finish < len(rows) && rows[finish][0] == node_id
+    finish = finish + 1
+  end
   let count = 0
-  for row in rows
-    if row[0] == node_id && row[1] == role
+  let index = start
+  while index < finish
+    if rows[index][1] == role
       count = count + 1
     end
+    index = index + 1
   end
   let targets = []
   let ordinal = 0
   while ordinal < count
-    for row in rows
-      if row[0] == node_id && row[1] == role && row[3] == ordinal
-        targets = [@targets, row[2]]
+    index = start
+    while index < finish
+      if rows[index][1] == role && rows[index][3] == ordinal
+        targets = [@targets, rows[index][2]]
+        break
       end
+      index = index + 1
     end
     ordinal = ordinal + 1
   end
