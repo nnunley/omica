@@ -3574,6 +3574,97 @@ assert Marker(#alice, :seed)
 }
 
 @(test)
+test_run_records_program_bytes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:Marker, 2)
+
+verb mark(who)
+  assert Marker(who, :marked)
+end
+assert Marker(#alice, :seed)
+`
+	path, path_ok := write_temp_source(t, "mica_program_bytes_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	directory, directory_error := os.temp_dir(context.temp_allocator)
+	if directory_error != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	store_path, join_error := filepath.join(
+		[]string{directory, "mica_program_bytes"},
+		context.temp_allocator,
+	)
+	if join_error != nil {
+		return
+	}
+	os.remove_all(store_path)
+	defer os.remove_all(store_path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		World_Config{store_path = store_path},
+	)
+	testing.expectf(t, start.ok, "load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+	testing.expect(t, world_checkpoint(world))
+
+	// Exactly one ProgramBytes row, keyed by content identity.
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	k.kernel_scan_into(
+		&kernel,
+		k.SYSTEM_PROGRAM_BYTES_ID,
+		[]v.Binding{{}, {}},
+		&rows,
+	)
+	testing.expect_value(t, len(rows), 1)
+	if len(rows) != 1 {
+		return
+	}
+	values := v.tuple_values(rows[0])
+	program_id, id_ok := v.value_as_identity(values[0])
+	testing.expect(t, id_ok)
+	artifact, artifact_ok := v.value_as_bytes(values[1])
+	testing.expect(t, artifact_ok)
+	if !id_ok || !artifact_ok {
+		return
+	}
+	testing.expect(t, len(artifact) > 0)
+
+	// The row decodes to a valid program whose fingerprint is the row id.
+	// Decoded into the temporary allocator; the deferred free_all reclaims
+	// it, so no program_destroy (which frees individual slices).
+	program, decode_error := vm.program_from_bytes(artifact, context.temp_allocator)
+	testing.expect_value(t, decode_error, vm.Artifact_Error.None)
+	if program == nil {
+		return
+	}
+	testing.expect_value(t, vm.program_validate(program), vm.Program_Error.None)
+	testing.expect_value(
+		t,
+		v.identity_raw(program_id),
+		vm.program_artifact_fingerprint(artifact) & v.IDENTITY_MAX,
+	)
+	testing.expect_value(t, len(program.functions), len(world.program.functions))
+	testing.expect_value(t, program.entry, world.program.entry)
+}
+
+@(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:Kept, 1)

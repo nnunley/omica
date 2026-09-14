@@ -70,6 +70,17 @@ program_artifact_fingerprint :: proc(bytes: []u8) -> u64 {
 	return hash
 }
 
+// Derives the durable program identity for encoded artifact bytes: the
+// fingerprint folded into the identity range. Never zero, so it always
+// forms a valid identity value.
+program_artifact_id :: proc(bytes: []u8) -> (v.Value, bool) {
+	id := program_artifact_fingerprint(bytes) & v.IDENTITY_MAX
+	if id == 0 {
+		id = 1
+	}
+	return v.value_identity_raw(id)
+}
+
 // Encodes `program` into `out`. Returns None on success; `out` may hold a
 // discarded prefix on any other result.
 program_to_bytes :: proc(program: ^Program, out: ^[dynamic]u8) -> Artifact_Error {

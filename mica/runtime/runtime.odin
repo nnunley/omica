@@ -723,6 +723,52 @@ Unit_Source_Fact :: struct {
 	source:  string,
 }
 
+// Encodes the freshly compiled program and records it as a ProgramBytes
+// row keyed by content identity, so a later boot can resolve methods
+// without recompiling sources (#77).
+@(private)
+assert_program_bytes :: proc(env: ^Builtin_Env, program: ^vm.Program) -> Run_Result {
+	bytes: [dynamic]u8
+	defer delete(bytes)
+	if error := vm.program_to_bytes(program, &bytes); error != .None {
+		return Run_Result{ok = false, message = fmt.aprintf(
+			"cannot encode program artifact: %v",
+			error,
+			allocator = env.allocator,
+		)}
+	}
+	id, id_ok := vm.program_artifact_id(bytes[:])
+	if !id_ok {
+		return Run_Result{ok = false, message = "program identity is out of range"}
+	}
+	tx := k.kernel_begin(env.kernel)
+	defer k.transaction_destroy(&tx)
+	if err := k.transaction_assert(
+		&tx,
+		k.SYSTEM_PROGRAM_BYTES_ID,
+		v.tuple_new(context.temp_allocator, []v.Value {
+			id,
+			v.value_bytes(env.allocator, bytes[:]),
+		}),
+	); err != k.Kernel_Error.None {
+		return Run_Result{ok = false, message = fmt.aprintf(
+			"cannot record program bytes: %v",
+			err,
+			allocator = env.allocator,
+		)}
+	}
+	committed, commit_err := k.transaction_commit(&tx)
+	if commit_err != k.Kernel_Error.None {
+		return Run_Result{ok = false, message = fmt.aprintf(
+			"cannot record program bytes: %v",
+			commit_err,
+			allocator = env.allocator,
+		)}
+	}
+	k.snapshot_release(committed)
+	return Run_Result{ok = true, message = "loaded"}
+}
+
 // Assert the catalog facts that describe rules: Rule, RuleHead, and RuleSource.
 @(private)
 assert_rule_facts :: proc(env: ^Builtin_Env, rules: []Rule_Fact) -> Run_Result {

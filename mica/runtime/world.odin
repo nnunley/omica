@@ -656,6 +656,11 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	}
 	world.program = compiled.program
 
+	program_bytes_result := assert_program_bytes(&world.env, world.program)
+	if !program_bytes_result.ok {
+		return program_bytes_result
+	}
+
 	// The entry task runs root so declarations and grant facts can load.
 	workers := config.workers
 	if workers < 1 {
