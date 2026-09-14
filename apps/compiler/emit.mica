@@ -682,6 +682,9 @@ end
 
 verb emit_binary(rows, node, state)
   let [found_op, op_sym] = ast_attr(rows, node, :op)
+  if found_op && (op_sym == :and || op_sym == :or)
+    return emit_short_circuit(rows, node, op_sym == :and, state)
+  end
   let flag = binary_flag(op_sym)
   if !found_op || flag < 0
     return emit_error(state, "an operator needs a later slice")
@@ -700,6 +703,58 @@ verb emit_binary(rows, node, state)
   let [_, after_emit] = emit_instruction(state, :Binary, flag, dst, left_reg, right_reg)
   state = after_emit
   return [dst, state]
+end
+
+// `a && b` and `a || b` short-circuit: the right operand is only evaluated
+// when the left does not decide the result.
+verb emit_short_circuit(rows, node, is_and, state)
+  let [found_left, left_node] = ast_attr(rows, node, :left)
+  let [found_right, right_node] = ast_attr(rows, node, :right)
+  if !found_left || !found_right
+    return emit_error(state, "a logical operator is missing an operand")
+  end
+  let [left, after_left] = emit_expr(rows, left_node, state)
+  state = after_left
+  let [result, after_result] = alloc_register(state)
+  state = after_result
+  let [truth, after_truth] = alloc_register(state)
+  state = after_truth
+  let [_, after_truthy] = emit_instruction(state, :Is_Truthy, 0, truth, left, 0)
+  state = after_truthy
+  let [branch, after_branch] = emit_jump(state, :Branch, 0, truth)
+  state = after_branch
+
+  if is_and
+    // Falsy left decides false.
+    let [false_reg, after_false] = load_constant(state, false)
+    state = after_false
+    let [_, after_move] = emit_instruction(state, :Move, 0, result, false_reg, 0)
+    state = after_move
+    let [end_jump, after_end_jump] = emit_jump(state, :Jump, 0, 0)
+    state = after_end_jump
+    state = patch_jump(state, branch, current_offset(state))
+    let [right, after_right] = emit_expr(rows, right_node, state)
+    state = after_right
+    let [_, after_right_move] = emit_instruction(state, :Move, 0, result, right, 0)
+    state = after_right_move
+    state = patch_jump(state, end_jump, current_offset(state))
+    return [result, state]
+  end
+
+  // Truthy left decides true; otherwise the right operand.
+  let [right, after_right] = emit_expr(rows, right_node, state)
+  state = after_right
+  let [_, after_right_move] = emit_instruction(state, :Move, 0, result, right, 0)
+  state = after_right_move
+  let [end_jump, after_end_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_end_jump
+  state = patch_jump(state, branch, current_offset(state))
+  let [true_reg, after_true] = load_constant(state, true)
+  state = after_true
+  let [_, after_true_move] = emit_instruction(state, :Move, 0, result, true_reg, 0)
+  state = after_true_move
+  state = patch_jump(state, end_jump, current_offset(state))
+  return [result, state]
 end
 
 // The Bin_Op flag for a parser operator symbol, or -1 when unsupported.
