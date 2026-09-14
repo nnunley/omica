@@ -1692,6 +1692,16 @@ verb emit_call(rows, node, state)
     return [dst, state]
   end
 
+  // `commit` and `suspend` are compiler-recognized VM ops, not builtins.
+  if callee_name == "commit"
+    if len(args) != 0
+      return emit_error(state, "commit expects no arguments")
+    end
+    let [_, after_emit] = emit_instruction(state, :Commit, 0, 0, 0, 0)
+    state = after_emit
+    return [-1, state]
+  end
+
   // `mailbox_recv` is a VM op rather than a runtime builtin: it suspends.
   if callee_name == "mailbox_recv"
     return emit_mailbox_recv(rows, args, state)
