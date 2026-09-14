@@ -8,9 +8,13 @@
 //
 // Slice one covers top-level expressions: int, float, and bool literals,
 // arithmetic (`+`, `-`, `*`, `/`), `return`, assignment, and `let`/`const`
-// bindings. Anything else records an error naming the unsupported node.
-// Roles that need source-text decoding (strings), control flow, calls, and
-// patterns arrive in later slices.
+// bindings.
+//
+// Slice two adds string and symbol literals (with source-text decoding),
+// list and map literals, indexing, unary operators, and the remaining
+// binary operators. Anything else records an error naming the unsupported
+// node. Calls, control flow, patterns, and identity/error/bytes literals
+// arrive in later slices.
 //
 // Naming follows the parse.mica rules: no local spells a lowercase keyword
 // or a keyword identifier, so suffixed names (`left_reg`, `binding_name`)
@@ -38,7 +42,7 @@ end
 // description carries `:errors` alongside the sections; `assemble` ignores
 // unknown keys, so the map feeds it directly.
 verb emit_program(rows, root) -> map
-  let state = [[], [], [[]], 0, []]
+  let state = [[], [], [[]], 0, [], []]
   let items = ast_children(rows, root, :item)
   if len(items) == 0
     state[4] = [@state[4], "a program needs at least one item"]
@@ -70,12 +74,13 @@ verb describe(state, last_reg)
   let constants = state[1]
   let next_reg = state[3]
   let errors = state[4]
+  let builtins = state[5]
   let main_fn = {:name -> "main", :code_offset -> 0, :code_len -> len(code),
                  :registers -> next_reg, :params -> 0, :required -> 0,
                  :rest -> false, :defaults -> []}
   return {:entry -> 0, :code -> code, :constants -> constants,
           :functions -> [main_fn], :patterns -> [], :shapes -> [],
-          :specs -> [], :builtins -> [], :errors -> errors}
+          :specs -> [], :builtins -> builtins, :errors -> errors}
 end
 
 // --- Fact queries ------------------------------------------------------------
@@ -146,6 +151,41 @@ verb alloc_register(state)
   return [reg, state]
 end
 
+// Registers a builtin name, returning [index, state]. Names are not
+// deduplicated, matching the Odin emitter: an unused duplicate is harmless
+// and dedup would need a lookup table here.
+verb add_builtin(state, builtin_name)
+  let index = len(state[5])
+  state[5] = [@state[5], builtin_name]
+  return [index, state]
+end
+
+// Reserves `len(registers)` consecutive registers and moves each value into
+// its slot, returning [first, state]. The VM reads call and build operands
+// from consecutive registers.
+verb marshal_arguments(state, registers)
+  if len(registers) == 0
+    return [0, state]
+  end
+  let [first, after_first] = alloc_register(state)
+  state = after_first
+  let reserved = 1
+  while reserved < len(registers)
+    let [_, after_more] = alloc_register(state)
+    state = after_more
+    reserved = reserved + 1
+  end
+  let index = 0
+  for register in registers
+    if register != first + index
+      let [_, after_move] = emit_instruction(state, :Move, 0, first + index, register, 0)
+      state = after_move
+    end
+    index = index + 1
+  end
+  return [first, state]
+end
+
 // Records an emitter error, returning [0, state] as a dummy register.
 verb emit_error(state, message)
   state[4] = [@state[4], message]
@@ -194,11 +234,38 @@ verb emit_expr(rows, node, state)
   if kind == :Bool_Literal
     return emit_bool_literal(rows, node, state)
   end
+  if kind == :String_Literal
+    return emit_string_literal(rows, node, state)
+  end
+  if kind == :Symbol_Literal
+    return emit_symbol_literal(rows, node, state)
+  end
+  if kind == :Error_Code_Literal
+    return emit_error_code_literal(rows, node, state)
+  end
+  if kind == :Identity_Literal
+    return emit_identity_literal(rows, node, state)
+  end
   if kind == :Name
     return emit_name(rows, node, state)
   end
+  if kind == :Unary
+    return emit_unary(rows, node, state)
+  end
   if kind == :Binary
     return emit_binary(rows, node, state)
+  end
+  if kind == :List_Literal
+    return emit_list_literal(rows, node, state)
+  end
+  if kind == :Map_Literal
+    return emit_map_literal(rows, node, state)
+  end
+  if kind == :Index
+    return emit_index(rows, node, state)
+  end
+  if kind == :Field
+    return emit_field(rows, node, state)
   end
   if kind == :Binding
     return emit_binding(rows, node, state)
@@ -254,6 +321,110 @@ verb emit_bool_literal(rows, node, state)
   return [dst, state]
 end
 
+// Loads `const_value` into a fresh register, returning [register, state].
+verb load_constant(state, const_value)
+  let [index, after_const] = emit_constant(state, const_value)
+  state = after_const
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Load_Const, 0, dst, index, 0)
+  state = after_emit
+  return [dst, state]
+end
+
+// A string literal's text is stored raw (with quotes and escapes) because
+// the lexer records token text verbatim. Decode it here, then intern.
+verb emit_string_literal(rows, node, state)
+  let [found, text] = ast_attr(rows, node, :text)
+  if !found
+    return emit_error(state, "a string literal is missing its text")
+  end
+  return load_constant(state, decode_string_literal(text))
+end
+
+// The :name of a symbol or identity literal, with quotes decoded when the
+// source wrote `:"..."`.
+verb literal_name(rows, node)
+  let [found, text] = ast_attr(rows, node, :name)
+  if !found
+    return [false, ""]
+  end
+  if len(text) > 0 && text[0] == 34
+    return [true, decode_string_literal(text)]
+  end
+  return [true, text]
+end
+
+verb emit_symbol_literal(rows, node, state)
+  let [found, text] = literal_name(rows, node)
+  if !found
+    return emit_error(state, "a symbol literal is missing its name")
+  end
+  return load_constant(state, to_symbol(text))
+end
+
+verb emit_error_code_literal(rows, node, state)
+  let [found, text] = ast_attr(rows, node, :text)
+  if !found
+    return emit_error(state, "an error-code literal is missing its text")
+  end
+  return load_constant(state, from_literal(text)[:value])
+end
+
+// `#123` is a raw identity. `#name` must have been created by the world and
+// declared through `make_identity` before this emitter runs.
+verb emit_identity_literal(rows, node, state)
+  let [found, text] = literal_name(rows, node)
+  if !found
+    return emit_error(state, "an identity literal is missing its name")
+  end
+  return load_constant(state, from_literal(string_concat("#", text))[:value])
+end
+
+// Decodes a source literal, stripping the surrounding quotes and expanding
+// the backslash escapes the lexer allowed. A value without a leading quote
+// is returned unchanged.
+verb decode_string_literal(text)
+  if string_len(text) < 2 || text[0] != 34
+    return text
+  end
+  let body = string_slice(text, 1, string_len(text) - 1)
+  if !string_contains(body, "\\")
+    return body
+  end
+  let out = ""
+  let index = 0
+  let length = string_len(body)
+  while index < length
+    let current = string_slice(body, index, index + 1)
+    if current != "\\" || index + 1 >= length
+      out = string_append(out, current)
+      index = index + 1
+      continue
+    end
+    index = index + 1
+    let escaped = string_slice(body, index, index + 1)
+    if escaped == "n"
+      out = string_append(out, "\n")
+    elseif escaped == "t"
+      out = string_append(out, "\t")
+    elseif escaped == "r"
+      out = string_append(out, "\r")
+    elseif escaped == "0"
+      out = string_append(out, "\0")
+    elseif escaped == "\\"
+      out = string_append(out, "\\")
+    elseif escaped == "\""
+      out = string_append(out, "\"")
+    else
+      out = string_append(out, "\\")
+      out = string_append(out, escaped)
+    end
+    index = index + 1
+  end
+  return out
+end
+
 // A bare name evaluates to its register; no copy.
 verb emit_name(rows, node, state)
   let [named, binding_name] = single_name(rows, node)
@@ -278,20 +449,8 @@ end
 
 verb emit_binary(rows, node, state)
   let [found_op, op_sym] = ast_attr(rows, node, :op)
-  let flag = -1
-  if found_op && op_sym == :add
-    flag = 0
-  end
-  if found_op && op_sym == :sub
-    flag = 1
-  end
-  if found_op && op_sym == :mul
-    flag = 2
-  end
-  if found_op && op_sym == :div
-    flag = 3
-  end
-  if flag < 0
+  let flag = binary_flag(op_sym)
+  if !found_op || flag < 0
     return emit_error(state, "an operator needs a later slice")
   end
   let [found_left, left_node] = ast_attr(rows, node, :left)
@@ -306,6 +465,147 @@ verb emit_binary(rows, node, state)
   let [dst, after_reg] = alloc_register(state)
   state = after_reg
   let [_, after_emit] = emit_instruction(state, :Binary, flag, dst, left_reg, right_reg)
+  state = after_emit
+  return [dst, state]
+end
+
+// The Bin_Op flag for a parser operator symbol, or -1 when unsupported.
+// The order matches vm.Bin_Op: Add, Sub, Mul, Div, Rem, Eq, Ne, Lt, Le, Gt,
+// Ge. Short-circuit `and`/`or` need control flow and arrive later.
+verb binary_flag(op_sym)
+  if op_sym == :add
+    return 0
+  end
+  if op_sym == :sub
+    return 1
+  end
+  if op_sym == :mul
+    return 2
+  end
+  if op_sym == :div
+    return 3
+  end
+  if op_sym == :rem
+    return 4
+  end
+  if op_sym == :eq
+    return 5
+  end
+  if op_sym == :ne
+    return 6
+  end
+  if op_sym == :lt
+    return 7
+  end
+  if op_sym == :le
+    return 8
+  end
+  if op_sym == :gt
+    return 9
+  end
+  if op_sym == :ge
+    return 10
+  end
+  return -1
+end
+
+verb emit_unary(rows, node, state)
+  let [found_op, op_sym] = ast_attr(rows, node, :op)
+  let [found_operand, operand_node] = ast_attr(rows, node, :operand)
+  if !found_op || !found_operand
+    return emit_error(state, "a unary operator is missing its operand")
+  end
+  let flag = 0
+  if op_sym == :not_op
+    flag = 1
+  end
+  let [operand_reg, after_operand] = emit_expr(rows, operand_node, state)
+  state = after_operand
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Unary, flag, dst, operand_reg, 0)
+  state = after_emit
+  return [dst, state]
+end
+
+verb emit_list_literal(rows, node, state)
+  let elements = ast_children(rows, node, :element)
+  let registers = []
+  for element in elements
+    let [reg, after_element] = emit_expr(rows, element, state)
+    state = after_element
+    registers = [@registers, reg]
+  end
+  let [first, after_marshal] = marshal_arguments(state, registers)
+  state = after_marshal
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Build_List, 0, dst, first, len(registers))
+  state = after_emit
+  return [dst, state]
+end
+
+verb emit_map_literal(rows, node, state)
+  let entries = ast_children(rows, node, :entry)
+  let registers = []
+  for entry in entries
+    let [found_key, key_node] = ast_attr(rows, entry, :key)
+    let [found_value, value_node] = ast_attr(rows, entry, :value)
+    if !found_key || !found_value
+      return emit_error(state, "a map entry is missing its key or value")
+    end
+    let [key_reg, after_key] = emit_expr(rows, key_node, state)
+    state = after_key
+    let [value_reg, after_value] = emit_expr(rows, value_node, state)
+    state = after_value
+    registers = [@registers, key_reg]
+    registers = [@registers, value_reg]
+  end
+  let [first, after_marshal] = marshal_arguments(state, registers)
+  state = after_marshal
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Build_Map, 0, dst, first, len(entries))
+  state = after_emit
+  return [dst, state]
+end
+
+verb emit_index(rows, node, state)
+  let [found_collection, collection_node] = ast_attr(rows, node, :collection)
+  let [found_key, key_node] = ast_attr(rows, node, :key)
+  if !found_collection || !found_key
+    return emit_error(state, "an index is missing its collection or key")
+  end
+  let [collection_reg, after_collection] = emit_expr(rows, collection_node, state)
+  state = after_collection
+  let [key_reg, after_key] = emit_expr(rows, key_node, state)
+  state = after_key
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Index, 0, dst, collection_reg, key_reg)
+  state = after_emit
+  return [dst, state]
+end
+
+// Field access lowers to the `__get_field` builtin with the receiver and the
+// field name as a symbol.
+verb emit_field(rows, node, state)
+  let [found_receiver, receiver_node] = ast_attr(rows, node, :receiver)
+  let [found_name, field_name] = ast_attr(rows, node, :name)
+  if !found_receiver || !found_name
+    return emit_error(state, "a field access is missing its receiver or name")
+  end
+  let [receiver_reg, after_receiver] = emit_expr(rows, receiver_node, state)
+  state = after_receiver
+  let [name_reg, after_name] = load_constant(state, to_symbol(field_name))
+  state = after_name
+  let [first, after_marshal] = marshal_arguments(state, [receiver_reg, name_reg])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "__get_field")
+  state = after_builtin
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, first)
   state = after_emit
   return [dst, state]
 end
