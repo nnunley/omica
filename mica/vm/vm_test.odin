@@ -74,6 +74,46 @@ test_vm_arithmetic_and_return :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
 	testing.expect_value(t, state.result, must_int(5))
+
+	// A halted VM refuses to run again until reset; after reset it runs the
+	// same program and produces the same result, reusing its buffers.
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	vm_reset(&state)
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect_value(t, state.result, must_int(5))
+}
+
+@(test)
+test_vm_reset_restores_instruction_budget :: proc(t: ^testing.T) {
+	arena := test_arena()
+	defer test_arena_destroy(arena)
+	alloc := virtual.arena_allocator(arena)
+
+	builder: Builder
+	builder_init(&builder)
+	defer builder_destroy(&builder)
+
+	two := constant(&builder, 2)
+	three := constant(&builder, 3)
+	builder_begin_function(&builder, v.symbol_intern("main"), 0, 4, true)
+	builder_emit(&builder, .Load_Const, 0, 0, two, 0)
+	builder_emit(&builder, .Load_Const, 0, 1, three, 0)
+	builder_emit(&builder, .Binary, u8(Bin_Op.Add), 2, 0, 1)
+	builder_emit(&builder, .Return, 0, 2, 0, 0)
+	builder_end_function(&builder)
+	program := builder_build(&builder, alloc)
+
+	state: VM
+	vm_init(&state, program, alloc)
+	defer vm_destroy(&state)
+	// Budget is consumed down to zero by the run; reset must restore the
+	// configured value rather than leaving zero, which means unlimited.
+	vm_set_instruction_budget(&state, 8)
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	vm_reset(&state)
+	testing.expect_value(t, state.instruction_budget, u64(8))
+	testing.expect_value(t, vm_run(&state), VM_Status.Halted)
+	testing.expect_value(t, state.result, must_int(5))
 }
 
 @(test)

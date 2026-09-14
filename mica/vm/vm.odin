@@ -131,6 +131,10 @@ VM :: struct {
 	// Execution limits. Zero means unlimited.
 	max_call_depth:     int,
 	instruction_budget: u64,
+	// The budget as configured, restored by `vm_reset`. Without it a reset
+	// after a run that consumed the budget would leave zero, which means
+	// unlimited, silently disabling the limit.
+	configured_budget: u64,
 	// Set once the budget reaches zero, so a caught E_BUDGET cannot silently
 	// turn the exhausted budget (0) into "unlimited".
 	instruction_budget_exhausted: bool,
@@ -192,6 +196,37 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.scratch_allocator = virtual.arena_allocator(state.scratch)
 }
 
+// Returns the VM to a runnable state so the same program can run again,
+// reusing the register, frame, and handler buffers and the scratch arena.
+// Configuration set through the `vm_set_*` calls (authority, workspace,
+// identities, entry overrides, limits) is preserved; only per-run state is
+// cleared.
+//
+// A benchmark that repeats a program must call this between runs: `vm_run`
+// returns immediately on a halted or failed VM, and re-initializing the VM
+// instead allocates several dynamic arrays and a fresh arena per iteration.
+vm_reset :: proc(state: ^VM) {
+	clear(&state.registers)
+	clear(&state.frames)
+	clear(&state.handlers)
+	clear(&state.pending_returns)
+	clear(&state.pending_raises)
+	state.result = v.value_empty_relation()
+	state.error = v.value_empty_relation()
+	state.status = .Ready
+	state.request = .None
+	state.request_spec = -1
+	state.request_value = v.Value(0)
+	state.request_payload = v.Value(0)
+	state.request_millis = 0
+	state.pending_resume = -1
+	state.instruction_budget = state.configured_budget
+	state.instruction_budget_exhausted = false
+	if state.scratch != nil {
+		virtual.arena_free_all(state.scratch)
+	}
+}
+
 vm_destroy :: proc(state: ^VM) {
 	delete(state.pending_returns)
 	delete(state.pending_raises)
@@ -232,6 +267,7 @@ vm_set_max_call_depth :: proc(state: ^VM, depth: int) {
 // fails even if the task catches `E_BUDGET`.
 vm_set_instruction_budget :: proc(state: ^VM, budget: u64) {
 	state.instruction_budget = budget
+	state.configured_budget = budget
 	state.instruction_budget_exhausted = false
 }
 
