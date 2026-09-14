@@ -4589,6 +4589,62 @@ assert Point(2, 20)
 // The strongest self-hosting check before the full bootstrap: the Mica
 // emitter must accept the language the compiler is written in. Each compiler
 // source compiles to a program that decodes and validates.
+// The Mica emitter must reject what the Odin compiler rejects: assigning to a
+// const binding is a compile error, and a program that silently allowed it
+// would diverge from the Odin compiler's diagnostics.
+@(test)
+test_mica_emitter_rejects_const_assignment :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
+		context.temp_allocator,
+	)
+	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	sources := []string{
+		// const reassignment must be rejected.
+		"verb go()\n const x = 10\n x = 20\n return x\nend",
+		// A mutable binding must still be accepted.
+		"verb go()\n let x = 10\n x = 20\n return x\nend",
+	}
+	expect_ok := []bool{false, true}
+	for source, index in sources {
+		outcome := world_call(world, "emit_source", []k.Role_Pair{{
+			role  = v.value_symbol(v.symbol_intern("source")),
+			value = v.value_string(context.temp_allocator, source),
+		}})
+		if outcome.kind != .Complete {
+			testing.expectf(t, false, "emit_source aborted for %q", source)
+			continue
+		}
+		fields, fields_ok := v.value_as_map(outcome.value)
+		if !fields_ok {
+			testing.expectf(t, false, "emit_source did not return a map for %q", source)
+			continue
+		}
+		ok, _ := v.value_as_bool(map_get(fields, "ok"))
+		testing.expectf(
+			t,
+			ok == expect_ok[index],
+			"%q: emitter ok=%v, expected %v",
+			source,
+			ok,
+			expect_ok[index],
+		)
+	}
+}
+
 @(test)
 test_mica_emitter_compiles_compiler :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)

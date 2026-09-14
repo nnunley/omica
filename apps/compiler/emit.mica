@@ -152,7 +152,7 @@ verb emit_program(raw_rows, root) -> map
     for param in params
       let [found_param_name, param_name] = ast_attr(rows, param, :name)
       if found_param_name
-        state = declare_local(state, param_name, param_index)
+        state = declare_local(state, param_name, param_index, false)
       end
       param_index = param_index + 1
     end
@@ -456,14 +456,14 @@ verb emit_pending_functions(rows, state)
     state[10] = state[3]
     let capture_index = 0
     for capture in captures
-      state = declare_local(state, capture[0], capture_index)
+      state = declare_local(state, capture[0], capture_index, false)
       capture_index = capture_index + 1
     end
     let param_index = 0
     for param in params
       let [found_param_name, param_name] = ast_attr(rows, param, :name)
       if found_param_name
-        state = declare_local(state, param_name, capture_count + param_index)
+        state = declare_local(state, param_name, capture_count + param_index, false)
       end
       param_index = param_index + 1
     end
@@ -761,19 +761,21 @@ verb emit_error(state, message)
   return [0, state]
 end
 
-// Declares `binding_name` at `reg` in the innermost scope.
-verb declare_local(state, binding_name, reg)
+// Declares `binding_name` at `reg` in the innermost scope. A const binding
+// cannot be reassigned.
+verb declare_local(state, binding_name, reg, constant_flag)
   let scopes = state[2]
   let top = scopes[len(scopes) - 1]
   let locals = top[1]
-  locals = [@locals, [binding_name, reg]]
+  locals = [@locals, [binding_name, reg, constant_flag]]
   top[1] = locals
   scopes[len(scopes) - 1] = top
   state[2] = scopes
   return state
 end
 
-// Resolves a name from the innermost scope outward as [found, register].
+// Resolves a name from the innermost scope outward as
+// [found, register, is_const].
 verb resolve_local(state, binding_name)
   let scopes = state[2]
   let depth = len(scopes) - 1
@@ -782,13 +784,13 @@ verb resolve_local(state, binding_name)
     let index = len(locals) - 1
     while index >= 0
       if locals[index][0] == binding_name
-        return [true, locals[index][1]]
+        return [true, locals[index][1], locals[index][2]]
       end
       index = index - 1
     end
     depth = depth - 1
   end
-  return [false, 0]
+  return [false, 0, false]
 end
 
 // --- Expressions -------------------------------------------------------------
@@ -1853,7 +1855,7 @@ verb declare_name(rows, name_node, reg, state)
   if !found
     return state
   end
-  return declare_local(state, binding_name, reg)
+  return declare_local(state, binding_name, reg, false)
 end
 
 // Binds a for-header destructuring pattern against the item in `value_reg`.
@@ -1867,7 +1869,7 @@ verb bind_for_pattern(rows, pattern, value_reg, state)
   if kind == :Binding_Pattern
     let [found_name, binding_name] = ast_attr(rows, pattern, :name)
     if found_name
-      return declare_local(state, binding_name, value_reg)
+      return declare_local(state, binding_name, value_reg, false)
     end
     return state
   end
@@ -1898,16 +1900,16 @@ verb bind_list_pattern(rows, pattern, value_reg, state)
       )
       state = after_index_op
       if found_name
-        state = declare_local(state, binding_name, column)
+        state = declare_local(state, binding_name, column, false)
       end
     elseif element_kind == :Wildcard_Pattern
       // Consumes the slot with no binding.
     elseif element_kind == :Optional_Pattern
-      state = bind_optional_scatter(rows, element, value_reg, position, state)
+      state = bind_optional_scatter(rows, element, value_reg, position, false, state)
     elseif element_kind == :Rest_Pattern
       let [found_name, rest_name] = ast_attr(rows, element, :name)
       if found_name
-        state = bind_rest_scatter(rows, element, value_reg, position, state, rest_name)
+        state = bind_rest_scatter(rows, element, value_reg, position, false, state, rest_name)
       end
     else
       state = emit_error(state, "a for list pattern needs names or wildcards")[1]
@@ -1940,7 +1942,7 @@ verb bind_map_pattern(rows, pattern, value_reg, state)
     if found_pattern && ast_kind(rows, binding) == :Binding_Pattern
       let [found_name, binding_name] = ast_attr(rows, binding, :name)
       if found_name
-        state = declare_local(state, binding_name, column)
+        state = declare_local(state, binding_name, column, false)
       end
     end
   end
@@ -2081,7 +2083,7 @@ verb emit_try(rows, node, state)
       state = after_binding
       let [_, after_move] = emit_instruction(state, :Move, 0, binding, error_register, 0)
       state = after_move
-      state = declare_local(state, clause_name, binding)
+      state = declare_local(state, clause_name, binding, false)
     end
     if has_finally
       let [push, after_push] = emit_instruction(state, :Push_Finally, 1, 0, 0, 0)
@@ -2904,7 +2906,7 @@ verb emit_match_pattern(rows, subject, pattern, state)
     let [_, after_move] = emit_instruction(state, :Move, 0, destination, subject, 0)
     state = after_move
     if found_name
-      state = declare_local(state, binding_name, destination)
+      state = declare_local(state, binding_name, destination, false)
     end
     return state
   end
@@ -2982,7 +2984,7 @@ verb emit_match_call_pattern(rows, subject, pattern, state)
     let [column, after_column] = emit_read_column(value_option, "value", state)
     state = after_column
     if found_binding_name
-      state = declare_local(state, binding_name, column)
+      state = declare_local(state, binding_name, column, false)
     end
   end
   return state
@@ -3117,7 +3119,7 @@ verb emit_match_rest_binding(subject, length_reg, rest_name, start, trailing, st
     state, :Builtin_Call, 3, destination, builtin, first,
   )
   state = after_call
-  return declare_local(state, rest_name, destination)
+  return declare_local(state, rest_name, destination, false)
 end
 
 // Matches a map pattern by reading each entry's value and matching it.
@@ -3383,6 +3385,7 @@ verb emit_binding(rows, node, state)
   if !found_pattern
     return emit_error(state, "a binding is missing its pattern")
   end
+  let [binding_is_const, _] = ast_attr(rows, node, :is_const)
   let [found_rhs, rhs] = ast_attr(rows, node, :value)
   // A named `fn f(...) ...` is a self-recursive binding: the parser wraps it
   // as a Binding whose pattern names f and whose value is the Fn. The function
@@ -3396,7 +3399,7 @@ verb emit_binding(rows, node, state)
       state = after_reg
       let [_, after_move] = emit_instruction(state, :Move, 0, dst, self_value, 0)
       state = after_move
-      state = declare_local(state, self_name, dst)
+      state = declare_local(state, self_name, dst, binding_is_const)
       return [dst, state]
     end
   end
@@ -3425,11 +3428,11 @@ verb emit_binding(rows, node, state)
     state = after_reg
     let [_, after_move] = emit_instruction(state, :Move, 0, dst, rhs_reg, 0)
     state = after_move
-    state = declare_local(state, binding_name, dst)
+    state = declare_local(state, binding_name, dst, binding_is_const)
     return [dst, state]
   end
   if pattern_kind == :List_Pattern
-    state = bind_list_scatter(rows, pattern, rhs_reg, state)
+    state = bind_list_scatter(rows, pattern, rhs_reg, binding_is_const, state)
     return [rhs_reg, state]
   end
   if pattern_kind == :Map_Pattern
@@ -3455,7 +3458,7 @@ verb emit_binding(rows, node, state)
       let [column, after_column] = emit_read_column(rhs_reg, "value", state)
       state = after_column
       if found_binding_name
-        state = declare_local(state, binding_name, column)
+        state = declare_local(state, binding_name, column, binding_is_const)
       end
     end
     let [result, after_result] = alloc_register(state)
@@ -3470,7 +3473,7 @@ end
 // Scatters a list binding's elements by position. Unlike the for-header
 // helper, a binding may not use a wildcard to skip a slot; `_` is a binding
 // name here, matching the Odin emitter.
-verb bind_list_scatter(rows, pattern, value_reg, state)
+verb bind_list_scatter(rows, pattern, value_reg, constant_flag, state)
   let elements = ast_children(rows, pattern, :element)
   let position = 0
   for element in elements
@@ -3486,17 +3489,17 @@ verb bind_list_scatter(rows, pattern, value_reg, state)
       )
       state = after_index_op
       if found_name
-        state = declare_local(state, binding_name, column)
+        state = declare_local(state, binding_name, column, false)
       end
     elseif element_kind == :Wildcard_Pattern
       // `_` discards this position but still consumes a slot, so a later
       // element keeps its ordinal.
     elseif element_kind == :Optional_Pattern
-      state = bind_optional_scatter(rows, element, value_reg, position, state)
+      state = bind_optional_scatter(rows, element, value_reg, position, false, state)
     elseif element_kind == :Rest_Pattern
       let [found_name, rest_name] = ast_attr(rows, element, :name)
       if found_name
-        state = bind_rest_scatter(rows, element, value_reg, position, state, rest_name)
+        state = bind_rest_scatter(rows, element, value_reg, position, false, state, rest_name)
       end
       // A rest consumes the remaining positions, so later elements do not
       // exist; the parser enforces it is last.
@@ -3510,7 +3513,7 @@ end
 
 // Binds `?name = default` from position `position`, falling back to the
 // default (or the empty relation) when the list is too short.
-verb bind_optional_scatter(rows, element, value_reg, position, state)
+verb bind_optional_scatter(rows, element, value_reg, position, constant_flag, state)
   let [found_name, binding_name] = ast_attr(rows, element, :name)
   let [destination, after_dest] = alloc_register(state)
   state = after_dest
@@ -3555,13 +3558,13 @@ verb bind_optional_scatter(rows, element, value_reg, position, state)
   state = after_default_move
   state = patch_jump(state, end_jump, current_offset(state))
   if found_name
-    state = declare_local(state, binding_name, destination)
+    state = declare_local(state, binding_name, destination, constant_flag)
   end
   return state
 end
 
 // Binds `@rest` from position `position` to the end of the list.
-verb bind_rest_scatter(rows, element, value_reg, position, state, rest_name)
+verb bind_rest_scatter(rows, element, value_reg, position, constant_flag, state, rest_name)
   let [start_reg, after_start] = load_constant(state, position)
   state = after_start
   let [end_reg, after_end] = load_constant(state, -1)
@@ -3574,7 +3577,7 @@ verb bind_rest_scatter(rows, element, value_reg, position, state, rest_name)
   state = after_dest
   let [_, after_call] = emit_instruction(state, :Builtin_Call, 3, destination, builtin, first)
   state = after_call
-  return declare_local(state, rest_name, destination)
+  return declare_local(state, rest_name, destination, false)
 end
 
 verb emit_assignment(rows, node, state)
@@ -3622,9 +3625,12 @@ verb emit_assignment(rows, node, state)
     if !named
       return emit_error(state, "a qualified collection needs a later slice")
     end
-    let [found, collection] = resolve_local(state, collection_name)
+    let [found, collection, collection_is_const] = resolve_local(state, collection_name)
     if !found
       return emit_error(state, "assignment to an unknown collection")
+    end
+    if collection_is_const
+      return emit_error(state, "assignment to a constant binding")
     end
     let [key_reg, after_key] = emit_expr(rows, key_node, state)
     state = after_key
@@ -3650,9 +3656,12 @@ verb emit_assignment(rows, node, state)
   if !named
     return emit_error(state, "a qualified target needs a later slice")
   end
-  let [found, reg] = resolve_local(state, binding_name)
+  let [found, reg, target_is_const] = resolve_local(state, binding_name)
   if !found
     return emit_error(state, "an unknown target needs a later slice")
+  end
+  if target_is_const
+    return emit_error(state, "assignment to a constant binding")
   end
   let [rhs_reg, after_rhs] = emit_expr(rows, rhs, state)
   state = after_rhs
