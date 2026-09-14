@@ -4659,6 +4659,137 @@ test_mica_emitter_compiles_compiler :: proc(t: ^testing.T) {
 	}
 }
 
+// Execution conformance: a Mica-emitted program must agree with the
+// Odin-compiled one. This covers a representative subset (queries,
+// comprehension/for patterns, concurrency with commit and mailboxes); the
+// full 19-file run lives in tools/conformance.
+@(test)
+test_mica_emitter_execution_conformance :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(
+		&kernel,
+		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
+		context.temp_allocator,
+	)
+	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	files := []string{
+		"benchmarks/mica/relation_join_scan.mica",
+		"benchmarks/mica/language_for_pattern.mica",
+		"benchmarks/mica/relation_commit.mica",
+	}
+	for path in files {
+		source, read_err := os.read_entire_file_from_path(path, context.temp_allocator)
+		if read_err != nil {
+			testing.expectf(t, false, "cannot read %s", path)
+			continue
+		}
+		outcome := world_call(world, "emit_source", []k.Role_Pair{{
+			role  = v.value_symbol(v.symbol_intern("source")),
+			value = v.value_string(context.temp_allocator, string(source)),
+		}})
+		if outcome.kind != .Complete {
+			testing.expectf(t, false, "%s: emit_source failed: %s", path, outcome.message)
+			continue
+		}
+		fields, fields_ok := v.value_as_map(outcome.value)
+		if !fields_ok {
+			testing.expectf(t, false, "%s: emit_source did not return a map", path)
+			continue
+		}
+		ok, _ := v.value_as_bool(map_get(fields, "ok"))
+		if !ok {
+			testing.expectf(t, false, "%s: emitter errors", path)
+			continue
+		}
+		artifact, artifact_ok := v.value_as_bytes(map_get(fields, "bytes"))
+		if !artifact_ok {
+			testing.expectf(t, false, "%s: emitted no bytes", path)
+			continue
+		}
+
+		baseline, baseline_ok := conformance_run(t, path, nil, alloc)
+		emitted, emitted_ok := conformance_run(t, path, artifact, alloc)
+		if !baseline_ok || !emitted_ok {
+			testing.expectf(t, false, "%s: could not run both programs", path)
+			continue
+		}
+		testing.expectf(
+			t,
+			v.value_eq(baseline, emitted),
+			"%s: results differ (odin %v, mica %v)",
+			path,
+			baseline,
+			emitted,
+		)
+	}
+}
+
+// Loads `path` in a fresh kernel, runs setup then bench, and returns the bench
+// result. A non-nil `artifact` replaces the world's program, so the calls run
+// the Mica-emitted program instead of the Odin-compiled one.
+@(private)
+conformance_run :: proc(
+	t: ^testing.T,
+	path: string,
+	artifact: []u8,
+	alloc: mem.Allocator,
+) -> (v.Value, bool) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	if !start.ok {
+		return v.Value(0), false
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	if entry.kind != .Complete {
+		return v.Value(0), false
+	}
+	if artifact != nil {
+		program, decode_error := vm.program_from_bytes(artifact, alloc)
+		if decode_error != .None {
+			return v.Value(0), false
+		}
+		if vm.program_validate(program) != .None {
+			return v.Value(0), false
+		}
+		vm.program_destroy(world.program, world.allocator)
+		world.program = program
+	}
+	if setup := world_call(world, "setup", nil); setup.kind != .Complete {
+		if setup.message != "no applicable method" {
+			testing.expectf(t, false, "%s: setup: %s", path, setup.message)
+			return v.Value(0), false
+		}
+	}
+	bench := world_call(world, "bench", nil)
+	if bench.kind != .Complete {
+		testing.expectf(t, false, "%s: bench: %s", path, bench.message)
+		return v.Value(0), false
+	}
+	return bench.value, true
+}
+
 @(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
