@@ -45,7 +45,7 @@ end
 // description carries `:errors` alongside the sections; `assemble` ignores
 // unknown keys, so the map feeds it directly.
 verb emit_program(raw_rows, root) -> map
-  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, [], []]
+  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, [], [], []]
   // Sort facts by node id once so every lookup can binary search instead of
   // scanning. Row order is not otherwise observable here.
   let rows = sort_ast_rows(raw_rows)
@@ -545,6 +545,21 @@ verb emit_expr(rows, node, state)
   if kind == :Spawn
     return emit_spawn(rows, node, state)
   end
+  if kind == :Dom_Element
+    return emit_dom_element(rows, node, state)
+  end
+  if kind == :Dom_Text
+    return emit_dom_text(rows, node, state)
+  end
+  if kind == :Match
+    return emit_match(rows, node, state)
+  end
+  if kind == :Raise
+    return emit_raise(rows, node, state)
+  end
+  if kind == :Structural_Literal
+    return emit_frob(rows, node, state)
+  end
   if kind == :Binding
     return emit_binding(rows, node, state)
   end
@@ -709,11 +724,21 @@ verb emit_name(rows, node, state)
   if !named
     return emit_error(state, "a qualified name needs a later slice")
   end
+  // `none` is an option literal, not a binding: the empty relation headed
+  // `[:value]`.
+  if binding_name == "none"
+    return load_constant(state, none_value())
+  end
   let [found, reg] = resolve_local(state, binding_name)
   if !found
-    return emit_error(state, "an unknown name needs a later slice")
+    return emit_error(state, string_concat("unknown name: ", binding_name))
   end
   return [reg, state]
+end
+
+// The `none` value: a relation with heading [:value] and no rows.
+verb none_value()
+  return __relation_literal([:value], [])
 end
 
 // The single-part name text of a :Name node as [ok, text].
@@ -723,6 +748,25 @@ verb single_name(rows, node)
     return [false, ""]
   end
   return [true, parts[0]]
+end
+
+// Joins a name node's parts with '/', matching the Odin emitter. A single
+// part is returned unchanged. Returns [ok, text]; ok is false for no parts.
+verb join_name(rows, node)
+  let parts = ast_children(rows, node, :part)
+  if len(parts) == 0
+    return [false, ""]
+  end
+  if len(parts) == 1
+    return [true, parts[0]]
+  end
+  let text = parts[0]
+  let index = 1
+  while index < len(parts)
+    text = string_concat(text, "/", parts[index])
+    index = index + 1
+  end
+  return [true, text]
 end
 
 verb emit_binary(rows, node, state)
@@ -1645,9 +1689,9 @@ verb emit_call(rows, node, state)
   if !found_callee || ast_kind(rows, callee_node) != :Name
     return emit_error(state, "a computed callee needs a later slice")
   end
-  let [named, callee_name] = single_name(rows, callee_node)
+  let [named, callee_name] = join_name(rows, callee_node)
   if !named
-    return emit_error(state, "a qualified callee needs a later slice")
+    return emit_error(state, "a callee is missing its name")
   end
   let args = ast_children(rows, node, :arg)
 
@@ -1822,9 +1866,9 @@ verb emit_relation_write(rows, node, assert_write, state)
   if !found_callee || ast_kind(rows, callee_node) != :Name
     return emit_error(state, "assert and retract need a relation name")
   end
-  let [named, relation_name] = single_name(rows, callee_node)
+  let [named, relation_name] = join_name(rows, callee_node)
   if !named
-    return emit_error(state, "a qualified relation name needs a later slice")
+    return emit_error(state, "a relation write is missing its relation name")
   end
 
   let args = ast_children(rows, atom, :arg)
@@ -1882,6 +1926,612 @@ end
 
 // `mailbox_recv([receivers])` or `mailbox_recv([receivers], timeout)` suspends
 // until a message arrives. Lowers to the Mailbox_Recv op.
+// `raise CODE, message, value` lowers to the Raise op. The message and value
+// are optional; -1 marks absent, matching the VM's encoding.
+verb emit_raise(rows, node, state)
+  let parts = ast_children(rows, node, :part)
+  if len(parts) == 0 || len(parts) > 3
+    return emit_error(state, "raise expects an error code and optional message and value")
+  end
+  let [code_reg, after_code] = emit_expr(rows, parts[0], state)
+  state = after_code
+  let message_reg = -1
+  if len(parts) > 1
+    let [reg, after_message] = emit_expr(rows, parts[1], state)
+    state = after_message
+    message_reg = reg
+  end
+  let value_reg = -1
+  if len(parts) > 2
+    let [reg, after_value] = emit_expr(rows, parts[2], state)
+    state = after_value
+    value_reg = reg
+  end
+  let [_, after_emit] = emit_instruction(state, :Raise, 0, code_reg, message_reg, value_reg)
+  state = after_emit
+  return [-1, state]
+end
+
+// `dom<tag attrs>children</tag>` lowers to the dom_element builtin with the
+// tag string, an attributes map, and a children list.
+verb emit_dom_element(rows, node, state)
+  let [found_tag, tag] = ast_attr(rows, node, :tag)
+  if !found_tag
+    return emit_error(state, "a dom element is missing its tag")
+  end
+  let [tag_reg, after_tag] = load_constant(state, tag)
+  state = after_tag
+
+  let attributes = ast_children(rows, node, :attribute)
+  let registers = []
+  for attribute in attributes
+    let [found_name, attribute_name] = ast_attr(rows, attribute, :name)
+    if !found_name
+      return emit_error(state, "a dom attribute is missing its name")
+    end
+    let [name_reg, after_name] = load_constant(state, attribute_name)
+    state = after_name
+    let [found_value, value_node] = ast_attr(rows, attribute, :value)
+    let value_reg = 0
+    if found_value
+      let [emitted, after_value] = emit_expr(rows, value_node, state)
+      state = after_value
+      value_reg = emitted
+    else
+      let [emitted, after_true] = load_constant(state, true)
+      state = after_true
+      value_reg = emitted
+    end
+    registers = [@registers, name_reg]
+    registers = [@registers, value_reg]
+  end
+  let [attr_first, after_attr_marshal] = marshal_arguments(state, registers)
+  state = after_attr_marshal
+  let [attributes_reg, after_attributes] = alloc_register(state)
+  state = after_attributes
+  let [_, after_map] = emit_instruction(
+    state, :Build_Map, 0, attributes_reg, attr_first, len(attributes),
+  )
+  state = after_map
+
+  let children = ast_children(rows, node, :child)
+  let [children_reg, after_children] = emit_list_of_nodes(rows, children, state)
+  state = after_children
+
+  let [first, after_marshal] = marshal_arguments(
+    state, [tag_reg, attributes_reg, children_reg],
+  )
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "dom_element")
+  state = after_builtin
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_call] = emit_instruction(state, :Builtin_Call, 3, dst, builtin, first)
+  state = after_call
+  return [dst, state]
+end
+
+verb emit_dom_text(rows, node, state)
+  let [found_text, text] = ast_attr(rows, node, :text)
+  if !found_text
+    return emit_error(state, "a dom text node is missing its text")
+  end
+  let [text_reg, after_text] = load_constant(state, text)
+  state = after_text
+  let [builtin, after_builtin] = add_builtin(state, "dom_text")
+  state = after_builtin
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_call] = emit_instruction(state, :Builtin_Call, 1, dst, builtin, text_reg)
+  state = after_call
+  return [dst, state]
+end
+
+// Builds a list from already-parsed child nodes, returning [register, state].
+// A child is an element, text, an interpolation, or a splice (`{@xs}`), which
+// contributes its elements rather than one child.
+verb emit_list_of_nodes(rows, children, state)
+  let has_splice = false
+  for child in children
+    if ast_kind(rows, child) == :Splice
+      has_splice = true
+    end
+  end
+  let registers = []
+  for child in children
+    if ast_kind(rows, child) == :Splice
+      let [found_value, value_node] = ast_attr(rows, child, :value)
+      if !found_value
+        return [0, emit_error(state, "a splice is missing its value")[1]]
+      end
+      let [reg, after_spliced] = emit_expr(rows, value_node, state)
+      state = after_spliced
+      registers = [@registers, reg]
+      continue
+    end
+    let [reg, after_child] = emit_expr(rows, child, state)
+    state = after_child
+    if has_splice
+      let [wrapped, after_wrap] = emit_singleton_list(state, reg)
+      state = after_wrap
+      registers = [@registers, wrapped]
+    else
+      registers = [@registers, reg]
+    end
+  end
+  if has_splice
+    let [first, after_marshal] = marshal_arguments(state, registers)
+    state = after_marshal
+    let [builtin, after_builtin] = add_builtin(state, "__list_concat")
+    state = after_builtin
+    let [dst, after_dst] = alloc_register(state)
+    state = after_dst
+    let [_, after_call] = emit_instruction(
+      state, :Builtin_Call, len(registers), dst, builtin, first,
+    )
+    state = after_call
+    return [dst, state]
+  end
+  let [first, after_marshal] = marshal_arguments(state, registers)
+  state = after_marshal
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_build] = emit_instruction(state, :Build_List, 0, dst, first, len(registers))
+  state = after_build
+  return [dst, state]
+end
+
+// `match subject` with `case pattern [if guard] ... end`. Each case tests its
+// pattern, running the body and jumping past the rest on success, or falling
+// through to the next case on failure.
+//
+// Case-failure jumps are collected on a stack in state[16] so nested matches
+// keep their own lists. A case boundary patches and clears the list for the
+// current match.
+verb emit_match(rows, node, state)
+  let [found_subject, subject_node] = ast_attr(rows, node, :value)
+  if !found_subject
+    return emit_error(state, "a match is missing its subject")
+  end
+  let [subject, after_subject] = emit_expr(rows, subject_node, state)
+  state = after_subject
+  let [result, after_result] = alloc_register(state)
+  state = after_result
+
+  // Push this match's failure-jump list.
+  state[16] = [@state[16], []]
+
+  let cases = ast_children(rows, node, :case)
+  let end_patches = []
+  for case_node in cases
+    state = match_clear_failures(state)
+    state = scope_enter(state)
+    let [found_pattern, pattern] = ast_attr(rows, case_node, :pattern)
+    if !found_pattern
+      state = scope_leave(state)
+      return emit_error(state, "a match case is missing its pattern")
+    end
+    state = emit_match_pattern(rows, subject, pattern, state)
+
+    let [found_guard, guard_node] = ast_attr(rows, case_node, :guard)
+    if found_guard
+      let [guard, after_guard] = emit_expr(rows, guard_node, state)
+      state = after_guard
+      state = emit_match_fail_test(guard, state)
+    end
+
+    let body = ast_children(rows, case_node, :body)
+    let [body_reg, body_has_value, after_body] = emit_block(rows, body, state)
+    state = after_body
+    state = scope_leave(state)
+    if body_has_value
+      let [_, after_move] = emit_instruction(state, :Move, 0, result, body_reg, 0)
+      state = after_move
+    end
+    let [end_jump, after_end_jump] = emit_jump(state, :Jump, 0, 0)
+    state = after_end_jump
+    end_patches = [@end_patches, end_jump]
+  end
+
+  // Patch any failures left after the last case to fall out of the match.
+  state = match_clear_failures(state)
+  // Pop this match's list (now empty).
+  state[16] = __list_slice(state[16], 0, len(state[16]) - 1)
+
+  for patch in end_patches
+    state = patch_jump(state, patch, current_offset(state))
+  end
+  return [result, state]
+end
+
+// Appends a test that falls through to the next case when `test` is false:
+// branch past a jump when true, and record the jump for the case boundary.
+verb emit_match_fail_test(test, state)
+  let [branch, after_branch] = emit_jump(state, :Branch, 0, test)
+  state = after_branch
+  let [skip, after_skip] = emit_jump(state, :Jump, 0, 0)
+  state = after_skip
+  let stack = state[16]
+  let top = __list_slice(stack, 0, len(stack) - 1)
+  top = [@top, skip]
+  stack = [@__list_slice(stack, 0, len(stack) - 1), top]
+  state[16] = stack
+  state = patch_jump(state, branch, current_offset(state))
+  return state
+end
+
+// Patches every recorded failure jump to the current offset and clears the
+// innermost match's list. Call at each case boundary.
+verb match_clear_failures(state)
+  let stack = state[16]
+  if len(stack) == 0
+    return state
+  end
+  let top = stack[len(stack) - 1]
+  for patch in top
+    state = patch_jump(state, patch, current_offset(state))
+  end
+  // Replace the innermost list with an empty one, without indexed assignment.
+  let replaced = [@__list_slice(stack, 0, len(stack) - 1), []]
+  state[16] = replaced
+  return state
+end
+
+// Reads `subject[name]` into a fresh register, returning [register, state].
+verb emit_read_column(subject, column_name, state)
+  let [symbol_reg, after_symbol] = load_constant(state, to_symbol(column_name))
+  state = after_symbol
+  let [column, after_column] = alloc_register(state)
+  state = after_column
+  let [_, after_index] = emit_instruction(state, :Index, 0, column, subject, symbol_reg)
+  state = after_index
+  return [column, state]
+end
+
+// Emits the tests for one pattern. Each test is followed by a branch to the
+// next case, so later reads run only after earlier tests pass.
+verb emit_match_pattern(rows, subject, pattern, state)
+  let kind = ast_kind(rows, pattern)
+  if kind == :Wildcard_Pattern
+    return state
+  end
+  if kind == :Binding_Pattern
+    let [found_name, binding_name] = ast_attr(rows, pattern, :name)
+    let [destination, after_dest] = alloc_register(state)
+    state = after_dest
+    let [_, after_move] = emit_instruction(state, :Move, 0, destination, subject, 0)
+    state = after_move
+    if found_name
+      state = declare_local(state, binding_name, destination)
+    end
+    return state
+  end
+  if kind == :Literal_Pattern
+    let [found_value, value_node] = ast_attr(rows, pattern, :value)
+    if !found_value
+      return emit_error(state, "a literal pattern is missing its value")[1]
+    end
+    let [literal, after_literal] = emit_expr(rows, value_node, state)
+    state = after_literal
+    let [test, after_test] = alloc_register(state)
+    state = after_test
+    let [_, after_eq] = emit_instruction(state, :Binary, 5, test, subject, literal)
+    state = after_eq
+    return emit_match_fail_test(test, state)
+  end
+  if kind == :Call_Pattern
+    return emit_match_call_pattern(rows, subject, pattern, state)
+  end
+  if kind == :List_Pattern
+    return emit_match_list_pattern(rows, subject, pattern, state)
+  end
+  if kind == :Map_Pattern
+    return emit_match_map_pattern(rows, subject, pattern, state)
+  end
+  return emit_error(state, "this pattern is not valid in a match case")[1]
+end
+
+// Matches `some(x)`, `ok(x)`, and `err(x)` against the option or result shape.
+// `some` reads the :value column directly; `ok`/`err` first compare the :case
+// symbol, then read :value.
+verb emit_match_call_pattern(rows, subject, pattern, state)
+  let [found_name, constructor] = ast_attr(rows, pattern, :name)
+  if !found_name
+    return emit_error(state, "a call pattern is missing its name")[1]
+  end
+  let value_option = -1
+  if constructor == "some"
+    let [option, after_option] = emit_pattern_lookup_symbol(subject, "value", state)
+    state = after_option
+    value_option = option
+  elseif constructor == "ok" || constructor == "err"
+    let expected_name = "ok"
+    if constructor == "err"
+      expected_name = "error"
+    end
+    let [case_option, after_case_option] = emit_pattern_lookup_symbol(subject, "case", state)
+    state = after_case_option
+    let [case_value, after_case_value] = emit_read_column(case_option, "value", state)
+    state = after_case_value
+    let [expected, after_expected] = load_constant(state, to_symbol(expected_name))
+    state = after_expected
+    let [test, after_test] = alloc_register(state)
+    state = after_test
+    let [_, after_eq] = emit_instruction(state, :Binary, 5, test, case_value, expected)
+    state = after_eq
+    state = emit_match_fail_test(test, state)
+    let [option, after_option] = emit_pattern_lookup_symbol(subject, "value", state)
+    state = after_option
+    value_option = option
+  else
+    return emit_error(state, string_concat("unknown match constructor: ", constructor))[1]
+  end
+
+  let args = ast_children(rows, pattern, :arg)
+  if len(args) > 1
+    return emit_error(state, "match constructors take at most one binding")[1]
+  end
+  if len(args) == 1
+    let arg_pattern = args[0]
+    if ast_kind(rows, arg_pattern) != :Binding_Pattern
+      return emit_error(state, "match pattern arguments must be names")[1]
+    end
+    let [found_binding_name, binding_name] = ast_attr(rows, arg_pattern, :name)
+    let [column, after_column] = emit_read_column(value_option, "value", state)
+    state = after_column
+    if found_binding_name
+      state = declare_local(state, binding_name, column)
+    end
+  end
+  return state
+end
+
+// `__index_option(subject, key)` plus a presence test. Returns
+// [option register, state]; the caller reads its :value only after the test.
+verb emit_pattern_lookup(subject, key_reg, state)
+  let [first, after_marshal] = marshal_arguments(state, [subject, key_reg])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "__index_option")
+  state = after_builtin
+  let [option, after_option] = alloc_register(state)
+  state = after_option
+  let [_, after_call] = emit_instruction(state, :Builtin_Call, 0, option, builtin, first)
+  state = after_call
+  let [test, after_test] = alloc_register(state)
+  state = after_test
+  let [_, after_truthy] = emit_instruction(state, :Is_Truthy, 0, test, option, 0)
+  state = after_truthy
+  state = emit_match_fail_test(test, state)
+  return [option, state]
+end
+
+verb emit_pattern_lookup_symbol(subject, column_name, state)
+  let [key, after_key] = load_constant(state, to_symbol(column_name))
+  state = after_key
+  return emit_pattern_lookup(subject, key, state)
+end
+
+// Matches a list pattern. Without a rest element the length must match
+// exactly; with @rest the fixed elements must be present and the middle is
+// bound to the rest name.
+verb emit_match_list_pattern(rows, subject, pattern, state)
+  let [first, after_marshal] = marshal_arguments(state, [subject])
+  state = after_marshal
+  let [len_builtin, after_len_builtin] = add_builtin(state, "__len_option")
+  state = after_len_builtin
+  let [length_option, after_length_option] = alloc_register(state)
+  state = after_length_option
+  let [_, after_len_call] = emit_instruction(
+    state, :Builtin_Call, 0, length_option, len_builtin, first,
+  )
+  state = after_len_call
+  let [length_presence, after_presence] = alloc_register(state)
+  state = after_presence
+  let [_, after_truthy] = emit_instruction(
+    state, :Is_Truthy, 0, length_presence, length_option, 0,
+  )
+  state = after_truthy
+  state = emit_match_fail_test(length_presence, state)
+  let [length_reg, after_read] = emit_read_column(length_option, "value", state)
+  state = after_read
+
+  let elements = ast_children(rows, pattern, :element)
+  let rest_index = -1
+  let index = 0
+  for element in elements
+    if ast_kind(rows, element) == :Rest_Pattern
+      rest_index = index
+      break
+    end
+    index = index + 1
+  end
+  let fixed_count = len(elements)
+  if rest_index >= 0
+    fixed_count = fixed_count - 1
+  end
+  let [length_value, after_length_value] = load_constant(state, fixed_count)
+  state = after_length_value
+  let [length_test, after_length_test] = alloc_register(state)
+  state = after_length_test
+  let op = 5
+  if rest_index >= 0
+    op = 9
+  end
+  let [_, after_test] = emit_instruction(state, :Binary, op, length_test, length_reg, length_value)
+  state = after_test
+  state = emit_match_fail_test(length_test, state)
+
+  index = 0
+  for element in elements
+    let element_kind = ast_kind(rows, element)
+    if element_kind == :Rest_Pattern
+      let [found_rest_name, rest_name] = ast_attr(rows, element, :name)
+      if found_rest_name
+        state = emit_match_rest_binding(
+          subject, length_reg, rest_name, index, len(elements) - index - 1, state,
+        )
+      end
+      index = index + 1
+      continue
+    end
+    let [item_index, after_item_index] = load_constant(state, index)
+    state = after_item_index
+    let [option, after_option] = emit_pattern_lookup(subject, item_index, state)
+    state = after_option
+    let [item, after_item] = emit_read_column(option, "value", state)
+    state = after_item
+    state = emit_match_pattern(rows, item, element, state)
+    index = index + 1
+  end
+  return state
+end
+
+// Binds the middle of a list to `rest_name`, from `start` up to
+// `length - trailing`, or the end when trailing is zero.
+verb emit_match_rest_binding(subject, length_reg, rest_name, start, trailing, state)
+  let [start_reg, after_start] = load_constant(state, start)
+  state = after_start
+  let end_reg = 0
+  if trailing == 0
+    let [end_const, after_end] = load_constant(state, -1)
+    state = after_end
+    end_reg = end_const
+  else
+    let [trailing_reg, after_trailing] = load_constant(state, trailing)
+    state = after_trailing
+    let [computed, after_computed] = alloc_register(state)
+    state = after_computed
+    let [_, after_sub] = emit_instruction(state, :Binary, 1, computed, length_reg, trailing_reg)
+    state = after_sub
+    end_reg = computed
+  end
+  let [first, after_marshal] = marshal_arguments(state, [subject, start_reg, end_reg])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "__list_slice")
+  state = after_builtin
+  let [destination, after_destination] = alloc_register(state)
+  state = after_destination
+  let [_, after_call] = emit_instruction(
+    state, :Builtin_Call, 3, destination, builtin, first,
+  )
+  state = after_call
+  return declare_local(state, rest_name, destination)
+end
+
+// Matches a map pattern by reading each entry's value and matching it.
+verb emit_match_map_pattern(rows, subject, pattern, state)
+  let entries = ast_children(rows, pattern, :entry)
+  for entry in entries
+    let [found_key, key_node] = ast_attr(rows, entry, :key)
+    if !found_key
+      return emit_error(state, "a match map pattern entry is missing its key")[1]
+    end
+    let [found_key_name, key_name] = ast_attr(rows, key_node, :name)
+    if !found_key_name
+      return emit_error(state, "a match map pattern key is missing its name")[1]
+    end
+    let [option, after_option] = emit_pattern_lookup_symbol(subject, key_name, state)
+    state = after_option
+    let [value, after_value] = emit_read_column(option, "value", state)
+    state = after_value
+    let [found_pattern, entry_pattern] = ast_attr(rows, entry, :pattern)
+    if !found_pattern
+      return emit_error(state, "a match map pattern entry is missing its pattern")[1]
+    end
+    state = emit_match_pattern(rows, value, entry_pattern, state)
+  end
+  return state
+end
+
+// `#tag[1, 2]` and `#tag{a -> 1}` lower to the frob builtin: an identity
+// delegate plus a payload. A named form makes a map from the cells; a
+// positional form makes a list, or the single cell's value directly.
+verb emit_frob(rows, node, state)
+  let [found_head, head] = ast_attr(rows, node, :head)
+  if !found_head || ast_kind(rows, head) != :Identity_Literal
+    return emit_error(state, "a structural literal head must be an identity")
+  end
+  let [delegate, after_delegate] = emit_expr(rows, head, state)
+  state = after_delegate
+
+  let cells = ast_children(rows, node, :cell)
+  let [named, _] = ast_attr(rows, node, :named)
+  let payload = 0
+  if named
+    let [payload_reg, after_payload] = emit_frob_named_payload(rows, cells, state)
+    state = after_payload
+    payload = payload_reg
+  elseif len(cells) == 1
+    let [found_value, value_node] = ast_attr(rows, cells[0], :value)
+    if !found_value
+      return emit_error(state, "a structural cell is missing its value")
+    end
+    let [value_reg, after_value] = emit_expr(rows, value_node, state)
+    state = after_value
+    payload = value_reg
+  else
+    let [payload_reg, after_payload] = emit_frob_list_payload(rows, cells, state)
+    state = after_payload
+    payload = payload_reg
+  end
+
+  let [first, after_marshal] = marshal_arguments(state, [delegate, payload])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "frob")
+  state = after_builtin
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_call] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, first)
+  state = after_call
+  return [dst, state]
+end
+
+// Builds a map from named structural cells, returning [register, state].
+verb emit_frob_named_payload(rows, cells, state)
+  let registers = []
+  for cell in cells
+    let [found_name, cell_name] = ast_attr(rows, cell, :name)
+    let [found_value, value_node] = ast_attr(rows, cell, :value)
+    if !found_name || !found_value
+      return [0, emit_error(state, "a named structural cell needs a name and value")[1]]
+    end
+    let [value_reg, after_value] = emit_expr(rows, value_node, state)
+    state = after_value
+    let [name_reg, after_name] = load_constant(state, cell_name)
+    state = after_name
+    registers = [@registers, name_reg]
+    registers = [@registers, value_reg]
+  end
+  let [first, after_marshal] = marshal_arguments(state, registers)
+  state = after_marshal
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_map] = emit_instruction(state, :Build_Map, 0, dst, first, len(cells))
+  state = after_map
+  return [dst, state]
+end
+
+// Builds a list from positional structural cells, returning [register, state].
+verb emit_frob_list_payload(rows, cells, state)
+  let registers = []
+  for cell in cells
+    let [found_value, value_node] = ast_attr(rows, cell, :value)
+    if !found_value
+      return [0, emit_error(state, "a structural cell is missing its value")[1]]
+    end
+    let [value_reg, after_value] = emit_expr(rows, value_node, state)
+    state = after_value
+    registers = [@registers, value_reg]
+  end
+  let [first, after_marshal] = marshal_arguments(state, registers)
+  state = after_marshal
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_build] = emit_instruction(state, :Build_List, 0, dst, first, len(cells))
+  state = after_build
+  return [dst, state]
+end
+
 verb emit_mailbox_recv(rows, args, state)
   if len(args) < 1 || len(args) > 2
     return emit_error(state, "mailbox_recv expects a receiver list and optional timeout")
@@ -2075,6 +2725,31 @@ verb emit_assignment(rows, node, state)
     return emit_error(state, "an assignment is missing its target or value")
   end
   let target_kind = ast_kind(rows, target)
+
+  // `receiver.name = value` lowers to the __set_field builtin with the
+  // receiver, the field name as a symbol, and the value.
+  if target_kind == :Field
+    let [found_receiver, receiver_node] = ast_attr(rows, target, :receiver)
+    let [found_field_name, field_name] = ast_attr(rows, target, :name)
+    if !found_receiver || !found_field_name
+      return emit_error(state, "a field assignment is missing its receiver or name")
+    end
+    let [receiver, after_receiver] = emit_expr(rows, receiver_node, state)
+    state = after_receiver
+    let [name_reg, after_name] = load_constant(state, to_symbol(field_name))
+    state = after_name
+    let [value_reg, after_value] = emit_expr(rows, rhs, state)
+    state = after_value
+    let [first, after_marshal] = marshal_arguments(state, [receiver, name_reg, value_reg])
+    state = after_marshal
+    let [builtin, after_builtin] = add_builtin(state, "__set_field")
+    state = after_builtin
+    let [dst, after_dst] = alloc_register(state)
+    state = after_dst
+    let [_, after_call] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, first)
+    state = after_call
+    return [value_reg, state]
+  end
 
   // `collection[key] = value` replaces the element and rebinds the name, since
   // Mica values are immutable.
