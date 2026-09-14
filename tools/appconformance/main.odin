@@ -1,0 +1,258 @@
+// Execution conformance for Mica applications (#81).
+//
+// For each case this loads a set of Mica files into a world and calls a verb
+// twice: once with the Odin-compiled program installed by world_load, and once
+// with the Mica emitter's program for the same sources swapped in. The results
+// must be equal, or both must raise the same error code.
+//
+// The cases exercise constructs the benchmarks do not: role dispatch,
+// try/catch/finally, match (including nested), DOM construction, structural
+// literals, and field writes. A case's `setup` verb runs before its `call`,
+// matching the benchmark convention.
+//
+//   odin run tools/appconformance
+package main
+
+import "core:fmt"
+import "core:os"
+
+import k "../../mica/kernel"
+import r "../../mica/runtime"
+import v "../../mica/var"
+import vm "../../mica/vm"
+
+COMPILER :: []string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"}
+
+// One conformance case: load `files`, run `setup` if non-empty, then call
+// `call` with `roles`. Each role's value names an identity in the world, so
+// the harness can drive role-dispatched verbs without hard-coding values.
+Case :: struct {
+	name:  string,
+	files: []string,
+	setup: string,
+	call:  string,
+	roles: []Role_Name,
+}
+
+Role_Name :: struct {
+	role:     string,
+	identity: string,
+}
+
+main :: proc() {
+	cases := []Case {
+		{
+			name  = "equipment-service: record calibration",
+			files = []string{"apps/examples/equipment-service.mica"},
+			call  = "record_calibration",
+			roles = []Role_Name {
+				{role = "actor", identity = "technician"},
+				{role = "instrument", identity = "sensor_17"},
+			},
+		},
+		{
+			name  = "equipment-service: transfer",
+			files = []string{"apps/examples/equipment-service.mica"},
+			call  = "transfer",
+			roles = []Role_Name {
+				{role = "actor", identity = "alice"},
+				{role = "instrument", identity = "sensor_17"},
+				{role = "destination", identity = "north_office"},
+			},
+		},
+		{
+			name  = "dependency-planner: mark unavailable",
+			files = []string{"apps/examples/dependency-planner.mica"},
+			call  = "mark_unavailable",
+			roles = []Role_Name {
+				{role = "actor", identity = "olivia"},
+				{role = "component", identity = "database"},
+			},
+		},
+		{
+			name  = "approval-workflow: approve",
+			files = []string{"apps/examples/approval-workflow.mica"},
+			call  = "approve",
+			roles = []Role_Name {
+				{role = "actor", identity = "sam"},
+				{role = "request", identity = "office_supplies_request"},
+				{role = "note", identity = "office_supplies_request"},
+			},
+		},
+		{
+			name  = "mud core: loads and answers",
+			files = []string{
+				"apps/shared/string.mica",
+				"apps/shared/events.mica",
+				"apps/mud/core.mica",
+				"apps/mud/command-parser.mica",
+				"apps/mud/event-substitutions.mica",
+			},
+			call = "",
+		},
+	}
+
+	pass, fail := 0, 0
+	for entry in cases {
+		baseline, baseline_ok := run_case(entry, nil)
+		emitted, emitted_ok := run_case(entry, compile_case(entry))
+		switch {
+		case !baseline_ok:
+			fmt.printf("SKIP %s: odin baseline did not run\n", entry.name)
+			fail += 1
+		case !emitted_ok:
+			fmt.printf("FAIL %s: mica program did not run\n", entry.name)
+			fail += 1
+		case v.value_eq(baseline, emitted):
+			fmt.printf("ok   %s (%s)\n", entry.name, v.value_to_string(baseline, context.temp_allocator))
+			pass += 1
+		case:
+			fmt.printf(
+				"FAIL %s: differ (odin %s, mica %s)\n",
+				entry.name,
+				v.value_to_string(baseline, context.temp_allocator),
+				v.value_to_string(emitted, context.temp_allocator),
+			)
+			fail += 1
+		}
+	}
+	fmt.printf("\npass=%d fail=%d\n", pass, fail)
+	if fail > 0 {
+		os.exit(1)
+	}
+}
+
+// Compiles the case's concatenated sources with the Mica emitter, returning
+// the artifact bytes or nil.
+compile_case :: proc(entry: Case) -> []u8 {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := r.world_start(&kernel, COMPILER, context.allocator)
+	if !start.ok {
+		fmt.eprintln("compiler load failed:", start.message)
+		return nil
+	}
+	defer r.world_destroy(world)
+	_ = r.world_wait(world, world.entry)
+
+	source := ""
+	for path in entry.files {
+		data, read_err := os.read_entire_file_from_path(path, context.allocator)
+		if read_err != nil {
+			fmt.eprintln("cannot read", path)
+			return nil
+		}
+		source = fmt.aprintf("%s\n%s", source, string(data))
+	}
+	outcome := r.world_call(world, "emit_source", []k.Role_Pair{{
+		role  = v.value_symbol(v.symbol_intern("source")),
+		value = v.value_string(context.allocator, source),
+	}})
+	if outcome.kind != .Complete {
+		return nil
+	}
+	fields, fields_ok := v.value_as_map(outcome.value)
+	if !fields_ok {
+		return nil
+	}
+	ok, _ := v.value_as_bool(map_get(fields, "ok"))
+	if !ok {
+		if errors := map_get(fields, "errors"); errors != 0 {
+			if list, list_ok := v.value_as_list(errors); list_ok && len(list) > 0 {
+				if s, s_ok := v.value_as_string(list[0]); s_ok {
+					fmt.eprintln("emit error:", s)
+				}
+			}
+		}
+		return nil
+	}
+	artifact, artifact_ok := v.value_as_bytes(map_get(fields, "bytes"))
+	if !artifact_ok {
+		return nil
+	}
+	owned := make([]u8, len(artifact), context.allocator)
+	copy(owned, artifact)
+	return owned
+}
+
+// Loads the case's files, swaps in `artifact` when non-nil, runs setup then
+// call, and returns [result, ok].
+run_case :: proc(entry: Case, artifact: []u8) -> (v.Value, bool) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := r.world_start(&kernel, entry.files, context.allocator)
+	if !start.ok {
+		return v.Value(0), false
+	}
+	defer r.world_destroy(world)
+	started := r.world_wait(world, world.entry)
+	if started.kind != .Complete {
+		return v.Value(0), false
+	}
+
+	if artifact != nil {
+		program, decode_error := vm.program_from_bytes(artifact, context.allocator)
+		if decode_error != .None {
+			fmt.eprintln("decode:", decode_error)
+			return v.Value(0), false
+		}
+		if validation := vm.program_validate(program); validation != .None {
+			fmt.eprintln(entry.name, "invalid program:", validation)
+			return v.Value(0), false
+		}
+		vm.program_destroy(world.program, world.allocator)
+		world.program = program
+	}
+
+	if entry.setup != "" {
+		if setup := r.world_call(world, entry.setup, nil); setup.kind != .Complete {
+			return v.Value(0), false
+		}
+	}
+	if entry.call == "" {
+		return v.Value(0), true
+	}
+	if len(entry.roles) == 0 {
+		// No roles: just check the call resolves, using no arguments.
+		outcome := r.world_call(world, entry.call, nil)
+		return outcome.value, outcome.kind == .Complete
+	}
+	roles := make([]k.Role_Pair, len(entry.roles), context.temp_allocator)
+	for role_name, index in entry.roles {
+		value, has_value := world.ctx.identities[role_name.identity]
+		if !has_value {
+			value = v.value_symbol(v.symbol_intern(role_name.identity))
+		}
+		roles[index] = k.Role_Pair {
+			role  = v.value_symbol(v.symbol_intern(role_name.role)),
+			value = value,
+		}
+	}
+	outcome := r.world_call(world, entry.call, roles)
+	if outcome.kind != .Complete {
+		// A raised error is a result too: compare its code so both programs
+		// failing the same way counts as agreement.
+		if error_value, is_error := v.value_as_error(outcome.value); is_error {
+			return v.value_error_code(error_value.code), true
+		}
+		detail := outcome.message
+		if error_value, is_error := v.value_as_error(outcome.value); is_error {
+			detail = error_value.message
+		}
+		fmt.eprintf("  [%s] call failed: kind=%v message=%s detail=%s\n", entry.name, outcome.kind, outcome.message, detail)
+		return v.Value(0), false
+	}
+	return outcome.value, true
+}
+
+map_get :: proc(entries: []v.Map_Entry, name: string) -> v.Value {
+	key := v.value_symbol(v.symbol_intern(name))
+	for entry in entries {
+		if entry.key == key {
+			return entry.value
+		}
+	}
+	return v.Value(0)
+}

@@ -1955,9 +1955,16 @@ verb emit_call(rows, node, state)
     return emit_mailbox_recv(rows, args, state)
   end
 
-  // A call carrying a query variable or wildcard is a relation scan. Query
-  // variables are not valid anywhere else, so this cannot shadow a builtin.
+  // Builtins are a fixed global set, so at compile time the emitter can tell
+  // a builtin call from anything else. A call with a query variable or
+  // wildcard is always a scan. Anything else that is not a builtin is a rule
+  // or relation predicate, which is a scan whose bound arguments match cells.
   if call_has_query(rows, args)
+    return emit_relation_query(rows, callee_name, args, state)
+  end
+  // The builtin set is fixed and global, so __is_builtin answers at emit time
+  // in the emitter's own execution, not in the target program.
+  if !__is_builtin(to_symbol(callee_name))
     return emit_relation_query(rows, callee_name, args, state)
   end
 

@@ -4659,6 +4659,204 @@ test_mica_emitter_compiles_compiler :: proc(t: ^testing.T) {
 	}
 }
 
+// Application execution conformance: the Mica emitter must produce a program
+// that behaves like the Odin-compiled one for role-dispatched app verbs.
+// `approve` is the important case: it calls a rule predicate with all-bound
+// arguments, which the emitter must route to a relation scan rather than a
+// builtin call. The app-conformance tool covers more cases.
+@(test)
+test_mica_emitter_app_conformance :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	cases := [?]struct {
+		name: string,
+		path: string,
+		call: string,
+	} {
+		{
+			name = "equipment-service",
+			path = "apps/examples/equipment-service.mica",
+			call = "record_calibration",
+		},
+		{
+			name = "approval-workflow",
+			path = "apps/examples/approval-workflow.mica",
+			call = "approve",
+		},
+	}
+
+	for entry in cases {
+		roles_array := app_conformance_roles(entry.path, entry.call)
+		roles := roles_array[:]
+		baseline, baseline_ok := app_conformance_run(t, entry.path, nil, entry.call, roles, alloc)
+		artifact, artifact_ok := app_conformance_emit(t, entry.path, alloc)
+		if !artifact_ok {
+			testing.expectf(t, false, "%s: Mica emitter failed", entry.name)
+			continue
+		}
+		emitted, emitted_ok := app_conformance_run(
+			t,
+			entry.path,
+			artifact,
+			entry.call,
+			roles,
+			alloc,
+		)
+		if !baseline_ok || !emitted_ok {
+			testing.expectf(t, false, "%s: a program did not run", entry.name)
+			continue
+		}
+		testing.expectf(
+			t,
+			v.value_eq(baseline, emitted),
+			"%s: results differ (odin %s, mica %s)",
+			entry.name,
+			v.value_to_string(baseline, context.temp_allocator),
+			v.value_to_string(emitted, context.temp_allocator),
+		)
+	}
+}
+
+// The role arguments a specific app verb needs, using identities the app
+// declares. Kept minimal: enough to drive a role-dispatched verb.
+@(private)
+app_conformance_roles :: proc(path, call: string) -> [3]k.Role_Pair {
+	if strings.has_suffix(path, "approval-workflow.mica") {
+		return {
+			{app_role("actor"), app_identity("sam")},
+			{app_role("request"), app_identity("office_supplies_request")},
+			{app_role("note"), app_identity("office_supplies_request")},
+		}
+	}
+	return {
+		{app_role("actor"), app_identity("technician")},
+		{app_role("instrument"), app_identity("sensor_17")},
+		{},
+	}
+}
+
+@(private)
+app_role :: proc(name: string) -> v.Value {
+	return v.value_symbol(v.symbol_intern(name))
+}
+
+// A placeholder that app_conformance_run replaces with the identity the world
+// declares under this name.
+@(private)
+app_identity :: proc(name: string) -> v.Value {
+	return v.value_symbol(v.symbol_intern(name))
+}
+
+// Emits `path` with the Mica emitter, returning the artifact.
+@(private)
+app_conformance_emit :: proc(t: ^testing.T, path: string, alloc: mem.Allocator) -> ([]u8, bool) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
+		context.temp_allocator,
+	)
+	if !start.ok {
+		return nil, false
+	}
+	defer world_destroy(world)
+	started := world_wait(world, world.entry)
+	if started.kind != .Complete {
+		return nil, false
+	}
+	source, read_err := os.read_entire_file_from_path(path, context.temp_allocator)
+	if read_err != nil {
+		return nil, false
+	}
+	outcome := world_call(world, "emit_source", []k.Role_Pair{{
+		role  = v.value_symbol(v.symbol_intern("source")),
+		value = v.value_string(context.temp_allocator, string(source)),
+	}})
+	if outcome.kind != .Complete {
+		return nil, false
+	}
+	fields, fields_ok := v.value_as_map(outcome.value)
+	if !fields_ok {
+		return nil, false
+	}
+	ok, _ := v.value_as_bool(map_get(fields, "ok"))
+	if !ok {
+		return nil, false
+	}
+	artifact, artifact_ok := v.value_as_bytes(map_get(fields, "bytes"))
+	if !artifact_ok {
+		return nil, false
+	}
+	owned := make([]u8, len(artifact), alloc)
+	copy(owned, artifact)
+	return owned, true
+}
+
+// Loads `path`, optionally swaps in `artifact`, calls `call` with `roles`, and
+// returns the result.
+@(private)
+app_conformance_run :: proc(
+	t: ^testing.T,
+	path: string,
+	artifact: []u8,
+	call: string,
+	roles: []k.Role_Pair,
+	alloc: mem.Allocator,
+) -> (v.Value, bool) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	if !start.ok {
+		return v.Value(0), false
+	}
+	defer world_destroy(world)
+	started := world_wait(world, world.entry)
+	if started.kind != .Complete {
+		return v.Value(0), false
+	}
+	if artifact != nil {
+		program, decode_error := vm.program_from_bytes(artifact, alloc)
+		if decode_error != .None {
+			return v.Value(0), false
+		}
+		if vm.program_validate(program) != .None {
+			return v.Value(0), false
+		}
+		vm.program_destroy(world.program, world.allocator)
+		world.program = program
+	}
+	// Resolve identity-named role values against the loaded world.
+	resolved := make([]k.Role_Pair, len(roles), context.temp_allocator)
+	for role, index in roles {
+		resolved[index] = role
+		if symbol, is_symbol := v.value_as_symbol(role.value); is_symbol {
+			if name_text, has_name := v.symbol_name(symbol); has_name {
+				if identity, found := world.ctx.identities[name_text]; found {
+					resolved[index] = k.Role_Pair{role = role.role, value = identity}
+				}
+			}
+		}
+	}
+	outcome := world_call(world, call, resolved)
+	if outcome.kind != .Complete {
+		if error_value, is_error := v.value_as_error(outcome.value); is_error {
+			return v.value_error_code(error_value.code), true
+		}
+		return v.Value(0), false
+	}
+	return outcome.value, true
+}
+
 // Execution conformance: a Mica-emitted program must agree with the
 // Odin-compiled one. This covers a representative subset (queries,
 // comprehension/for patterns, concurrency with commit and mailboxes); the

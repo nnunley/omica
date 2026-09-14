@@ -101,6 +101,7 @@ runtime_builtins := [?]Builtin_Spec {
 	{"enable_rule", 1, builtin_enable_rule},
 	{"disable_rule", 1, builtin_disable_rule},
 	{"rules", 1, builtin_rules},
+	{"__is_builtin", 1, builtin_is_builtin},
 	{"describe_rule", 1, builtin_describe_rule},
 	{"fileout", 1, builtin_fileout},
 	{"fileout_rules", -1, builtin_fileout_rules},
@@ -1446,10 +1447,28 @@ rule_active_builtin :: proc(
 	return v.value_bool(true), true
 }
 
-// Rule introspection: `rules(:Relation)` returns the active rule identities
-// whose head relation matches the named relation; `describe_rule(#rule)`
-// returns one rule's installed source.
+
+
+// Reports whether a symbol names a runtime builtin. Unlike a relation, the
+// builtin set is fixed and global, so the Mica emitter can call this at emit
+// time to choose Builtin_Call over a relation scan.
 @(private)
+builtin_is_builtin :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 1 {
+		return builtin_error(state, "E_INVARG", "__is_builtin expects a name")
+	}
+	name_symbol, is_symbol := v.value_as_symbol(args[0])
+	if !is_symbol {
+		return builtin_error(state, "E_TYPE", "__is_builtin expects a symbol")
+	}
+	name, has_name := v.symbol_name(name_symbol)
+	if !has_name {
+		return builtin_error(state, "E_INVARG", "__is_builtin expects an interned symbol")
+	}
+	env := builtin_env(state)
+	return v.value_bool(env.ctx.builtins[name]), true
+}
+
 builtin_rules :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	if len(args) != 1 {
 		return builtin_error(state, "E_INVARG", "rules expects rules(:Relation)")
