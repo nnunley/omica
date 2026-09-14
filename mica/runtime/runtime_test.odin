@@ -4362,6 +4362,113 @@ mica_emitter_matches_odin :: proc(
 	return v.value_eq(odin_state.result, mica_state.result)
 }
 
+// The Mica emitter lowers `assert`/`retract` to name-resolving builtins
+// rather than baked relation ids. Compile a write with it, run the decoded
+// artifact against a real kernel transaction, and confirm the row lands.
+@(test)
+test_mica_emitter_relation_write :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	// The declaration lives in the same world as the emitted program, so the
+	// name-resolving builtin sees :Point through the world's context.
+	declaration := "make_relation(:Point, 1)\n"
+	declaration_path, declaration_ok := write_temp_source(
+		t,
+		"mica_emitter_write_decl.mica",
+		declaration,
+	)
+	if !declaration_ok {
+		return
+	}
+	defer os.remove(declaration_path)
+
+	world, start := world_start(
+		&kernel,
+		[]string{
+			"apps/compiler/lex.mica",
+			"apps/compiler/parse.mica",
+			"apps/compiler/emit.mica",
+			declaration_path,
+		},
+		context.temp_allocator,
+	)
+	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	outcome := world_call(world, "emit_source", []k.Role_Pair{{
+		role  = v.value_symbol(v.symbol_intern("source")),
+		value = v.value_string(context.temp_allocator, "assert Point(7)"),
+	}})
+	testing.expectf(t, outcome.kind == .Complete, "emit_source failed: %s", outcome.message)
+	if outcome.kind != .Complete {
+		return
+	}
+	fields, fields_ok := v.value_as_map(outcome.value)
+	testing.expect(t, fields_ok)
+	if !fields_ok {
+		return
+	}
+	ok, _ := v.value_as_bool(map_get(fields, "ok"))
+	testing.expect(t, ok, "emitter reported an error for the write")
+	if !ok {
+		return
+	}
+	artifact, artifact_ok := v.value_as_bytes(map_get(fields, "bytes"))
+	testing.expect(t, artifact_ok)
+	if !artifact_ok {
+		return
+	}
+	program, decode_error := vm.program_from_bytes(artifact, alloc)
+	testing.expect_value(t, decode_error, vm.Artifact_Error.None)
+	if program == nil {
+		return
+	}
+	testing.expect_value(t, vm.program_validate(program), vm.Program_Error.None)
+
+	// The Mica world's context must be reachable to the running program so
+	// the name-resolving builtin can find :Point.
+	tx := k.kernel_begin(&kernel)
+	relation_source := k.Relation_Source{transaction = &tx, use_stored_derived = true}
+	state: vm.VM
+	vm.vm_init(&state, program, alloc)
+	defer vm.vm_destroy(&state)
+	register_runtime_builtins(&state)
+	state.user = &world.env
+	vm.vm_set_workspace(&state, &relation_source, &tx)
+	run_status := vm.vm_run(&state)
+	if run_status != .Halted {
+		error_message := "?"
+		if error_value, is_error := v.value_as_error(state.error); is_error {
+			error_message = error_value.message
+		}
+		testing.expectf(t, false, "mica write program failed: %s", error_message)
+		return
+	}
+
+	committed, commit_err := k.transaction_commit(&tx)
+	testing.expect_value(t, commit_err, k.Kernel_Error.None)
+	k.snapshot_release(committed)
+	k.transaction_destroy(&tx)
+
+	expect_relation_rows(t, &kernel, "Point", 1)
+}
+
 @(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)

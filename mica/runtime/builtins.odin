@@ -107,6 +107,8 @@ runtime_builtins := [?]Builtin_Spec {
 	{"tasks", 0, builtin_tasks},
 	{"log", -1, builtin_log},
 	{"__relation_literal", 2, builtin_relation_literal},
+	{"__relation_assert", 2, builtin_relation_assert},
+	{"__relation_retract", 2, builtin_relation_retract},
 	{"assemble", 1, builtin_assemble},
 	{"project", -1, builtin_project},
 	{"union", 2, builtin_union},
@@ -2663,6 +2665,74 @@ builtin_relation_literal :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bo
 		return builtin_error(state, "E_INVARG", "relation literal shape is invalid")
 	}
 	return result, true
+}
+
+// Asserts or retracts one row of a relation addressed by name, resolving the
+// relation id at execution time through the world's compile context. This is
+// the runtime-resolution path for relation writes: an emitted program names
+// the relation instead of baking a kernel id, so the same artifact stays
+// valid across worlds whose relation ids differ.
+@(private)
+builtin_relation_write :: proc(
+	state: ^vm.VM,
+	args: []v.Value,
+	assert_write: bool,
+) -> (v.Value, bool) {
+	if len(args) != 2 {
+		return builtin_error(state, "E_INVARG", "a relation write takes a name and a row")
+	}
+	name_symbol, is_symbol := v.value_as_symbol(args[0])
+	if !is_symbol {
+		return builtin_error(state, "E_TYPE", "a relation write name must be a symbol")
+	}
+	name, has_name := v.symbol_name(name_symbol)
+	if !has_name {
+		return builtin_error(state, "E_INVARG", "a relation write name must be interned")
+	}
+	if state.transaction == nil {
+		return builtin_error(state, "E_NO_TRANSACTION", "relation write has no transaction")
+	}
+	env := builtin_env(state)
+	relation, known := env.ctx.relations[name]
+	if !known {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			fmt.aprintf("unknown relation :%s", name, allocator = state.allocator),
+		)
+	}
+	row, is_relation := v.value_as_relation(args[1])
+	if !is_relation || len(row.rows) != 1 {
+		return builtin_error(
+			state,
+			"E_TYPE",
+			"relation write expects a single-row relation value",
+		)
+	}
+	relation_id := k.Relation_ID(relation)
+	if !k.authority_can_write(state.authority, relation_id) {
+		return builtin_error(state, "E_PERMISSION", "relation write denied")
+	}
+	err: k.Kernel_Error
+	if assert_write {
+		err = k.transaction_assert(state.transaction, relation_id, row.rows[0])
+	} else {
+		err = k.transaction_retract(state.transaction, relation_id, row.rows[0])
+	}
+	if err != .None {
+		return builtin_error(state, "E_WRITE", "relation write failed")
+	}
+	return args[1], true
+}
+
+@(private)
+builtin_relation_assert :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	return builtin_relation_write(state, args, true)
+}
+
+@(private)
+builtin_relation_retract :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	return builtin_relation_write(state, args, false)
 }
 
 // Assembles a program description value into artifact bytes (#81).

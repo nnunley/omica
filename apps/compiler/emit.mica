@@ -488,6 +488,12 @@ verb emit_expr(rows, node, state)
   if kind == :Require
     return emit_require(rows, node, state)
   end
+  if kind == :Assert
+    return emit_relation_write(rows, node, true, state)
+  end
+  if kind == :Retract
+    return emit_relation_write(rows, node, false, state)
+  end
   if kind == :Binding
     return emit_binding(rows, node, state)
   end
@@ -1308,6 +1314,106 @@ verb emit_builtin_call(rows, args, callee_name, state)
   )
   state = after_emit
   return [dst, state]
+end
+
+// `assert R(a, b)` and `retract R(a, b)` build a single-row relation value
+// with generated column names and lower to the runtime write builtin, which
+// resolves the relation by name at execution time.
+verb emit_relation_write(rows, node, assert_write, state)
+  let [found_atom, atom] = ast_attr(rows, node, :atom)
+  if !found_atom || ast_kind(rows, atom) != :Call
+    return emit_error(state, "assert and retract need a relation atom")
+  end
+  let [found_callee, callee_node] = ast_attr(rows, atom, :callee)
+  if !found_callee || ast_kind(rows, callee_node) != :Name
+    return emit_error(state, "assert and retract need a relation name")
+  end
+  let [named, relation_name] = single_name(rows, callee_node)
+  if !named
+    return emit_error(state, "a qualified relation name needs a later slice")
+  end
+
+  let args = ast_children(rows, atom, :arg)
+  let heading = []
+  let registers = []
+  let index = 0
+  for arg in args
+    let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+    if !found_expr
+      return emit_error(state, "a relation write argument is missing its expression")
+    end
+    heading = [@heading, generated_column(index)]
+    let [arg_reg, after_arg] = emit_expr(rows, arg_expr, state)
+    state = after_arg
+    registers = [@registers, arg_reg]
+    index = index + 1
+  end
+
+  // The row value is built with the relation-literal builtin over a
+  // single-row list, so the shape is known at run time, then the write
+  // builtin resolves the relation by name.
+  let [rows_reg, after_rows] = build_single_row(state, registers)
+  state = after_rows
+  let [heading_reg, after_heading] = load_constant(state, heading)
+  state = after_heading
+  let [literal_first, after_literal_marshal] = marshal_arguments(
+    state, [heading_reg, rows_reg],
+  )
+  state = after_literal_marshal
+  let [literal_builtin, after_literal_builtin] = add_builtin(state, "__relation_literal")
+  state = after_literal_builtin
+  let [row_value, after_row_value] = alloc_register(state)
+  state = after_row_value
+  let [_, after_literal] = emit_instruction(
+    state, :Builtin_Call, 0, row_value, literal_builtin, literal_first,
+  )
+  state = after_literal
+
+  let [name_reg, after_name] = load_constant(state, to_symbol(relation_name))
+  state = after_name
+  let [first, after_marshal] = marshal_arguments(state, [name_reg, row_value])
+  state = after_marshal
+  let builtin_name = "__relation_assert"
+  if !assert_write
+    builtin_name = "__relation_retract"
+  end
+  let [builtin, after_builtin] = add_builtin(state, builtin_name)
+  state = after_builtin
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, first)
+  state = after_emit
+  return [dst, state]
+end
+
+// Wraps `registers` as a one-row list of cell values, returning
+// [register, state].
+verb build_single_row(state, registers)
+  let [first, after_marshal] = marshal_arguments(state, registers)
+  state = after_marshal
+  let [row, after_row] = alloc_register(state)
+  state = after_row
+  let [_, after_build] = emit_instruction(
+    state, :Build_List, 0, row, first, len(registers),
+  )
+  state = after_build
+  let [outer, after_outer] = alloc_register(state)
+  state = after_outer
+  let [_, after_outer_build] = emit_instruction(state, :Build_List, 0, outer, row, 1)
+  state = after_outer_build
+  return [outer, state]
+end
+
+// The generated heading name for column `position`, matching the Odin
+// compiler so assembled shapes agree.
+verb generated_column(position)
+  return to_symbol(string_concat("column", string_from_chars([int_digit(position)])))
+end
+
+// The decimal text of a small non-negative integer. Column counts are tiny,
+// so only a single digit is needed.
+verb int_digit(value)
+  return string_slice("0123456789", value % 10, value % 10 + 1)
 end
 
 verb emit_binding(rows, node, state)
