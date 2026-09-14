@@ -117,9 +117,6 @@ scheduler_init :: proc(
 	worker_count := max(config.workers, 1)
 	for _ in 0 ..< worker_count {
 		worker := thread.create_and_start_with_data(scheduler, scheduler_worker_proc)
-		if worker == nil {
-			fmt.eprintf("SCHED worker thread create failed\n")
-		}
 		append(&scheduler.threads, worker)
 	}
 	scheduler.timer = thread.create_and_start_with_data(scheduler, scheduler_timer_proc)
@@ -164,8 +161,10 @@ scheduler_shutdown :: proc(scheduler: ^Scheduler) {
 	sync.mutex_unlock(&scheduler.lock)
 
 	for worker in scheduler.threads {
-		thread.join(worker)
-		thread.destroy(worker)
+		if worker != nil {
+			thread.join(worker)
+			thread.destroy(worker)
+		}
 	}
 	thread.join(scheduler.timer)
 	thread.destroy(scheduler.timer)

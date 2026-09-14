@@ -77,7 +77,7 @@ send_all :: proc(socket: net.TCP_Socket, bytes: []byte) {
 // any bytes (or before the body completes) just continues until the outer
 // deadline, instead of returning a short or empty response.
 @(private)
-	read_response :: proc(socket: net.TCP_Socket) -> []u8 {
+read_response :: proc(socket: net.TCP_Socket) -> []u8 {
 	bytes: [dynamic]u8
 	chunk: [4096]u8
 	start := time.tick_now()
