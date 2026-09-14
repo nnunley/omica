@@ -79,4 +79,54 @@ Result :: struct {
 	samples:        []f64,
 	stats:          Stats,
 	ops_per_second: f64,
+	// Hardware counters for one operation, from the last measurement sample.
+	// `counters_available` is false when no counter could be opened, in which
+	// case the values are zero and the report omits them.
+	counters:           Counters,
+	counters_available: bool,
 }
+
+// Per-operation hardware counter values. Only the counters the kernel actually
+// scheduled are meaningful; each `has_*` flag says which those are.
+Counters :: struct {
+	cycles:                 f64,
+	instructions:           f64,
+	cache_references:       f64,
+	cache_misses:           f64,
+	branches:               f64,
+	branch_misses:          f64,
+	stalled_cycles_frontend: f64,
+	stalled_cycles_backend:  f64,
+	has_cycles:             bool,
+	has_instructions:       bool,
+	has_cache_references:   bool,
+	has_cache_misses:       bool,
+	has_branches:           bool,
+	has_branch_misses:      bool,
+	has_stalled_frontend:   bool,
+	has_stalled_backend:    bool,
+}
+
+// Returns the per-operation value and availability flag for one counter kind.
+counter_value :: proc(counters: Counters, kind: Counter_Kind) -> (f64, bool) {
+	switch kind {
+	case .Cycles:
+		return counters.cycles, counters.has_cycles
+	case .Instructions:
+		return counters.instructions, counters.has_instructions
+	case .Cache_References:
+		return counters.cache_references, counters.has_cache_references
+	case .Cache_Misses:
+		return counters.cache_misses, counters.has_cache_misses
+	case .Branches:
+		return counters.branches, counters.has_branches
+	case .Branch_Misses:
+		return counters.branch_misses, counters.has_branch_misses
+	case .Stalled_Frontend:
+		return counters.stalled_cycles_frontend, counters.has_stalled_frontend
+	case .Stalled_Backend:
+		return counters.stalled_cycles_backend, counters.has_stalled_backend
+	}
+	return 0, false
+}
+

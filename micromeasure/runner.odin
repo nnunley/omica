@@ -152,12 +152,27 @@ measure_bench :: proc(
 
 	chunk := calibrate_chunk(runner, bench)
 
+	// Hardware counters, when the platform and kernel allow them. Opened once
+	// and reused across samples; each sample resets, enables, and reads.
+	counters := counters_open()
+	defer counters_close(&counters)
+	total_counts: [COUNTER_COUNT]u64
+	total_ops := u64(0)
+
 	max_samples := max(runner.config.max_samples, 1)
 	min_samples := clamp(runner.config.min_samples, 1, max_samples)
 	per_op := make([dynamic]f64, 0, max_samples)
 	for sample_index in 0 ..< max_samples {
+		counters_begin(&counters)
 		elapsed := sample_ns(bench, chunk, sample_index)
+		counters_end(&counters)
 		append(&per_op, f64(elapsed) / f64(max(chunk, 1)))
+		if counters.usable {
+			for kind in Counter_Kind {
+				total_counts[kind] += counters.values[kind]
+			}
+			total_ops += u64(max(chunk, 1))
+		}
 		if len(per_op) >= min_samples {
 			if coefficient_of_variation(per_op[:]) <= runner.config.noise_cv {
 				break
@@ -175,6 +190,33 @@ measure_bench :: proc(
 	}
 	if stats.median > 0 {
 		result.ops_per_second = 1e9 / stats.median
+	}
+
+	// Report counters per throughput unit, matching the throughput column. A
+	// benchmark that counts several units per harness operation (a VM opcode
+	// suite counts 20000 opcodes per run) would otherwise report a native
+	// instruction count that is off by that factor.
+	if counters.usable && total_ops > 0 {
+		result.counters_available = true
+		units := f64(total_ops) * max(group.throughput.units_per_op, 1)
+		result.counters = Counters {
+			cycles = f64(total_counts[Counter_Kind.Cycles]) / units,
+			instructions = f64(total_counts[Counter_Kind.Instructions]) / units,
+			cache_references = f64(total_counts[Counter_Kind.Cache_References]) / units,
+			cache_misses = f64(total_counts[Counter_Kind.Cache_Misses]) / units,
+			branches = f64(total_counts[Counter_Kind.Branches]) / units,
+			branch_misses = f64(total_counts[Counter_Kind.Branch_Misses]) / units,
+			stalled_cycles_frontend = f64(total_counts[Counter_Kind.Stalled_Frontend]) / units,
+			stalled_cycles_backend = f64(total_counts[Counter_Kind.Stalled_Backend]) / units,
+			has_cycles = counters_has(&counters, .Cycles),
+			has_instructions = counters_has(&counters, .Instructions),
+			has_cache_references = counters_has(&counters, .Cache_References),
+			has_cache_misses = counters_has(&counters, .Cache_Misses),
+			has_branches = counters_has(&counters, .Branches),
+			has_branch_misses = counters_has(&counters, .Branch_Misses),
+			has_stalled_frontend = counters_has(&counters, .Stalled_Frontend),
+			has_stalled_backend = counters_has(&counters, .Stalled_Backend),
+		}
 	}
 
 	owned := make([]f64, len(per_op))

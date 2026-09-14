@@ -16,6 +16,13 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 	}
 
 	has_baseline := baseline != nil && len(baseline) > 0
+	has_counters := false
+	for result in runner.results {
+		if result.counters_available {
+			has_counters = true
+			break
+		}
+	}
 	name_width := 20
 	for result in runner.results {
 		name_width = max(name_width, len(result.name) + 2)
@@ -30,6 +37,12 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 	write_field(&header, 8, "%s", "cv%")
 	write_field(&header, 5, "%s", "n")
 	write_field(&header, 12, "%s", "throughput")
+	if has_counters {
+		write_field(&header, 8, "%s", "insn/op")
+		write_field(&header, 8, "%s", "cyc/op")
+		write_field(&header, 7, "%s", "IPC")
+		write_field(&header, 7, "%s", "br/op")
+	}
 	if has_baseline {
 		write_field(&header, 10, "%s", "delta")
 	}
@@ -54,6 +67,35 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 		throughput := result.throughput.units_per_op * result.ops_per_second
 		write_field(&line, 9, "%.4g", throughput)
 		fmt.sbprintf(&line, " %s/s", result.throughput.unit)
+
+		if has_counters {
+			instructions, has_instructions := counter_value(
+				result.counters,
+				.Instructions,
+			)
+			cycles, has_cycles := counter_value(result.counters, .Cycles)
+			branches, has_branches := counter_value(result.counters, .Branches)
+			if has_instructions {
+				write_field(&line, 8, "%.1f", instructions)
+			} else {
+				write_field(&line, 8, "%s", "-")
+			}
+			if has_cycles {
+				write_field(&line, 8, "%.1f", cycles)
+			} else {
+				write_field(&line, 8, "%s", "-")
+			}
+			if has_instructions && has_cycles && cycles > 0 {
+				write_field(&line, 7, "%.2f", instructions / cycles)
+			} else {
+				write_field(&line, 7, "%s", "-")
+			}
+			if has_branches {
+				write_field(&line, 7, "%.2f", branches)
+			} else {
+				write_field(&line, 7, "%s", "-")
+			}
+		}
 
 		if has_baseline {
 			if previous, found := baseline[result.name]; found && previous > 0 {
