@@ -45,7 +45,7 @@ end
 // description carries `:errors` alongside the sections; `assemble` ignores
 // unknown keys, so the map feeds it directly.
 verb emit_program(raw_rows, root) -> map
-  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, [], [], [], {}, {}, []]
+  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, [], [], [], {}, {}, [], []]
   // Sort facts by node id once so every lookup can binary search instead of
   // scanning. Row order is not otherwise observable here.
   let rows = sort_ast_rows(raw_rows)
@@ -170,6 +170,9 @@ verb emit_program(raw_rows, root) -> map
     state = function_leave(state)
   end
 
+  // Emit queued fn bodies after all outer code is placed.
+  state = emit_pending_functions(rows, state)
+
   return describe(state, last_reg)
 end
 
@@ -190,11 +193,10 @@ verb params_have_restriction(rows, params)
   return false
 end
 
-// Reserves a function slot for a verb's parameters, returning [index, state].
-// Parameter metadata (required count, rest flag) is recorded now; the body is
-// emitted later. The name is recorded so dispatch can resolve the method.
-verb reserve_verb(rows, params, function_name, state)
-  let index = len(state[11])
+// The required-parameter count and rest flag for a parameter list, as
+// [required, has_rest]. Required parameters must precede optional and rest
+// parameters; a later one is counted as optional.
+verb param_arity(rows, params)
   let required = 0
   let has_rest = false
   let seen_optional = false
@@ -210,6 +212,165 @@ verb reserve_verb(rows, params, function_name, state)
       seen_optional = true
     end
   end
+  return [required, has_rest]
+end
+
+// A named recursive `fn f(...)`: emits Make_Self_Function, which supplies the
+// function's own value as its last capture so the body can call itself.
+verb emit_self_fn(rows, node, self_name, state)
+  let index = len(state[11])
+  let params = ast_children(rows, node, :param)
+  let [required, has_rest] = param_arity(rows, params)
+  let desc = {:name -> "fn", :code_offset -> 0, :code_len -> 0,
+              :registers -> 0, :params -> len(params), :required -> required,
+              :rest -> has_rest, :defaults -> []}
+  state[11] = [@state[11], desc]
+
+  // Captures are the visible locals plus a trailing slot for the function's
+  // own value, which the VM fills in.
+  let captures = all_locals(state)
+  let [scratch, after_scratch] = alloc_register(state)
+  state = after_scratch
+  captures = [@captures, [self_name, scratch]]
+  if len(captures) > 255
+    return emit_error(state, "a closure may capture at most 255 values")
+  end
+  let capture_registers = []
+  for capture in captures
+    capture_registers = [@capture_registers, capture[1]]
+  end
+  let [first_capture, after_marshal] = marshal_arguments(state, capture_registers)
+  state = after_marshal
+
+  state[20] = [@state[20], {:index -> index, :node -> node, :captures -> captures}]
+
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_emit] = emit_instruction(
+    state, :Make_Self_Function, len(captures), dst, index, first_capture,
+  )
+  state = after_emit
+  return [dst, state]
+end
+
+// Every visible local, innermost scope first, as [name, register] pairs. Used
+// to capture a closure's environment by value.
+verb all_locals(state)
+  let locals = []
+  let scopes = state[2]
+  let depth = len(scopes) - 1
+  while depth >= 0
+    let scope_locals = scopes[depth][1]
+    for entry in scope_locals
+      locals = [@locals, entry]
+    end
+    depth = depth - 1
+  end
+  return locals
+end
+
+// `fn(params) => body` and `fn(params) ... end` make a function value that
+// captures every visible local by value. The body is emitted later, after the
+// enclosing code, so a slot is reserved now and the body queued.
+verb emit_fn_literal(rows, node, state)
+  let index = len(state[11])
+  let params = ast_children(rows, node, :param)
+  let [required, has_rest] = param_arity(rows, params)
+  let desc = {:name -> "fn", :code_offset -> 0, :code_len -> 0,
+              :registers -> 0, :params -> len(params), :required -> required,
+              :rest -> has_rest, :defaults -> []}
+  state[11] = [@state[11], desc]
+
+  // Capture every visible local. Captures land in the callee's first
+  // registers, before its parameters.
+  let captures = all_locals(state)
+  if len(captures) > 255
+    return emit_error(state, "a closure may capture at most 255 values")
+  end
+  let capture_registers = []
+  for capture in captures
+    capture_registers = [@capture_registers, capture[1]]
+  end
+  let [first_capture, after_marshal] = marshal_arguments(state, capture_registers)
+  state = after_marshal
+
+  // Queue the body; deferring keeps the enclosing code contiguous.
+  state[20] = [@state[20], {:index -> index, :node -> node, :captures -> captures}]
+
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_emit] = emit_instruction(
+    state, :Make_Function, len(captures), dst, index, first_capture,
+  )
+  state = after_emit
+  return [dst, state]
+end
+
+// Emits every queued fn body. A body captures its environment in the first
+// registers (declared as locals), then binds its parameters after them.
+verb emit_pending_functions(rows, state)
+  let pending_index = 0
+  while pending_index < len(state[20])
+    // A body may itself contain fn literals, which append to the queue as it
+    // runs; re-read the list each iteration so those are included.
+    let entry = state[20][pending_index]
+    pending_index = pending_index + 1
+    state = function_enter(state, entry[:index])
+    let captures = entry[:captures]
+    let capture_count = len(captures)
+    let params = ast_children(rows, entry[:node], :param)
+    state[3] = capture_count + len(params)
+    state[10] = state[3]
+    let capture_index = 0
+    for capture in captures
+      state = declare_local(state, capture[0], capture_index)
+      capture_index = capture_index + 1
+    end
+    let param_index = 0
+    for param in params
+      let [found_param_name, param_name] = ast_attr(rows, param, :name)
+      if found_param_name
+        state = declare_local(state, param_name, capture_count + param_index)
+      end
+      param_index = param_index + 1
+    end
+
+    let [found_expr_body, _] = ast_attr(rows, entry[:node], :has_expression_body)
+    let return_reg = 0
+    let has_return = false
+    if found_expr_body
+      let [found_body, body_node] = ast_attr(rows, entry[:node], :expression_body)
+      if found_body
+        let [reg, after_body] = emit_expr(rows, body_node, state)
+        state = after_body
+        return_reg = reg
+        has_return = true
+      end
+    else
+      let body = ast_children(rows, entry[:node], :body)
+      let [reg, body_has_value, after_body] = emit_block(rows, body, state)
+      state = after_body
+      return_reg = reg
+      has_return = body_has_value
+    end
+    if !has_return
+      let [zero_reg, after_zero] = load_constant(state, empty_relation_value())
+      state = after_zero
+      return_reg = zero_reg
+    end
+    let [_, after_return] = emit_instruction(state, :Return, 0, return_reg, 0, 0)
+    state = after_return
+    state = function_leave(state)
+  end
+  return state
+end
+
+// Reserves a function slot for a verb's parameters, returning [index, state].
+// Parameter metadata (required count, rest flag) is recorded now; the body is
+// emitted later. The name is recorded so dispatch can resolve the method.
+verb reserve_verb(rows, params, function_name, state)
+  let index = len(state[11])
+  let [required, has_rest] = param_arity(rows, params)
   let desc = {:name -> function_name, :code_offset -> 0, :code_len -> 0,
               :registers -> 0, :params -> len(params), :required -> required,
               :rest -> has_rest, :defaults -> []}
@@ -582,6 +743,9 @@ verb emit_expr(rows, node, state)
   end
   if kind == :Try
     return emit_try(rows, node, state)
+  end
+  if kind == :Fn
+    return emit_fn_literal(rows, node, state)
   end
   if kind == :Dom_Element
     return emit_dom_element(rows, node, state)
@@ -1965,6 +2129,32 @@ verb emit_call(rows, node, state)
     return [dst, state]
   end
 
+  // A lexically visible local function value takes precedence: `add5(3)` calls
+  // the closure bound to `add5`. This mirrors the Odin emitter, which resolves
+  // a local before builtins and verb dispatch.
+  let [is_local_function, local_reg] = resolve_local(state, callee_name)
+  if is_local_function
+    let registers = []
+    for arg in args
+      let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+      if !found_expr
+        return emit_error(state, "a call argument is missing its expression")
+      end
+      let [arg_reg, after_arg] = emit_expr(rows, arg_expr, state)
+      state = after_arg
+      registers = [@registers, arg_reg]
+    end
+    let [first, after_marshal] = marshal_arguments(state, registers)
+    state = after_marshal
+    let [dst, after_reg] = alloc_register(state)
+    state = after_reg
+    let [_, after_emit] = emit_instruction(
+      state, :Call_Value, len(registers), dst, local_reg, first,
+    )
+    state = after_emit
+    return [dst, state]
+  end
+
   let [found_function, function_index] = find_function(state, callee_name)
   if found_function
     let registers = []
@@ -3042,6 +3232,22 @@ verb emit_binding(rows, node, state)
     return emit_error(state, "a binding is missing its pattern")
   end
   let [found_rhs, rhs] = ast_attr(rows, node, :value)
+  // A named `fn f(...) ...` is a self-recursive binding: the parser wraps it
+  // as a Binding whose pattern names f and whose value is the Fn. The function
+  // must capture its own value so its body can recurse.
+  if found_rhs && ast_kind(rows, rhs) == :Fn && ast_kind(rows, pattern) == :Binding_Pattern
+    let [found_binding_name, self_name] = ast_attr(rows, pattern, :name)
+    if found_binding_name
+      let [self_value, after_self] = emit_self_fn(rows, rhs, self_name, state)
+      state = after_self
+      let [dst, after_reg] = alloc_register(state)
+      state = after_reg
+      let [_, after_move] = emit_instruction(state, :Move, 0, dst, self_value, 0)
+      state = after_move
+      state = declare_local(state, self_name, dst)
+      return [dst, state]
+    end
+  end
   let rhs_reg = 0
   if found_rhs
     let [emitted, after_rhs] = emit_expr(rows, rhs, state)

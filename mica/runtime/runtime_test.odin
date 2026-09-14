@@ -4281,7 +4281,13 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"[n for n in [1, 2, 3, 4] if n == 2]",
 		"[n for n in [3, 1, 2] sort]",
 		"[pair[1] for pair in [[1, \"b\"], [0, \"a\"]] sort pair[0]]",
-		"[a + b for [a, b] in [[1, 2], [3, 4]]]",	}
+		"[a + b for [a, b] in [[1, 2], [3, 4]]]",
+		"let add = fn(a, b) => a + b\nadd(3, 4)",
+		"verb make_adder(base)\n fn(value) => base + value\nend\nlet add5 = make_adder(5)\nadd5(3)",
+		"let x = 10\nlet f = fn() => x\nf()",
+		"let f = fn(n)\n n * n\nend\nf(6)",
+		"let make = fn(base) => fn(v) => base + v\nlet add10 = make(10)\nadd10(7)",
+		"let fact = fn f(n) => if n < 2\n 1\nelse\n n * f(n - 1)\nend\nfact(5)",	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {
 			testing.expectf(t, false, "emitter mismatch for %q", source)
