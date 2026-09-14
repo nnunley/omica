@@ -1215,7 +1215,19 @@ parse_list_literal :: proc(parser: ^Parser) -> ^Expr {
 			advance(parser)
 			append(&elements, expr_node(parser, Splice{value = parse_unary(parser)}))
 		} else {
+			first := len(elements) == 0
 			append(&elements, parse_expression(parser))
+			skip_newlines(parser)
+			// `[body for pattern in iterable if condition sort key]`.
+			// `for` cannot continue any expression, so it unambiguously
+			// opens a comprehension after a single leading element. The
+			// elements array is closed out here: to_slice would delete it
+			// on the list path, so the early return must free it instead.
+			if first && at(parser, .For) {
+				body := elements[0]
+				delete(elements)
+				return parse_comprehension(parser, body)
+			}
 		}
 		skip_newlines(parser)
 		if at(parser, .Comma) {
@@ -1248,6 +1260,55 @@ parse_list_literal :: proc(parser: ^Parser) -> ^Expr {
 		})
 	}
 	return expr_node(parser, List_Literal{elements = elements_slice})
+}
+
+// Parses the tail of a comprehension once the leading body element and
+// `for` are consumed: a binding pattern (or single name), the iterable,
+// and optional `if` and `sort` clauses.
+@(private)
+parse_comprehension :: proc(parser: ^Parser, body: ^Expr) -> ^Expr {
+	advance(parser)
+	pattern: ^Pattern
+	// A bare name binds directly; anything structural goes through patterns.
+	// Call patterns make no sense over iteration items.
+	if at(parser, .Ident) && peek_at(parser, 1).kind != .LParen {
+		pattern = pattern_node(parser, Binding_Pattern{name = advance(parser).text})
+	} else {
+		pattern = parse_pattern(parser)
+		#partial switch _ in pattern^ {
+		case Binding_Pattern, List_Pattern, Map_Pattern, Wildcard_Pattern:
+		case:
+			error_here(parser, "comprehension pattern must be a name, list, map, or wildcard")
+			pattern = pattern_node(parser, Wildcard_Pattern{})
+		}
+	}
+	expect(parser, .In, "expected 'in' in comprehension")
+	iterable := parse_expression(parser)
+	condition: ^Expr
+	if at(parser, .If) {
+		advance(parser)
+		condition = parse_expression(parser)
+	}
+	has_sort := false
+	key: ^Expr
+	if is_contextual_keyword(parser, "sort") {
+		advance(parser)
+		has_sort = true
+		skip_newlines(parser)
+		if !at(parser, .RBracket) {
+			key = parse_expression(parser)
+		}
+	}
+	skip_newlines(parser)
+	expect(parser, .RBracket, "expected ']' to close comprehension")
+	return expr_node(parser, Comprehension {
+		body      = body,
+		pattern   = pattern,
+		iterable  = iterable,
+		condition = condition,
+		key       = key,
+		has_sort  = has_sort,
+	})
 }
 
 @(private)

@@ -27,5 +27,8 @@ verb bench()
   for _ in [1, 2, 3]
     total = total + 1
   end
-  return total
+  let evens = [n for n in [1, 2, 3, 4] if n == 2]
+  let ordered = [n for n in [3, 1, 2] sort]
+  let keyed = [pair[1] for pair in [[1, "b"], [0, "a"]] sort pair[0]]
+  return total + len(evens) + ordered[0] + len(keyed)
 end

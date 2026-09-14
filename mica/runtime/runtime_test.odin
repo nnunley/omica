@@ -4069,6 +4069,76 @@ end
 }
 
 @(test)
+test_comprehension_exec :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `verb comp_map()
+  let got = [x + 1 for x in [1, 2, 3]]
+  return len(got) == 3 && got[0] == 2 && got[1] == 3 && got[2] == 4
+end
+
+verb comp_filter()
+  let got = [n for n in [1, 2, 3, 4] if n == 2]
+  return len(got) == 1 && got[0] == 2
+end
+
+verb comp_sort()
+  let got = [n for n in [3, 1, 2] sort]
+  return len(got) == 3 && got[0] == 1 && got[1] == 2 && got[2] == 3
+end
+
+verb comp_sort_key()
+  let got = [pair[1] for pair in [[1, 2], [0, 3]] sort pair[0]]
+  return len(got) == 2 && got[0] == 3 && got[1] == 2
+end
+
+verb comp_pattern()
+  let got = [a + b for [a, b] in [[1, 2], [3, 4]]]
+  return len(got) == 2 && got[0] == 3 && got[1] == 7
+end
+
+verb comp_map_pattern()
+  let got = [v for {v} in [{:v -> 5}, {:v -> 7}]]
+  return len(got) == 2 && got[0] == 5 && got[1] == 7
+end
+`
+	path, path_ok := write_temp_source(t, "mica_comprehension_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, start.ok, "load failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	entry := world_wait(world, world.entry)
+	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+
+	names := []string{
+		"comp_map",
+		"comp_filter",
+		"comp_sort",
+		"comp_sort_key",
+		"comp_pattern",
+		"comp_map_pattern",
+	}
+	for name in names {
+		outcome := world_call(world, name, nil)
+		testing.expectf(t, outcome.kind == .Complete, "%s failed: %s", name, outcome.message)
+		if outcome.kind != .Complete {
+			continue
+		}
+		flag, flag_ok := v.value_as_bool(outcome.value)
+		testing.expectf(t, flag_ok && flag, "%s returned false", name)
+	}
+}
+
+@(test)
 test_run_shutdown_checkpoint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:Kept, 1)

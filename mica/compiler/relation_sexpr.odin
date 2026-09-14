@@ -439,6 +439,29 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		strings.write_string(builder, "(list")
 		rel_write_body(builder, rows, node, "element")
 		strings.write_byte(builder, ')')
+	case "Comprehension":
+		strings.write_string(builder, "(comprehension (pattern ")
+		pattern, _ := rel_child(rows, node, "pattern")
+		rel_write_pattern(builder, rows, pattern)
+		strings.write_string(builder, ") ")
+		iterable, _ := rel_child(rows, node, "iterable")
+		rel_write_node(builder, rows, iterable)
+		strings.write_byte(builder, ' ')
+		body, _ := rel_child(rows, node, "body")
+		rel_write_node(builder, rows, body)
+		if condition, ok := rel_child(rows, node, "condition"); ok {
+			strings.write_string(builder, " (if ")
+			rel_write_node(builder, rows, condition)
+			strings.write_byte(builder, ')')
+		}
+		if key, ok := rel_child(rows, node, "key"); ok {
+			strings.write_string(builder, " (sort ")
+			rel_write_node(builder, rows, key)
+			strings.write_byte(builder, ')')
+		} else if rel_bool(rows, node, "sort_bare") {
+			strings.write_string(builder, " (sort)")
+		}
+		strings.write_byte(builder, ')')
 	case "Relation_Literal":
 		strings.write_string(builder, "(relation (heading")
 		rel_write_body(builder, rows, node, "heading")

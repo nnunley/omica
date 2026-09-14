@@ -1508,6 +1508,7 @@ end
 verb parse_list_literal(state)
   let elements = []
   state = skip_newlines(state)
+  let first_item = true
   while !at(state, :RBracket) && !at(state, :Eof)
     if at(state, :At)
       state = bump(state)
@@ -1521,7 +1522,17 @@ verb parse_list_literal(state)
       let [element, after_element] = parse_expression(state)
       state = after_element
       elements = [@elements, element]
+      // `[body for pattern in iterable if condition sort key]`. `for`
+      // cannot continue any expression, so it unambiguously opens a
+      // comprehension after a single leading element.
+      if first_item
+        state = skip_newlines(state)
+        if at(state, :For)
+          return parse_comprehension(state, element)
+        end
+      end
     end
+    first_item = false
     state = skip_newlines(state)
     if at(state, :Comma)
       state = bump(state)
@@ -1568,6 +1579,64 @@ verb parse_list_literal(state)
     element_index = element_index + 1
   end
   return [list_node, state]
+end
+
+// Parses the tail of a comprehension once the leading body element is
+// parsed and `for` is current: a binding pattern (or single name), the
+// iterable, and optional `if` and `sort` clauses.
+verb parse_comprehension(state, body_expr)
+  let [_, after_for] = expect(state, :For, "expected 'for'")
+  state = after_for
+  let pattern_node = 0
+  if at(state, :Ident) && tok_at(state, 1)[:kind] != :LParen
+    let name_token = tok(state)
+    state = bump(state)
+    let [bind_pattern, after_bind] = make_node(state, :Binding_Pattern)
+    state = after_bind
+    state = fact(state, bind_pattern, :name, name_token[:text], 0)
+    pattern_node = bind_pattern
+  else
+    let [parsed, after_parsed] = parse_pattern(state)
+    state = after_parsed
+    let parsed_kind = node_kind(state, parsed)
+    if parsed_kind != :List_Pattern && parsed_kind != :Map_Pattern && parsed_kind != :Wildcard_Pattern
+      state = error_here(state, "comprehension pattern must be a name, list, map, or wildcard")
+      let [wild, after_wild] = make_node(state, :Wildcard_Pattern)
+      state = after_wild
+      pattern_node = wild
+    else
+      pattern_node = parsed
+    end
+  end
+  let [comp_node, after_comp] = make_node(state, :Comprehension)
+  state = after_comp
+  state = fact(state, comp_node, :body, body_expr, 0)
+  state = fact(state, comp_node, :pattern, pattern_node, 0)
+  let [_, after_in] = expect(state, :In, "expected 'in' in comprehension")
+  state = after_in
+  let [iterable, after_iterable] = parse_expression(state)
+  state = after_iterable
+  state = fact(state, comp_node, :iterable, iterable, 0)
+  if at(state, :If)
+    state = bump(state)
+    let [condition, after_condition] = parse_expression(state)
+    state = after_condition
+    state = fact(state, comp_node, :condition, condition, 0)
+  end
+  if is_contextual(state, "sort")
+    state = bump(state)
+    if at(state, :RBracket)
+      state = fact(state, comp_node, :sort_bare, true, 0)
+    else
+      let [key, after_key] = parse_expression(state)
+      state = after_key
+      state = fact(state, comp_node, :key, key, 0)
+    end
+  end
+  state = skip_newlines(state)
+  let [_, after_rbracket] = expect(state, :RBracket, "expected ']' to close comprehension")
+  state = after_rbracket
+  return [comp_node, state]
 end
 
 verb parse_map_literal(state)

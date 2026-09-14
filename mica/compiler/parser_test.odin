@@ -460,6 +460,54 @@ test_parse_for_pattern :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_parse_comprehension :: proc(t: ^testing.T) {
+	program := parse_ok(t, "[x + 1 for x in xs]")
+	expr := first_item_expr(t, program)
+	comprehension, comprehension_ok := expr^.(Comprehension)
+	testing.expect(t, comprehension_ok)
+	testing.expect(t, comprehension.pattern != nil)
+	if comprehension.pattern != nil {
+		name, name_ok := comprehension.pattern^.(Binding_Pattern)
+		testing.expect(t, name_ok)
+		if name_ok {
+			testing.expect_value(t, name.name, "x")
+		}
+	}
+	testing.expect(t, comprehension.condition == nil)
+	testing.expect(t, !comprehension.has_sort)
+
+	filtered := parse_ok(t, "[n for n in ns if n == 2 sort n]")
+	filtered_expr := first_item_expr(t, filtered)
+	filtered_comp, filtered_ok := filtered_expr^.(Comprehension)
+	testing.expect(t, filtered_ok)
+	testing.expect(t, filtered_comp.condition != nil)
+	testing.expect(t, filtered_comp.has_sort)
+	testing.expect(t, filtered_comp.key != nil)
+
+	bare := parse_ok(t, "[n for n in ns sort]")
+	bare_expr := first_item_expr(t, bare)
+	bare_comp, bare_ok := bare_expr^.(Comprehension)
+	testing.expect(t, bare_ok)
+	testing.expect(t, bare_comp.has_sort)
+	testing.expect(t, bare_comp.key == nil)
+
+	patterned := parse_ok(t, "[[a, b] for [a, b] in pairs]")
+	patterned_expr := first_item_expr(t, patterned)
+	patterned_comp, patterned_ok := patterned_expr^.(Comprehension)
+	testing.expect(t, patterned_ok)
+	if patterned_comp.pattern != nil {
+		_, list_ok := patterned_comp.pattern^.(List_Pattern)
+		testing.expect(t, list_ok)
+	}
+
+	_, pattern_errors := parse_program(
+		"[x for 123 in xs]",
+		context.temp_allocator,
+	)
+	testing.expect(t, len(pattern_errors) > 0)
+}
+
+@(test)
 test_parse_grant_block :: proc(t: ^testing.T) {
 	source := "grant role #builder\n  read:\n    :inspection\n  write:\n    :editing\n  invoke:\n    :maintenance\n  effect\nend"
 	program := parse_ok(t, source)

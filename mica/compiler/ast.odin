@@ -94,6 +94,18 @@ List_Literal :: struct {
 	elements: []^Expr,
 }
 
+// `[body for pattern in iterable if condition sort key]`. The condition
+// and key are optional (nil); `has_sort` distinguishes a bare `sort`
+// (order by value) from no sorting at all.
+Comprehension :: struct {
+	body:      ^Expr,
+	pattern:   ^Pattern,
+	iterable:  ^Expr,
+	condition: ^Expr,
+	key:       ^Expr,
+	has_sort:  bool,
+}
+
 Map_Entry_AST :: struct {
 	key:   ^Expr,
 	value: ^Expr,
@@ -420,6 +432,7 @@ Expr :: union {
 	Dom_Text,
 	Dom_Element,
 	Fn,
+	Comprehension,
 }
 
 // Authority sections inside a `grant` block.

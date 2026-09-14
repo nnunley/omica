@@ -232,6 +232,27 @@ sexpr_expr :: proc(builder: ^strings.Builder, expr: ^Expr) {
 			sexpr_expr(builder, element)
 		}
 		strings.write_byte(builder, ')')
+	case Comprehension:
+		strings.write_string(builder, "(comprehension (pattern ")
+		sexpr_pattern(builder, n.pattern)
+		strings.write_string(builder, ") ")
+		sexpr_expr(builder, n.iterable)
+		strings.write_byte(builder, ' ')
+		sexpr_expr(builder, n.body)
+		if n.condition != nil {
+			strings.write_string(builder, " (if ")
+			sexpr_expr(builder, n.condition)
+			strings.write_byte(builder, ')')
+		}
+		if n.has_sort {
+			strings.write_string(builder, " (sort")
+			if n.key != nil {
+				strings.write_byte(builder, ' ')
+				sexpr_expr(builder, n.key)
+			}
+			strings.write_byte(builder, ')')
+		}
+		strings.write_byte(builder, ')')
 	case Relation_Literal:
 		strings.write_string(builder, "(relation (heading")
 		for heading in n.heading {

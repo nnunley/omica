@@ -538,6 +538,9 @@ emit_expr :: proc(emitter: ^Emitter, node: ^Expr) -> (int, bool) {
 	case List_Literal:
 		return emit_list(emitter, n)
 
+	case Comprehension:
+		return emit_comprehension(emitter, n)
+
 	case Relation_Literal:
 		return emit_relation_literal(emitter, n)
 
@@ -1195,6 +1198,15 @@ collect_literals :: proc(emitter: ^Emitter, expr: ^Expr, out: ^[dynamic]v.Value)
 	case For:
 		collect_literals(emitter, node.iterable, out)
 		collect_block_literals(emitter, node.body, out)
+	case Comprehension:
+		collect_literals(emitter, node.iterable, out)
+		collect_literals(emitter, node.body, out)
+		if node.condition != nil {
+			collect_literals(emitter, node.condition, out)
+		}
+		if node.key != nil {
+			collect_literals(emitter, node.key, out)
+		}
 	case Begin:
 		collect_block_literals(emitter, node.body, out)
 	case Try:
@@ -1292,6 +1304,14 @@ expr_has_assignment :: proc(expr: ^Expr) -> bool {
 		return expr_has_assignment(node.operand)
 	case Index:
 		return expr_has_assignment(node.collection) || expr_has_assignment(node.key)
+	case Comprehension:
+		if expr_has_assignment(node.body) || expr_has_assignment(node.iterable) {
+			return true
+		}
+		if node.condition != nil && expr_has_assignment(node.condition) {
+			return true
+		}
+		return node.key != nil && expr_has_assignment(node.key)
 	case Int_Literal, Float_Literal, String_Literal, Bytes_Literal, Bool_Literal,
 	     Error_Code_Literal, Identity_Literal, Symbol_Literal, Name, Query_Variable,
 	     Wildcard, Splice, List_Literal, Relation_Literal, Map_Literal, Range_Literal,
@@ -1388,7 +1408,7 @@ emit_into :: proc(emitter: ^Emitter, expr: ^Expr, destination: int) -> (int, boo
 
 	case Int_Literal, Float_Literal, String_Literal, Bytes_Literal, Bool_Literal,
 	     Error_Code_Literal, Identity_Literal, Symbol_Literal, Name, Query_Variable,
-	     Wildcard, Splice, List_Literal, Relation_Literal, Map_Literal, Range_Literal,
+	     Wildcard, Splice, List_Literal, Comprehension, Relation_Literal, Map_Literal, Range_Literal,
 	     Binding, Assignment, Call, Receiver_Call, Field, If, While, For, Begin,
 	     Return, Break, Continue, Assert, Retract, Require, Raise, Match, Try, Spawn,
 	     Structural_Literal, Dom_Text, Dom_Element, Fn:
@@ -1899,6 +1919,223 @@ emit_list_concat :: proc(emitter: ^Emitter, lists: []int) -> (int, bool) {
 		i32(first),
 	)
 	return destination, true
+}
+
+// Emits a comprehension by desugaring: accumulate passing items in a fresh
+// list, then decorate-sort-undecorate when a key is present. A bare `sort`
+// orders the values directly. `break` and `continue` inside the clauses
+// target the accumulation loop through the usual patch lists.
+@(private)
+emit_comprehension :: proc(emitter: ^Emitter, comprehension: Comprehension) -> (int, bool) {
+	iterable, iterable_ok := emit_expr(emitter, comprehension.iterable)
+	if !iterable_ok {
+		return -1, false
+	}
+	accumulator := alloc_register(emitter)
+	vm.builder_emit(emitter.builder, .Build_List, 0, i32(accumulator), 0, 0)
+
+	emitter.loop_depth += 1
+	defer emitter.loop_depth -= 1
+
+	scope_enter(emitter)
+	defer scope_leave(emitter)
+
+	index_register := alloc_register(emitter)
+	zero_index := emit_constant(emitter, int_value(0))
+	vm.builder_emit(emitter.builder, .Move, 0, i32(index_register), i32(zero_index), 0)
+
+	length_register := alloc_register(emitter)
+	vm.builder_emit(emitter.builder, .Len, 0, i32(length_register), i32(iterable), 0)
+
+	break_mark := len(emitter.break_patches)
+	loop_start := current_offset(emitter)
+	append(&emitter.continue_marks, len(emitter.continue_patches))
+
+	condition_register := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Binary,
+		u8(vm.Bin_Op.Lt),
+		i32(condition_register),
+		i32(index_register),
+		i32(length_register),
+	)
+	body_jump := emit_instruction(emitter, .Branch, 0, condition_register, 0, 0)
+	exit_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+	patch_jump(emitter, body_jump, current_offset(emitter))
+
+	item_register := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Collection_Value_At,
+		0,
+		i32(item_register),
+		i32(iterable),
+		i32(index_register),
+	)
+	if _, bound := emit_pattern_value(
+		emitter,
+		comprehension.pattern,
+		item_register,
+		true,
+		false,
+	); !bound {
+		return -1, false
+	}
+
+	if comprehension.condition != nil {
+		keep, keep_ok := emit_expr(emitter, comprehension.condition)
+		if !keep_ok {
+			return -1, false
+		}
+		enter_jump := emit_instruction(emitter, .Branch, 0, keep, 0, 0)
+		skip_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+		patch_jump(emitter, enter_jump, current_offset(emitter))
+		if !emit_comprehension_append(emitter, comprehension, accumulator) {
+			return -1, false
+		}
+		patch_jump(emitter, skip_jump, current_offset(emitter))
+	} else {
+		if !emit_comprehension_append(emitter, comprehension, accumulator) {
+			return -1, false
+		}
+	}
+
+	// A `continue` advances the index first, so it targets the increment
+	// block rather than the loop condition.
+	increment_start := current_offset(emitter)
+	patch_loop_continues(emitter, increment_start)
+
+	one_register := emit_constant(emitter, int_value(1))
+	vm.builder_emit(
+		emitter.builder,
+		.Binary,
+		u8(vm.Bin_Op.Add),
+		i32(index_register),
+		i32(index_register),
+		i32(one_register),
+	)
+
+	back_jump := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+	patch_jump(emitter, back_jump, loop_start)
+
+	patch_jump(emitter, exit_jump, current_offset(emitter))
+	for index in break_mark ..< len(emitter.break_patches) {
+		patch_jump(emitter, emitter.break_patches[index], current_offset(emitter))
+	}
+	resize(&emitter.break_patches, break_mark)
+
+	if !comprehension.has_sort {
+		return accumulator, true
+	}
+	first := marshal_arguments(emitter, []int{accumulator})
+	sorted := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("sort"))
+	vm.builder_emit(emitter.builder, .Builtin_Call, 0, i32(sorted), builtin, i32(first))
+	if comprehension.key == nil {
+		return sorted, true
+	}
+	projected := alloc_register(emitter)
+	vm.builder_emit(emitter.builder, .Build_List, 0, i32(projected), 0, 0)
+	one_index := emit_constant(emitter, int_value(1))
+	project_index := alloc_register(emitter)
+	vm.builder_emit(emitter.builder, .Move, 0, i32(project_index), i32(zero_index), 0)
+	project_length := alloc_register(emitter)
+	vm.builder_emit(emitter.builder, .Len, 0, i32(project_length), i32(sorted), 0)
+	project_start := current_offset(emitter)
+	project_condition := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Binary,
+		u8(vm.Bin_Op.Lt),
+		i32(project_condition),
+		i32(project_index),
+		i32(project_length),
+	)
+	project_body := emit_instruction(emitter, .Branch, 0, project_condition, 0, 0)
+	project_exit := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+	patch_jump(emitter, project_body, current_offset(emitter))
+	pair_register := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Collection_Value_At,
+		0,
+		i32(pair_register),
+		i32(sorted),
+		i32(project_index),
+	)
+	element_register := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Index,
+		0,
+		i32(element_register),
+		i32(pair_register),
+		i32(one_index),
+	)
+	project_first := marshal_arguments(emitter, []int{projected, element_register})
+	project_next := alloc_register(emitter)
+	append_builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__list_append"))
+	vm.builder_emit(
+		emitter.builder,
+		.Builtin_Call,
+		0,
+		i32(project_next),
+		append_builtin,
+		i32(project_first),
+	)
+	vm.builder_emit(emitter.builder, .Move, 0, i32(projected), i32(project_next), 0)
+	vm.builder_emit(
+		emitter.builder,
+		.Binary,
+		u8(vm.Bin_Op.Add),
+		i32(project_index),
+		i32(project_index),
+		i32(one_register),
+	)
+	project_back := emit_instruction(emitter, .Jump, 0, 0, 0, 0)
+	patch_jump(emitter, project_back, project_start)
+	patch_jump(emitter, project_exit, current_offset(emitter))
+	return projected, true
+}
+
+// Evaluates one comprehension item (key first, then body) and appends the
+// element to the accumulator in place: the loop body is emitted once, so
+// the fresh call result moves back into the accumulator register for the
+// next iteration to read.
+@(private)
+emit_comprehension_append :: proc(
+	emitter: ^Emitter,
+	comprehension: Comprehension,
+	accumulator: int,
+) -> bool {
+	element: int
+	if comprehension.key != nil {
+		key_register, key_ok := emit_expr(emitter, comprehension.key)
+		if !key_ok {
+			return false
+		}
+		body_register, body_ok := emit_expr(emitter, comprehension.body)
+		if !body_ok {
+			return false
+		}
+		first := marshal_arguments(emitter, []int{key_register, body_register})
+		pair := alloc_register(emitter)
+		vm.builder_emit(emitter.builder, .Build_List, 0, i32(pair), i32(first), 2)
+		element = pair
+	} else {
+		body_register, body_ok := emit_expr(emitter, comprehension.body)
+		if !body_ok {
+			return false
+		}
+		element = body_register
+	}
+	first := marshal_arguments(emitter, []int{accumulator, element})
+	destination := alloc_register(emitter)
+	builtin := vm.builder_add_builtin(emitter.builder, v.symbol_intern("__list_append"))
+	vm.builder_emit(emitter.builder, .Builtin_Call, 0, i32(destination), builtin, i32(first))
+	vm.builder_emit(emitter.builder, .Move, 0, i32(accumulator), i32(destination), 0)
+	return true
 }
 
 @(private)

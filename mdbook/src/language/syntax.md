@@ -72,6 +72,21 @@ b"aGk="
 `[@prefix, last]` splices the list in `prefix` into a new list before `last`. `2.._` is an
 open-ended range used by index operations.
 
+A list beginning with a single element followed by `for` is a comprehension: it maps the
+body over matching items, keeping those that satisfy an optional `if`, and orders the
+result with an optional `sort` key (or by value for a bare `sort`):
+
+```mica
+[x + 1 for x in [1, 2, 3]]
+[n for n in [1, 2, 3, 4] if n == 2]
+[n for n in [3, 1, 2] sort]
+[pair[1] for pair in [[1, "b"], [0, "a"]] sort pair[0]]
+[a + b for [a, b] in [[1, 2], [3, 4]]]
+```
+
+The header takes the same patterns as `for` loop headers: a name, a list or map pattern,
+or `_`. `break` and `continue` inside the clauses target the comprehension loop.
+
 Operator precedence and call resolution are specified in
 [Operators, Indexing, and Calls](./operators-and-calls.md).
 
