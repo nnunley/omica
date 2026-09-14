@@ -1686,7 +1686,16 @@ end
 // through to Builtin_Call.
 verb emit_call(rows, node, state)
   let [found_callee, callee_node] = ast_attr(rows, node, :callee)
-  if !found_callee || ast_kind(rows, callee_node) != :Name
+  if !found_callee
+    return emit_error(state, "a call is missing its callee")
+  end
+  let callee_kind = ast_kind(rows, callee_node)
+  // `:selector(role: value, ...)` is a role dispatch: the selector plus named
+  // roles pick the method at run time.
+  if callee_kind == :Symbol_Literal
+    return emit_role_dispatch(rows, callee_node, node, state)
+  end
+  if callee_kind != :Name
     return emit_error(state, "a computed callee needs a later slice")
   end
   let [named, callee_name] = join_name(rows, callee_node)
@@ -1828,6 +1837,37 @@ verb emit_relation_query(rows, relation_name, args, state)
   return [dst, state]
 end
 
+// `:selector(role: value, ...)` lowers to a Dispatch with a spec naming the
+// selector and each role's register. Every argument must use an explicit role.
+verb emit_role_dispatch(rows, callee_node, node, state)
+  let [found_selector, selector_name] = ast_attr(rows, callee_node, :name)
+  if !found_selector
+    return emit_error(state, "a dispatch selector is missing its name")
+  end
+  let args = ast_children(rows, node, :arg)
+  let roles = []
+  for arg in args
+    let [found_role, role_name] = ast_attr(rows, arg, :role)
+    if !found_role
+      return emit_error(state, "dispatch arguments must use explicit role names")
+    end
+    let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+    if !found_expr
+      return emit_error(state, "a dispatch argument is missing its expression")
+    end
+    let [arg_reg, after_arg] = emit_expr(rows, arg_expr, state)
+    state = after_arg
+    roles = [@roles, {:role -> role_name, :register -> arg_reg}]
+  end
+  let spec_index = len(state[15])
+  state[15] = [@state[15], {:selector -> selector_name, :roles -> roles}]
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_dispatch] = emit_instruction(state, :Dispatch, 0, dst, spec_index, 0)
+  state = after_dispatch
+  return [dst, state]
+end
+
 // A call to a runtime builtin: marshal the arguments and emit Builtin_Call
 // with the builtin's slot in the program's builtin table.
 verb emit_builtin_call(rows, args, callee_name, state)
@@ -1872,6 +1912,23 @@ verb emit_relation_write(rows, node, assert_write, state)
   end
 
   let args = ast_children(rows, atom, :arg)
+
+  // `retract R(x, _)` retracts every matching row, so a wildcard routes to
+  // the Retract_Where op with a scan pattern rather than a single-row write.
+  if !assert_write
+    let has_wildcard = false
+    for arg in args
+      let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+      if found_expr && ast_kind(rows, arg_expr) == :Wildcard
+        has_wildcard = true
+        break
+      end
+    end
+    if has_wildcard
+      return emit_retract_where(rows, args, relation_name, state)
+    end
+  end
+
   let heading = []
   let registers = []
   let index = 0
@@ -2615,6 +2672,37 @@ verb emit_spawn(rows, node, state)
   return [dst, state]
 end
 
+// `retract R(a, _, c)` retracts every row matching the bound cells. The
+// pattern names the relation (resolved at scan time) and binds the non-
+// wildcard arguments.
+verb emit_retract_where(rows, args, relation_name, state)
+  let column_names = []
+  let cells = []
+  let index = 0
+  for arg in args
+    let [found_expr, arg_expr] = ast_attr(rows, arg, :expr)
+    if !found_expr
+      return emit_error(state, "a retract argument is missing its expression")
+    end
+    column_names = [@column_names, generated_column(index)]
+    if ast_kind(rows, arg_expr) == :Wildcard
+      cells = [@cells, {:kind -> :Wildcard, :operand -> 0}]
+    else
+      let [arg_reg, after_arg] = emit_expr(rows, arg_expr, state)
+      state = after_arg
+      cells = [@cells, {:kind -> :Bind, :operand -> arg_reg}]
+    end
+    index = index + 1
+  end
+  let pattern_index = len(state[14])
+  state[14] = [@state[14], {:name -> relation_name, :columns -> column_names, :cells -> cells}]
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_emit] = emit_instruction(state, :Retract_Where, 0, dst, pattern_index, 0)
+  state = after_emit
+  return [dst, state]
+end
+
 // Wraps `registers` as a one-row list of cell values, returning
 // [register, state].
 verb build_single_row(state, registers)
@@ -2651,11 +2739,18 @@ verb emit_binding(rows, node, state)
     return emit_error(state, "a binding is missing its pattern")
   end
   let [found_rhs, rhs] = ast_attr(rows, node, :value)
-  if !found_rhs
-    return emit_error(state, "a binding is missing its value")
+  let rhs_reg = 0
+  if found_rhs
+    let [emitted, after_rhs] = emit_expr(rows, rhs, state)
+    state = after_rhs
+    rhs_reg = emitted
+  else
+    // `let x` with no value declares a binding for later assignment; it
+    // starts as none.
+    let [emitted, after_none] = load_constant(state, none_value())
+    state = after_none
+    rhs_reg = emitted
   end
-  let [rhs_reg, after_rhs] = emit_expr(rows, rhs, state)
-  state = after_rhs
 
   let pattern_kind = ast_kind(rows, pattern)
   if pattern_kind == :Binding_Pattern
@@ -2682,6 +2777,31 @@ verb emit_binding(rows, node, state)
   end
   if pattern_kind == :Wildcard_Pattern
     return [rhs_reg, state]
+  end
+  // `let some(x) = v` or `if let ok(x) = v`: bind x to the option/result's
+  // :value column, and yield whether v is present (truthy) so `if let` can
+  // test it.
+  if pattern_kind == :Call_Pattern
+    let args = ast_children(rows, pattern, :arg)
+    if len(args) > 1
+      return emit_error(state, "call patterns support one binding")
+    end
+    if len(args) == 1
+      if ast_kind(rows, args[0]) != :Binding_Pattern
+        return emit_error(state, "call pattern arguments must be names")
+      end
+      let [found_binding_name, binding_name] = ast_attr(rows, args[0], :name)
+      let [column, after_column] = emit_read_column(rhs_reg, "value", state)
+      state = after_column
+      if found_binding_name
+        state = declare_local(state, binding_name, column)
+      end
+    end
+    let [result, after_result] = alloc_register(state)
+    state = after_result
+    let [_, after_truthy] = emit_instruction(state, :Is_Truthy, 0, result, rhs_reg, 0)
+    state = after_truthy
+    return [result, state]
   end
   return emit_error(state, "a pattern needs a later slice")
 end
