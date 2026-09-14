@@ -1994,6 +1994,28 @@ verb emit_call(rows, node, state)
     return [dst, state]
   end
 
+  // `invoke(selector, roles)` is a compiler-recognized dynamic dispatch, not
+  // a builtin. The first argument is the selector, the second a role map.
+  if callee_name == "invoke"
+    if len(args) != 2
+      return emit_error(state, "invoke expects a selector and a role map")
+    end
+    let [found_selector, selector_node] = ast_attr(rows, args[0], :expr)
+    let [found_roles, roles_node] = ast_attr(rows, args[1], :expr)
+    if !found_selector || !found_roles
+      return emit_error(state, "invoke is missing its selector or roles")
+    end
+    let [selector, after_selector] = emit_expr(rows, selector_node, state)
+    state = after_selector
+    let [roles_reg, after_roles] = emit_expr(rows, roles_node, state)
+    state = after_roles
+    let [dst, after_dst] = alloc_register(state)
+    state = after_dst
+    let [_, after_dispatch] = emit_instruction(state, :Dynamic_Dispatch, 0, dst, selector, roles_reg)
+    state = after_dispatch
+    return [dst, state]
+  end
+
   // `commit` and `suspend` are compiler-recognized VM ops, not builtins.
   if callee_name == "commit"
     if len(args) != 0
@@ -2828,14 +2850,19 @@ end
 verb emit_frob_named_payload(rows, cells, state)
   let registers = []
   for cell in cells
-    let [found_name, cell_name] = ast_attr(rows, cell, :name)
+    let [found_name_node, cell_name_node] = ast_attr(rows, cell, :name)
     let [found_value, value_node] = ast_attr(rows, cell, :value)
-    if !found_name || !found_value
+    if !found_name_node || !found_value
       return [0, emit_error(state, "a named structural cell needs a name and value")[1]]
+    end
+    // The cell's :name is a Symbol_Literal node; the map key is its name.
+    let [found_name, cell_name] = ast_attr(rows, cell_name_node, :name)
+    if !found_name
+      return [0, emit_error(state, "a named structural cell has a nameless key")[1]]
     end
     let [value_reg, after_value] = emit_expr(rows, value_node, state)
     state = after_value
-    let [name_reg, after_name] = load_constant(state, cell_name)
+    let [name_reg, after_name] = load_constant(state, to_symbol(cell_name))
     state = after_name
     registers = [@registers, name_reg]
     registers = [@registers, value_reg]

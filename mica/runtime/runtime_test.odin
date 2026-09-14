@@ -4677,33 +4677,48 @@ test_mica_emitter_app_conformance :: proc(t: ^testing.T) {
 
 	cases := [?]struct {
 		name: string,
-		path: string,
+		paths: []string,
 		call: string,
 	} {
 		{
 			name = "equipment-service",
-			path = "apps/examples/equipment-service.mica",
+			paths = []string{"apps/examples/equipment-service.mica"},
 			call = "record_calibration",
 		},
 		{
 			name = "approval-workflow",
-			path = "apps/examples/approval-workflow.mica",
+			paths = []string{"apps/examples/approval-workflow.mica"},
 			call = "approve",
+		},
+		{
+			// Exercises match, structural literals, verb overloading with
+			// parameter restrictions, runtime identity resolution, and dynamic
+			// invoke in one scenario suite.
+			name = "mud scenarios",
+			paths = []string{
+				"apps/shared/string.mica",
+				"apps/shared/events.mica",
+				"apps/mud/core.mica",
+				"apps/mud/command-parser.mica",
+				"apps/mud/event-substitutions.mica",
+				"apps/mud/tests/event-scenarios.mica",
+			},
+			call = "test/command_parser_records_structured_utility_events",
 		},
 	}
 
 	for entry in cases {
-		roles_array := app_conformance_roles(entry.path, entry.call)
+		roles_array := app_conformance_roles(entry.paths[0], entry.call)
 		roles := roles_array[:]
-		baseline, baseline_ok := app_conformance_run(t, entry.path, nil, entry.call, roles, alloc)
-		artifact, artifact_ok := app_conformance_emit(t, entry.path, alloc)
+		baseline, baseline_ok := app_conformance_run(t, entry.paths, nil, entry.call, roles, alloc)
+		artifact, artifact_ok := app_conformance_emit(t, entry.paths, alloc)
 		if !artifact_ok {
 			testing.expectf(t, false, "%s: Mica emitter failed", entry.name)
 			continue
 		}
 		emitted, emitted_ok := app_conformance_run(
 			t,
-			entry.path,
+			entry.paths,
 			artifact,
 			entry.call,
 			roles,
@@ -4754,9 +4769,11 @@ app_identity :: proc(name: string) -> v.Value {
 	return v.value_symbol(v.symbol_intern(name))
 }
 
-// Emits `path` with the Mica emitter, returning the artifact.
+// Emits the concatenated `paths` with the Mica emitter, returning the
+// artifact. Concatenation matches how the app-conformance tool compiles a
+// multi-file app: one program from all its sources.
 @(private)
-app_conformance_emit :: proc(t: ^testing.T, path: string, alloc: mem.Allocator) -> ([]u8, bool) {
+app_conformance_emit :: proc(t: ^testing.T, paths: []string, alloc: mem.Allocator) -> ([]u8, bool) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -4773,13 +4790,20 @@ app_conformance_emit :: proc(t: ^testing.T, path: string, alloc: mem.Allocator) 
 	if started.kind != .Complete {
 		return nil, false
 	}
-	source, read_err := os.read_entire_file_from_path(path, context.temp_allocator)
-	if read_err != nil {
-		return nil, false
+	builder: strings.Builder
+	strings.builder_init(&builder, context.temp_allocator)
+	defer strings.builder_destroy(&builder)
+	for path in paths {
+		source, read_err := os.read_entire_file_from_path(path, context.temp_allocator)
+		if read_err != nil {
+			return nil, false
+		}
+		strings.write_string(&builder, "\n")
+		strings.write_string(&builder, string(source))
 	}
 	outcome := world_call(world, "emit_source", []k.Role_Pair{{
 		role  = v.value_symbol(v.symbol_intern("source")),
-		value = v.value_string(context.temp_allocator, string(source)),
+		value = v.value_string(context.temp_allocator, strings.to_string(builder)),
 	}})
 	if outcome.kind != .Complete {
 		return nil, false
@@ -4801,12 +4825,12 @@ app_conformance_emit :: proc(t: ^testing.T, path: string, alloc: mem.Allocator) 
 	return owned, true
 }
 
-// Loads `path`, optionally swaps in `artifact`, calls `call` with `roles`, and
+// Loads `paths`, optionally swaps in `artifact`, calls `call` with `roles`, and
 // returns the result.
 @(private)
 app_conformance_run :: proc(
 	t: ^testing.T,
-	path: string,
+	paths: []string,
 	artifact: []u8,
 	call: string,
 	roles: []k.Role_Pair,
@@ -4815,7 +4839,7 @@ app_conformance_run :: proc(
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, paths, context.temp_allocator)
 	if !start.ok {
 		return v.Value(0), false
 	}

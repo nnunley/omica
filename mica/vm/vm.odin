@@ -1583,7 +1583,12 @@ vm_resolve_pattern_relation :: proc(
 	}
 	metadata, found := k.snapshot_relation_metadata_named(snapshot, pattern.relation_name)
 	if !found {
-		vm_fail(state, "E_UNKNOWN_RELATION", "relation scan names an unknown relation")
+		name, _ := v.symbol_name(pattern.relation_name)
+		vm_fail(
+			state,
+			"E_UNKNOWN_RELATION",
+			fmt.aprintf("relation scan names an unknown relation: %s", name, allocator = context.temp_allocator),
+		)
 		return 0, false
 	}
 	return metadata.id, true
