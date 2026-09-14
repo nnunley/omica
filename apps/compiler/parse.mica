@@ -865,26 +865,40 @@ verb parse_for(state)
   state = bump(state)
   let [for_node, after_for] = make_node(state, :For)
   state = after_for
-  let name_index = 0
-  while true
-    let [name_token, after_name] = expect(state, :Ident, "expected loop name")
-    state = after_name
-    let [name_node, after_name_node] = make_node(state, :LoopName)
-    state = after_name_node
-    state = fact(state, name_node, :name, name_token[:text], 0)
-    if at(state, :Colon)
-      state = bump(state)
-      let [annotation, after_annotation] = parse_type_text(state)
-      state = after_annotation
-      state = fact(state, name_node, :annotation, annotation, 0)
+  let head_kind = tok(state)[:kind]
+  if head_kind == :LBracket || head_kind == :LBrace || head_kind == :Underscore
+    // Destructuring headers bind each item against a list, map, or
+    // wildcard pattern; anything else stays an error.
+    let [pattern_node, after_pattern] = parse_pattern(state)
+    state = after_pattern
+    let pattern_kind = node_kind(state, pattern_node)
+    if pattern_kind != :List_Pattern && pattern_kind != :Map_Pattern && pattern_kind != :Wildcard_Pattern
+      state = error_here(state, "for loop pattern must be a list, map, or wildcard")
+    else
+      state = fact(state, for_node, :pattern, pattern_node, 0)
     end
-    state = fact(state, for_node, :name, name_node, name_index)
-    name_index = name_index + 1
-    if at(state, :Comma)
-      state = bump(state)
-      continue
+  else
+    let name_index = 0
+    while true
+      let [name_token, after_name] = expect(state, :Ident, "expected loop name")
+      state = after_name
+      let [name_node, after_name_node] = make_node(state, :LoopName)
+      state = after_name_node
+      state = fact(state, name_node, :name, name_token[:text], 0)
+      if at(state, :Colon)
+        state = bump(state)
+        let [annotation, after_annotation] = parse_type_text(state)
+        state = after_annotation
+        state = fact(state, name_node, :annotation, annotation, 0)
+      end
+      state = fact(state, for_node, :name, name_node, name_index)
+      name_index = name_index + 1
+      if at(state, :Comma)
+        state = bump(state)
+        continue
+      end
+      break
     end
-    break
   end
   let [_, after_in] = expect(state, :In, "expected 'in' in for loop")
   state = after_in

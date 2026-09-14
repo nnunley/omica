@@ -418,6 +418,48 @@ test_parse_typed_for :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_parse_for_pattern :: proc(t: ^testing.T) {
+	list_program := parse_ok(t, "for [a, b] in pairs\n  emit(a, b)\nend")
+	list_expr := first_item_expr(t, list_program)
+	list_loop, list_ok := list_expr^.(For)
+	testing.expect(t, list_ok)
+	testing.expect_value(t, len(list_loop.names), 0)
+	testing.expect(t, list_loop.pattern != nil)
+	if list_loop.pattern != nil {
+		elements, elements_ok := list_loop.pattern^.(List_Pattern)
+		testing.expect(t, elements_ok)
+		if elements_ok {
+			testing.expect_value(t, len(elements.elements), 2)
+		}
+	}
+
+	map_program := parse_ok(t, "for {x} in rows\n  emit(x)\nend")
+	map_expr := first_item_expr(t, map_program)
+	map_loop, map_ok := map_expr^.(For)
+	testing.expect(t, map_ok)
+	testing.expect(t, map_loop.pattern != nil)
+	if map_loop.pattern != nil {
+		_, entries_ok := map_loop.pattern^.(Map_Pattern)
+		testing.expect(t, entries_ok)
+	}
+
+	wild_program := parse_ok(t, "for _ in rows\n  emit(1)\nend")
+	wild_expr := first_item_expr(t, wild_program)
+	wild_loop, wild_ok := wild_expr^.(For)
+	testing.expect(t, wild_ok)
+	if wild_loop.pattern != nil {
+		_, wildcard_ok := wild_loop.pattern^.(Wildcard_Pattern)
+		testing.expect(t, wildcard_ok)
+	}
+
+	_, literal_errors := parse_program(
+		"for 123 in rows\n  emit(1)\nend",
+		context.temp_allocator,
+	)
+	testing.expect(t, len(literal_errors) > 0)
+}
+
+@(test)
 test_parse_grant_block :: proc(t: ^testing.T) {
 	source := "grant role #builder\n  read:\n    :inspection\n  write:\n    :editing\n  invoke:\n    :maintenance\n  effect\nend"
 	program := parse_ok(t, source)

@@ -575,20 +575,33 @@ rel_write_node :: proc(builder: ^strings.Builder, rows: ^v.Relation_Value, node:
 		rel_write_body(builder, rows, node, "body")
 		strings.write_byte(builder, ')')
 	case "For":
-		strings.write_string(builder, "(for (names")
+		strings.write_string(builder, "(for ")
+		// Name and pattern headers are mutually exclusive by construction,
+		// so the pattern scan only runs when no names exist. Each scan
+		// allocates through rel_facts, so skipping it keeps legacy files
+		// at their previous allocation count.
 		name_facts := rel_facts(rows, node, v.symbol_intern("name"))
-		for fact in name_facts {
-			name_node, _ := v.value_as_int(fact.target)
-			strings.write_string(builder, " (name ")
-			rel_atom(builder, rel_str(rows, int(name_node), "name"))
-			kind_text := rel_str(rows, int(name_node), "annotation")
-			if kind_text != "" {
-				strings.write_byte(builder, ' ')
-				rel_atom(builder, kind_text)
+		if len(name_facts) > 0 {
+			strings.write_string(builder, "(names")
+			for fact in name_facts {
+				name_node, _ := v.value_as_int(fact.target)
+				strings.write_string(builder, " (name ")
+				rel_atom(builder, rel_str(rows, int(name_node), "name"))
+				kind_text := rel_str(rows, int(name_node), "annotation")
+				if kind_text != "" {
+					strings.write_byte(builder, ' ')
+					rel_atom(builder, kind_text)
+				}
+				strings.write_byte(builder, ')')
 			}
-			strings.write_byte(builder, ')')
+			strings.write_string(builder, ") ")
+		} else if pattern, ok := rel_child(rows, node, "pattern"); ok {
+			strings.write_string(builder, "(pattern ")
+			rel_write_pattern(builder, rows, pattern)
+			strings.write_string(builder, ") ")
+		} else {
+			strings.write_string(builder, "(names) ")
 		}
-		strings.write_string(builder, ") ")
 		iterable, _ := rel_child(rows, node, "iterable")
 		rel_write_node(builder, rows, iterable)
 		rel_write_body(builder, rows, node, "body")

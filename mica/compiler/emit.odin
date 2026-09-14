@@ -728,27 +728,62 @@ emit_binding :: proc(emitter: ^Emitter, binding: Binding) -> (int, bool) {
 		return value_register, true
 	}
 
-	pattern, is_binding_pattern := binding.pattern^.(Binding_Pattern)
+	if call_pattern, is_call_pattern := binding.pattern^.(Call_Pattern); is_call_pattern {
+		return emit_call_pattern_binding(emitter, binding, call_pattern)
+	}
+	return emit_pattern_value(emitter, binding.pattern, value_register, has_value, binding.is_const)
+}
+
+// Binds an already-evaluated value register against a pattern: the shared
+// tail of let-bindings (after the value expression) and for-loop headers
+// (after the item fetch).
+@(private)
+emit_pattern_value :: proc(
+	emitter: ^Emitter,
+	pattern: ^Pattern,
+	value_register: int,
+	has_value: bool,
+	is_const: bool,
+) -> (int, bool) {
+	if map_pattern, is_map_pattern := pattern^.(Map_Pattern); is_map_pattern {
+		return emit_map_pattern_value(emitter, map_pattern, value_register, is_const)
+	}
+	if list_pattern, is_list_pattern := pattern^.(List_Pattern); is_list_pattern {
+		if !has_value {
+			push_error(emitter, "list binding needs a value")
+			return -1, false
+		}
+		if !emit_list_scatter_binding(emitter, value_register, list_pattern, is_const) {
+			return -1, false
+		}
+		return value_register, true
+	}
+	if wildcard, is_wildcard := pattern^.(Wildcard_Pattern); is_wildcard {
+		_ = wildcard
+		return value_register, true
+	}
+	name_pattern, is_binding_pattern := pattern^.(Binding_Pattern)
 	if !is_binding_pattern {
-		if call_pattern, is_call_pattern := binding.pattern^.(Call_Pattern); is_call_pattern {
-			return emit_call_pattern_binding(emitter, binding, call_pattern)
+		if _, is_call_pattern := pattern^.(Call_Pattern); is_call_pattern {
+			push_error(emitter, "call patterns need an explicit binding")
+			return -1, false
 		}
 		push_error(emitter, "this pattern is only valid in a scatter binding")
 		return -1, false
 	}
 
+	destination := value_register
 	if !has_value {
-		value_register = alloc_register(emitter)
-	} else if !binding.is_const {
+		destination = alloc_register(emitter)
+	} else if !is_const {
 		// A mutable binding must own its register. The value may be a shared
 		// preloaded constant (or a register reused within an expression), and a
 		// later assignment would otherwise overwrite that shared slot.
-		destination := alloc_register(emitter)
+		destination = alloc_register(emitter)
 		vm.builder_emit(emitter.builder, .Move, 0, i32(destination), i32(value_register), 0)
-		value_register = destination
 	}
-	declare_local(emitter, pattern.name, value_register, binding.is_const)
-	return value_register, true
+	declare_local(emitter, name_pattern.name, destination, is_const)
+	return destination, true
 }
 
 // Binds a scatter list pattern such as `[a, ?b = default, @rest]`. Required
@@ -3645,7 +3680,7 @@ emit_while :: proc(emitter: ^Emitter, loop: While) -> (int, bool) {
 
 @(private)
 emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
-	if len(loop.names) != 1 && len(loop.names) != 2 {
+	if loop.pattern == nil && len(loop.names) != 1 && len(loop.names) != 2 {
 		push_error(emitter, "for loops take one or two bindings")
 		return -1, false
 	}
@@ -3707,6 +3742,25 @@ emit_for :: proc(emitter: ^Emitter, loop: For) -> (int, bool) {
 		)
 		declare_local(emitter, loop.names[0], key_register, false)
 		declare_local(emitter, loop.names[1], value_register, false)
+	} else if loop.pattern != nil {
+		item_register := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Collection_Value_At,
+			0,
+			i32(item_register),
+			i32(iterable),
+			i32(index_register),
+		)
+		if _, bound := emit_pattern_value(
+			emitter,
+			loop.pattern,
+			item_register,
+			true,
+			false,
+		); !bound {
+			return -1, false
+		}
 	} else {
 		item_register := alloc_register(emitter)
 		vm.builder_emit(
@@ -4113,6 +4167,18 @@ emit_map_pattern_binding :: proc(
 	if !has_value {
 		return -1, false
 	}
+	return emit_map_pattern_value(emitter, pattern, value_register, binding.is_const)
+}
+
+// Binds a map value register column by column. Map pattern entries must
+// name plain bindings; anything else is a compile error.
+@(private)
+emit_map_pattern_value :: proc(
+	emitter: ^Emitter,
+	pattern: Map_Pattern,
+	value_register: int,
+	is_const: bool,
+) -> (int, bool) {
 	result := alloc_register(emitter)
 	for entry in pattern.entries {
 		key_name := pattern_key_name(entry, emitter.allocator)
@@ -4134,7 +4200,7 @@ emit_map_pattern_binding :: proc(
 			push_error(emitter, "map pattern values must be names")
 			return -1, false
 		}
-		declare_local(emitter, binding_pattern.name, column, binding.is_const)
+		declare_local(emitter, binding_pattern.name, column, is_const)
 		vm.builder_emit(emitter.builder, .Move, 0, i32(result), i32(column), 0)
 	}
 	return result, true

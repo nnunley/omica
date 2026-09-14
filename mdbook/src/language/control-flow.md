@@ -88,7 +88,23 @@ for key, value in properties
 end
 ```
 
-`for` evaluates its iterable expression once. The number and shape of the bindings determine what
+`for` evaluates its iterable expression once. A header can also destructure
+each item with a list, map, or wildcard pattern:
+
+```mica
+for [a, b] in pairs
+  emit(a, b)
+end
+
+for {work} in AssignedTo(?work, actor)
+  emit(actor, work)
+end
+```
+
+Patterns bind against the same item the single-name form would receive, so
+`for {work} in ...` is shorthand for binding the row map and projecting its
+columns. Anything but a list, map, or wildcard pattern in the header is a
+compile error. The number and shape of the bindings determine what
 each iteration receives:
 
 | Iterable             | One binding | Two bindings                  |
@@ -127,14 +143,11 @@ require visited == [1, 2]
 require pending == [3, 4]
 ```
 
-Queries with named variables are iterable because they return relation values. A structural row
-pattern binds the projected cells directly:
+Queries with named variables are iterable because they return relation values:
 
 ```mica
-for {work} in AssignedTo(?work, actor)
-  if let {label} = Label(work, ?label)
-    emit(actor, label)
-  end
+for row in AssignedTo(?work, actor)
+  emit(actor, row[:work])
 end
 ```
 

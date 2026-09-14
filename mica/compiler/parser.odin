@@ -709,6 +709,31 @@ parse_while :: proc(parser: ^Parser) -> ^Expr {
 @(private)
 parse_for :: proc(parser: ^Parser) -> ^Expr {
 	advance(parser)
+	// Destructuring headers bind each item against a list, map, or
+	// wildcard pattern. Anything else stays on the legacy name path so
+	// `for x in ...`, `for k, v in ...`, and annotations parse unchanged.
+	// The kinds compare directly: at_any would allocate its kind slice on
+	// every loop header.
+	head := peek(parser)
+	if head.kind == .LBracket || head.kind == .LBrace || head.kind == .Underscore {
+		pattern := parse_pattern(parser)
+		#partial switch _ in pattern^ {
+		case List_Pattern, Map_Pattern, Wildcard_Pattern:
+		case:
+			error_here(parser, "for loop pattern must be a list, map, or wildcard")
+			pattern = pattern_node(parser, Wildcard_Pattern{})
+		}
+		expect(parser, .In, "expected 'in' in for loop")
+		iterable := parse_expression(parser)
+		skip_separators(parser)
+		body := parse_block_until(parser, []Token_Kind{.End})
+		expect(parser, .End, "expected 'end' to close for")
+		return expr_node(parser, For {
+			pattern  = pattern,
+			iterable = iterable,
+			body     = body,
+		})
+	}
 	names: [dynamic]string
 	kinds: [dynamic]string
 	for {

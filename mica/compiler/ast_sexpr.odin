@@ -347,17 +347,24 @@ sexpr_expr :: proc(builder: ^strings.Builder, expr: ^Expr) {
 		sexpr_body(builder, n.body)
 		strings.write_byte(builder, ')')
 	case For:
-		strings.write_string(builder, "(for (names")
-		for name, index in n.names {
-			strings.write_string(builder, " (name ")
-			sexpr_atom(builder, name)
-			if index < len(n.kinds) && n.kinds[index] != "" {
-				strings.write_byte(builder, ' ')
-				sexpr_atom(builder, n.kinds[index])
+		strings.write_string(builder, "(for ")
+		if n.pattern != nil {
+			strings.write_string(builder, "(pattern ")
+			sexpr_pattern(builder, n.pattern)
+			strings.write_string(builder, ") ")
+		} else {
+			strings.write_string(builder, "(names")
+			for name, index in n.names {
+				strings.write_string(builder, " (name ")
+				sexpr_atom(builder, name)
+				if index < len(n.kinds) && n.kinds[index] != "" {
+					strings.write_byte(builder, ' ')
+					sexpr_atom(builder, n.kinds[index])
+				}
+				strings.write_byte(builder, ')')
 			}
-			strings.write_byte(builder, ')')
+			strings.write_string(builder, ") ")
 		}
-		strings.write_string(builder, ") ")
 		sexpr_expr(builder, n.iterable)
 		sexpr_body(builder, n.body)
 		strings.write_byte(builder, ')')

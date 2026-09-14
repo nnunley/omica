@@ -241,10 +241,13 @@ While :: struct {
 }
 
 // `for name[, value] in iterable`. `kinds` is parallel to `names`; empty
-// strings mean no annotation.
+// strings mean no annotation. Destructuring headers (`for [a, b] in ...`,
+// `for {a} in ...`, `for _ in ...`) set `pattern` instead and leave
+// `names` empty.
 For :: struct {
 	names:    []string,
 	kinds:    []string,
+	pattern:  ^Pattern,
 	iterable: ^Expr,
 	body:     []^Expr,
 }

@@ -101,6 +101,69 @@ test_emit_arithmetic_and_locals :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_emit_for_list_pattern :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	program := compile_test_program(
+		t,
+		"let total = 0\nfor [a, b] in [[1, 2], [3, 4]]\n  total = total + a + b\nend\ntotal",
+		&ctx,
+		allocator,
+	)
+	state := run_test_program(t, program, allocator)
+	defer vm.vm_destroy(&state)
+	expect_int_result(t, &state, 10)
+}
+
+@(test)
+test_emit_for_map_pattern :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	program := compile_test_program(
+		t,
+		"let total = 0\nfor {a} in [{:a -> 1}, {:a -> 2}]\n  total = total + a\nend\ntotal",
+		&ctx,
+		allocator,
+	)
+	state := run_test_program(t, program, allocator)
+	defer vm.vm_destroy(&state)
+	expect_int_result(t, &state, 3)
+}
+
+@(test)
+test_emit_for_wildcard :: proc(t: ^testing.T) {
+	arena := emit_test_arena()
+	defer emit_test_arena_destroy(arena)
+	allocator := virtual.arena_allocator(arena)
+	ctx := new_context()
+	defer delete(ctx.builtins)
+	defer delete(ctx.relations)
+	defer delete(ctx.identities)
+
+	program := compile_test_program(
+		t,
+		"let total = 0\nfor _ in [1, 2, 3]\n  total = total + 1\nend\ntotal",
+		&ctx,
+		allocator,
+	)
+	state := run_test_program(t, program, allocator)
+	defer vm.vm_destroy(&state)
+	expect_int_result(t, &state, 3)
+}
+
+@(test)
 test_emit_if_value :: proc(t: ^testing.T) {
 	arena := emit_test_arena()
 	defer emit_test_arena_destroy(arena)
