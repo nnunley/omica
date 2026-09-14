@@ -326,6 +326,9 @@ verb emit_expr(rows, node, state)
   if kind == :While
     return emit_while(rows, node, state)
   end
+  if kind == :For
+    return emit_for(rows, node, state)
+  end
   if kind == :Begin
     return emit_begin(rows, node, state)
   end
@@ -334,6 +337,9 @@ verb emit_expr(rows, node, state)
   end
   if kind == :Continue
     return emit_continue(state)
+  end
+  if kind == :Require
+    return emit_require(rows, node, state)
   end
   if kind == :Binding
     return emit_binding(rows, node, state)
@@ -785,6 +791,107 @@ verb emit_while(rows, node, state)
   return [result, state]
 end
 
+// Emits `for name in iterable`. A second name receives the zero-based index
+// or map key. Destructuring headers and comprehensions arrive later.
+verb emit_for(rows, node, state)
+  let [found_iterable, iterable_node] = ast_attr(rows, node, :iterable)
+  if !found_iterable
+    return emit_error(state, "a for loop is missing its iterable")
+  end
+  let names = ast_children(rows, node, :name)
+  if len(names) != 1 && len(names) != 2
+    return emit_error(state, "a for loop needs one or two names")
+  end
+
+  let [result, after_reg] = alloc_register(state)
+  state = after_reg
+  let [iterable, after_iterable] = emit_expr(rows, iterable_node, state)
+  state = after_iterable
+
+  let break_mark = len(state[6])
+  state[9] = state[9] + 1
+  let loop_depth = state[9]
+
+  state = scope_enter(state)
+  let [index_reg, after_index] = alloc_register(state)
+  state = after_index
+  let [zero_reg, after_zero_const] = load_constant(state, 0)
+  state = after_zero_const
+  let [_, after_zero] = emit_instruction(state, :Move, 0, index_reg, zero_reg, 0)
+  state = after_zero
+
+  let [length_reg, after_length] = alloc_register(state)
+  state = after_length
+  let [_, after_len] = emit_instruction(state, :Len, 0, length_reg, iterable, 0)
+  state = after_len
+
+  let loop_start = current_offset(state)
+  state[8] = [@state[8], len(state[7])]
+
+  let [condition_reg, after_condition] = alloc_register(state)
+  state = after_condition
+  let [_, after_lt] = emit_instruction(state, :Binary, 7, condition_reg, index_reg, length_reg)
+  state = after_lt
+  let [body_jump, after_body_jump] = emit_jump(state, :Branch, 0, condition_reg)
+  state = after_body_jump
+  let [exit_jump, after_exit_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_exit_jump
+  state = patch_jump(state, body_jump, current_offset(state))
+
+  state = scope_enter(state)
+  let [item_reg, after_item] = alloc_register(state)
+  state = after_item
+  let [_, after_value_at] = emit_instruction(state, :Collection_Value_At, 0, item_reg, iterable, index_reg)
+  state = after_value_at
+  if len(names) == 2
+    let [key_reg, after_key] = alloc_register(state)
+    state = after_key
+    let [_, after_key_at] = emit_instruction(state, :Collection_Key_At, 0, key_reg, iterable, index_reg)
+    state = after_key_at
+    state = declare_name(rows, names[0], key_reg, state)
+    state = declare_name(rows, names[1], item_reg, state)
+  else
+    state = declare_name(rows, names[0], item_reg, state)
+  end
+
+  let body = ast_children(rows, node, :body)
+  let [body_reg, body_has_value, after_body] = emit_block(rows, body, state)
+  state = after_body
+  state = scope_leave(state)
+  if body_has_value
+    let [_, after_move] = emit_instruction(state, :Move, 0, result, body_reg, 0)
+    state = after_move
+  end
+
+  // `continue` advances the index first, so it targets the increment block.
+  let increment_start = current_offset(state)
+  state = patch_loop_continues(state, increment_start)
+
+  let [one_reg, after_one] = load_constant(state, 1)
+  state = after_one
+  let [_, after_inc] = emit_instruction(state, :Binary, 0, index_reg, index_reg, one_reg)
+  state = after_inc
+
+  let [back_jump, after_back] = emit_jump(state, :Jump, 0, 0)
+  state = after_back
+  state = patch_jump(state, back_jump, loop_start)
+
+  state = patch_jump(state, exit_jump, current_offset(state))
+  state = patch_loop_breaks(state, break_mark)
+  state = scope_leave(state)
+  state[9] = loop_depth - 1
+  return [result, state]
+end
+
+// Declares the single-part name of a LoopName node at `reg`.
+verb declare_name(rows, name_node, reg, state)
+  let [found, binding_name] = ast_attr(rows, name_node, :name)
+  if !found
+    return state
+  end
+  return declare_local(state, binding_name, reg)
+end
+
 // Patches every `continue` recorded for the innermost active loop to `target`
 // and pops its mark.
 verb patch_loop_continues(state, target)
@@ -812,6 +919,24 @@ verb patch_loop_breaks(state, mark)
   end
   state[6] = __list_slice(patches, 0, mark)
   return state
+end
+
+// `require` fails the task with E_REQUIRE when its condition is false. It
+// lowers to the `require` builtin.
+verb emit_require(rows, node, state)
+  let [found_condition, condition_node] = ast_attr(rows, node, :condition)
+  if !found_condition
+    return emit_error(state, "a require is missing its condition")
+  end
+  let [condition_reg, after_condition] = emit_expr(rows, condition_node, state)
+  state = after_condition
+  let [builtin, after_builtin] = add_builtin(state, "require")
+  state = after_builtin
+  let [dst, after_reg] = alloc_register(state)
+  state = after_reg
+  let [_, after_emit] = emit_instruction(state, :Builtin_Call, 0, dst, builtin, condition_reg)
+  state = after_emit
+  return [dst, state]
 end
 
 verb emit_begin(rows, node, state)

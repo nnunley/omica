@@ -4263,6 +4263,9 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"let n = 0\nlet i = 0\nwhile i < 5\n i = i + 1\n if i == 2\n  continue\n end\n n = n + i\nend\nn",
 		"begin\n 1\n 2\n 3\nend",
 		"let x = 4\nif x > 3\n \"big\"\nelse\n \"small\"\nend",
+		"let n = 0\nfor v in [10, 20, 30]\n n = n + v\nend\nn",
+		"let n = 0\nfor v, i in [10, 20, 30]\n n = n + i\nend\nn",
+		"let n = 0\nfor v in [1, 2, 3, 4]\n if v == 3\n  break\n end\n n = n + v\nend\nn",
 	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {
