@@ -102,6 +102,7 @@ runtime_builtins := [?]Builtin_Spec {
 	{"disable_rule", 1, builtin_disable_rule},
 	{"rules", 1, builtin_rules},
 	{"__is_builtin", 1, builtin_is_builtin},
+	{"__identity", 1, builtin_named_identity},
 	{"describe_rule", 1, builtin_describe_rule},
 	{"fileout", 1, builtin_fileout},
 	{"fileout_rules", -1, builtin_fileout_rules},
@@ -1448,6 +1449,46 @@ rule_active_builtin :: proc(
 }
 
 
+
+// Resolves a named identity (`#alice`) at execution time against the running
+// world. The Mica emitter cannot resolve identity literals while emitting: it
+// runs in a compiler world that does not know the target's identities, so
+// emitted code calls this instead. A raw numeric identity (`#123`) needs no
+// world. Tolerates a bare VM with no environment, which the differential
+// harness uses.
+@(private)
+builtin_named_identity :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 1 {
+		return builtin_error(state, "E_INVARG", "__identity expects a name")
+	}
+	name_symbol, is_symbol := v.value_as_symbol(args[0])
+	if !is_symbol {
+		return builtin_error(state, "E_TYPE", "__identity expects a symbol")
+	}
+	name, has_name := v.symbol_name(name_symbol)
+	if !has_name {
+		return builtin_error(state, "E_INVARG", "__identity expects an interned symbol")
+	}
+	if raw, parsed := strconv.parse_u64(name); parsed {
+		return v.value_identity_raw(raw)
+	}
+	env := builtin_env(state)
+	if env == nil || env.ctx == nil {
+		return builtin_error(
+			state,
+			"E_INVARG",
+			fmt.aprintf("unknown identity literal: %s", name, allocator = state.allocator),
+		)
+	}
+	if value, found := env.ctx.identities[name]; found {
+		return value, true
+	}
+	return builtin_error(
+		state,
+		"E_INVARG",
+		fmt.aprintf("unknown identity literal: %s", name, allocator = state.allocator),
+	)
+}
 
 // Reports whether a symbol names a runtime builtin. Unlike a relation, the
 // builtin set is fixed and global, so the Mica emitter can call this at emit

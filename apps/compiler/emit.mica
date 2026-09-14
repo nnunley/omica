@@ -45,7 +45,7 @@ end
 // description carries `:errors` alongside the sections; `assemble` ignores
 // unknown keys, so the map feeds it directly.
 verb emit_program(raw_rows, root) -> map
-  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, [], [], []]
+  let state = [[], [], [[0, []]], 0, [], [], [], [], [], 0, 0, [], {}, 0, [], [], [], {}, {}, []]
   // Sort facts by node id once so every lookup can binary search instead of
   // scanning. Row order is not otherwise observable here.
   let rows = sort_ast_rows(raw_rows)
@@ -72,11 +72,29 @@ verb emit_program(raw_rows, root) -> map
       continue
     end
     let params = ast_children(rows, item, :param)
-    let [slot, after_slot] = reserve_verb(rows, params, state)
+    let has_restriction = params_have_restriction(rows, params)
+    let [slot, after_slot] = reserve_verb(rows, params, verb_name, state)
     state = after_slot
+    // Slots in declaration order. Body emission walks this list, so each
+    // overload gets its own slot rather than all sharing the name's first.
+    state[19] = [@state[19], slot]
+    // The name table keeps the first slot as a fallback for unknown lookups.
     let table = state[12]
-    table[verb_name] = slot
+    if index_or(table, verb_name, -1) < 0
+      table[verb_name] = slot
+    end
     state[12] = table
+    // A name with several declarations, or any restricted parameter, must be
+    // called through dispatch so every declaration is considered and the
+    // restriction is enforced.
+    let counts = state[17]
+    counts[verb_name] = index_or(counts, verb_name, 0) + 1
+    state[17] = counts
+    if has_restriction
+      let restricted = state[18]
+      restricted[verb_name] = true
+      state[18] = restricted
+    end
   end
 
   // Emit the entry function: top-level expressions in order, returning the
@@ -108,7 +126,11 @@ verb emit_program(raw_rows, root) -> map
   state = function_leave(state)
 
   // Emit each verb body. A verb's parameters occupy the first registers of
-  // its frame; the body returns its last value.
+  // its frame; the body returns its last value. Slots are consumed in the
+  // same declaration order the reservation loop recorded, so overloads do not
+  // overwrite each other.
+  let verb_slots = state[19]
+  let verb_slot_index = 0
   for item in items
     if ast_kind(rows, item) != :VerbItem
       continue
@@ -117,10 +139,11 @@ verb emit_program(raw_rows, root) -> map
     if !found_name
       continue
     end
-    let [found_slot, slot] = find_function(state, verb_name)
-    if !found_slot
+    if verb_slot_index >= len(verb_slots)
       continue
     end
+    let slot = verb_slots[verb_slot_index]
+    verb_slot_index = verb_slot_index + 1
     let params = ast_children(rows, item, :param)
     state = function_enter(state, slot)
     state[3] = len(params)
@@ -155,10 +178,22 @@ verb empty_relation_value()
   return []
 end
 
+// Reports whether any parameter declares a restriction (`@ #type`). A
+// restricted verb must be called through dispatch so the runtime enforces it.
+verb params_have_restriction(rows, params)
+  for param in params
+    let [found, _] = ast_attr(rows, param, :restrict)
+    if found
+      return true
+    end
+  end
+  return false
+end
+
 // Reserves a function slot for a verb's parameters, returning [index, state].
 // Parameter metadata (required count, rest flag) is recorded now; the body is
-// emitted later.
-verb reserve_verb(rows, params, state)
+// emitted later. The name is recorded so dispatch can resolve the method.
+verb reserve_verb(rows, params, function_name, state)
   let index = len(state[11])
   let required = 0
   let has_rest = false
@@ -175,7 +210,7 @@ verb reserve_verb(rows, params, state)
       seen_optional = true
     end
   end
-  let desc = {:name -> "", :code_offset -> 0, :code_len -> 0,
+  let desc = {:name -> function_name, :code_offset -> 0, :code_len -> 0,
               :registers -> 0, :params -> len(params), :required -> required,
               :rest -> has_rest, :defaults -> []}
   state[11] = [@state[11], desc]
@@ -669,12 +704,25 @@ end
 
 // `#123` is a raw identity. `#name` must have been created by the world and
 // declared through `make_identity` before this emitter runs.
+// `#123` is a raw identity; `#name` resolves at execution time against the
+// running world. The Mica emitter runs in a compiler world that does not know
+// the target's identities, so it cannot resolve a name here.
 verb emit_identity_literal(rows, node, state)
   let [found, text] = literal_name(rows, node)
   if !found
     return emit_error(state, "an identity literal is missing its name")
   end
-  return load_constant(state, from_literal(string_concat("#", text))[:value])
+  let [name_reg, after_name] = load_constant(state, to_symbol(text))
+  state = after_name
+  let [first, after_marshal] = marshal_arguments(state, [name_reg])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "__identity")
+  state = after_builtin
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_call] = emit_instruction(state, :Builtin_Call, 1, dst, builtin, first)
+  state = after_call
+  return [dst, state]
 end
 
 // Decodes a source literal, stripping the surrounding quotes and expanding
@@ -1931,6 +1979,12 @@ verb emit_call(rows, node, state)
     end
     let [first, after_marshal] = marshal_arguments(state, registers)
     state = after_marshal
+    // An overloaded or restricted verb cannot be called directly: every
+    // declaration must be considered and restrictions enforced, which is what
+    // Positional_Dispatch does. A directly callable verb takes the fast path.
+    if verb_needs_dispatch(state, callee_name)
+      return emit_positional_dispatch(callee_name, first, len(registers), state)
+    end
     let [dst, after_reg] = alloc_register(state)
     state = after_reg
     let [_, after_emit] = emit_instruction(
@@ -2041,6 +2095,31 @@ end
 
 // `:selector(role: value, ...)` lowers to a Dispatch with a spec naming the
 // selector and each role's register. Every argument must use an explicit role.
+// Whether `verb_name` is declared more than once or has any restricted
+// parameter, in which case a call must go through Positional_Dispatch.
+verb verb_needs_dispatch(state, verb_name)
+  let counts = state[17]
+  if index_or(counts, verb_name, 0) > 1
+    return true
+  end
+  let restricted = state[18]
+  return index_or(restricted, verb_name, false)
+end
+
+// Emits Positional_Dispatch for a verb name. The runtime selects the
+// declaration whose restrictions and arity match and enforces them.
+verb emit_positional_dispatch(verb_name, first_argument, argument_count, state)
+  let [selector, after_selector] = load_constant(state, to_symbol(verb_name))
+  state = after_selector
+  let [dst, after_dst] = alloc_register(state)
+  state = after_dst
+  let [_, after_dispatch] = emit_instruction(
+    state, :Positional_Dispatch, argument_count, dst, selector, first_argument,
+  )
+  state = after_dispatch
+  return [dst, state]
+end
+
 verb emit_role_dispatch(rows, callee_node, node, state)
   let [found_selector, selector_name] = ast_attr(rows, callee_node, :name)
   if !found_selector

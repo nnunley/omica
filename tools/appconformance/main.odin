@@ -90,6 +90,41 @@ main :: proc() {
 			},
 			call = "",
 		},
+		{
+			name  = "mud scenarios: substitutions only",
+			files = []string{
+				"apps/shared/string.mica",
+				"apps/shared/events.mica",
+				"apps/mud/core.mica",
+				"apps/mud/event-substitutions.mica",
+				"apps/mud/tests/event-scenarios.mica",
+			},
+			call = "test/event_substitutions_render_per_viewer",
+		},
+		{
+			name  = "mud scenarios: command parser and substitutions",
+			files = []string{
+				"apps/shared/string.mica",
+				"apps/shared/events.mica",
+				"apps/mud/core.mica",
+				"apps/mud/command-parser.mica",
+				"apps/mud/event-substitutions.mica",
+				"apps/mud/tests/event-scenarios.mica",
+			},
+			call = "test/command_parser_records_structured_utility_events",
+		},
+		{
+			name  = "mud scenarios: social commands",
+			files = []string{
+				"apps/shared/string.mica",
+				"apps/shared/events.mica",
+				"apps/mud/core.mica",
+				"apps/mud/command-parser.mica",
+				"apps/mud/event-substitutions.mica",
+				"apps/mud/tests/event-scenarios.mica",
+			},
+			call = "test/social_commands_emit_perspective_events",
+		},
 	}
 
 	pass, fail := 0, 0
@@ -215,8 +250,15 @@ run_case :: proc(entry: Case, artifact: []u8) -> (v.Value, bool) {
 		return v.Value(0), true
 	}
 	if len(entry.roles) == 0 {
-		// No roles: just check the call resolves, using no arguments.
+		// No roles: call with no arguments.
 		outcome := r.world_call(world, entry.call, nil)
+		if outcome.kind != .Complete {
+			detail := outcome.message
+			if error_value, is_error := v.value_as_error(outcome.error); is_error {
+				detail = error_value.message
+			}
+			fmt.eprintf("  [%s] call failed: kind=%v message=%s error=%s\n", entry.name, outcome.kind, outcome.message, detail)
+		}
 		return outcome.value, outcome.kind == .Complete
 	}
 	roles := make([]k.Role_Pair, len(entry.roles), context.temp_allocator)

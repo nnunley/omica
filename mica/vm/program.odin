@@ -577,6 +577,12 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 		   function.code_offset + function.code_len > len(program.code) {
 			return .Bad_Function
 		}
+		// Parameter binding writes registers `0 ..< param_count` before the
+		// body runs, so a function must reserve at least that many. A smaller
+		// count would write past the frame.
+		if function.param_count < 0 || function.register_count < function.param_count {
+			return .Bad_Register
+		}
 
 		code_end := function.code_offset + function.code_len
 		for offset in function.code_offset ..< code_end {
