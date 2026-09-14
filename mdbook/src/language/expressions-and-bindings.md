@@ -100,6 +100,8 @@ return [first, second, rest]
 Use braces to bind a named relation row and brackets to destructure a positional list. These are
 different contracts: `let exactly {name} = rows` checks one row with the stated heading, whereas
 `let [name] = values` reads a list position. A relation row is not a positional argument list.
+Map pattern values in `let` must be names; `for` headers additionally accept literals as
+row filters (see [Control Flow](./control-flow.md)).
 
 ## Splicing Values into Collections and Calls
 

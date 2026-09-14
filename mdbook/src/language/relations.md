@@ -100,6 +100,21 @@ for row in InstalledAt(?instrument, ?site)
 end
 ```
 
+Rows held in a value can also be destructured and filtered directly, without
+touching the store. A `for` header over a value accepts the same list, map,
+and wildcard patterns as a store query, and map entries accept literals that
+keep only matching rows:
+
+```mica
+for {instrument -> #sensor, site -> site} in cached
+  emit(#observer, site)
+end
+```
+
+Value queries are single scans: they filter and project one row set. Compose
+them by nesting, or join two values with `natural_join`. Store queries remain
+the only way to use rules, subscriptions, and authority checks.
+
 A relation call with no named query variables is a boolean predicate test:
 
 ```mica
