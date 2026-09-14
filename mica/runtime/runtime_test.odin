@@ -4290,7 +4290,10 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"let fact = fn f(n) => if n < 2\n 1\nelse\n n * f(n - 1)\nend\nfact(5)",
 		"b\"YWJj\"",
 		"1..5",
-		"[:x, :y] {[1, 2], [3, 4]}",	}
+		"[:x, :y] {[1, 2], [3, 4]}",
+		"let [first, ?second = \"dflt\", @rest] = [\"a\"]\n[first, second, rest]",
+		"let [first, ?second = \"dflt\", @rest] = [\"a\", \"b\", \"c\"]\n[first, second, rest]",
+		"let [a, @more] = [1, 2, 3]\n[a, more]",	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {
 			testing.expectf(t, false, "emitter mismatch for %q", source)

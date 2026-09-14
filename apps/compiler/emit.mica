@@ -1902,6 +1902,13 @@ verb bind_list_pattern(rows, pattern, value_reg, state)
       end
     elseif element_kind == :Wildcard_Pattern
       // Consumes the slot with no binding.
+    elseif element_kind == :Optional_Pattern
+      state = bind_optional_scatter(rows, element, value_reg, position, state)
+    elseif element_kind == :Rest_Pattern
+      let [found_name, rest_name] = ast_attr(rows, element, :name)
+      if found_name
+        state = bind_rest_scatter(rows, element, value_reg, position, state, rest_name)
+      end
     else
       state = emit_error(state, "a for list pattern needs names or wildcards")[1]
     end
@@ -3484,12 +3491,90 @@ verb bind_list_scatter(rows, pattern, value_reg, state)
     elseif element_kind == :Wildcard_Pattern
       // `_` discards this position but still consumes a slot, so a later
       // element keeps its ordinal.
+    elseif element_kind == :Optional_Pattern
+      state = bind_optional_scatter(rows, element, value_reg, position, state)
+    elseif element_kind == :Rest_Pattern
+      let [found_name, rest_name] = ast_attr(rows, element, :name)
+      if found_name
+        state = bind_rest_scatter(rows, element, value_reg, position, state, rest_name)
+      end
+      // A rest consumes the remaining positions, so later elements do not
+      // exist; the parser enforces it is last.
     else
       return emit_error(state, "a list binding needs names")[1]
     end
     position = position + 1
   end
   return state
+end
+
+// Binds `?name = default` from position `position`, falling back to the
+// default (or the empty relation) when the list is too short.
+verb bind_optional_scatter(rows, element, value_reg, position, state)
+  let [found_name, binding_name] = ast_attr(rows, element, :name)
+  let [destination, after_dest] = alloc_register(state)
+  state = after_dest
+  let [length_reg, after_len] = alloc_register(state)
+  state = after_len
+  let [_, after_len_op] = emit_instruction(state, :Len, 0, length_reg, value_reg, 0)
+  state = after_len_op
+  let [index_reg, after_index] = load_constant(state, position)
+  state = after_index
+  let [present, after_present] = alloc_register(state)
+  state = after_present
+  let [_, after_cmp] = emit_instruction(state, :Binary, 9, present, length_reg, index_reg)
+  state = after_cmp
+  let [present_jump, after_present_jump] = emit_jump(state, :Branch, 0, present)
+  state = after_present_jump
+  let [missing_jump, after_missing_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_missing_jump
+  state = patch_jump(state, present_jump, current_offset(state))
+
+  let [item, after_item] = alloc_register(state)
+  state = after_item
+  let [_, after_index_op] = emit_instruction(state, :Index, 0, item, value_reg, index_reg)
+  state = after_index_op
+  let [_, after_move] = emit_instruction(state, :Move, 0, destination, item, 0)
+  state = after_move
+  let [end_jump, after_end_jump] = emit_jump(state, :Jump, 0, 0)
+  state = after_end_jump
+  state = patch_jump(state, missing_jump, current_offset(state))
+
+  let [found_default, default_node] = ast_attr(rows, element, :default)
+  let default_reg = 0
+  if found_default
+    let [emitted, after_default] = emit_expr(rows, default_node, state)
+    state = after_default
+    default_reg = emitted
+  else
+    let [emitted, after_empty] = load_constant(state, empty_relation_value())
+    state = after_empty
+    default_reg = emitted
+  end
+  let [_, after_default_move] = emit_instruction(state, :Move, 0, destination, default_reg, 0)
+  state = after_default_move
+  state = patch_jump(state, end_jump, current_offset(state))
+  if found_name
+    state = declare_local(state, binding_name, destination)
+  end
+  return state
+end
+
+// Binds `@rest` from position `position` to the end of the list.
+verb bind_rest_scatter(rows, element, value_reg, position, state, rest_name)
+  let [start_reg, after_start] = load_constant(state, position)
+  state = after_start
+  let [end_reg, after_end] = load_constant(state, -1)
+  state = after_end
+  let [first, after_marshal] = marshal_arguments(state, [value_reg, start_reg, end_reg])
+  state = after_marshal
+  let [builtin, after_builtin] = add_builtin(state, "__list_slice")
+  state = after_builtin
+  let [destination, after_dest] = alloc_register(state)
+  state = after_dest
+  let [_, after_call] = emit_instruction(state, :Builtin_Call, 3, destination, builtin, first)
+  state = after_call
+  return declare_local(state, rest_name, destination)
 end
 
 verb emit_assignment(rows, node, state)
