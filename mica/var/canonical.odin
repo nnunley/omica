@@ -54,6 +54,32 @@ rows_key_encodable :: proc(rows: []Tuple) -> bool {
 	return true
 }
 
+// Reports whether `a` sorts strictly before `b` in canonical order, using
+// encoded keys when every cell of both rows is keyable. Returns ok=false when
+// a heap-kind cell is present, in which case the caller must use `tuple_cmp`.
+//
+// This is for the orderedness check a scan result runs before it is stored:
+// that check is O(n) and otherwise pays a recursive comparison per row.
+tuple_less_keyed :: proc(a, b: Tuple) -> (less: bool, ok: bool) {
+	av := tuple_values(a)
+	bv := tuple_values(b)
+	n := min(len(av), len(bv))
+	for i in 0 ..< n {
+		ka, a_ok := value_sort_key(av[i])
+		if !a_ok {
+			return false, false
+		}
+		kb, b_ok := value_sort_key(bv[i])
+		if !b_ok {
+			return false, false
+		}
+		if ka != kb {
+			return ka < kb, true
+		}
+	}
+	return len(av) < len(bv), true
+}
+
 @(private)
 Key_Sort_Context :: struct {
 	keys:  []u64,

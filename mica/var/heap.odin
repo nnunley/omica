@@ -789,8 +789,18 @@ value_relation :: proc(
 		if !already_ordered {
 			canonical = tuple_select(row, alloc, positions)
 		}
-		if rows_ordered && i > 0 && tuple_cmp(canonical_rows[i - 1], canonical) != .Less {
-			rows_ordered = false
+		if rows_ordered && i > 0 {
+			// A scan result is usually already canonical, so this check runs
+			// over the whole set. Encoded keys make it a streamed scan instead
+			// of a recursive comparison per row; heap cells fall back.
+			less, keyed := tuple_less_keyed(canonical_rows[i - 1], canonical)
+			if keyed {
+				if !less {
+					rows_ordered = false
+				}
+			} else if tuple_cmp(canonical_rows[i - 1], canonical) != .Less {
+				rows_ordered = false
+			}
 		}
 		canonical_rows[i] = canonical
 	}
