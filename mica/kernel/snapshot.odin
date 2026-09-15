@@ -307,22 +307,6 @@ snapshot_active_rules :: proc(snapshot: ^Snapshot, alloc: mem.Allocator) -> []Ru
 }
 
 
-@(private)
-canonicalize_tuples :: proc(tuples: []v.Tuple) -> []v.Tuple {
-	slice.sort_by(tuples, proc(a, b: v.Tuple) -> bool {
-		return v.tuple_cmp(a, b) == .Less
-	})
-	write := 0
-	for row in tuples {
-		if write > 0 && v.tuple_cmp(tuples[write - 1], row) == .Equal {
-			continue
-		}
-		tuples[write] = row
-		write += 1
-	}
-	return tuples[:write]
-}
-
 // Converts an evaluation result into sorted relation row sets allocated from
 // `alloc`. Tuples are deep-copied so the result does not reference evaluation
 // scratch storage.
@@ -335,7 +319,7 @@ derived_relations_from :: proc(alloc: mem.Allocator, derived: ^Rule_Derived) -> 
 		}
 		relations[i] = Derived_Relation {
 			relation = relation,
-			tuples   = canonicalize_tuples(rows),
+			tuples   = v.canonicalize_tuples(rows, alloc),
 		}
 	}
 	return relations

@@ -203,7 +203,7 @@ relation_block_build :: proc(
 ) -> ^Relation_Block {
 	rows := make([]v.Tuple, len(tuples), alloc)
 	copy(rows, tuples)
-	rows = sorted_unique_rows(rows)
+	rows = sorted_unique_rows(rows, alloc)
 
 	block := new(Relation_Block, alloc)
 	block.metadata = metadata
@@ -227,7 +227,7 @@ relation_block_build_pooled :: proc(
 ) -> ^Relation_Block {
 	rows := make([]v.Tuple, len(tuples), context.temp_allocator)
 	copy(rows, tuples)
-	rows = sorted_unique_rows(rows)
+	rows = sorted_unique_rows(rows, context.temp_allocator)
 
 	block_arena := arena_pool_take(kernel.arena_pool)
 	block_alloc := frame_arena_allocator(block_arena)
@@ -326,19 +326,8 @@ relation_block_apply :: proc(
 }
 
 @(private)
-sorted_unique_rows :: proc(rows: []v.Tuple) -> []v.Tuple {
-	slice.sort_by(rows, proc(a, b: v.Tuple) -> bool {
-		return v.tuple_cmp(a, b) == .Less
-	})
-	write := 0
-	for row in rows {
-		if write > 0 && v.tuple_cmp(rows[write - 1], row) == .Equal {
-			continue
-		}
-		rows[write] = row
-		write += 1
-	}
-	return rows[:write]
+sorted_unique_rows :: proc(rows: []v.Tuple, alloc: mem.Allocator) -> []v.Tuple {
+	return v.canonicalize_tuples(rows, alloc)
 }
 
 @(private)
