@@ -220,7 +220,14 @@ run_artifact :: proc(path: string, artifact: []u8) -> (v.Value, bool) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := r.world_start(&kernel, []string{path}, context.allocator)
+	// A mis-emitted loop is unbounded; the budget turns that into a failed
+	// case rather than a hung run.
+	world, start := r.world_start(
+		&kernel,
+		[]string{path},
+		context.allocator,
+		r.HARNESS_CONFIG,
+	)
 	if !start.ok {
 		fmt.eprintln("  target load failed:", start.message)
 		return v.Value(0), false

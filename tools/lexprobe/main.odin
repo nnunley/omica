@@ -62,7 +62,14 @@ run_lexer :: proc(replace: []u8) -> v.Value {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := r.world_start(&kernel, []string{"apps/compiler/lex.mica"}, context.allocator)
+	// Budget the lexer under test so a mis-emitted loop fails instead of
+	// hanging.
+	world, start := r.world_start(
+		&kernel,
+		[]string{"apps/compiler/lex.mica"},
+		context.allocator,
+		r.HARNESS_CONFIG,
+	)
 	if !start.ok { fmt.eprintln("lexer load:", start.message); return v.Value(0) }
 	defer r.world_destroy(world)
 	_ = r.world_wait(world, world.entry)

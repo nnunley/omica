@@ -11,11 +11,25 @@ import "core:mem"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:time"
 import c "../compiler"
 import s "../store"
 import k "../kernel"
 import vm "../vm"
 import v "../var"
+
+// Limits for conformance and differential harnesses. A mis-emitted loop is
+// unbounded, so a finite limit turns a hang into a failure at a known case.
+// Both are needed: the instruction budget bounds a pure compute loop in
+// milliseconds, while the wall-clock limit bounds a commit-heavy loop that
+// spends almost all its time in kernel work and would otherwise trip the
+// instruction budget only after minutes (its cost grows with the transaction).
+// Sized well above the heaviest legitimate workload: the heaviest corpus
+// benchmark needs ~1.2M instructions and well under a second. Neither limit is
+// applied to the compiler worlds, which need ~130M instructions to emit the
+// compiler itself.
+HARNESS_INSTRUCTION_BUDGET :: u64(8_000_000)
+HARNESS_TIME_LIMIT :: 10 * time.Second
 
 World_Config :: struct {
 	// Name of the declared identity that submitted tasks run as. Empty keeps
@@ -33,6 +47,26 @@ World_Config :: struct {
 	durability: s.Durability,
 	// WAL bytes before an automatic checkpoint. Zero uses the store default.
 	checkpoint_bytes: i64,
+	// Per-task instruction budget. A task that executes this many instructions
+	// fails with `E_BUDGET` instead of running forever. Zero means unlimited,
+	// which is the production default; the differential and conformance
+	// harnesses set it so a mis-emitted loop fails at a known case instead of
+	// hanging the test run.
+	instruction_budget: u64,
+	// Per-task wall-clock limit. A task still running after this long fails
+	// with `E_DEADLINE`. Zero means unlimited. The harnesses set it alongside
+	// the instruction budget: a commit-heavy runaway loop spends most of its
+	// time in kernel work, so the budget alone trips too slowly to tell a hang
+	// from a slow test.
+	time_limit: time.Duration,
+}
+
+// The `World_Config` a harness uses for the program under test. A harness must
+// leave its compiler world unlimited, since emitting the compiler needs far
+// more than either harness limit.
+HARNESS_CONFIG :: World_Config {
+	instruction_budget = HARNESS_INSTRUCTION_BUDGET,
+	time_limit         = HARNESS_TIME_LIMIT,
 }
 
 // A relation write applied to a task transaction before it starts.
@@ -669,7 +703,11 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	scheduler_init(
 		&world.scheduler,
 		world.kernel,
-		Scheduler_Config{workers = workers},
+		Scheduler_Config {
+			workers            = workers,
+			instruction_budget = config.instruction_budget,
+			time_limit         = config.time_limit,
+		},
 		allocator,
 	)
 	world.started = true
@@ -839,7 +877,11 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	scheduler_init(
 		&world.scheduler,
 		world.kernel,
-		Scheduler_Config{workers = workers},
+		Scheduler_Config {
+			workers            = workers,
+			instruction_budget = config.instruction_budget,
+			time_limit         = config.time_limit,
+		},
 		allocator,
 	)
 	world.started = true

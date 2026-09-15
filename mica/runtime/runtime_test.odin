@@ -4907,7 +4907,12 @@ app_conformance_run :: proc(
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, paths, context.temp_allocator)
+	world, start := world_start(
+		&kernel,
+		paths,
+		context.temp_allocator,
+		HARNESS_CONFIG,
+	)
 	if !start.ok {
 		return v.Value(0), false
 	}
@@ -5033,6 +5038,90 @@ test_mica_emitter_execution_conformance :: proc(t: ^testing.T) {
 	}
 }
 
+// A world configured with the harness limits must fail a non-terminating
+// program promptly instead of hanging. This is the regression guard for #92:
+// a mis-emitted loop previously spun forever, blocking the whole runtime
+// suite with no failure location. Both shapes are covered: a pure compute
+// loop (bounded by the instruction budget) and a commit-heavy loop (bounded
+// by the wall-clock deadline, since its kernel cost makes the budget trip too
+// slowly to matter).
+@(test)
+test_harness_limits_bound_runaway_programs :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	compute_loop := `verb bench()
+  let i = 0
+  while i < 1000
+    i = i - 1
+  end
+  return i
+end
+`
+	commit_loop := `make_relation(:Point, 2)
+verb bench()
+  let i = 0
+  while i < 1000
+    assert Point(i, i * 2)
+    i = i - 1
+  end
+  return i
+end
+`
+	for source, index in ([]string{compute_loop, commit_loop}) {
+		path, path_ok := write_temp_source(
+			t,
+			fmt.aprintf("mica_harness_limit_%d.mica", index, allocator = context.temp_allocator),
+			source,
+		)
+		if !path_ok {
+			return
+		}
+		defer os.remove(path)
+
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		defer k.kernel_destroy(&kernel)
+
+		// A short limit keeps the test fast; the harness passes
+		// HARNESS_TIME_LIMIT, and only the value differs here.
+		limit := 500 * time.Millisecond
+		started := time.tick_now()
+		world, start := world_start(
+			&kernel,
+			[]string{path},
+			context.temp_allocator,
+			World_Config {
+				instruction_budget = HARNESS_INSTRUCTION_BUDGET,
+				time_limit         = limit,
+			},
+		)
+		testing.expectf(t, start.ok, "world start failed: %s", start.message)
+		if !start.ok {
+			return
+		}
+		entry := world_wait(world, world.entry)
+		testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+		bench := world_call(world, "bench", nil)
+		world_destroy(world)
+
+		testing.expectf(
+			t,
+			bench.kind == .Aborted,
+			"runaway program %d should abort, got %v",
+			index,
+			bench.kind,
+		)
+		elapsed := time.tick_since(started)
+		testing.expectf(
+			t,
+			elapsed < limit + 5 * time.Second,
+			"runaway program %d took %v, expected the limits to bound it",
+			index,
+			elapsed,
+		)
+	}
+}
+
 // Loads `path` in a fresh kernel, runs setup then bench, and returns the bench
 // result. A non-nil `artifact` replaces the world's program, so the calls run
 // the Mica-emitted program instead of the Odin-compiled one.
@@ -5046,7 +5135,14 @@ conformance_run :: proc(
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	// Budget the file under test so a mis-emitted loop fails here instead of
+	// hanging the suite. The compiler world in the caller is left unlimited.
+	world, start := world_start(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		HARNESS_CONFIG,
+	)
 	if !start.ok {
 		return v.Value(0), false
 	}
@@ -5248,7 +5344,12 @@ run_target :: proc(
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		HARNESS_CONFIG,
+	)
 	if !start.ok {
 		testing.expectf(t, false, "target load failed: %s", start.message)
 		return v.Value(0), false

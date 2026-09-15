@@ -138,6 +138,15 @@ VM :: struct {
 	// Set once the budget reaches zero, so a caught E_BUDGET cannot silently
 	// turn the exhausted budget (0) into "unlimited".
 	instruction_budget_exhausted: bool,
+	// Wall-clock deadline, checked every `DEADLINE_CHECK_INTERVAL`
+	// instructions. A program whose work is dominated by per-instruction host
+	// calls (relation writes, for one) can burn little instruction budget per
+	// second, so a deadline bounds it when the budget would trip only after
+	// minutes. `has_deadline` false means unlimited.
+	deadline:     time.Tick,
+	has_deadline: bool,
+	// Counts instructions down to the next deadline check.
+	deadline_countdown: u32,
 	// Runtime context identities: endpoint, actor, and principal.
 	endpoint:  v.Value,
 	actor:     v.Value,
@@ -222,6 +231,11 @@ vm_reset :: proc(state: ^VM) {
 	state.pending_resume = -1
 	state.instruction_budget = state.configured_budget
 	state.instruction_budget_exhausted = false
+	// The deadline is an absolute wall-clock limit set by the caller, so a
+	// reset only rearms the check interval, not the limit itself.
+	if state.has_deadline {
+		state.deadline_countdown = DEADLINE_CHECK_INTERVAL
+	}
 	if state.scratch != nil {
 		virtual.arena_free_all(state.scratch)
 	}
@@ -269,6 +283,24 @@ vm_set_instruction_budget :: proc(state: ^VM, budget: u64) {
 	state.instruction_budget = budget
 	state.configured_budget = budget
 	state.instruction_budget_exhausted = false
+}
+
+// How often the run loop checks the wall-clock deadline, in instructions. The
+// check is a clock read, so it is amortized: coarse enough not to matter for
+// throughput, fine enough to stop a runaway program promptly.
+DEADLINE_CHECK_INTERVAL :: u32(1 << 16)
+
+// Limits how long the VM may run. A run still executing when the limit
+// elapses fails with `E_DEADLINE`. A zero limit means unlimited.
+vm_set_deadline :: proc(state: ^VM, limit: time.Duration) {
+	if limit <= 0 {
+		state.has_deadline = false
+		state.deadline = time.Tick{}
+		return
+	}
+	state.deadline = time.tick_add(time.tick_now(), limit)
+	state.has_deadline = true
+	state.deadline_countdown = DEADLINE_CHECK_INTERVAL
 }
 
 // Sets the authority used for permission checks. Nil means root access.
@@ -432,6 +464,24 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 		if frame.ip < 0 || frame.ip >= len(program.code) {
 			vm_fail(state, "E_VM_FAULT", "instruction pointer out of range")
 			return .Failed
+		}
+
+		// Check the wall-clock deadline every `DEADLINE_CHECK_INTERVAL`
+		// instructions: a clock read per instruction would cost more than the
+		// limit is worth, and a runaway loop only needs to be caught promptly,
+		// not exactly.
+		if state.has_deadline {
+			state.deadline_countdown -= 1
+			if state.deadline_countdown == 0 {
+				state.deadline_countdown = DEADLINE_CHECK_INTERVAL
+				if time.tick_since(state.deadline) > 0 {
+					vm_fail(state, "E_DEADLINE", "wall-clock deadline exceeded")
+					if vm_unwind(state) {
+						continue
+					}
+					return .Failed
+				}
+			}
 		}
 
 		// A configured budget is the uncommon case, so test the stable

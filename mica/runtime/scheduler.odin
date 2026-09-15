@@ -22,6 +22,11 @@ import v "../var"
 
 Scheduler_Config :: struct {
 	workers: int,
+	// Per-task instruction budget and wall-clock limit, applied to every task
+	// as it is submitted. Zero means unlimited. See
+	// `World_Config.instruction_budget` and `World_Config.time_limit`.
+	instruction_budget: u64,
+	time_limit:         time.Duration,
 }
 
 DEFAULT_SCHEDULER_WORKERS :: 8
@@ -66,6 +71,10 @@ Scheduler_Entry :: struct {
 Scheduler :: struct {
 	kernel:    ^k.Kernel,
 	allocator: mem.Allocator,
+	// Per-task instruction budget and wall-clock limit applied to each task
+	// at submit. Zero means unlimited.
+	instruction_budget: u64,
+	time_limit:         time.Duration,
 
 	lock: sync.Mutex,
 	// Signals runnable work to the worker pool. Only ever signalled, never
@@ -106,6 +115,8 @@ scheduler_init :: proc(
 ) {
 	scheduler.kernel = kernel
 	scheduler.allocator = allocator
+	scheduler.instruction_budget = config.instruction_budget
+	scheduler.time_limit = config.time_limit
 	scheduler.ready = make([dynamic]Task_ID, allocator)
 	scheduler.timers = make([dynamic]Timer_Entry, allocator)
 	scheduler.entries = make(map[Task_ID]^Scheduler_Entry, allocator)
@@ -192,6 +203,12 @@ scheduler_submit_task :: proc(
 	owned_program: bool,
 	arguments: []v.Value = nil,
 ) -> Task_ID {
+	// Every task reaches a worker through here, including entry tasks, calls,
+	// dispatches, evals, and spawns, so this is the one place the scheduler
+	// limits are applied. Zero leaves the task unlimited.
+	vm.vm_set_instruction_budget(&task.state, scheduler.instruction_budget)
+	vm.vm_set_deadline(&task.state, scheduler.time_limit)
+
 	sync.mutex_lock(&scheduler.lock)
 	id := Task_ID(scheduler.next_id)
 	scheduler.next_id += 1

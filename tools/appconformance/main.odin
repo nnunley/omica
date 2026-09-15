@@ -217,7 +217,14 @@ run_case :: proc(entry: Case, artifact: []u8) -> (v.Value, bool) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := r.world_start(&kernel, entry.files, context.allocator)
+	// A mis-emitted loop is unbounded; the budget turns that into a failed
+	// case rather than a hung run.
+	world, start := r.world_start(
+		&kernel,
+		entry.files,
+		context.allocator,
+		r.HARNESS_CONFIG,
+	)
 	if !start.ok {
 		return v.Value(0), false
 	}
