@@ -434,14 +434,17 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			return .Failed
 		}
 
-		if state.instruction_budget_exhausted {
-			vm_fail(state, "E_BUDGET", "instruction budget exhausted")
-			if vm_unwind(state) {
-				continue
+		// A configured budget is the uncommon case, so test the stable
+		// enabled flag once. Inside it the live count can be zero, which is
+		// when the budget is exhausted rather than disabled.
+		if state.configured_budget != 0 {
+			if state.instruction_budget_exhausted {
+				vm_fail(state, "E_BUDGET", "instruction budget exhausted")
+				if vm_unwind(state) {
+					continue
+				}
+				return .Failed
 			}
-			return .Failed
-		}
-		if state.instruction_budget > 0 {
 			state.instruction_budget -= 1
 			if state.instruction_budget == 0 {
 				state.instruction_budget_exhausted = true
