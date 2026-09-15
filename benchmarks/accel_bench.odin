@@ -81,10 +81,10 @@ bench_cpu_membership :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Accel_State)(user)
 	total := u64(0)
 	for _ in 0 ..< chunk {
-		selected, ok := state.cpu.membership_select(state.mem_left, state.mem_right, true)
+		selected, ok := state.cpu.membership_select(state.mem_left, state.mem_right, true, context.temp_allocator)
+			delete(selected, context.temp_allocator)
 		if ok {
 			total += u64(len(selected))
-			delete(selected)
 		}
 	}
 	state.sink = mm.black_box(total)
@@ -101,10 +101,11 @@ when ODIN_OS == .Darwin {
 				state.mem_left,
 				state.mem_right,
 				true,
+				context.temp_allocator,
 			)
 			if ok {
 				total += u64(len(selected))
-				delete(selected)
+				delete(selected, context.temp_allocator)
 			}
 		}
 		state.sink = mm.black_box(total)
@@ -120,10 +121,11 @@ when ODIN_OS == .Darwin {
 				state.cos_docs,
 				state.cos_docs_n,
 				state.cos_dim,
+				context.temp_allocator,
 			)
 			if ok {
 				total += u64(len(scores))
-				delete(scores)
+				delete(scores, context.temp_allocator)
 			}
 		}
 		state.sink = mm.black_box(total)
@@ -146,10 +148,11 @@ bench_cpu_cosine :: proc(user: rawptr, chunk: int, _: int) {
 			state.cos_docs,
 			state.cos_docs_n,
 			state.cos_dim,
+			context.temp_allocator,
 		)
 		if ok {
 			total += u64(len(scores))
-			delete(scores)
+			delete(scores, context.temp_allocator)
 		}
 	}
 	state.sink = mm.black_box(total)

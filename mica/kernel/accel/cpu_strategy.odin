@@ -3,6 +3,8 @@
 // with the Metal strategy over identical inputs.
 package accel
 
+import "core:mem"
+
 @(private)
 cpu_available :: proc() -> bool {
 	return true
@@ -15,12 +17,13 @@ cpu_membership_select :: proc(
 	left: []u64,
 	right_sorted_unique: []u64,
 	keep_matches: bool,
+	allocator: mem.Allocator,
 ) -> (
 	selected: []bool,
 	ok: bool,
 ) {
 	if len(right_sorted_unique) == 0 {
-		out := make([]bool, len(left), context.allocator)
+		out := make([]bool, len(left), allocator)
 		for i in 0 ..< len(left) {
 			out[i] = !keep_matches
 		}
@@ -29,7 +32,7 @@ cpu_membership_select :: proc(
 	if !is_sorted_unique(right_sorted_unique) {
 		return nil, false
 	}
-	out := make([]bool, len(left), context.allocator)
+	out := make([]bool, len(left), allocator)
 	for probe, i in left {
 		hit := cpu_sorted_contains(right_sorted_unique, probe)
 		out[i] = (hit == keep_matches)
@@ -59,6 +62,7 @@ cpu_cosine_query :: proc(
 	docs: []f32,
 	n_docs: int,
 	dim: int,
+	allocator: mem.Allocator,
 ) -> (
 	scores: []f32,
 	ok: bool,
@@ -69,7 +73,7 @@ cpu_cosine_query :: proc(
 	if len(query) < dim || len(docs) < n_docs * dim {
 		return nil, false
 	}
-	out := make([]f32, n_docs, context.allocator)
+	out := make([]f32, n_docs, allocator)
 	for i in 0 ..< n_docs {
 		d2, qn, dn := f32(0), f32(0), f32(0)
 		for d in 0 ..< dim {
@@ -80,6 +84,44 @@ cpu_cosine_query :: proc(
 			dn += dv * dv
 		}
 		out[i] = d2 / (cpu_sqrt(qn) * cpu_sqrt(dn) + 1e-9)
+	}
+	return out, true
+}
+
+// Batched cosine: n_queries x dim scored against n_docs x dim in one call.
+// This is the measured fast path on Metal (one thread per query/doc pair);
+// the CPU reference runs the same arithmetic sequentially.
+@(private)
+cpu_cosine_queries :: proc(
+	queries: []f32,
+	docs: []f32,
+	n_queries: int,
+	n_docs: int,
+	dim: int,
+	allocator: mem.Allocator,
+) -> (
+	scores: []f32,
+	ok: bool,
+) {
+	if n_queries < 1 || n_docs < 1 || dim < 1 {
+		return nil, false
+	}
+	if len(queries) < n_queries * dim || len(docs) < n_docs * dim {
+		return nil, false
+	}
+	out := make([]f32, n_queries * n_docs, allocator)
+	for q in 0 ..< n_queries {
+		for i in 0 ..< n_docs {
+			d2, qn, dn := f32(0), f32(0), f32(0)
+			for d in 0 ..< dim {
+				qv := queries[q * dim + d]
+				dv := docs[i * dim + d]
+				d2 += qv * dv
+				qn += qv * qv
+				dn += dv * dv
+			}
+			out[q * n_docs + i] = d2 / (cpu_sqrt(qn) * cpu_sqrt(dn) + 1e-9)
+		}
 	}
 	return out, true
 }

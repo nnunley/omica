@@ -4,6 +4,8 @@
 #+build darwin
 package accel
 
+import "core:mem"
+
 // The Metal operator set. Gated to Apple hardware at runtime via
 // CreateSystemDefaultDevice; without a device `available` is false and every
 // operator declines.
@@ -13,6 +15,7 @@ metal_strategy :: proc() -> Strategy {
 		available = metal_available_impl,
 		membership_select = metal_membership_select,
 		cosine_query = metal_cosine_query,
+		cosine_queries = metal_cosine_queries,
 	}
 }
 
@@ -20,11 +23,12 @@ metal_membership_select :: proc(
 	left: []u64,
 	right_sorted_unique: []u64,
 	keep_matches: bool,
+	allocator: mem.Allocator,
 ) -> (
 	selected: []bool,
 	ok: bool,
 ) {
-	return membership_select_impl(left, right_sorted_unique, keep_matches)
+	return membership_select_impl(left, right_sorted_unique, keep_matches, allocator)
 }
 
 metal_cosine_query :: proc(
@@ -32,11 +36,26 @@ metal_cosine_query :: proc(
 	docs: []f32,
 	n_docs: int,
 	dim: int,
+	allocator: mem.Allocator,
 ) -> (
 	scores: []f32,
 	ok: bool,
 ) {
-	return cosine_query_impl(query, docs, n_docs, dim)
+	return cosine_query_impl(query, docs, n_docs, dim, allocator)
+}
+
+metal_cosine_queries :: proc(
+	queries: []f32,
+	docs: []f32,
+	n_queries: int,
+	n_docs: int,
+	dim: int,
+	allocator: mem.Allocator,
+) -> (
+	scores: []f32,
+	ok: bool,
+) {
+	return cosine_queries_impl(queries, docs, n_queries, n_docs, dim, allocator)
 }
 
 // Opts production dispatch into Metal, declining to CPU per operator.

@@ -52,11 +52,11 @@ cosine_top_k :: proc(
 	for cand, i in candidates {
 		copy(flat[i * dim:(i + 1) * dim], cand.vector)
 	}
-	scores, scores_ok := s.cosine_query(query, flat, len(candidates), dim)
+	scores, scores_ok := s.cosine_query(query, flat, len(candidates), dim, allocator)
 	if !scores_ok {
 		return nil, false
 	}
-	defer delete(scores)
+	defer delete(scores, allocator)
 	ranked, ranked_ok := rank_cosine_hits(candidates, scores, limit, allocator)
 	return ranked, ranked_ok
 }

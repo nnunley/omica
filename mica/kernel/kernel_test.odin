@@ -2079,6 +2079,54 @@ test_transaction_derived_invalidation :: proc(t: ^testing.T) {
 	transaction_destroy(&tx)
 }
 
+// The negated single-column identity atom is the accelerator's first kernel
+// caller: `apply_negated_atom` routes it through `membership_select` as one
+// batch instead of one existence scan per binding. This test pins the wiring
+// with enough bindings to matter; the operator thresholds still apply, so it
+// passes on both CPU and Metal strategies.
+@(test)
+test_negated_atom_batch_path :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	item := create_relation(&kernel, 1, "Item", 1)
+	held := create_relation(&kernel, 2, "Held", 1)
+	free := create_relation(&kernel, 3, "Free", 1)
+
+	x := v.symbol_intern("x")
+	rule := rule_new(
+		free,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(item, []Term{term_var(x)})),
+			body_atom(atom_negated(held, []Term{term_var(x)})),
+		},
+	)
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(810), rule, "Free(x) :- Item(x), not Held(x).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	// 64 items, even ones held: Free must be exactly the odd ones however
+	// the negated atom is evaluated.
+	tx := kernel_begin(&kernel)
+	for i in 1 ..= 64 {
+		transaction_assert(&tx, item, tuple_of(must_identity(u64(i))))
+		if i % 2 == 0 {
+			transaction_assert(&tx, held, tuple_of(must_identity(u64(i))))
+		}
+	}
+	commit_transaction(t, &tx)
+
+	rows := kernel_rows(&kernel, free, 1)
+	defer delete(rows)
+	testing.expect_value(t, len(rows), 32)
+	for i in 1 ..= 64 {
+		has := has_tuple(rows[:], tuple_of(must_identity(u64(i))))
+		testing.expectf(t, has == (i % 2 == 1), "item %d: has=%v", i, has)
+	}
+}
+
 @(test)
 test_derived_dedupe :: proc(t: ^testing.T) {
 	kernel: Kernel

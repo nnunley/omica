@@ -56,7 +56,7 @@ membership_probe_identities :: proc(
 		return nil, false
 	}
 	encoded := encode_identities(probes, context.temp_allocator)
-	selected, selected_ok := s.membership_select(encoded, column_sorted_unique, keep_matches)
+	selected, selected_ok := s.membership_select(encoded, column_sorted_unique, keep_matches, context.temp_allocator)
 	if !selected_ok {
 		return nil, false
 	}

@@ -18,14 +18,14 @@ test_metal_probe_no_crash :: proc(t: ^testing.T) {
 test_membership_small_declines_metal :: proc(t: ^testing.T) {
 	// Below MEMBERSHIP_MIN_ROWS the Metal operator must decline.
 	m := metal_strategy()
-	_, ok := m.membership_select([]u64{1, 2, 3}, []u64{2, 3, 4}, true)
+	_, ok := m.membership_select([]u64{1, 2, 3}, []u64{2, 3, 4}, true, context.temp_allocator)
 	testing.expect(t, !ok)
 }
 
 @(test)
 test_cosine_small_declines_metal :: proc(t: ^testing.T) {
 	m := metal_strategy()
-	_, ok := m.cosine_query([]f32{1, 0}, []f32{1, 0, 0, 1}, 2, 2)
+	_, ok := m.cosine_query([]f32{1, 0}, []f32{1, 0, 0, 1}, 2, 2, context.temp_allocator)
 	testing.expect(t, !ok)
 }
 
@@ -45,35 +45,35 @@ strategy_agreement :: proc(
 	if !m.available() {
 		return
 	}
-	cpu_sel, cpu_ok := c.membership_select(left, right, true)
+	cpu_sel, cpu_ok := c.membership_select(left, right, true, context.temp_allocator)
 	testing.expect(t, cpu_ok)
 	if !cpu_ok {
 		return
 	}
-	defer delete(cpu_sel)
-	gpu_sel, gpu_ok := m.membership_select(left, right, true)
+	defer delete(cpu_sel, context.temp_allocator)
+	gpu_sel, gpu_ok := m.membership_select(left, right, true, context.temp_allocator)
 	testing.expect(t, gpu_ok)
 	if !gpu_ok {
 		return
 	}
-	defer delete(gpu_sel)
+	defer delete(gpu_sel, context.temp_allocator)
 	testing.expect(t, len(cpu_sel) == len(gpu_sel))
 	for i in 0 ..< min(len(cpu_sel), len(gpu_sel)) {
 		testing.expect_value(t, gpu_sel[i], cpu_sel[i])
 	}
 
-	cpu_scores, cpu_scores_ok := c.cosine_query(query, docs, n_docs, dim)
+	cpu_scores, cpu_scores_ok := c.cosine_query(query, docs, n_docs, dim, context.temp_allocator)
 	testing.expect(t, cpu_scores_ok)
 	if !cpu_scores_ok {
 		return
 	}
-	defer delete(cpu_scores)
-	gpu_scores, gpu_scores_ok := m.cosine_query(query, docs, n_docs, dim)
+	defer delete(cpu_scores, context.temp_allocator)
+	gpu_scores, gpu_scores_ok := m.cosine_query(query, docs, n_docs, dim, context.temp_allocator)
 	testing.expect(t, gpu_scores_ok)
 	if !gpu_scores_ok {
 		return
 	}
-	defer delete(gpu_scores)
+	defer delete(gpu_scores, context.temp_allocator)
 	testing.expect(t, len(cpu_scores) == len(gpu_scores))
 	for i in 0 ..< min(len(cpu_scores), len(gpu_scores)) {
 		diff := abs(cpu_scores[i] - gpu_scores[i])
@@ -106,6 +106,57 @@ test_strategies_agree_large :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_batch_cosine_agrees_across_strategies :: proc(t: ^testing.T) {
+	m := metal_strategy()
+	if !m.available() {
+		return
+	}
+	dim := 32
+	n_queries := 8
+	n_docs := 2048
+	queries := make([]f32, n_queries * dim, context.temp_allocator)
+	docs := make([]f32, n_docs * dim, context.temp_allocator)
+	for i in 0 ..< len(queries) {
+		queries[i] = f32((i % 13) + 1) / 13.0
+	}
+	for i in 0 ..< len(docs) {
+		docs[i] = f32((i % 37) + 1) / 37.0
+	}
+	c := cpu_strategy()
+	gpu, gpu_ok := m.cosine_queries(
+		queries,
+		docs,
+		n_queries,
+		n_docs,
+		dim,
+		context.temp_allocator,
+	)
+	testing.expect(t, gpu_ok)
+	if !gpu_ok {
+		return
+	}
+	defer delete(gpu, context.temp_allocator)
+	cpu, cpu_ok := c.cosine_queries(
+		queries,
+		docs,
+		n_queries,
+		n_docs,
+		dim,
+		context.temp_allocator,
+	)
+	testing.expect(t, cpu_ok)
+	if !cpu_ok {
+		return
+	}
+	defer delete(cpu, context.temp_allocator)
+	testing.expect(t, len(gpu) == len(cpu))
+	for i in 0 ..< min(len(gpu), len(cpu)) {
+		diff := abs(gpu[i] - cpu[i])
+		testing.expectf(t, diff < 1e-3, "score %d: metal %v cpu %v", i, gpu[i], cpu[i])
+	}
+}
+
+@(test)
 test_top_k_agrees_across_strategies :: proc(t: ^testing.T) {
 	m := metal_strategy()
 	if !m.available() {
@@ -134,13 +185,13 @@ test_top_k_agrees_across_strategies :: proc(t: ^testing.T) {
 	if !gpu_ok {
 		return
 	}
-	defer delete(gpu_hits)
+	defer delete(gpu_hits, context.allocator)
 	cpu_hits, cpu_ok := cosine_top_k(query, cands, 8, context.allocator, cpu_strategy())
 	testing.expect(t, cpu_ok)
 	if !cpu_ok {
 		return
 	}
-	defer delete(cpu_hits)
+	defer delete(cpu_hits, context.allocator)
 	testing.expect(t, len(gpu_hits) == len(cpu_hits))
 	for i in 0 ..< min(len(gpu_hits), len(cpu_hits)) {
 		testing.expect_value(t, gpu_hits[i].subject, cpu_hits[i].subject)

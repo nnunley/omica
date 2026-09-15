@@ -172,6 +172,7 @@ membership_select_impl :: proc(
 	left: []u64,
 	right_sorted_unique: []u64,
 	keep_matches: bool,
+	allocator: mem.Allocator,
 ) -> (
 	selected: []bool,
 	accelerated: bool,
@@ -209,7 +210,7 @@ membership_select_impl :: proc(
 		len(left),
 	)
 	raw := fbuf->contents()
-	out := make([]bool, len(left), context.allocator)
+	out := make([]bool, len(left), allocator)
 	for i in 0 ..< len(left) {
 		out[i] = raw[i * 4] != 0
 	}
@@ -224,7 +225,7 @@ cosine_queries_impl :: proc(
 	n_queries: int,
 	n_docs: int,
 	dim: int,
-	allocator := context.allocator,
+	allocator: mem.Allocator,
 ) -> (
 	scores: []f32,
 	accelerated: bool,
@@ -273,9 +274,10 @@ cosine_query_impl :: proc(
 	docs: []f32,
 	n_docs: int,
 	dim: int,
+	allocator: mem.Allocator,
 ) -> (
 	scores: []f32,
 	accelerated: bool,
 ) {
-	return cosine_queries_impl(query, docs, 1, n_docs, dim)
+	return cosine_queries_impl(query, docs, 1, n_docs, dim, allocator)
 }

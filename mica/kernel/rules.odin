@@ -10,7 +10,9 @@ package kernel
 
 import "core:mem"
 import "core:mem/virtual"
+import "core:slice"
 import "core:strings"
+import accel "./accel"
 import v "../var"
 
 // A term in an atom, guard, or rule head.
@@ -741,6 +743,13 @@ apply_negated_atom :: proc(
 		return {}, .Unsafe_Negation
 	}
 
+	// Batch fast path: a fully-bound single-column atom over identity values
+	// is one sorted membership probe (row-order pass) instead of one
+	// per-binding existence scan. Anything else declines to the row path.
+	if batched, ok := try_negated_atom_batch(atom, bindings, slots, source, alloc); ok {
+		return batched, .None
+	}
+
 	out: [dynamic][]v.Binding
 	for binding in bindings {
 		scan_bindings := make([]v.Binding, len(atom.terms), alloc)
@@ -762,6 +771,115 @@ apply_negated_atom :: proc(
 		}
 	}
 	return out, .None
+}
+
+// Batch fast path for a negated single-column atom over identity values.
+//
+// When every probe value is an identity and the relation's rows project to a
+// single identity column (one probe per incoming binding), the whole filter
+// is one `membership_select` call against a sorted-unique column instead of
+// N existence scans. Returns (rows, true) when the shape holds; (nil, false)
+// declines to the row path for any other shape. Columnar projection of the
+// relation is Ryan's work; until it lands the column is gathered row-wise
+// here, so this path exercises the operator wiring, not the data layout.
+@(private)
+try_negated_atom_batch :: proc(
+	atom: ^Atom,
+	bindings: [][]v.Binding,
+	slots: ^Slot_Map,
+	source: ^Relation_Source,
+	alloc: mem.Allocator,
+) -> (
+	[dynamic][]v.Binding,
+	bool,
+) {
+	if len(atom.terms) != 1 || len(bindings) == 0 {
+		return nil, false
+	}
+
+	// Evaluate all probe values first: every term must be identity-bound.
+	// Constant (.Value) terms are only usable when they are identities.
+	probes := make([]v.Value, len(bindings), alloc)
+	for binding, i in bindings {
+		value, err := term_evaluate(atom.terms[0], binding, slots)
+		if err != .None || v.value_tag(value) != .Identity {
+			delete(probes)
+			return nil, false
+		}
+		probes[i] = value
+	}
+
+// Gather the relation's first column row-wise (temporary; the columnar
+	// projection will replace this with a contiguous read). Atom arity was
+	// validated at install, so full-width unbound bindings match every row.
+	rows := make([dynamic]v.Tuple, 0, 64, context.temp_allocator)
+	defer delete(rows)
+	unbound := make([]v.Binding, len(atom.terms), context.temp_allocator)
+	relation_source_scan_into(source, atom.relation, unbound, &rows)
+	defer delete(rows)
+	arity_ok := true
+	for row in rows {
+		if v.tuple_arity(row) < 1 {
+			arity_ok = false
+			break
+		}
+	}
+	if !arity_ok {
+		delete(probes)
+		return nil, false
+	}
+	column := make([]u64, len(rows), context.temp_allocator)
+	ident_ok := true
+	for row, i in rows {
+		cell := v.tuple_values(row)[0]
+		if v.value_tag(cell) != .Identity {
+			ident_ok = false
+			break
+		}
+		column[i] = u64(cell)
+	}
+	if !ident_ok {
+		delete(probes)
+		return nil, false
+	}
+	slice.sort(column)
+	sorted_unique := column[:]
+	write := 0
+	for i in 1 ..< len(column) {
+		if column[i] != column[write] {
+			write += 1
+			column[write] = column[i]
+		}
+	}
+	if len(column) > 0 {
+		sorted_unique = column[:write + 1]
+	}
+
+	// keep_matches=false: a binding survives when its probe is ABSENT.
+	// Membership across a strategy boundary can only leak on decline if the
+	// strategy allocated: every path either returns before allocating or
+	// frees on decline, so temp ownership here is sound.
+	selected, selected_ok := accel.active_strategy().membership_select(
+		accel.encode_identities(probes, context.temp_allocator),
+		sorted_unique,
+		false,
+		context.temp_allocator,
+	)
+	if !selected_ok {
+		delete(probes)
+		return nil, false
+	}
+	defer delete(selected, context.temp_allocator)
+	out: [dynamic][]v.Binding
+	for binding, i in bindings {
+		if selected[i] {
+			next := make([]v.Binding, len(binding), alloc)
+			copy(next, binding)
+			append(&out, next)
+		}
+	}
+	delete(probes)
+	return out, true
 }
 
 @(private)
