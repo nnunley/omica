@@ -1,90 +1,181 @@
 // OWL fact loading: stream triples into kernel asserts.
 //
-// The loader opens (or boots) a world, declares the bycycle relations as a
-// filein unit, then streams owl:Class blocks: one kernel transaction per
-// --commit-batch triples, each triple becoming one assertion. GUID subjects
-// and GUID objects become named identities (#guid_<sanitized>); literals
-// become strings. A GuidOf functional relation maps identity -> GUID string
-// for audit; labels/comments live in Label/Comment/Alias functional
-// relations. The inferencing rules live in ontology/*.mica fileins loaded
-// separately (same store, same unit or another).
+// The loader opens (or boots) a world whose bycycle relations were declared
+// by the apps/bycycle fileins, then streams owl:Class blocks: one kernel
+// transaction per --commit-batch queued facts, each triple becoming one
+// assertion. GUID subjects and GUID objects become named identities
+// (#guid_<sanitized>); literals become strings. A GuidOf functional relation
+// maps identity -> GUID string for audit; labels/comments live in
+// Label/Comment/Alias functional relations. The inferencing rules live in the
+// apps/bycycle fileins.
 package main
 
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strconv"
 import "core:strings"
+import "core:time"
 
+import "core:mem/virtual"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
 import s "../../mica/store"
 import v "../../mica/var"
 
-// Relation names the loader asserts into. Declared by the bycycle ontology
-// filein; the loader resolves ids against the live world after filein load.
-Loader_Relations :: struct {
-	isa:        k.Relation_ID,
-	genls:      k.Relation_ID,
-	disjoint:   k.Relation_ID,
-	quoted_isa: k.Relation_ID,
-	type_genls: k.Relation_ID,
-	arg1_pred:  k.Relation_ID,
-	rewrite_of: k.Relation_ID,
-	broader:    k.Relation_ID,
-	label:      k.Relation_ID,
-	cycl:       k.Relation_ID,
-	comment:    k.Relation_ID,
-	alias:      k.Relation_ID,
-	see_also:   k.Relation_ID,
-	wiki_name:  k.Relation_ID,
-	wiki_url:   k.Relation_ID,
-	same_as:    k.Relation_ID,
-	guid_of:    k.Relation_ID,
+// Every relation the loader writes. The first block maps one-to-one onto OWL
+// predicates (see predicate_field); the rest are loader-internal.
+Field :: enum {
+	None,
+	Isa,
+	Genls,
+	Disjoint,
+	Quoted_Isa,
+	Type_Genls,
+	Arg1_Pred,
+	Rewrite_Of,
+	Broader,
+	Label,
+	Cycl,
+	Comment,
+	Alias,
+	See_Also,
+	Wiki_Name,
+	Wiki_URL,
+	Same_As,
+	// Audit: identity -> source GUID string.
+	Guid_Of,
+	// Durable resume checkpoint: functional key :resume -> "owl\npos\nsubjects".
+	// Optional (old stores lack it); without it a rerun starts from scratch.
+	Loader_State,
+	// Retrieval gate read by apps/shared/retrieval.mica. Optional; required
+	// only when --retrieval-actor is given.
+	Can_Retrieve,
 }
+
+// Relation names as declared by the bycycle ontology filein.
+FIELD_RELATION_NAMES :: [Field]string {
+	.None         = "",
+	.Isa          = "Isa",
+	.Genls        = "Genls",
+	.Disjoint     = "DisjointWith",
+	.Quoted_Isa   = "QuotedIsa",
+	.Type_Genls   = "TypeGenls",
+	.Arg1_Pred    = "Arg1Pred",
+	.Rewrite_Of   = "RewriteOf",
+	.Broader      = "BroaderTerm",
+	.Label        = "Label",
+	.Cycl         = "CycLabel",
+	.Comment      = "Comment",
+	.Alias        = "Alias",
+	.See_Also     = "SeeAlso",
+	.Wiki_Name    = "WikiName",
+	.Wiki_URL     = "WikiURL",
+	.Same_As      = "SameAs",
+	.Guid_Of      = "GuidOf",
+	.Loader_State = "LoaderState",
+	.Can_Retrieve = "CanRetrieveSubject",
+}
+
+OPTIONAL_FIELDS :: bit_set[Field]{.None, .Loader_State, .Can_Retrieve}
+
+// Functional single-valued relations: the kernel enforces the key, so a
+// second value for the same subject would fail the batch. Repeats route to
+// Alias (see queue_triple).
+FIRST_WINS_FIELDS :: bit_set[Field]{.Label, .Cycl, .Comment}
+
+// Relation ids resolved against the live world after filein load; 0 for an
+// optional relation the store lacks.
+Loader_Relations :: [Field]k.Relation_ID
 
 Loader_Stats :: struct {
 	subjects:   int,
+	// OWL triples queued. Loader-internal rows (GuidOf, NamedIdentity,
+	// CanRetrieveSubject) count under internal instead.
 	triples:    int,
+	internal:   int,
 	asserted:   int,
+	// Input intentionally not loaded: non-GUID subjects (owl:Ontology,
+	// property declarations) and empty literals.
 	skipped:    int,
+	// Resource objects discarded because their fragment is not a GUID (see
+	// is_guid). Counted apart from skipped: this is data loss, not policy.
+	dropped_resources: int,
+	// Every kernel commit: batch flushes and resume-state writes.
 	commits:    int,
 	identities: int,
+	// Timing: wall seconds per phase, accumulated across batches.
+	scan_seconds:    f64,
+	assert_seconds:  f64,
+	commit_seconds:  f64,
+	checkpoint_seconds: f64,
+	// Error counters (omica has no telemetry package; loader-local).
+	err_assert:    int,
+	err_commit:    int,
+	err_identity:  int,
+	err_checkpoint: int,
+}
+
+Pending_Assert :: struct {
+	relation: k.Relation_ID,
+	tuple:    v.Tuple,
+}
+
+// Everything the per-triple path needs, so the scan procs take one pointer
+// instead of nine.
+Loader :: struct {
+	world:         ^r.World,
+	rels:          Loader_Relations,
+	identities:    map[string]v.Value,
+	next_identity: u64,
+	pending:       [dynamic]Pending_Assert,
+	stats:         Loader_Stats,
+	// Batch arena: all pending tuples/strings allocate here and are freed
+	// wholesale after each flush. transaction_assert deep-copies into the
+	// tx arena synchronously, so nothing in pending outlives the flush.
+	// pending's own backing array is on context.allocator so its capacity is
+	// reused across batches.
+	batch_arena: virtual.Arena,
+	batch_alloc: mem.Allocator,
+	// First-label-wins bookkeeping for FIRST_WINS_FIELDS, keyed by identity
+	// raw word (stable across reboots). On a resumed run the kernel already
+	// holds first labels while this map starts empty, so first-seen-this-run
+	// duplicates route to Alias and kernel set semantics dedupe exact repeats.
+	label_seen: map[u64]bit_set[Field],
 }
 
 // sanitize_guid maps an OpenCyc GUID fragment to a Mica identity name.
 // Dots and dashes are not ident chars (lexer.odin:485); map . and - to _.
 // Prefix avoids collisions with ontology names and keeps the mapping
-// invertible via GuidOf.
+// invertible via GuidOf. The result is a fresh allocation owned by the caller.
 sanitize_guid :: proc(guid: string, allocator := context.allocator) -> string {
 	prefix := "guid_"
-	buf := make([dynamic]u8, 0, len(guid) + 5, allocator)
-	for i in 0 ..< len(prefix) {
-		append(&buf, prefix[i])
-	}
+	buf := make([]u8, len(prefix) + len(guid), allocator)
+	copy(buf, prefix)
 	for i in 0 ..< len(guid) {
 		ch := guid[i]
-		if ch == '.' || ch == '-' {
-			append(&buf, u8('_'))
-		} else {
-			append(&buf, ch)
-		}
+		buf[len(prefix) + i] = (ch == '.' || ch == '-') ? '_' : ch
 	}
-	return string(buf[:])
+	return string(buf)
 }
 
 // frag_of takes the fragment after the last # or / of a URI.
 frag_of :: proc(uri: string) -> string {
-	rest := uri
-	if at := strings.last_index_byte(rest, '#'); at >= 0 {
-		rest = rest[at + 1:]
-	} else if at := strings.last_index_byte(rest, '/'); at >= 0 {
-		rest = rest[at + 1:]
+	if at := strings.last_index_byte(uri, '#'); at >= 0 {
+		return uri[at + 1:]
 	}
-	return rest
+	if at := strings.last_index_byte(uri, '/'); at >= 0 {
+		return uri[at + 1:]
+	}
+	return uri
 }
 
-// is_guid reports whether a fragment looks like an OpenCyc GUID (long,
-// mostly alnum with _ and -). Short fragments are predicates/labels.
+// is_guid reports whether a fragment looks like an OpenCyc GUID: at least 20
+// chars of alnum, _ and -. OpenCyc GUID fragments are 26 chars ("Mx4r..."),
+// so the cutoff separates them from vocabulary fragments such as "Class".
+// Any other resource with a short fragment (a hand-written ".../Dog") is not
+// loaded: as a subject it counts under skipped, as an object under
+// dropped_resources.
 is_guid :: proc(frag: string) -> bool {
 	if len(frag) < 20 {
 		return false
@@ -98,121 +189,68 @@ is_guid :: proc(frag: string) -> bool {
 	return true
 }
 
-// Maps a child predicate tag to a loader relation field. Returns "" for
+// Maps a child predicate tag to the relation it loads into. Returns .None for
 // tags we drop (owl:Restriction structure, versionInfo, datatypes).
-predicate_relation :: proc(child_tag: string) -> string {
+predicate_field :: proc(child_tag: string) -> Field {
 	switch child_tag {
 	case RDF_TYPE:
-		return "isa"
+		return .Isa
 	case RDFS_SUBCLASS:
-		return "genls"
+		return .Genls
 	case OWL_DISJOINT:
-		return "disjoint"
+		return .Disjoint
 	case OWL_SAMEAS:
-		return "same_as"
+		return .Same_As
 	case RDFS_LABEL:
-		return "label"
+		return .Label
 	case CYCL_LABEL:
-		return "cycl"
+		return .Cycl
 	case RDFS_COMMENT:
-		return "comment"
+		return .Comment
 	case GUID_PRETTY_STRING:
-		return "alias"
+		return .Alias
 	case GUID_QUOTED_ISA:
-		return "quoted_isa"
+		return .Quoted_Isa
 	case GUID_TYPE_GENLS:
-		return "type_genls"
+		return .Type_Genls
 	case GUID_REQUIRED_ARG1:
-		return "arg1_pred"
+		return .Arg1_Pred
 	case GUID_REWRITE_OF:
-		return "rewrite_of"
+		return .Rewrite_Of
 	case GUID_BROADER_TERM:
-		return "broader"
+		return .Broader
 	case GUID_SEE_ALSO:
-		return "see_also"
+		return .See_Also
 	case GUID_WIKI_NAME:
-		return "wiki_name"
+		return .Wiki_Name
 	case GUID_WIKI_URL:
-		return "wiki_url"
+		return .Wiki_URL
 	}
-	return ""
+	return .None
 }
 
 // Loads OWL facts into the world at store_path. The ontology fileins must
-// already be loaded (or passed as extra filein paths via filein tool);
-// this loader only asserts facts. Every batch closes its world (releasing
-// the LOCK) and reopens for the next: a killed run leaves a checkpointed
-// prefix, and reruns are idempotent (set semantics dedupe re-asserted
-// facts).
+// already be loaded (scripts/bycycle-load.sh init); this loader only asserts
+// facts.
+//
+// Single pass: the world stays open for the whole run and the XML is scanned
+// once, front to back. Every fact the loader produces, including the GuidOf
+// and NamedIdentity rows for new identities, is queued in pending; once
+// pending holds commit_batch rows it is flushed in one kernel transaction, so
+// the rule fixpoint is recomputed once per batch rather than once per
+// identity. After each flush the scan position is saved to LoaderState and,
+// with checkpoint set, the store is checkpointed. A killed run resumes from
+// LoaderState; set semantics dedupe the replayed tail. When retrieval_actor
+// is non-empty every subject also gets CanRetrieveSubject(actor, subject).
 run_load :: proc(
 	xml_text: string,
 	store_path: string,
-	unit: string,
+	owl_path: string,
 	limit: int,
 	commit_batch: int,
 	durability: s.Durability,
-) {
-	_ = unit
-	stats: Loader_Stats
-	// Resume: count GUID subjects already in the store via GuidOf rows, so
-	// a rerun skips what a previous run committed (set semantics make the
-	// overlap harmless, the offset makes it fast).
-	offset := committed_subject_count(store_path)
-	if offset > 0 {
-		fmt.eprintf("  resuming: %d subjects already committed\n", offset)
-	}
-	for {
-		if limit > 0 && stats.subjects >= limit {
-			break
-		}
-		more, batch_stats := run_batch(
-			xml_text,
-			store_path,
-			limit,
-			commit_batch,
-			durability,
-			offset,
-			&stats,
-		)
-		stats.subjects += batch_stats.subjects
-		stats.triples += batch_stats.triples
-		stats.asserted += batch_stats.asserted
-		stats.skipped += batch_stats.skipped
-		stats.commits += batch_stats.commits
-		stats.identities += batch_stats.identities
-		if !more {
-			break
-		}
-		offset = stats.subjects
-	}
-
-	fmt.printf(
-		"done: %d subjects, %d triples, %d asserted, %d skipped, %d commits, %d identities\n",
-		stats.subjects,
-		stats.triples,
-		stats.asserted,
-		stats.skipped,
-		stats.commits,
-		stats.identities,
-	)
-}
-
-// One batch: open the world, stream up to commit_batch triples worth of
-// subjects starting after `skip_subjects` GUID subjects, commit, checkpoint,
-// close (releasing LOCK). Returns (more, batch_stats): more=false when the
-// scan hit end-of-file or the caller's limit. Offset is subject-count based;
-// reruns are idempotent under set semantics.
-run_batch :: proc(
-	xml_text: string,
-	store_path: string,
-	limit: int,
-	commit_batch: int,
-	durability: s.Durability,
-	skip_subjects: int,
-	accum: ^Loader_Stats,
-) -> (
-	more: bool,
-	batch_stats: Loader_Stats,
+	checkpoint: bool,
+	retrieval_actor: string,
 ) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
@@ -230,278 +268,340 @@ run_batch :: proc(
 	}
 	defer r.world_destroy(world)
 
-	rels, rels_ok := resolve_loader_relations(world)
+	ld: Loader
+	ld.world = world
+	rels_ok: bool
+	ld.rels, rels_ok = resolve_loader_relations(world)
 	if !rels_ok {
 		fmt.eprintf(
-			"loader relations missing: load ontology/*.mica into the store first " +
-			"(filein --store DIR --unit bycycle ontology/*.mica)\n",
+			"loader relations missing: load the bycycle ontology into the store first " +
+			"(scripts/bycycle-load.sh init DIR)\n",
 		)
 		os.exit(1)
 	}
-
-	identities := make(map[string]v.Value)
-	defer delete(identities)
-	next_identity := next_identity_seed(world)
-
-	stats: Loader_Stats
-	pending: [dynamic]Pending_Assert
-	defer delete(pending)
-
-	flush := proc(
-		accum: ^Loader_Stats,
-		kernel: ^k.Kernel,
-		rels: ^Loader_Relations,
-		pending: ^[dynamic]Pending_Assert,
-		stats: ^Loader_Stats,
-	) -> bool {
-		if len(pending) == 0 {
-			return true
-		}
-		tx := k.kernel_begin(kernel)
-		for p in pending {
-			if err := k.transaction_assert(&tx, p.relation, p.tuple); err != .None {
-				fmt.eprintf("assert failed: %v\n", err)
-				k.transaction_destroy(&tx)
-				return false
-			}
-			stats.asserted += 1
-		}
-		committed, commit_err := k.transaction_commit(&tx)
-		k.transaction_destroy(&tx)
-		if commit_err != .None {
-			fmt.eprintf("commit failed: %v\n", commit_err)
-			return false
-		}
-		k.snapshot_release(committed)
-		stats.commits += 1
-		clear(pending)
-		fmt.eprintf(
-			"  ... batch done: %d subjects, %d triples asserted total\n",
-			accum.subjects + stats.subjects,
-			accum.asserted + stats.asserted,
-		)
-		return true
+	if retrieval_actor != "" && ld.rels[.Can_Retrieve] == 0 {
+		fmt.eprintf("--retrieval-actor given but CanRetrieveSubject is not declared in the store\n")
+		os.exit(1)
 	}
 
+	ld.identities = make(map[string]v.Value)
+	defer delete(ld.identities)
+	defer delete(ld.label_seen)
+	defer delete(ld.pending)
+	ld.next_identity = next_identity_seed(world)
+	fmt.eprintf("  ... seeding done\n")
+
+	if err := virtual.arena_init_growing(&ld.batch_arena); err != nil {
+		fmt.eprintf("arena init failed\n")
+		os.exit(1)
+	}
+	defer virtual.arena_destroy(&ld.batch_arena)
+	ld.batch_alloc = virtual.arena_allocator(&ld.batch_arena)
+	preseed_identities(&ld)
+
+	actor: v.Value
+	has_actor := retrieval_actor != ""
+	if has_actor {
+		actor = resolve_actor(&ld, retrieval_actor)
+	}
+
+	// Resume position: durable in LoaderState (Mica store), not derived
+	// from GuidOf row counting and not a re-scan over already-loaded
+	// subjects. GuidOf rows still pre-seed the identity map (forward refs
+	// from new subjects may point at old ones).
+	scan_t0 := time.tick_now()
 	pos := 0
-	skipped_offset := 0
-	guid_seen := 0
 	subjects_done := 0
-	fmt.eprintf("  batch start: skipping %d subjects\n", skip_subjects)
-	for {
-		if limit > 0 && accum.subjects + subjects_done >= limit {
-			flush(accum, &kernel, &rels, &pending, &stats)
-			r.world_checkpoint(world)
-			return false, stats
+	resume_pos, resume_subjects, has_resume := load_resume_state(&ld, owl_path)
+	if has_resume {
+		if resume_pos < len(xml_text) {
+			pos = resume_pos
+			subjects_done = resume_subjects
+			ld.stats.subjects = resume_subjects
+			fmt.eprintf(
+				"  resuming at byte %d/%d (%d subjects done)\n",
+				pos,
+				len(xml_text),
+				subjects_done,
+			)
+		} else {
+			fmt.eprintf("  resume pos out of range, starting fresh\n")
 		}
-		if stats.triples >= commit_batch {
-			flush(accum, &kernel, &rels, &pending, &stats)
-			r.world_checkpoint(world)
-			return true, stats
+	}
+	for limit <= 0 || subjects_done < limit {
+		tag, ok := next_tag(xml_text, pos)
+		if !ok {
+			break
 		}
-		open, is_subject, _ := scan_next_open(xml_text, pos)
-		if open < 0 {
-			flush(accum, &kernel, &rels, &pending, &stats)
-			r.world_checkpoint(world)
-			return false, stats
-		}
-		pos = open
-		if !is_subject {
+		pos = tag.end
+		if !tag.is_subject {
 			continue
 		}
-		// re-derive the head span to read rdf:about
-		head_start := open
-		for head_start > 0 && xml_text[head_start - 1] != '<' {
-			head_start -= 1
-		}
-		head := xml_text[head_start:open]
-		about, about_ok := attr_value(head, "rdf:about")
-		if !about_ok || about == "" {
-			stats.skipped += 1
-			skip_subject(xml_text, &pos)
-			continue
-		}
+		about, about_ok := attr_value(tag.head, ABOUT_ATTR)
 		frag := frag_of(about)
-		if frag == "" || !is_guid(frag) {
-			// skips owl:Ontology, AnnotationProperty declarations, etc.
-			stats.skipped += 1
-			skip_subject(xml_text, &pos)
+		if !about_ok || frag == "" || !is_guid(frag) {
+			// owl:Ontology, AnnotationProperty declarations, etc.
+			ld.stats.skipped += 1
+			skip_subject(xml_text, &pos, tag)
 			continue
 		}
-		if skipped_offset < skip_subjects {
-			skipped_offset += 1
-			guid_seen += 1
-			skip_subject(xml_text, &pos)
-			continue
-		}
-		guid_seen += 1
-		subj := intern_guid(
-			world,
-			&rels,
-			&identities,
-			&next_identity,
-			&pending,
-			&stats,
-			frag,
-		)
-		stats.subjects += 1
+		subj := intern_guid(&ld, frag)
+		ld.stats.subjects += 1
 		subjects_done += 1
-		scan_subject_children(
-			xml_text,
-			&pos,
-			world,
-			&rels,
-			&identities,
-			&next_identity,
-			&pending,
-			&stats,
-			subj,
-			frag,
-		)
+		if has_actor {
+			queue(&ld, .Can_Retrieve, actor, subj)
+			ld.stats.internal += 1
+		}
+		scan_subject_children(&ld, xml_text, &pos, tag, subj)
+		if len(ld.pending) >= commit_batch {
+			if !flush(&ld) {
+				os.exit(1)
+			}
+			if checkpoint {
+				checkpoint_here(&ld)
+			}
+			save_resume_state(&ld, owl_path, pos, subjects_done)
+			reset_batch(&ld)
+			fmt.eprintf(
+				"  ... %d subjects, %d triples asserted\n",
+				ld.stats.subjects,
+				ld.stats.asserted,
+			)
+		}
 		if subjects_done % 20000 == 0 {
 			fmt.eprintf(
 				"  ... %d subjects, %d triples seen\n",
-				accum.subjects + subjects_done,
-				accum.triples + stats.triples,
+				ld.stats.subjects,
+				ld.stats.triples,
 			)
 		}
 	}
-}
+	if !flush(&ld) {
+		os.exit(1)
+	}
+	reset_batch(&ld)
+	ld.stats.scan_seconds += time.duration_seconds(time.tick_since(scan_t0))
+	if checkpoint {
+		checkpoint_here(&ld)
+	}
+	save_resume_state(&ld, owl_path, pos, subjects_done)
 
-Pending_Assert :: struct {
-	relation: k.Relation_ID,
-	tuple:    v.Tuple,
-}
+	print_timing_summary(&ld.stats)
 
-// Counts already-committed subjects by scanning GuidOf rows in the store.
-// Opens the world read-only through the same boot path and closes it,
-// releasing LOCK before the first batch.
-committed_subject_count :: proc(store_path: string) -> int {
-	kernel: k.Kernel
-	k.kernel_init(&kernel)
-	defer k.kernel_destroy(&kernel)
-
-	world, start := r.world_start(
-		&kernel,
-		nil,
-		context.allocator,
-		r.World_Config{store_path = store_path},
+	fmt.printf(
+		"done: %d subjects, %d triples, %d internal, %d asserted, %d skipped, " +
+		"%d dropped resources, %d commits, %d identities\n",
+		ld.stats.subjects,
+		ld.stats.triples,
+		ld.stats.internal,
+		ld.stats.asserted,
+		ld.stats.skipped,
+		ld.stats.dropped_resources,
+		ld.stats.commits,
+		ld.stats.identities,
 	)
-	if !start.ok {
-		return 0
-	}
-	defer r.world_destroy(world)
+}
 
-	guid_id, found := world.ctx.relations["GuidOf"]
-	if !found {
-		return 0
+// Commits everything in pending as one transaction.
+flush :: proc(ld: ^Loader) -> bool {
+	if len(ld.pending) == 0 {
+		return true
 	}
+	t0 := time.tick_now()
+	tx := k.kernel_begin(ld.world.kernel)
+	for p in ld.pending {
+		if err := k.transaction_assert(&tx, p.relation, p.tuple); err != .None {
+			fmt.eprintf("assert failed: %v\n", err)
+			ld.stats.err_assert += 1
+			k.transaction_destroy(&tx)
+			return false
+		}
+		ld.stats.asserted += 1
+	}
+	ld.stats.assert_seconds += time.duration_seconds(time.tick_since(t0))
+	t0 = time.tick_now()
+	committed, commit_err := k.transaction_commit(&tx)
+	k.transaction_destroy(&tx)
+	ld.stats.commit_seconds += time.duration_seconds(time.tick_since(t0))
+	if commit_err != .None {
+		fmt.eprintf("commit failed: %v\n", commit_err)
+		ld.stats.err_commit += 1
+		return false
+	}
+	k.snapshot_release(committed)
+	ld.stats.commits += 1
+	clear(&ld.pending)
+	return true
+}
+
+// Frees everything the batch allocated (tuples, strings). Called right after
+// flush; transaction_assert already deep-copied into the tx arena, so pending
+// memory is dead here.
+reset_batch :: proc(ld: ^Loader) {
+	clear(&ld.pending)
+	virtual.arena_free_all(&ld.batch_arena)
+}
+
+checkpoint_here :: proc(ld: ^Loader) {
+	t0 := time.tick_now()
+	if !r.world_checkpoint(ld.world) {
+		ld.stats.err_checkpoint += 1
+		fmt.eprintf("checkpoint failed\n")
+	}
+	ld.stats.checkpoint_seconds += time.duration_seconds(time.tick_since(t0))
+}
+
+// Queues one binary fact on the batch arena. Callers count it under triples
+// or internal as appropriate.
+queue :: proc(ld: ^Loader, field: Field, a, b: v.Value) {
+	append(&ld.pending, Pending_Assert {
+		relation = ld.rels[field],
+		tuple = v.tuple_new(ld.batch_alloc, []v.Value{a, b}),
+	})
+}
+
+// Prints the load timing curve: wall per phase plus derived rates. Called
+// once at the end of run_load so a single pass reports the whole curve.
+print_timing_summary :: proc(stats: ^Loader_Stats) {
+	total := stats.scan_seconds + stats.assert_seconds + stats.commit_seconds + stats.checkpoint_seconds
+	fmt.eprintf(
+		"timing: scan %.1fs assert %.1fs commit %.1fs checkpoint %.1fs total %.1fs\n",
+		stats.scan_seconds,
+		stats.assert_seconds,
+		stats.commit_seconds,
+		stats.checkpoint_seconds,
+		total,
+	)
+	if stats.subjects > 0 && total > 0 {
+		fmt.eprintf(
+			"curve: %d subjects %.1f subj/s, %d triples %.1f trip/s\n",
+			stats.subjects,
+			f64(stats.subjects) / total,
+			stats.triples,
+			f64(stats.triples) / total,
+		)
+	}
+	fmt.eprintf(
+		"errors: assert %d commit %d identity %d checkpoint %d\n",
+		stats.err_assert,
+		stats.err_commit,
+		stats.err_identity,
+		stats.err_checkpoint,
+	)
+}
+
+// Pre-seeds the identities map from GuidOf rows already committed: guid
+// string -> identity value. A resumed run then reuses identities for
+// re-encountered subjects instead of minting duplicates, and set semantics
+// dedupe the re-asserted facts. Runs once at startup; the scan itself is
+// still exactly one forward pass.
+preseed_identities :: proc(ld: ^Loader) {
 	rows: [dynamic]v.Tuple
 	defer delete(rows)
-	source := k.Relation_Source{snapshot = world.kernel.current}
+	source := k.Relation_Source{snapshot = ld.world.kernel.current}
 	unbound := make([]v.Binding, 2, context.temp_allocator)
-	k.relation_source_scan_into(&source, k.Relation_ID(guid_id), unbound, &rows)
-	seen := make(map[v.Value]bool, len(rows), context.temp_allocator)
+	k.relation_source_scan_into(&source, ld.rels[.Guid_Of], unbound, &rows)
 	for row in rows {
 		cells := v.tuple_values(row)
-		if len(cells) > 0 {
-			seen[cells[0]] = true
+		if len(cells) < 2 {
+			continue
 		}
+		id, id_ok := v.value_as_identity(cells[0])
+		if !id_ok {
+			continue
+		}
+		guid, guid_ok := v.value_as_string(cells[1])
+		if !guid_ok {
+			continue
+		}
+		// Clone into the map with a heap-stable key.
+		key := strings.clone(guid, context.allocator)
+		ld.identities[key] = v.value_identity(id)
+		// Register the sanitized name so #guid_X resolves in later evals
+		// within this process too. The map owns sanitize_guid's result.
+		ld.world.ctx.identities[sanitize_guid(key, context.allocator)] = v.value_identity(id)
 	}
-	return len(seen)
+	if len(rows) > 0 {
+		fmt.eprintf("  ... pre-seeded %d committed identities\n", len(ld.identities))
+	}
 }
 
-// Skips from the current pos (just past a subject open tag) to just past its
-// matching close tag.
-skip_subject :: proc(xml_text: string, pos: ^int) {
-	depth := 1
+// Skips from just past a subject's open tag to just past its matching close
+// tag. A self-closing subject has no body, so there is nothing to skip.
+skip_subject :: proc(xml_text: string, pos: ^int, subject: Tag) {
+	depth := subject.kind == .Self_Close ? 0 : 1
 	for depth > 0 {
-		copen, _, _ := scan_next_open(xml_text, pos^)
-		cclose := scan_next_close(xml_text, pos^)
-		if copen >= 0 && (cclose < 0 || copen < cclose) {
-			pos^ = copen
-			if is_self_closing(xml_text, copen) {
-			} else {
-				depth += 1
-			}
-		} else if cclose >= 0 {
-			pos^ = cclose
-			depth -= 1
-		} else {
+		tag, ok := next_tag(xml_text, pos^)
+		if !ok {
 			return
 		}
+		pos^ = tag.end
+		switch tag.kind {
+		case .Open:
+			depth += 1
+		case .Close:
+			depth -= 1
+		case .Self_Close:
+		}
 	}
 }
 
-// Interns a GUID fragment to a named identity, queueing the GuidOf audit
-// fact. Reuses the map when seen before. Also records a NamedIdentity fact
-// so the name resolves (#guid_X) after reboot and shows in fileout.
-intern_guid :: proc(
-	world: ^r.World,
-	rels: ^Loader_Relations,
-	identities: ^map[string]v.Value,
-	next_identity: ^u64,
-	pending: ^[dynamic]Pending_Assert,
-	stats: ^Loader_Stats,
-	guid: string,
-) -> v.Value {
-	if existing, found := identities[guid]; found {
-		return existing
-	}
-	raw := next_identity^
-	next_identity^ += 1
+// Mints a fresh loader identity, registered under name in the world (so
+// #name resolves in later evals this process) and queued as a NamedIdentity
+// fact (so it resolves after reboot). The fact rides the batch like any
+// other: a commit of its own would rerun the rule fixpoint once per identity.
+mint_identity :: proc(ld: ^Loader, name: string) -> v.Value {
+	raw := ld.next_identity
+	ld.next_identity += 1
 	identity, ok := v.value_identity_raw(raw)
 	if !ok {
 		fmt.eprintf("identity space exhausted at %d\n", raw)
+		ld.stats.err_identity += 1
 		os.exit(1)
 	}
-	name := sanitize_guid(guid, context.allocator)
-	// Register the name so #guid_X resolves in later evals.
-	world.ctx.identities[name] = identity
-	identities[guid] = identity
-	stats.identities += 1
-	append(pending, Pending_Assert {
-		relation = rels.guid_of,
-		tuple = v.tuple_new(context.allocator, []v.Value {
-			identity,
-			v.value_string(context.allocator, guid),
-		}),
-	})
-	stats.triples += 1
-	// NamedIdentity(identity, :guid_X) so world_boot resolves the name.
-	named_identity_assert(world, pending, stats, identity, name)
-	return identity
-}
-
-// Queues a NamedIdentity fact for a loader identity. The boot path resolves
-// #name from these facts; without one the name dies with the process.
-named_identity_assert :: proc(
-	world: ^r.World,
-	pending: ^[dynamic]Pending_Assert,
-	stats: ^Loader_Stats,
-	identity: v.Value,
-	name: string,
-) {
-	tx := k.kernel_begin(world.kernel)
-	err := k.transaction_assert(
-		&tx,
-		k.SYSTEM_NAMED_IDENTITY_ID,
-		v.tuple_new(context.temp_allocator, []v.Value {
+	ld.world.ctx.identities[name] = identity
+	ld.stats.identities += 1
+	append(&ld.pending, Pending_Assert {
+		relation = k.SYSTEM_NAMED_IDENTITY_ID,
+		tuple = v.tuple_new(ld.batch_alloc, []v.Value {
 			identity,
 			v.value_symbol(v.symbol_intern(name)),
 		}),
-	)
-	if err != .None {
-		k.transaction_destroy(&tx)
-		return
+	})
+	ld.stats.internal += 1
+	return identity
+}
+
+// Interns a GUID fragment to a named identity, queueing the GuidOf audit
+// fact. Reuses the map when seen before.
+intern_guid :: proc(ld: ^Loader, guid: string) -> v.Value {
+	if existing, found := ld.identities[guid]; found {
+		return existing
 	}
-	committed, commit_err := k.transaction_commit(&tx)
-	k.transaction_destroy(&tx)
-	if commit_err != .None {
-		return
+	// Both the name and the map key outlive every batch, so they live on
+	// context.allocator: the name in world.ctx.identities, the key here
+	// (guid borrows xml_text, which also lives for the run, but a heap-stable
+	// key keeps the map independent of the input buffer).
+	identity := mint_identity(ld, sanitize_guid(guid, context.allocator))
+	ld.identities[strings.clone(guid, context.allocator)] = identity
+	append(&ld.pending, Pending_Assert {
+		relation = ld.rels[.Guid_Of],
+		tuple = v.tuple_new(ld.batch_alloc, []v.Value {
+			identity,
+			v.value_string(ld.batch_alloc, guid),
+		}),
+	})
+	ld.stats.internal += 1
+	return identity
+}
+
+// Resolves the retrieval actor by name, minting it when the store has none
+// yet. A rerun finds the name through NamedIdentity at boot and reuses it.
+resolve_actor :: proc(ld: ^Loader, name: string) -> v.Value {
+	if existing, found := ld.world.ctx.identities[name]; found {
+		return existing
 	}
-	k.snapshot_release(committed)
-	stats.triples += 1
+	return mint_identity(ld, strings.clone(name, context.allocator))
 }
 
 // Reads the world for the highest stored identity so fresh loader ids do not
@@ -528,248 +628,234 @@ next_identity_seed :: proc(world: ^r.World) -> u64 {
 	return highest
 }
 
-// Resolves the loader's relation names against the live world. All must
-// exist (ontology fileins load first).
-resolve_loader_relations :: proc(world: ^r.World) -> (Loader_Relations, bool) {
-	rels: Loader_Relations
-	look :: proc(world: ^r.World, name: string) -> (k.Relation_ID, bool) {
-		id, found := world.ctx.relations[name]
-		if !found {
-			return 0, false
+// Resolves the loader's relation names against the live world. Every
+// non-optional relation must exist (ontology fileins load first).
+resolve_loader_relations :: proc(world: ^r.World) -> (rels: Loader_Relations, ok: bool) {
+	names := FIELD_RELATION_NAMES
+	for field in Field {
+		id, found := world.ctx.relations[names[field]]
+		if found {
+			rels[field] = k.Relation_ID(id)
+		} else if field not_in OPTIONAL_FIELDS {
+			return rels, false
 		}
-		return k.Relation_ID(id), true
 	}
-	ok := true
-	rels.isa, ok = look(world, "Isa"); if !ok { return rels, false }
-	rels.genls, ok = look(world, "Genls"); if !ok { return rels, false }
-	rels.disjoint, ok = look(world, "DisjointWith"); if !ok { return rels, false }
-	rels.quoted_isa, ok = look(world, "QuotedIsa"); if !ok { return rels, false }
-	rels.type_genls, ok = look(world, "TypeGenls"); if !ok { return rels, false }
-	rels.arg1_pred, ok = look(world, "Arg1Pred"); if !ok { return rels, false }
-	rels.rewrite_of, ok = look(world, "RewriteOf"); if !ok { return rels, false }
-	rels.broader, ok = look(world, "BroaderTerm"); if !ok { return rels, false }
-	rels.label, ok = look(world, "Label"); if !ok { return rels, false }
-	rels.cycl, ok = look(world, "CycLabel"); if !ok { return rels, false }
-	rels.comment, ok = look(world, "Comment"); if !ok { return rels, false }
-	rels.alias, ok = look(world, "Alias"); if !ok { return rels, false }
-	rels.see_also, ok = look(world, "SeeAlso"); if !ok { return rels, false }
-	rels.wiki_name, ok = look(world, "WikiName"); if !ok { return rels, false }
-	rels.wiki_url, ok = look(world, "WikiURL"); if !ok { return rels, false }
-	rels.same_as, ok = look(world, "SameAs"); if !ok { return rels, false }
-	rels.guid_of, ok = look(world, "GuidOf"); if !ok { return rels, false }
 	return rels, true
 }
 
-// Scans one subject's children, queueing one assertion per triple. Advances
-// *pos past the subject's close tag.
-scan_subject_children :: proc(
-	xml_text: string,
-	pos: ^int,
-	world: ^r.World,
-	rels: ^Loader_Relations,
-	identities: ^map[string]v.Value,
-	next_identity: ^u64,
-	pending: ^[dynamic]Pending_Assert,
-	stats: ^Loader_Stats,
-	subj: v.Value,
-	subj_guid: string,
-) {
-	depth := 1
-	for depth > 0 {
-		copen, _, ctag := scan_next_open(xml_text, pos^)
-		cclose := scan_next_close(xml_text, pos^)
-		if copen >= 0 && (cclose < 0 || copen < cclose) {
-			// child element: parse its head, literal or resource, then skip
-			head_start := copen
-			for head_start > 0 && xml_text[head_start - 1] != '<' {
-				head_start -= 1
-			}
-			head := xml_text[head_start:copen]
-			self_close := is_self_closing(xml_text, copen)
-			resource, has_resource := attr_value(head, "rdf:resource")
-			field := predicate_relation(ctag)
-			if field != "" {
-				literal := ""
-				if !has_resource && !self_close {
-					// literal text runs to the matching close
-					inner_start := copen
-					inner_end := scan_next_close(xml_text, copen)
-					if inner_end >= 0 {
-						// back up to '<' of the close
-						lt := inner_end
-						for lt > inner_start && xml_text[lt - 1] != '<' {
-							lt -= 1
-						}
-						literal = strings.trim_space(xml_text[inner_start:lt - 1])
-					}
-				}
-				queue_triple(
-					world,
-					rels,
-					identities,
-					next_identity,
-					pending,
-					stats,
-					subj,
-					field,
-					literal,
-					resource,
-					has_resource,
-				)
-			}
-			pos^ = copen
-			if self_close {
-				// no depth change; skip nothing further
-				// advance past children scan of empty element
-				skip_shallow(xml_text, pos)
-			} else {
-				depth += 1
-			}
-		} else if cclose >= 0 {
-			pos^ = cclose
-			depth -= 1
-		} else {
-			return
+// Reads the durable resume point from LoaderState(:resume) if present.
+// Returns the byte offset to continue from and the subject count already
+// committed, plus whether a valid point exists AND the stored owl path
+// matches the file this run is loading.
+load_resume_state :: proc(ld: ^Loader, owl_path: string) -> (resume_pos: int, resume_subjects: int, ok: bool) {
+	if ld.rels[.Loader_State] == 0 {
+		return 0, 0, false
+	}
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	source := k.Relation_Source{snapshot = ld.world.kernel.current}
+	unbound := make([]v.Binding, 2, context.temp_allocator)
+	k.relation_source_scan_into(&source, ld.rels[.Loader_State], unbound, &rows)
+	for row in rows {
+		cells := v.tuple_values(row)
+		if len(cells) < 2 {
+			continue
 		}
+		key, key_ok := v.value_as_symbol(cells[0])
+		if !key_ok {
+			continue
+		}
+		kname, has_name := v.symbol_name(key)
+		if !has_name || kname != "resume" {
+			continue
+		}
+		val, val_ok := v.value_as_string(cells[1])
+		if !val_ok {
+			return 0, 0, false
+		}
+		// Format: "owl_path\npos\nsubjects"
+		parts := strings.split(val, "\n", context.temp_allocator)
+		if len(parts) != 3 || parts[0] != owl_path {
+			return 0, 0, false
+		}
+		pos, pos_ok := strconv.parse_int(parts[1])
+		subj, subj_ok := strconv.parse_int(parts[2])
+		if !pos_ok || !subj_ok || pos < 0 {
+			return 0, 0, false
+		}
+		return pos, subj, true
+	}
+	return 0, 0, false
+}
+
+// Writes (or replaces) the durable resume point. Called after each
+// checkpoint so a crash before the next checkpoint still resumes from
+// this position; the retried batch is idempotent under set semantics.
+save_resume_state :: proc(ld: ^Loader, owl_path: string, pos: int, subjects: int) {
+	rel := ld.rels[.Loader_State]
+	if rel == 0 {
+		return
+	}
+	val := fmt.tprintf("%s\n%d\n%d", owl_path, pos, subjects)
+	key := v.value_symbol(v.symbol_intern("resume"))
+
+	tx := k.kernel_begin(ld.world.kernel)
+	// Retract any existing :resume tuple, then assert the new one.
+	existing: [dynamic]v.Tuple
+	defer delete(existing)
+	unbound := make([]v.Binding, 2, context.temp_allocator)
+	unbound[0] = v.binding_of(key)
+	source := k.Relation_Source{transaction = &tx}
+	k.relation_source_scan_into(&source, rel, unbound, &existing)
+	for row in existing {
+		k.transaction_retract(&tx, rel, row)
+	}
+	if err := k.transaction_assert(
+		&tx,
+		rel,
+		v.tuple_new(context.temp_allocator, []v.Value {
+			key,
+			v.value_string(context.temp_allocator, val),
+		}),
+	); err != .None {
+		k.transaction_destroy(&tx)
+		return
+	}
+	committed, commit_err := k.transaction_commit(&tx)
+	k.transaction_destroy(&tx)
+	if commit_err == .None {
+		k.snapshot_release(committed)
+		ld.stats.commits += 1
 	}
 }
 
-// Advances pos past any nested content at the current level without
-// interpreting it (used after handling a child element's own triple).
-skip_shallow :: proc(_: string, _: ^int) {
+// Scans one subject's children, queueing one assertion per triple. Advances
+// *pos past the subject's close tag. A self-closing subject has no children.
+scan_subject_children :: proc(ld: ^Loader, xml_text: string, pos: ^int, subject: Tag, subj: v.Value) {
+	depth := subject.kind == .Self_Close ? 0 : 1
+	for depth > 0 {
+		tag, ok := next_tag(xml_text, pos^)
+		if !ok {
+			return
+		}
+		pos^ = tag.end
+		switch tag.kind {
+		case .Close:
+			depth -= 1
+			continue
+		case .Open:
+			depth += 1
+		case .Self_Close:
+		}
+		field := predicate_field(tag.name)
+		if field == .None {
+			continue
+		}
+		resource, has_resource := attr_value(tag.head, RESOURCE_ATTR)
+		if has_resource || tag.kind != .Open {
+			queue_triple(ld, subj, field, "", false, resource, has_resource)
+			continue
+		}
+		literal, is_cdata, end, text_ok := element_text(xml_text, tag)
+		if !text_ok {
+			return
+		}
+		// The element's body and close tag are consumed here, so the depth
+		// walk never sees the markup inside a comment.
+		pos^ = end
+		depth -= 1
+		queue_triple(ld, subj, field, literal, is_cdata, "", false)
+	}
+}
+
+CDATA_OPEN :: "<![CDATA["
+CDATA_CLOSE :: "]]>"
+
+// Returns the text between an open tag and its matching close, and the
+// offset just past that close. A CDATA section is unwrapped and taken
+// verbatim: OpenCyc comments are CDATA holding HTML (<a href=...>), which is
+// content, not structure, and need not be balanced.
+element_text :: proc(xml_text: string, open: Tag) -> (text: string, is_cdata: bool, end: int, ok: bool) {
+	body := xml_text[open.end:]
+	if strings.has_prefix(body, CDATA_OPEN) {
+		stop := strings.index(body, CDATA_CLOSE)
+		if stop < 0 {
+			return "", false, 0, false
+		}
+		text = body[len(CDATA_OPEN):stop]
+		close, close_ok := next_tag(xml_text, open.end + stop + len(CDATA_CLOSE))
+		if !close_ok || close.kind != .Close {
+			return "", false, 0, false
+		}
+		return text, true, close.end, true
+	}
+	depth := 1
+	pos := open.end
+	for depth > 0 {
+		tag, tag_ok := next_tag(xml_text, pos)
+		if !tag_ok {
+			return "", false, 0, false
+		}
+		pos = tag.end
+		switch tag.kind {
+		case .Open:
+			depth += 1
+		case .Close:
+			depth -= 1
+			if depth == 0 {
+				return xml_text[open.end:tag.start], false, tag.end, true
+			}
+		case .Self_Close:
+		}
+	}
+	return "", false, 0, false
 }
 
 // Queues one assertion for a triple. Resource objects that are GUIDs become
 // identities (interned); absolute URIs only survive on same_as (kept as
-// strings); literals are entity-decoded strings.
+// strings); literals are entity-decoded strings, except CDATA text, which
+// the source already wrote verbatim.
 queue_triple :: proc(
-	world: ^r.World,
-	rels: ^Loader_Relations,
-	identities: ^map[string]v.Value,
-	next_identity: ^u64,
-	pending: ^[dynamic]Pending_Assert,
-	stats: ^Loader_Stats,
+	ld: ^Loader,
 	subj: v.Value,
-	field: string,
+	field: Field,
 	literal: string,
+	is_cdata: bool,
 	resource: string,
 	has_resource: bool,
 ) {
-	alloc := context.allocator
-	rel: k.Relation_ID
-	switch field {
-	case "isa":
-		rel = rels.isa
-	case "genls":
-		rel = rels.genls
-	case "disjoint":
-		rel = rels.disjoint
-	case "quoted_isa":
-		rel = rels.quoted_isa
-	case "type_genls":
-		rel = rels.type_genls
-	case "arg1_pred":
-		rel = rels.arg1_pred
-	case "rewrite_of":
-		rel = rels.rewrite_of
-	case "broader":
-		rel = rels.broader
-	case "label":
-		rel = rels.label
-	case "cycl":
-		rel = rels.cycl
-	case "comment":
-		rel = rels.comment
-	case "alias":
-		rel = rels.alias
-	case "see_also":
-		rel = rels.see_also
-	case "wiki_name":
-		rel = rels.wiki_name
-	case "wiki_url":
-		rel = rels.wiki_url
-	case "same_as":
-		rel = rels.same_as
-	case:
-		return
-	}
 	if has_resource {
 		frag := frag_of(resource)
 		if is_guid(frag) {
-			obj := intern_guid(world, rels, identities, next_identity, pending, stats, frag)
-			append(pending, Pending_Assert {
-				relation = rel,
-				tuple = v.tuple_new(alloc, []v.Value{subj, obj}),
-			})
-			stats.triples += 1
-		} else if field == "same_as" && resource != "" {
-			append(pending, Pending_Assert {
-				relation = rel,
-				tuple = v.tuple_new(alloc, []v.Value {
-					subj,
-					v.value_string(alloc, resource),
-				}),
-			})
-			stats.triples += 1
+			queue(ld, field, subj, intern_guid(ld, frag))
+			ld.stats.triples += 1
+		} else if field == .Same_As && resource != "" {
+			queue(ld, field, subj, v.value_string(ld.batch_alloc, resource))
+			ld.stats.triples += 1
 		} else {
-			stats.skipped += 1
+			ld.stats.dropped_resources += 1
 		}
 		return
 	}
-	text := decode_entities(strings.trim_space(literal), alloc)
-	defer delete(text, alloc)
+	text := strings.trim_space(literal)
+	if !is_cdata {
+		text = decode_entities(text, ld.batch_alloc)
+	}
 	if text == "" {
-		stats.skipped += 1
+		ld.stats.skipped += 1
 		return
 	}
-	// Functional single-valued relations (Label/CycLabel/Comment) keep the
-	// first value; the kernel enforces the key, so later duplicates fail.
-	// Route repeats to Alias instead of erroring the batch.
-	if (field == "label" || field == "cycl" || field == "comment") {
-		if seen_label(world, rels, field, subj) {
-			append(pending, Pending_Assert {
-				relation = rels.alias,
-				tuple = v.tuple_new(alloc, []v.Value {
-					subj,
-					v.value_string(alloc, text),
-				}),
-			})
-			stats.triples += 1
-			return
+	target := field
+	if field in FIRST_WINS_FIELDS {
+		if id, ok := v.value_as_identity(subj); ok {
+			seen := ld.label_seen[u64(id)]
+			if field in seen {
+				target = .Alias
+			} else {
+				ld.label_seen[u64(id)] = seen + {field}
+			}
 		}
-		mark_label(world, field, subj)
 	}
-	append(pending, Pending_Assert {
-		relation = rel,
-		tuple = v.tuple_new(alloc, []v.Value{subj, v.value_string(alloc, text)}),
-	})
-	stats.triples += 1
-}
-
-// First-label-wins bookkeeping for functional Label/CycLabel/Comment.
-// Process-local only; a rerun against a fresh store starts empty.
-@(private)
-label_seen: map[v.Value]map[string]bool
-
-seen_label :: proc(_: ^r.World, _: ^Loader_Relations, field: string, subj: v.Value) -> bool {
-	if label_seen == nil {
-		return false
-	}
-	fields, found := label_seen[subj]
-	if !found {
-		return false
-	}
-	return fields[field]
-}
-
-mark_label :: proc(_: ^r.World, field: string, subj: v.Value) {
-	if label_seen == nil {
-		label_seen = make(map[v.Value]map[string]bool)
-	}
-	fields, found := label_seen[subj]
-	if !found {
-		fields = make(map[string]bool)
-		label_seen[subj] = fields
-	}
-	fields[field] = true
+	queue(ld, target, subj, v.value_string(ld.batch_alloc, text))
+	ld.stats.triples += 1
 }

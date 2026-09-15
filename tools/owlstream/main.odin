@@ -24,14 +24,12 @@ import "core:bytes"
 import "core:compress/gzip"
 import "core:encoding/entity"
 import "core:fmt"
-import "core:mem"
 import "core:os"
+import "core:strconv"
 import "core:strings"
+import "core:time"
 
-import k "../../mica/kernel"
-import r "../../mica/runtime"
 import s "../../mica/store"
-import v "../../mica/var"
 
 // GUID predicates in opencyc-latest.owl, mapped to bycycle relations.
 // Decoded once via the labels on their own rdf:about subjects:
@@ -62,20 +60,14 @@ RDFS_LABEL :: "rdfs:label"
 CYCL_LABEL :: "cycAnnot:label"
 RDFS_COMMENT :: "rdfs:comment"
 
-// One streamed triple: subject GUID, predicate tag, literal or resource.
-Triple :: struct {
-	subject:  string,
-	predicate: string,
-	literal:  string,
-	resource: string,
-}
-
 @(private)
 USAGE :: "usage: owlstream --owl PATH [--store DIR] [--census] [--limit N] " +
-	"[--commit-batch N] [--durability none|group|strict] [--checkpoint] [--unit NAME]\n" +
+	"[--commit-batch N] [--durability none|group|strict] [--checkpoint] [--retrieval-actor NAME]\n" +
 	"  --census: print top-level element + child predicate frequencies, assert nothing\n" +
 	"  --limit N: stop after N subjects (default 0 = all)\n" +
-	"  --commit-batch N: triples per transaction commit (default 20000)\n"
+	"  --commit-batch N: queued facts per transaction commit (default 20000)\n" +
+	"  --checkpoint: checkpoint the store after every commit batch\n" +
+	"  --retrieval-actor NAME: assert CanRetrieveSubject(#NAME, subject) for every subject\n"
 
 main :: proc() {
 	owl_path := ""
@@ -83,7 +75,8 @@ main :: proc() {
 	census_only := false
 	limit := 0
 	commit_batch := 20000
-	unit := "bycycle"
+	checkpoint := false
+	retrieval_actor := ""
 	durability := s.Durability.Group
 
 	arguments := os.args[1:]
@@ -111,14 +104,14 @@ main :: proc() {
 				fmt.eprintf(USAGE)
 				os.exit(1)
 			}
-			limit = atoi(arguments[index])
+			limit = atoi("--limit", arguments[index])
 		case "--commit-batch":
 			index += 1
 			if index >= len(arguments) {
 				fmt.eprintf(USAGE)
 				os.exit(1)
 			}
-			commit_batch = atoi(arguments[index])
+			commit_batch = atoi("--commit-batch", arguments[index])
 		case "--durability":
 			index += 1
 			if index >= len(arguments) {
@@ -132,15 +125,14 @@ main :: proc() {
 				durability = s.Durability.Strict
 			}
 		case "--checkpoint":
-			// handled below via world_checkpoint
-			os.set_env("OWLSTREAM_CHECKPOINT", "1")
-		case "--unit":
+			checkpoint = true
+		case "--retrieval-actor":
 			index += 1
 			if index >= len(arguments) {
 				fmt.eprintf(USAGE)
 				os.exit(1)
 			}
-			unit = arguments[index]
+			retrieval_actor = arguments[index]
 		case "--help", "-h":
 			fmt.printf(USAGE)
 			return
@@ -165,36 +157,55 @@ main :: proc() {
 	}
 	defer delete(raw, context.allocator)
 
+	t0 := time.tick_now()
+	// NOTE: buf must live until run_load/run_census return: xml_text
+	// aliases its memory. Do NOT scope buf in the if-block with a defer
+	// (Odin runs block-scoped defers at block end, dangling xml_text ->
+	// SIGSEGV in scan_next_open once pages are reused; ASan proved it).
+	buf: bytes.Buffer
+	have_buf := false
 	xml_text: string
 	if strings.has_suffix(owl_path, ".gz") {
-		buf: bytes.Buffer
-		defer bytes.buffer_destroy(&buf)
 		if err := gzip.load_from_bytes(raw, &buf, len(raw)); err != nil {
 			fmt.eprintf("gzip decode failed: %v\n", err)
 			os.exit(1)
 		}
+		have_buf = true
 		xml_text = string(bytes.buffer_to_bytes(&buf))
 	} else {
 		xml_text = string(raw)
 	}
-	fmt.eprintf("decoded %d bytes of XML\n", len(xml_text))
+	fmt.eprintf(
+		"decoded %d bytes of XML in %.1fs\n",
+		len(xml_text),
+		time.duration_seconds(time.tick_since(t0)),
+	)
 
 	if census_only {
 		run_census(xml_text)
-		return
+	} else {
+		run_load(
+			xml_text,
+			store_path,
+			owl_path,
+			limit,
+			commit_batch,
+			durability,
+			checkpoint,
+			retrieval_actor,
+		)
 	}
-
-	run_load(xml_text, store_path, unit, limit, commit_batch, durability)
+	if have_buf {
+		bytes.buffer_destroy(&buf)
+	}
 }
 
 @(private)
-atoi :: proc(text: string) -> int {
-	n := 0
-	for ch in text {
-		if ch < '0' || ch > '9' {
-			return n
-		}
-		n = n * 10 + int(ch - '0')
+atoi :: proc(flag: string, text: string) -> int {
+	n, ok := strconv.parse_int(text)
+	if !ok || n < 0 {
+		fmt.eprintf("%s: expected a non-negative integer, got %q\n%s", flag, text, USAGE)
+		os.exit(1)
 	}
 	return n
 }
@@ -211,35 +222,34 @@ run_census :: proc(xml_text: string) {
 	pos := 0
 	n_subjects := 0
 	for {
-		open, is_subject, tag := scan_next_open(xml_text, pos)
-		if open < 0 {
+		tag, ok := next_tag(xml_text, pos)
+		if !ok {
 			break
 		}
-		pos = open
-		if is_subject {
-			n_subjects += 1
-			subjects[tag] = (subjects[tag] or_else 0) + 1
-			// scan children until matching close
-			depth := 1
-			for depth > 0 {
-				copen, csubject, ctag := scan_next_open(xml_text, pos)
-				cclose := scan_next_close(xml_text, pos)
-				if copen >= 0 && (cclose < 0 || copen < cclose) {
-					pos = copen
-					if !csubject {
-						preds[ctag] = (preds[ctag] or_else 0) + 1
-					}
-					if is_self_closing(xml_text, copen) {
-						// no depth change
-					} else {
-						depth += 1
-					}
-				} else if cclose >= 0 {
-					pos = cclose
-					depth -= 1
-				} else {
-					break
-				}
+		pos = tag.end
+		if !tag.is_subject {
+			continue
+		}
+		n_subjects += 1
+		subjects[tag.name] = (subjects[tag.name] or_else 0) + 1
+		// scan children until matching close
+		depth := tag.kind == .Self_Close ? 0 : 1
+		for depth > 0 {
+			child, child_ok := next_tag(xml_text, pos)
+			if !child_ok {
+				break
+			}
+			pos = child.end
+			switch child.kind {
+			case .Close:
+				depth -= 1
+				continue
+			case .Open:
+				depth += 1
+			case .Self_Close:
+			}
+			if !child.is_subject {
+				preds[child.name] = (preds[child.name] or_else 0) + 1
 			}
 		}
 	}
@@ -285,80 +295,78 @@ print_top :: proc(counts: map[string]int, n: int) {
 // boundaries without building a DOM. Attribute values needed: rdf:about and
 // rdf:resource. Text content is entity-decoded via core:encoding/entity.
 
-// Finds the next `<tag` open (not `</`, not `<?`, not `<!--`). Returns the
-// offset just past `>`, whether the tag carries rdf:about (a subject), and
-// the raw tag name.
+Tag_Kind :: enum {
+	Open,
+	Close,
+	Self_Close,
+}
+
+// One `<...>` in the input. Comments and processing instructions never
+// surface as tags.
+Tag :: struct {
+	kind:       Tag_Kind,
+	// Byte offsets of `<` and just past `>`.
+	start, end: int,
+	// Raw tag name (with namespace prefix); empty for a close tag.
+	name:       string,
+	// text[start:end], for attribute lookup.
+	head:       string,
+	// Whether the tag carries rdf:about, i.e. opens a subject.
+	is_subject: bool,
+}
+
+// Attribute needles for attr_value, in the form the input writes them.
+ABOUT_ATTR :: `rdf:about="`
+RESOURCE_ATTR :: `rdf:resource="`
+
+// Finds the next tag at or after pos. Returns ok=false at end of input or on
+// an unterminated tag.
 @(private)
-scan_next_open :: proc(text: string, pos: int) -> (end: int, is_subject: bool, tag: string) {
-	i := pos
+next_tag :: proc(text: string, pos: int) -> (tag: Tag, ok: bool) {
+	i := max(pos, 0)
 	for i < len(text) {
-		lt := strings.index_byte(text[i:], '<')
-		if lt < 0 {
-			return -1, false, ""
+		rel := strings.index_byte(text[i:], '<')
+		if rel < 0 || i + rel + 1 >= len(text) {
+			return {}, false
 		}
-		i += lt
-		if i + 1 >= len(text) {
-			return -1, false, ""
-		}
-		next := text[i + 1]
-		if next == '/' || next == '?' || next == '!' {
+		i += rel
+		switch text[i + 1] {
+		case '?', '!':
 			i += 2
 			continue
+		case '/':
+			tag.kind = .Close
+		case:
+			tag.kind = .Open
 		}
-		// tag name ends at space, /, or >
-		j := i + 1
-		for j < len(text) && text[j] != ' ' && text[j] != '\t' && text[j] != '\n' && text[j] != '\r' && text[j] != '/' && text[j] != '>' {
-			j += 1
-		}
-		tag = text[i + 1:j]
-		// find end of tag
-		gt := strings.index_byte(text[j:], '>')
+		gt := strings.index_byte(text[i:], '>')
 		if gt < 0 {
-			return -1, false, ""
+			return {}, false
 		}
-		end = j + gt + 1
-		head := text[i:end]
-		is_subject = strings.contains(head, "rdf:about=")
-		return end, is_subject, tag
-	}
-	return -1, false, ""
-}
-
-// Finds the next `</tag>` close. Returns the offset just past `>`.
-@(private)
-scan_next_close :: proc(text: string, pos: int) -> int {
-	i := pos
-	for i < len(text) {
-		lt := strings.index_byte(text[i:], '<')
-		if lt < 0 {
-			return -1
-		}
-		i += lt
-		if i + 1 < len(text) && text[i + 1] == '/' {
-			gt := strings.index_byte(text[i:], '>')
-			if gt < 0 {
-				return -1
+		tag.start = i
+		tag.end = i + gt + 1
+		tag.head = text[tag.start:tag.end]
+		if tag.kind == .Open {
+			if text[tag.end - 2] == '/' {
+				tag.kind = .Self_Close
 			}
-			return i + gt + 1
+			// tag name ends at whitespace, /, or >
+			j := 1
+			for j < len(tag.head) && strings.index_byte(" \t\n\r/>", tag.head[j]) < 0 {
+				j += 1
+			}
+			tag.name = tag.head[1:j]
+			tag.is_subject = strings.contains(tag.head, ABOUT_ATTR)
 		}
-		i += 1
+		return tag, true
 	}
-	return -1
+	return {}, false
 }
 
-// Reports whether the tag ending at `end` (offset past `>`) is self-closing.
+// Extracts the value of an attribute from a tag head; needle is the attribute
+// name followed by `="`.
 @(private)
-is_self_closing :: proc(text: string, end: int) -> bool {
-	if end < 2 {
-		return false
-	}
-	return text[end - 2] == '/'
-}
-
-// Extracts attr="value" from a tag head span.
-@(private)
-attr_value :: proc(head: string, attr: string) -> (string, bool) {
-	needle := strings.concatenate([]string{attr, `="`}, context.temp_allocator)
+attr_value :: proc(head: string, needle: string) -> (string, bool) {
 	at := strings.index(head, needle)
 	if at < 0 {
 		return "", false
@@ -371,14 +379,13 @@ attr_value :: proc(head: string, attr: string) -> (string, bool) {
 	return rest[:end], true
 }
 
-// Decodes XML entities in literal text (&amp; &#65; &#x42; &quot; ...).
-// Malformed entities pass through untouched.
+// Decodes XML entities in literal text (&amp; &#65; &#x42; &quot; ...) into
+// allocator. Malformed entities pass through untouched.
 @(private)
 decode_entities :: proc(text: string, allocator := context.allocator) -> string {
-	opts := entity.XML_Decode_Options{.Comment_Strip}
-	out, err := entity.decode_xml(text, opts)
+	out, err := entity.decode_xml(text, {.Comment_Strip}, allocator)
 	if err != .None {
 		return strings.clone(text, allocator)
 	}
-	return strings.clone(out, allocator)
+	return out
 }
