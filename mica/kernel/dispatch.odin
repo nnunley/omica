@@ -210,19 +210,37 @@ frob_only_dispatch_restriction :: proc(allocator: mem.Allocator, delegate: v.Ide
 	return v.value_frob(allocator, delegate, frob_only_marker())
 }
 
+// Frees the slices in an applicable-method result. The dynamic array itself
+// and each entry's parameter slice are allocated from `allocator`, so a caller
+// that owns the result must release both. Does nothing for a nil result.
+applicable_methods_destroy :: proc(
+	methods: ^[dynamic]Applicable_Method,
+	allocator: mem.Allocator,
+) {
+	if methods == nil {
+		return
+	}
+	for method in methods {
+		delete(method.params, allocator)
+	}
+	delete(methods^)
+	methods^ = nil
+}
+
 // Returns the method values applicable to `selector` with the given roles.
 applicable_methods :: proc(
 	source: ^Relation_Source,
 	relations: Dispatch_Relations,
 	selector: v.Value,
 	roles: []Role_Pair,
-	allocator := context.temp_allocator,
+	allocator: mem.Allocator,
 ) -> [dynamic]v.Value {
 	entries := applicable_method_entries(source, relations, selector, roles, allocator)
 	methods := make([dynamic]v.Value, 0, len(entries), allocator)
 	for entry in entries {
 		append(&methods, entry.method)
 	}
+	applicable_methods_destroy(&entries, allocator)
 	return methods
 }
 
@@ -232,7 +250,7 @@ applicable_method_entries :: proc(
 	relations: Dispatch_Relations,
 	selector: v.Value,
 	roles: []Role_Pair,
-	allocator := context.temp_allocator,
+	allocator: mem.Allocator,
 ) -> [dynamic]Applicable_Method {
 	methods := make([dynamic]Applicable_Method, 0, 4, allocator)
 	selector_rows: [dynamic]v.Tuple
@@ -265,8 +283,8 @@ applicable_method_entries :: proc(
 	slice.sort_by(methods[:], proc(a, b: Applicable_Method) -> bool {
 		return v.value_cmp(a.method, b.method) == .Less
 	})
-	prune_duplicate_methods(&methods)
-	return prune_dominated_methods(source, relations.delegates, methods)
+	prune_duplicate_methods(&methods, allocator)
+	return prune_dominated_methods(source, relations.delegates, methods, allocator)
 }
 
 // Returns applicable methods for a positional call: arguments are matched to
@@ -276,7 +294,7 @@ applicable_positional_method_entries :: proc(
 	relations: Dispatch_Relations,
 	selector: v.Value,
 	args: []v.Value,
-	allocator := context.temp_allocator,
+	allocator: mem.Allocator,
 ) -> [dynamic]Applicable_Method {
 	methods := make([dynamic]Applicable_Method, 0, 4, allocator)
 	selector_rows: [dynamic]v.Tuple
@@ -296,9 +314,7 @@ applicable_positional_method_entries :: proc(
 			[]v.Binding{v.binding_of(method), {}, {}, {}},
 			&param_rows,
 		)
-		ordered := make([]v.Tuple, len(param_rows), context.temp_allocator)
-		copy(ordered, param_rows[:])
-		slice.sort_by(ordered, proc(a, b: v.Tuple) -> bool {
+		slice.sort_by(param_rows[:], proc(a, b: v.Tuple) -> bool {
 			a_values := v.tuple_values(a)
 			b_values := v.tuple_values(b)
 			a_position, _ := v.value_as_int(a_values[3])
@@ -309,13 +325,13 @@ applicable_positional_method_entries :: proc(
 			source,
 			relations.delegates,
 			args,
-			ordered,
+			param_rows[:],
 		) {
 			delete(param_rows)
 			continue
 		}
-		params := make([]v.Tuple, len(ordered), allocator)
-		copy(params, ordered)
+		params := make([]v.Tuple, len(param_rows), allocator)
+		copy(params, param_rows[:])
 		delete(param_rows)
 		append(&methods, Applicable_Method{method = method, params = params})
 	}
@@ -323,8 +339,8 @@ applicable_positional_method_entries :: proc(
 	slice.sort_by(methods[:], proc(a, b: Applicable_Method) -> bool {
 		return v.value_cmp(a.method, b.method) == .Less
 	})
-	prune_duplicate_methods(&methods)
-	return prune_dominated_methods(source, relations.delegates, methods)
+	prune_duplicate_methods(&methods, allocator)
+	return prune_dominated_methods(source, relations.delegates, methods, allocator)
 }
 
 @(private)
@@ -365,11 +381,14 @@ positional_params_match :: proc(
 	return true
 }
 
+// Drops duplicate entries in place, keeping the first of each method. The
+// parameter slice of every dropped entry is freed.
 @(private)
-prune_duplicate_methods :: proc(methods: ^[dynamic]Applicable_Method) {
+prune_duplicate_methods :: proc(methods: ^[dynamic]Applicable_Method, allocator: mem.Allocator) {
 	write := 0
 	for method in methods {
 		if write > 0 && v.value_eq(methods[write - 1].method, method.method) {
+			delete(method.params, allocator)
 			continue
 		}
 		methods[write] = method
@@ -378,13 +397,19 @@ prune_duplicate_methods :: proc(methods: ^[dynamic]Applicable_Method) {
 	resize(methods, write)
 }
 
+// Returns a copy of `methods` with dominated entries removed, most specific
+// first. The parameter slice of every dropped entry is freed, and the input
+// array's storage is freed once its surviving entries have moved to the
+// result. A dominated entry cannot hide another entry's domination, so
+// checking against the full input set is correct.
 @(private)
 prune_dominated_methods :: proc(
 	source: ^Relation_Source,
 	delegates: Relation_ID,
 	methods: [dynamic]Applicable_Method,
+	allocator: mem.Allocator,
 ) -> [dynamic]Applicable_Method {
-	pruned := make([dynamic]Applicable_Method, 0, len(methods), context.temp_allocator)
+	pruned := make([dynamic]Applicable_Method, 0, len(methods), allocator)
 	for candidate in methods {
 		dominated := false
 		for other in methods {
@@ -396,10 +421,13 @@ prune_dominated_methods :: proc(
 				break
 			}
 		}
-		if !dominated {
-			append(&pruned, candidate)
+		if dominated {
+			delete(candidate.params, allocator)
+			continue
 		}
+		append(&pruned, candidate)
 	}
+	delete(methods)
 	return pruned
 }
 
@@ -591,7 +619,7 @@ dispatch_method_program :: proc(
 dispatch_method_args :: proc(
 	params: []v.Tuple,
 	roles: []Role_Pair,
-	allocator := context.temp_allocator,
+	allocator: mem.Allocator,
 ) -> ([]v.Value, bool) {
 	ordered := make([]v.Tuple, len(params), allocator)
 	copy(ordered, params)

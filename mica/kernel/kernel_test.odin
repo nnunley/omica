@@ -837,6 +837,60 @@ test_dispatch_matches_through_delegation :: proc(t: ^testing.T) {
 	commit_transaction(t, &tx)
 }
 
+// Dispatching repeatedly with an explicit allocator must not accumulate
+// memory: every intermediate the resolver allocates is released. Regression
+// for #74, where the resolver allocated its scratch from the never-reset
+// ambient temporary arena.
+@(test)
+test_dispatch_resolution_is_allocation_balanced :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	method_selector := create_relation(&kernel, 40, "MethodSelector", 2)
+	param := create_relation(&kernel, 41, "Param", 4)
+	delegates := create_relation(&kernel, 42, "Delegates", 3)
+	relations := Dispatch_Relations {
+		method_selector = method_selector,
+		param           = param,
+		delegates       = delegates,
+	}
+
+	tx := kernel_begin(&kernel)
+	method := must_int(100)
+	transaction_assert(&tx, method_selector, tuple_of(method, sym("take")))
+	transaction_assert(&tx, param, tuple_of(method, sym("actor"), must_identity(10), must_int(0)))
+	transaction_assert(&tx, param, tuple_of(method, sym("item"), must_identity(20), must_int(1)))
+	source := Relation_Source{transaction = &tx, use_stored_derived = true}
+	roles := []Role_Pair {
+		{role = sym("actor"), value = must_identity(10)},
+		{role = sym("item"), value = must_identity(20)},
+	}
+
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	alloc := mem.tracking_allocator(&track)
+
+	// Resolve many times with a tracking allocator: any scratch that is not
+	// released shows up as a live allocation. This is the shape the worker
+	// path runs in, and the old code accumulated one entry per dispatch.
+	for _ in 0 ..< 1_000 {
+		entries := applicable_method_entries(&source, relations, sym("take"), roles, alloc)
+		testing.expect_value(t, len(entries), 1)
+		applicable_methods_destroy(&entries, alloc)
+	}
+
+	testing.expectf(
+		t,
+		len(track.allocation_map) == 0,
+		"dispatch resolution left %d allocation(s) live",
+		len(track.allocation_map),
+	)
+	commit_transaction(t, &tx)
+}
+
 @(test)
 test_dispatch_open_signature_and_unrestricted_params :: proc(t: ^testing.T) {
 	kernel: Kernel

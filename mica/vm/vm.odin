@@ -2041,6 +2041,7 @@ vm_positional_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> boo
 		relations,
 		selector,
 		args,
+		state.scratch_allocator,
 	)
 	if len(all_entries) == 0 {
 		vm_fail(state, "E_DISPATCH", "no applicable method")

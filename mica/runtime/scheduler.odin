@@ -794,7 +794,8 @@ scheduler_task_values :: proc(scheduler: ^Scheduler, allocator: mem.Allocator) -
 	defer sync.mutex_unlock(&scheduler.lock)
 
 	ids: [dynamic]Task_ID
-	ids = make([dynamic]Task_ID, 0, len(scheduler.entries), context.temp_allocator)
+	ids = make([dynamic]Task_ID, 0, len(scheduler.entries), allocator)
+	defer delete(ids)
 	for id, entry in scheduler.entries {
 		if entry.done {
 			continue
@@ -812,7 +813,14 @@ scheduler_task_values :: proc(scheduler: ^Scheduler, allocator: mem.Allocator) -
 		}
 		id_value, id_ok := v.value_int(i64(id))
 		if !id_ok {
-			id_value = v.value_string(allocator, fmt.aprintf("%d", id, allocator = context.temp_allocator))
+			// Format into a stack buffer: a task id only overflows the integer
+			// payload at astronomically high counts, but this path still runs
+			// on a worker thread whose temporary arena is never reset.
+			text: [24]byte
+			id_value = v.value_string(
+				allocator,
+				fmt.bprintf(text[:], "%d", id),
+			)
 		}
 		values[index] = v.value_map(allocator, []v.Map_Entry {
 			{
@@ -972,13 +980,19 @@ scheduler_submit_dispatch :: proc(
 		param           = k.DISPATCH_PARAM_ID,
 		delegates       = k.DISPATCH_DELEGATES_ID,
 	}
+	// Resolution scratch is allocated from the scheduler's own allocator and
+	// freed before returning. The worker threads never reset their ambient
+	// temporary arena, so allocating this per-dispatch scratch from
+	// `context.temp_allocator` would grow without bound in a long-lived host
+	// (see #74).
 	entries := k.applicable_method_entries(
 		&source,
 		relations,
 		selector,
 		roles,
-		context.temp_allocator,
+		scheduler.allocator,
 	)
+	defer k.applicable_methods_destroy(&entries, scheduler.allocator)
 	if len(entries) == 0 {
 		return Dispatch_Result{error = .No_Method}
 	}
@@ -1053,7 +1067,8 @@ scheduler_spawn_child :: proc(scheduler: ^Scheduler, parent: ^Task) -> Task_ID {
 	spec := parent.program.dispatch_specs[parent.state.request_spec]
 	base := vm.vm_frame_base(&parent.state)
 
-	roles := make([]k.Role_Pair, len(spec.roles), context.temp_allocator)
+	roles := make([]k.Role_Pair, len(spec.roles), scheduler.allocator)
+	defer delete(roles, scheduler.allocator)
 	for role, index in spec.roles {
 		roles[index] = k.Role_Pair {
 			role  = v.value_symbol(role.role),
