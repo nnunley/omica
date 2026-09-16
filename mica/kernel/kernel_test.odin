@@ -2439,6 +2439,97 @@ test_slot_map_init_no_leak :: proc(t: ^testing.T) {
 // read-only commit advancing the version makes read-only CLI evals grow the
 // store on the shutdown checkpoint.
 @(test)
+test_replace_relation_block_replaces_and_owns_block :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "Replaced", 2)
+
+	// Seed a base block through the normal transaction path.
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, relation, tuple_of(must_identity(1), must_identity(2)))
+	commit_transaction(t, &tx)
+
+	base := kernel_snapshot(&kernel)
+	base_block, base_found := snapshot_relation_block(base, relation)
+	testing.expect(t, base_found)
+	testing.expect_value(t, relation_block_len(base_block), 1)
+	snapshot_release(base)
+
+	// Build a replacement block with two rows and publish it. The block is
+	// owned by the kernel after the call; the caller must not release it.
+	alloc := context.temp_allocator
+	rows := make([]v.Tuple, 2, alloc)
+	rows[0] = tuple_of(must_identity(10), must_identity(20))
+	rows[1] = tuple_of(must_identity(11), must_identity(21))
+	base_snapshot := kernel_snapshot(&kernel)
+	metadata, _ := snapshot_relation_metadata(base_snapshot, relation)
+	snapshot_release(base_snapshot)
+	block := relation_block_build(alloc, metadata, rows)
+
+	replaced, err := kernel_replace_relation_block(&kernel, block)
+	testing.expect_value(t, err, Kernel_Error.None)
+	if replaced != nil {
+		new_block, new_found := snapshot_relation_block(replaced, relation)
+		testing.expect(t, new_found)
+		testing.expect_value(t, relation_block_len(new_block), 2)
+		snapshot_release(replaced)
+	}
+
+	// The old block is gone; the new block is visible in a fresh snapshot.
+	after := kernel_snapshot(&kernel)
+	after_block, after_found := snapshot_relation_block(after, relation)
+	testing.expect(t, after_found)
+	testing.expect_value(t, relation_block_len(after_block), 2)
+	snapshot_release(after)
+}
+
+@(test)
+test_replace_relation_block_rejects_arity_mismatch :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "ArityMismatch", 2)
+
+	// A block with the wrong arity must be rejected.
+	alloc := context.temp_allocator
+	rows := make([]v.Tuple, 1, alloc)
+	rows[0] = tuple_of(must_identity(1))
+	wrong_arity_metadata := relation_metadata(relation, v.symbol_intern("ArityMismatch"), 1)
+	block := relation_block_build(alloc, wrong_arity_metadata, rows)
+
+	replaced, err := kernel_replace_relation_block(&kernel, block)
+	testing.expect_value(t, err, Kernel_Error.Invalid_Metadata)
+	testing.expect(t, replaced == nil)
+	// The block was not adopted; the caller still owns it and must release it.
+	relation_block_release(block)
+}
+
+@(test)
+test_replace_relation_block_unknown_relation :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	create_relation(&kernel, 1, "Known", 2)
+
+	// A block for an unregistered relation id must be rejected.
+	alloc := context.temp_allocator
+	rows := make([]v.Tuple, 1, alloc)
+	rows[0] = tuple_of(must_identity(1), must_identity(2))
+	unknown_metadata := relation_metadata(Relation_ID(99), v.symbol_intern("Unknown"), 2)
+	block := relation_block_build(alloc, unknown_metadata, rows)
+
+	replaced, err := kernel_replace_relation_block(&kernel, block)
+	testing.expect_value(t, err, Kernel_Error.Unknown_Relation)
+	testing.expect(t, replaced == nil)
+	// The block was not adopted; the caller still owns it.
+	relation_block_release(block)
+}
+
+ @(test)
 test_read_only_commit_does_not_advance_version :: proc(t: ^testing.T) {
 	kernel: Kernel
 	kernel_init(&kernel)

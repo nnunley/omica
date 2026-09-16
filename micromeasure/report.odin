@@ -17,9 +17,15 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 
 	has_baseline := baseline != nil && len(baseline) > 0
 	has_counters := false
+	has_memory := false
 	for result in runner.results {
 		if result.counters_available {
 			has_counters = true
+		}
+		if result.memory_available {
+			has_memory = true
+		}
+		if has_counters && has_memory {
 			break
 		}
 	}
@@ -42,6 +48,9 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 		write_field(&header, 8, "%s", "cyc/op")
 		write_field(&header, 7, "%s", "IPC")
 		write_field(&header, 7, "%s", "br/op")
+	}
+	if has_memory {
+		write_field(&header, 12, "%s", "memory (B)")
 	}
 	if has_baseline {
 		write_field(&header, 10, "%s", "delta")
@@ -97,6 +106,14 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 			}
 		}
 
+		if has_memory {
+			if result.memory_available {
+				write_field(&line, 12, "%d", result.memory)
+			} else {
+				write_field(&line, 12, "%s", "-")
+			}
+		}
+
 		if has_baseline {
 			if previous, found := baseline[result.name]; found && previous > 0 {
 				delta := (result.stats.median - previous) / previous * 100
@@ -110,17 +127,32 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 }
 
 // Writes results as a tab-separated baseline file.
+//
+// Format: <name>\t<ns/op>\t<ops/s>\t<memory-bytes-or->\n
+// The memory column is "-" when the benchmark did not record a memory
+// observation.
 save_report :: proc(path: string, runner: ^Runner) -> bool {
 	builder: strings.Builder
 	strings.builder_init(&builder, context.temp_allocator)
 	for result in runner.results {
-		fmt.sbprintf(
-			&builder,
-			"%s\t%.4f\t%.4f\n",
-			result.name,
-			result.stats.median,
-			result.ops_per_second,
-		)
+		if result.memory_available {
+			fmt.sbprintf(
+				&builder,
+				"%s\t%.4f\t%.4f\t%d\n",
+				result.name,
+				result.stats.median,
+				result.ops_per_second,
+				result.memory,
+			)
+		} else {
+			fmt.sbprintf(
+				&builder,
+				"%s\t%.4f\t%.4f\t-\n",
+				result.name,
+				result.stats.median,
+				result.ops_per_second,
+			)
+		}
 	}
 	content := strings.to_string(builder)
 	return os.write_entire_file(path, transmute([]u8)content) == nil

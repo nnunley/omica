@@ -73,6 +73,30 @@ bench_capped :: proc(
 	})
 }
 
+// Registers a benchmark with a memory probe. The probe is called before the
+// first warmup sample and after the last measured sample; the difference (in
+// bytes) is recorded in the result's `memory` field. The probe may run
+// repeatedly during warmup and calibration, so it must be cheap. Use a
+// monotonic probe (e.g. `peak_rss_bytes`) for delta reporting; a non-
+// monotonic probe (e.g. `current_rss_bytes`) will record a noisy after-
+// baseline that includes later samples' growth.
+bench_with_memory :: proc(
+	group: ^Group,
+	name: string,
+	user: rawptr,
+	run: Bench_Proc,
+	max_chunk: int,
+	memory_probe: proc() -> int,
+) {
+	append(&group.benches, Bench {
+		name         = name,
+		run          = run,
+		user         = user,
+		max_chunk    = max_chunk,
+		memory_probe = memory_probe,
+	})
+}
+
 // Runs every registered benchmark that matches the filter. Returns the number
 // of benchmarks that ran.
 runner_run :: proc(runner: ^Runner) -> int {
@@ -143,6 +167,13 @@ measure_bench :: proc(
 	bench: Bench,
 	full_name: string,
 ) -> Result {
+	// Memory probe baseline, when the bench registered one. Captured before
+	// any warmup so the delta measures only the timed region's growth.
+	memory_before := 0
+	if bench.memory_probe != nil {
+		memory_before = bench.memory_probe()
+	}
+
 	// Warm up the code paths and caches.
 	warmup_start := time.tick_now()
 	for time.duration_nanoseconds(time.tick_diff(warmup_start, time.tick_now())) <
@@ -216,6 +247,19 @@ measure_bench :: proc(
 			has_branch_misses = counters_has(&counters, .Branch_Misses),
 			has_stalled_frontend = counters_has(&counters, .Stalled_Frontend),
 			has_stalled_backend = counters_has(&counters, .Stalled_Backend),
+		}
+	}
+
+	// Memory delta, when the bench registered a probe. The probe is called
+	// once before warmup and once after the last sample; the difference is
+	// the per-run memory growth. A negative delta (the process released more
+	// than it grew) is clamped to zero.
+	if bench.memory_probe != nil {
+		memory_after := bench.memory_probe()
+		delta := memory_after - memory_before
+		if delta > 0 {
+			result.memory = delta
+			result.memory_available = true
 		}
 	}
 

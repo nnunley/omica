@@ -77,3 +77,22 @@ test_counters_open_reports_consistently :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+@(test)
+test_read_status_field_kb_parses_vmhwm :: proc(t: ^testing.T) {
+	// The value is environment-dependent (the kernel must expose /proc/self/
+	// status), so this only checks the parse path: a non-negative integer, and
+	// zero when the file is unreadable.
+	hwm := read_status_field_kb("VmHWM:")
+	testing.expect(t, hwm >= 0)
+	rss := read_status_field_kb("VmRSS:")
+	testing.expect(t, rss >= 0)
+	// A missing field must report zero, not a parse error.
+	testing.expect_value(t, read_status_field_kb("NoSuchField:"), 0)
+}
+
+@(test)
+test_peak_rss_bytes_is_non_negative :: proc(t: ^testing.T) {
+	// VmHWM is in kilobytes; the byte value is the field times 1024.
+	testing.expect(t, peak_rss_bytes() >= 0)
+}

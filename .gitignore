@@ -45,8 +45,13 @@ desktop.ini
 # mdBook build output
 mdbook/book/
 
-# Mica-source benchmark outputs
-benchmarks/results/
+# Mica-source benchmark outputs (all generated files in this directory).
+benchmarks/results/*
+# The committed kernel baseline is the only tracked file in this directory.
+!benchmarks/results/kernel.tsv
+
+# Local world state from running the host or tests.
+world-db/
 
 # Python bytecode from the benchmark reference implementation
 __pycache__/

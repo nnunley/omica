@@ -333,13 +333,64 @@ kernel_destroy :: proc(kernel: ^Kernel) {
 }
 
 // Returns a reset staging arena, creating one on demand.
+@(private)
 kernel_take_arena :: proc(kernel: ^Kernel) -> ^Frame_Arena {
 	return arena_pool_take(kernel.arena_pool)
 }
 
 // Resets `arena` and returns it to the pool for reuse.
+@(private)
 kernel_return_arena :: proc(kernel: ^Kernel, arena: ^Frame_Arena) {
 	arena_pool_return(kernel.arena_pool, arena)
+}
+
+// Replaces a relation block in the current snapshot. The new block must have
+// the same relation id and arity as the catalog entry; the old block is
+// released. `snapshot_set_block` takes ownership of the block reference on
+// every path, so the caller must not release the block after the call — the
+// fork releases it on `.Conflict`, and the published snapshot owns it on
+// success.
+//
+// This is a direct publish that skips the normal transaction path, so it does
+// not record a change-feed entry or admit persistence. It is intended for
+// tests and benchmarks that need to reset a relation's state between samples.
+// Derived facts that depend on the replaced relation are not recomputed; the
+// caller must ensure no active rules read this relation, or call
+// `snapshot_compute_derived` on the returned snapshot before publishing it.
+kernel_replace_relation_block :: proc(
+	kernel: ^Kernel,
+	block: ^Relation_Block,
+) -> (
+	^Snapshot,
+	Kernel_Error,
+) {
+	current := kernel_snapshot(kernel)
+	metadata, ok := snapshot_relation_metadata(current, block.metadata.id)
+	if !ok {
+		snapshot_release(current)
+		return nil, .Unknown_Relation
+	}
+	if metadata.arity != block.metadata.arity {
+		snapshot_release(current)
+		return nil, .Invalid_Metadata
+	}
+
+	next := snapshot_fork(kernel, current)
+	// `snapshot_set_block` takes ownership of the block reference. If the
+	// publish fails, the fork is released and the block is released with it;
+	// the caller must not release the block on either path.
+	snapshot_set_block(next, block)
+	previous, published := kernel_try_publish(kernel, current, next)
+	if !published {
+		// The publish failed: another publisher won. The fork (and the block
+		// it adopted) is released; the caller's reference is consumed.
+		snapshot_release(next)
+		snapshot_release(current)
+		return nil, .Conflict
+	}
+	kernel_retire(kernel, previous)
+	snapshot_release(current)
+	return next, .None
 }
 
 // Returns a retained reference to the current snapshot. The caller must

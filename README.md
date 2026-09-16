@@ -472,6 +472,12 @@ The [guide](mdbook/src/SUMMARY.md) walks through the examples, the language, and
 - [`apps/examples`](apps/examples): guide examples for equipment service, approval workflow,
   dependency planning, and structural values.
 - [`benchmarks`](benchmarks): microbenchmarks for the value, kernel, and runtime layers.
+  - [`scripts/kernel-bench.sh`](scripts/kernel-bench.sh) runs the kernel suite and writes
+    `benchmarks/results/kernel.tsv` as a committed baseline. Run it without a filter to update
+    the baseline; use `filter=<text>` for spot checks and `baseline` to compare against the
+    saved file. **Warning:** `quick` and `filter` runs overwrite the committed baseline with
+    lower-fidelity numbers — use them only for local spot checks, not for updating the
+    baseline.
 - [`scripts/mud.sh`](scripts/mud.sh): builds and runs the web host with the MUD fileins.
 - [`mdbook`](mdbook): The Mica Guide, a tutorial and language/runtime reference.
 

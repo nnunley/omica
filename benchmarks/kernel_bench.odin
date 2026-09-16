@@ -867,4 +867,5 @@ register_kernel_benches :: proc(runner: ^mm.Runner) {
 	mm.bench(dispatch_group, "applicable_10_methods", dispatch_state, bench_dispatch)
 
 	register_kernel_concurrent_benches(runner)
+	register_kernel_large_benches(runner)
 }

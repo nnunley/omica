@@ -47,6 +47,11 @@ Bench :: struct {
 	user:      rawptr,
 	// Optional upper bound for the calibrated chunk. Zero means no bound.
 	max_chunk: int,
+	// When non-nil, the harness calls it before the first warmup sample and
+	// after the last measured sample, and records the difference (in bytes)
+	// in the result's `memory` field. Use this for benchmarks that want to
+	// report a per-run memory delta rather than the process-lifetime peak.
+	memory_probe: proc() -> int,
 }
 
 // A named group of benchmarks with shared throughput configuration.
@@ -84,6 +89,12 @@ Result :: struct {
 	// case the values are zero and the report omits them.
 	counters:           Counters,
 	counters_available: bool,
+	// Optional memory observation for this benchmark, in bytes. When
+	// `memory_available` is false the value is zero and the report omits the
+	// column. A benchmark that measures memory growth records the delta
+	// (after - before) so the number is per-run rather than process-lifetime.
+	memory:            int,
+	memory_available:  bool,
 }
 
 // Per-operation hardware counter values. Only the counters the kernel actually
