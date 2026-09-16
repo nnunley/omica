@@ -435,6 +435,58 @@ test_secondary_index_scan_returns_matching_rows :: proc(t: ^testing.T) {
 	delete(rows)
 }
 
+// A recycled pool arena must not hand a new block the previous block's index:
+// the frame allocator returns non-zeroed memory, so the constructors must
+// clear the fields `new` would otherwise have zeroed.
+@(test)
+test_pooled_block_recycled_arena_fresh_index :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	indexes := [1]Index_Spec{index_spec([]u16{1})}
+	metadata := relation_metadata(Relation_ID(1), v.symbol_intern("Fresh"), 3)
+	metadata.indexes = indexes[:]
+
+	first_rows := make([]v.Tuple, 8, context.temp_allocator)
+	for row in 0 ..< 8 {
+		first_rows[row] = tuple_of(
+			must_identity(u64(row)),
+			must_identity(u64(row % 2)),
+			must_int(0),
+		)
+	}
+	second_rows := make([]v.Tuple, 8, context.temp_allocator)
+	for row in 0 ..< 8 {
+		second_rows[row] = tuple_of(must_identity(u64(row)), must_identity(5), must_int(0))
+	}
+
+	first := relation_block_build_pooled(&kernel, metadata, first_rows)
+	testing.expect_value(t, index_scan_count_for_test(first, must_identity(1)), 4)
+	relation_block_release(first)
+
+	second := relation_block_build_pooled(&kernel, metadata, second_rows)
+	count := index_scan_count_for_test(second, must_identity(5))
+	relation_block_release(second)
+	testing.expect_value(t, count, 8)
+}
+
+@(private)
+index_scan_count_for_test :: proc(block: ^Relation_Block, key: v.Value) -> int {
+	bindings := []v.Binding{{}, v.binding_of(key), {}}
+	count := 0
+	relation_block_visit(
+		block,
+		bindings,
+		proc(user: rawptr, row: v.Tuple) -> bool {
+			(^int)(user)^ += 1
+			return true
+		},
+		&count,
+	)
+	return count
+}
+
 @(private)
 scan_count_for_key :: proc(kernel: ^Kernel, relation: Relation_ID, key: v.Value) -> int {
 	bindings := []v.Binding{{}, v.binding_of(key), {}}

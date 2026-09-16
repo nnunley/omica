@@ -212,13 +212,18 @@ relation_block_build :: proc(
 	copy(rows, tuples)
 	rows = sorted_unique_rows(rows, alloc)
 
+	chunks := chunks_from_rows(nil, rows, alloc)
+	// Assign the whole struct: frame allocators return non-zeroed memory, so a
+	// field left to `new` could hold the previous occupant's index cache.
 	block := new(Relation_Block, alloc)
-	block.metadata = metadata
-	block.storage = alloc
-	block.refs = 1
-	block.count = len(rows)
-	block.chunks = chunks_from_rows(nil, rows, alloc)
-	block.chunk_rows = make([]u32, len(block.chunks), alloc)
+	block^ = Relation_Block {
+		metadata   = metadata,
+		chunks     = chunks,
+		chunk_rows = make([]u32, len(chunks), alloc),
+		count      = len(rows),
+		refs       = 1,
+		storage    = alloc,
+	}
 	fill_chunk_rows(block)
 	return block
 }
@@ -238,14 +243,19 @@ relation_block_build_pooled :: proc(
 	block_arena := arena_pool_take(kernel.arena_pool)
 	block_alloc := frame_arena_allocator(block_arena)
 
+	chunks := chunks_from_rows(kernel.arena_pool, rows, block_alloc)
+	// Assign the whole struct: the arena is recycled without zeroing, so a
+	// field left to `new` could hold the previous block's index cache.
 	block := new(Relation_Block, block_alloc)
-	block.metadata = metadata
-	block.refs = 1
-	block.count = len(rows)
-	block.chunks = chunks_from_rows(kernel.arena_pool, rows, block_alloc)
-	block.chunk_rows = make([]u32, len(block.chunks), block_alloc)
-	block.arena = block_arena
-	block.pool = kernel.arena_pool
+	block^ = Relation_Block {
+		metadata   = metadata,
+		chunks     = chunks,
+		chunk_rows = make([]u32, len(chunks), block_alloc),
+		count      = len(rows),
+		refs       = 1,
+		arena      = block_arena,
+		pool       = kernel.arena_pool,
+	}
 	fill_chunk_rows(block)
 	return block
 }
@@ -317,14 +327,19 @@ relation_block_apply :: proc(
 		write += 1
 	}
 
+	// Assign the whole struct: the pooled arena is recycled without zeroing, so
+	// a field left to `new` would hold the previous block's index cache and
+	// serve stale or corrupt index results.
 	block := new(Relation_Block, block_alloc)
-	block.metadata = metadata
-	block.chunks = spine
-	block.count = count
-	block.refs = 1
-	block.arena = block_arena
-	block.pool = kernel.arena_pool
-	block.chunk_rows = make([]u32, len(spine), block_alloc)
+	block^ = Relation_Block {
+		metadata   = metadata,
+		chunks     = spine,
+		chunk_rows = make([]u32, len(spine), block_alloc),
+		count      = count,
+		refs       = 1,
+		arena      = block_arena,
+		pool       = kernel.arena_pool,
+	}
 	fill_chunk_rows(block)
 	return block
 }

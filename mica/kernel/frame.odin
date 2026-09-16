@@ -89,6 +89,11 @@ frame_alloc_proc :: proc(
 	arena := (^Frame_Arena)(allocator_data)
 	switch mode {
 	case .Alloc, .Alloc_Non_Zeroed:
+		// Deliberately not zeroed, even for `.Alloc`: the arena hands back
+		// recycled blocks and every caller overwrites what it allocates. Odin
+		// expects `.Alloc` to return zeroed memory, so users of this allocator
+		// must not rely on `new`/`make` zeroing; assign a struct literal or
+		// write every field (see the `Relation_Block` constructors).
 		if size == 0 {
 			return nil, nil
 		}
