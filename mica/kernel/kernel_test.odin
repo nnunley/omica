@@ -2,6 +2,7 @@ package kernel
 
 import "core:mem"
 import "core:testing"
+import "core:time"
 import v "../var"
 
 @(private)
@@ -2547,4 +2548,123 @@ test_read_only_commit_does_not_advance_version :: proc(t: ^testing.T) {
 		snapshot_release(committed)
 	}
 	transaction_destroy(&tx)
+}
+
+// #102 regression guard: staging k writes must not scan every prior entry.
+// Before the per-relation bucket index, 100k distinct asserts took tens of
+// seconds; the bound is loose enough for a slow machine but catches the
+// quadratic path. The duplicate pair pins the last-write-wins semantics the
+// index replaced.
+@(test)
+test_staging_scales_linearly_and_last_write_wins :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	relation := create_relation(&kernel, 1, "Staging", 2)
+
+	dup := kernel_begin(&kernel)
+	defer transaction_destroy(&dup)
+	first := tuple_of(must_identity(1), must_identity(2))
+	transaction_assert(&dup, relation, first)
+	kind, found := transaction_effective_write(&dup, relation, first)
+	testing.expect(t, found)
+	testing.expect_value(t, kind, Write_Kind.Assert)
+	transaction_retract(&dup, relation, first)
+	kind, found = transaction_effective_write(&dup, relation, first)
+	testing.expect(t, found)
+	testing.expect_value(t, kind, Write_Kind.Retract)
+	testing.expect_value(t, len(dup.writes), 1)
+	if len(dup.writes) == 1 {
+		testing.expect_value(t, len(dup.writes[0].entries), 1)
+	}
+
+	start := time.tick_now()
+	tx := transaction_begin(&kernel)
+	defer transaction_destroy(&tx)
+	for i in 0 ..< 100_000 {
+		left, left_ok := v.value_identity_raw(u64(i))
+		right, right_ok := v.value_identity_raw(u64(i) + 1)
+		testing.expect(t, left_ok && right_ok)
+		if err := transaction_assert(&tx, relation, tuple_of(left, right)); err != .None {
+			testing.fail_now(t, "staging failed before 100k writes")
+		}
+	}
+	testing.expect_value(t, len(tx.writes), 1)
+	if len(tx.writes) == 1 {
+		testing.expect_value(t, len(tx.writes[0].entries), 100_000)
+	}
+	testing.expect(t, time.tick_since(start) < 5 * time.Second)
+}
+
+// #102 regression guard for functional relations: the key visibility check
+// used to scan every prior staged entry as well. The bound is loose; the
+// pre-index path took minutes at this size.
+@(test)
+test_functional_staging_scales_linearly :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	key_positions := []u16{0}
+	relation := create_relation_with(
+		&kernel,
+		1,
+		"Keyed",
+		2,
+		conflict_functional(key_positions),
+		nil,
+	)
+
+	start := time.tick_now()
+	tx := kernel_begin(&kernel)
+	defer transaction_destroy(&tx)
+	for i in 0 ..< 100_000 {
+		key := must_identity(u64(i))
+		value := must_identity(u64(i) + 100_000)
+		if err := transaction_assert(&tx, relation, tuple_of(key, value)); err != .None {
+			testing.fail_now(t, "functional staging failed before 100k writes")
+		}
+	}
+	testing.expect(t, time.tick_since(start) < 5 * time.Second)
+
+	// The staged tuple for a key is visible, a second value for the key is a
+	// functional violation, and a retract followed by a new value works.
+	first := tuple_of(must_identity(0), must_identity(100_000))
+	if existing, found := transaction_tuple_for_key(
+		&tx,
+		relation,
+		key_positions,
+		[]v.Value{must_identity(0)},
+	); found {
+		testing.expect(t, v.tuple_eq(existing, first))
+	} else {
+		testing.fail_now(t, "staged key is not visible")
+	}
+	testing.expect_value(
+		t,
+		transaction_assert(&tx, relation, tuple_of(must_identity(0), must_identity(999_999))),
+		Kernel_Error.Functional_Key_Violation,
+	)
+	transaction_retract(&tx, relation, first)
+	if _, found := transaction_tuple_for_key(
+		&tx,
+		relation,
+		key_positions,
+		[]v.Value{must_identity(0)},
+	); found {
+		testing.fail_now(t, "retracted key is still visible")
+	}
+	replacement := tuple_of(must_identity(0), must_identity(999_999))
+	testing.expect_value(t, transaction_assert(&tx, relation, replacement), Kernel_Error.None)
+	if existing, found := transaction_tuple_for_key(
+		&tx,
+		relation,
+		key_positions,
+		[]v.Value{must_identity(0)},
+	); found {
+		testing.expect(t, v.tuple_eq(existing, replacement))
+	} else {
+		testing.fail_now(t, "replacement key is not visible")
+	}
 }

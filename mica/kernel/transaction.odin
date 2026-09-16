@@ -27,10 +27,31 @@ Pending_Write :: struct {
 	kind:  Write_Kind,
 }
 
+// Entry-index sentinel for the staging bucket chains.
+@(private)
+NO_ENTRY :: max(u32)
+
 // Staged writes for one relation.
 Relation_Writes :: struct {
 	relation: Relation_ID,
 	entries:  [dynamic]Pending_Write,
+	// Hash index over `entries` for duplicate lookup: `buckets` maps a tuple
+	// hash to an entry index and `next_in_bucket` chains entries that share a
+	// hash. Staging a write then costs O(1) expected instead of scanning every
+	// prior entry. `transaction_prepare_writes` rebuilds the chains after its
+	// compaction and sort.
+	buckets:        map[u64]u32,
+	next_in_bucket: [dynamic]u32,
+	// Functional-key index over `entries`, maintained only for functional
+	// relations: `key_buckets` maps the hash of the projected key to an entry
+	// index and `next_key` chains entries whose key hashes collide. This keeps
+	// the functional-key visibility check O(1) expected per assert. The
+	// positions are a view into the base snapshot's cloned catalog metadata,
+	// valid for the transaction's lifetime.
+	functional:    bool,
+	key_positions: []u16,
+	key_buckets:   map[u64]u32,
+	next_key:      [dynamic]u32,
 }
 
 // A snapshot-isolated transaction over a base snapshot.
@@ -63,6 +84,10 @@ transaction_begin :: proc(kernel: ^Kernel) -> Transaction {
 transaction_destroy :: proc(transaction: ^Transaction) {
 	for &writes in transaction.writes {
 		delete(writes.entries)
+		delete(writes.buckets)
+		delete(writes.next_in_bucket)
+		delete(writes.key_buckets)
+		delete(writes.next_key)
 	}
 	delete(transaction.writes)
 	transaction.writes = nil
@@ -97,8 +122,105 @@ transaction_relation_writes :: proc(
 	if !create {
 		return nil, false
 	}
-	append(&transaction.writes, Relation_Writes{relation = relation})
+	writes := Relation_Writes{relation = relation}
+	if metadata, ok := snapshot_relation_metadata(transaction.base, relation); ok &&
+	   metadata.conflict.kind == .Functional {
+		writes.functional = true
+		writes.key_positions = metadata.conflict.key_positions
+	}
+	append(&transaction.writes, writes)
 	return &transaction.writes[len(transaction.writes) - 1], true
+}
+
+// Finds the staged entry equal to `tuple` under a known `hash`, or -1. Walks
+// only the bucket chain for the hash, not every prior entry.
+@(private)
+transaction_find_write :: proc(writes: ^Relation_Writes, tuple: v.Tuple, hash: u64) -> int {
+	entry, found := writes.buckets[hash]
+	if !found {
+		return -1
+	}
+	for entry != NO_ENTRY {
+		index := int(entry)
+		if v.tuple_eq(writes.entries[index].tuple, tuple) {
+			return index
+		}
+		entry = writes.next_in_bucket[index]
+	}
+	return -1
+}
+
+// Mixes one value into a key hash. Local to the kernel: equality consistency
+// comes from `value_hash`, the mixing only needs to spread hashes.
+@(private)
+key_hash_mix :: proc(hash, value: u64) -> u64 {
+	mixed := (hash ~ value) * 0xbf58_476d_1ce4_e5b9
+	return mixed ~ (mixed >> 27)
+}
+
+@(private)
+key_values_hash :: proc(key_values: []v.Value) -> u64 {
+	hash := u64(0x9e37_79b9_7f4a_7c15)
+	for value in key_values {
+		hash = key_hash_mix(hash, v.value_hash(value))
+	}
+	return hash
+}
+
+@(private)
+tuple_key_hash :: proc(tuple: v.Tuple, positions: []u16) -> u64 {
+	values := v.tuple_values(tuple)
+	hash := u64(0x9e37_79b9_7f4a_7c15)
+	for position in positions {
+		hash = key_hash_mix(hash, v.value_hash(values[int(position)]))
+	}
+	return hash
+}
+
+@(private)
+same_positions :: proc(a, b: []u16) -> bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for position, i in a {
+		if position != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+tuple_matches_key_values :: proc(tuple: v.Tuple, positions: []u16, key_values: []v.Value) -> bool {
+	values := v.tuple_values(tuple)
+	for key, i in key_values {
+		if !v.value_eq(values[int(positions[i])], key) {
+			return false
+		}
+	}
+	return true
+}
+
+// Finds a staged assert whose projected key equals `key_values`, or -1. Walks
+// only the key bucket chain for the hash.
+@(private)
+transaction_find_staged_assert_by_key :: proc(
+	writes: ^Relation_Writes,
+	key_values: []v.Value,
+) -> int {
+	entry, found := writes.key_buckets[key_values_hash(key_values)]
+	if !found {
+		return -1
+	}
+	for entry != NO_ENTRY {
+		index := int(entry)
+		if writes.entries[index].kind == .Assert &&
+		   tuple_matches_key_values(writes.entries[index].tuple, writes.key_positions, key_values) {
+			return index
+		}
+		entry = writes.next_key[index]
+	}
+	return -1
 }
 
 @(private)
@@ -109,13 +231,29 @@ transaction_record_write :: proc(
 	kind: Write_Kind,
 ) {
 	writes, _ := transaction_relation_writes(transaction, relation, true)
-	for &entry in writes.entries {
-		if v.tuple_eq(entry.tuple, tuple) {
-			entry.kind = kind
-			return
-		}
+	hash := v.tuple_hash(tuple)
+	if index := transaction_find_write(writes, tuple, hash); index >= 0 {
+		writes.entries[index].kind = kind
+		return
+	}
+	index := u32(len(writes.entries))
+	previous, found := writes.buckets[hash]
+	if !found {
+		previous = NO_ENTRY
 	}
 	append(&writes.entries, Pending_Write{tuple = tuple, kind = kind})
+	append(&writes.next_in_bucket, previous)
+	writes.buckets[hash] = index
+
+	if writes.functional {
+		key_hash := tuple_key_hash(tuple, writes.key_positions)
+		previous_key, key_found := writes.key_buckets[key_hash]
+		if !key_found {
+			previous_key = NO_ENTRY
+		}
+		append(&writes.next_key, previous_key)
+		writes.key_buckets[key_hash] = index
+	}
 }
 
 @(private)
@@ -144,10 +282,8 @@ transaction_effective_write :: proc(
 	if !ok {
 		return .Assert, false
 	}
-	for entry in writes.entries {
-		if v.tuple_eq(entry.tuple, tuple) {
-			return entry.kind, true
-		}
+	if index := transaction_find_write(writes, tuple, v.tuple_hash(tuple)); index >= 0 {
+		return writes.entries[index].kind, true
 	}
 	return .Assert, false
 }
@@ -326,6 +462,27 @@ transaction_tuple_for_key :: proc(
 	if len(key_values) != len(positions) {
 		return nil, false
 	}
+
+	// Functional relations keep a staged key index, so the visibility check
+	// does not walk every prior staged entry. A staged assert shadows the
+	// base tuple; a base tuple hidden by a staged retract is not visible.
+	if writes, has_writes := transaction_relation_writes(transaction, relation, false); has_writes &&
+	   writes.functional &&
+	   same_positions(writes.key_positions, positions) {
+		if index := transaction_find_staged_assert_by_key(writes, key_values); index >= 0 {
+			return writes.entries[index].tuple, true
+		}
+		base_tuple, base_ok := snapshot_tuple_for_key(transaction.base, relation, positions, key_values)
+		if !base_ok {
+			return nil, false
+		}
+		if kind, found := transaction_effective_write(transaction, relation, base_tuple); found &&
+		   kind == .Retract {
+			return nil, false
+		}
+		return base_tuple, true
+	}
+
 	scan_bindings := make([]v.Binding, metadata.arity, context.temp_allocator)
 	for position, i in positions {
 		scan_bindings[int(position)] = v.binding_of(key_values[i])
@@ -627,7 +784,7 @@ transaction_build_candidate :: proc(
 		snapshot_set_block(fork, block)
 	}
 
-	snapshot_compute_derived(fork)
+	kernel_compute_derived(kernel, fork)
 	return fork
 }
 
@@ -673,8 +830,40 @@ transaction_rebase_in_place :: proc(
 	copy(candidate.rules, winner.rules)
 	candidate.version = winner.version + 1
 	candidate.parent = winner
-	snapshot_compute_derived(candidate)
+	kernel_compute_derived(kernel, candidate)
 	return true
+}
+
+// Rebuilds the per-relation bucket chains from `entries`. Called after
+// `transaction_prepare_writes` compacts and sorts them, since the chains store
+// entry indices.
+@(private)
+transaction_reindex_writes :: proc(writes: ^Relation_Writes) {
+	clear(&writes.buckets)
+	resize(&writes.next_in_bucket, len(writes.entries))
+	if writes.functional {
+		clear(&writes.key_buckets)
+		resize(&writes.next_key, len(writes.entries))
+	}
+	for &entry, index in writes.entries {
+		hash := v.tuple_hash(entry.tuple)
+		previous, found := writes.buckets[hash]
+		if !found {
+			previous = NO_ENTRY
+		}
+		writes.next_in_bucket[index] = previous
+		writes.buckets[hash] = u32(index)
+
+		if writes.functional {
+			key_hash := tuple_key_hash(entry.tuple, writes.key_positions)
+			previous_key, key_found := writes.key_buckets[key_hash]
+			if !key_found {
+				previous_key = NO_ENTRY
+			}
+			writes.next_key[index] = previous_key
+			writes.key_buckets[key_hash] = u32(index)
+		}
+	}
 }
 
 // Filters and sorts staged writes once, before candidate construction. A
@@ -701,6 +890,7 @@ transaction_prepare_writes :: proc(transaction: ^Transaction) {
 				return v.tuple_cmp(a.tuple, b.tuple) == .Less
 			})
 		}
+		transaction_reindex_writes(&writes)
 	}
 }
 
