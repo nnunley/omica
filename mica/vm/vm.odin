@@ -7,6 +7,7 @@
 package vm
 
 import "base:intrinsics"
+import "base:runtime"
 import "core:fmt"
 import "core:math"
 import "core:mem"
@@ -257,6 +258,89 @@ vm_destroy :: proc(state: ^VM) {
 	state.builtin_index = nil
 }
 
+// --- Stack growth ----------------------------------------------------------
+//
+// The register and frame arrays are flat stacks whose length is the current
+// top. `resize` and `append` funnel through the generic dynamic-array runtime,
+// a call plus a zero fill per operation; a call/return pair does that twice
+// per call. These helpers set the length through the same type-erased layout
+// the runtime's built-ins use, grow capacity geometrically, and leave zero
+// fills to the caller. They are the only raw layout access in the VM.
+
+// Opens the register stack to `needed` entries. Entries the call does not
+// write must be zeroed by the caller (see `vm_zero_locals`).
+@(private)
+vm_registers_open :: #force_inline proc(state: ^VM, needed: int) {
+	if needed > cap(state.registers) {
+		reserve(&state.registers, max(needed, cap(state.registers) * 2 + 16))
+	}
+	(^runtime.Raw_Dynamic_Array)(&state.registers).len = needed
+}
+
+// Drops the register stack back to `length` entries. Shrinking never needs a
+// zero fill: entries above the top are stale until the next open, which writes
+// or zeroes them.
+@(private)
+vm_registers_close :: #force_inline proc(state: ^VM, length: int) {
+	assert(length <= len(state.registers))
+	(^runtime.Raw_Dynamic_Array)(&state.registers).len = length
+}
+
+// Zeroes the registers a callee's binding does not write: the locals after its
+// parameters. `param_base` is where binding started and `param_count` how many
+// registers it wrote. Compiler-sized frames measure worse with a scalar store
+// loop than with the memset it replaced, and one- or two-register tails measure
+// worse with a call to memset, so small tails use stores and large ones a
+// bulk zero.
+@(private)
+vm_zero_locals :: #force_inline proc(
+	state: ^VM,
+	param_base: int,
+	param_count: int,
+	register_count: int,
+) {
+	first := param_base + param_count
+	count := register_count - first
+	if count <= 0 {
+		return
+	}
+	// Small tails are cheaper as stores; a bulk zero is a libc memset call for
+	// larger ones, which wins once the tail is more than a few registers.
+	if count <= 8 {
+		for index in first ..< register_count {
+			state.registers[index] = v.Value(0)
+		}
+	} else {
+		intrinsics.mem_zero(raw_data(state.registers[first:]), count * size_of(v.Value))
+	}
+}
+
+@(private)
+vm_frames_push :: #force_inline proc(state: ^VM, frame: Frame) {
+	if len(state.frames) >= cap(state.frames) {
+		reserve(&state.frames, max(8, len(state.frames) * 2))
+	}
+	raw := (^runtime.Raw_Dynamic_Array)(&state.frames)
+	([^]Frame)(raw.data)[raw.len] = frame
+	raw.len += 1
+}
+
+@(private)
+vm_frames_pop :: #force_inline proc(state: ^VM) -> Frame {
+	raw := (^runtime.Raw_Dynamic_Array)(&state.frames)
+	assert(raw.len > 0)
+	frame := ([^]Frame)(raw.data)[raw.len - 1]
+	raw.len -= 1
+	return frame
+}
+
+// Drops frames above `length`, mirroring a run of pops.
+@(private)
+vm_frames_close :: #force_inline proc(state: ^VM, length: int) {
+	assert(length <= len(state.frames))
+	(^runtime.Raw_Dynamic_Array)(&state.frames).len = length
+}
+
 // Writes a resume value into the register the suspended instruction named.
 // Does nothing when the suspension has no destination.
 vm_resume_with :: proc(state: ^VM, value: v.Value) {
@@ -430,14 +514,15 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			return .Failed
 		}
 		entry_function := program.functions[entry]
-		append(&state.frames, Frame {
+		vm_frames_push(state, Frame {
 			function      = entry,
 			ip            = entry_function.code_offset,
 			register_base = 0,
 			caller_base   = 0,
 			caller_dst    = -1,
 		})
-		resize(&state.registers, entry_function.register_count)
+		vm_registers_open(state, entry_function.register_count)
+		vm_zero_locals(state, 0, 0, entry_function.register_count)
 		if len(state.entry_arguments) > len(state.registers) {
 			vm_fail(state, "E_VM_FAULT", "too many entry arguments")
 			return .Failed
@@ -682,10 +767,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			if vm_depth_exceeded(state) {
 				break
 			}
-			callee := program.functions[instr.b]
+			callee := &program.functions[instr.b]
 			argument_count := int(instr.flags)
 			callee_base := len(state.registers)
-			resize(&state.registers, callee_base + callee.register_count)
+			callee_top := callee_base + callee.register_count
+			vm_registers_open(state, callee_top)
 			// Bind from the caller's register window directly: materializing
 			// an args slice allocated from scratch memory and copied it on
 			// every call, and the common case is a straight register copy.
@@ -698,7 +784,8 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			) {
 				break
 			}
-			append(&state.frames, Frame {
+			vm_zero_locals(state, callee_base, callee.param_count, callee_top)
+			vm_frames_push(state, Frame {
 				function      = int(instr.b),
 				ip            = callee.code_offset,
 				register_base = callee_base,
@@ -708,19 +795,27 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 
 		case .Return:
 			value := state.registers[base + int(instr.a)]
-			if handler_index := vm_finally_handler(state, top); handler_index >= 0 {
-				handler := state.handlers[handler_index]
-				ordered_remove(&state.handlers, handler_index)
-				append(&state.pending_returns, Pending_Return {
-					frame = top,
-					value = value,
-				})
-				state.frames[top].ip = int(handler.target)
-				break
+			// A frame with no active handlers and no diverted return or raise
+			// is the common case; skip both scans entirely.
+			if len(state.handlers) > 0 {
+				if handler_index := vm_finally_handler(state, top); handler_index >= 0 {
+					handler := state.handlers[handler_index]
+					ordered_remove(&state.handlers, handler_index)
+					append(&state.pending_returns, Pending_Return {
+						frame = top,
+						value = value,
+					})
+					state.frames[top].ip = int(handler.target)
+					break
+				}
 			}
-			vm_remove_frame_handlers(state, top)
-			returned := pop(&state.frames)
-			resize(&state.registers, base)
+			if len(state.handlers) > 0 ||
+			   len(state.pending_returns) > 0 ||
+			   len(state.pending_raises) > 0 {
+				vm_remove_frame_handlers(state, top)
+			}
+			returned := vm_frames_pop(state)
+			vm_registers_close(state, base)
 			if len(state.frames) == 0 {
 				state.result = value
 				state.status = .Halted
@@ -1036,7 +1131,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				vm_fail(state, "E_DISPATCH", "function index is invalid")
 				break
 			}
-			callee := program.functions[function_index]
+			callee := &program.functions[function_index]
 			capture_count := len(callable.captures)
 			argument_count := int(instr.flags)
 			args := make([]v.Value, argument_count, state.scratch_allocator)
@@ -1044,7 +1139,8 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				args[index] = state.registers[base + int(instr.c) + index]
 			}
 			callee_base := len(state.registers)
-			resize(&state.registers, callee_base + callee.register_count)
+			callee_top := callee_base + callee.register_count
+			vm_registers_open(state, callee_top)
 			for capture, index in callable.captures {
 				state.registers[callee_base + index] = capture
 			}
@@ -1056,7 +1152,13 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			) {
 				break
 			}
-			append(&state.frames, Frame {
+			vm_zero_locals(
+				state,
+				callee_base + capture_count,
+				callee.param_count,
+				callee_top,
+			)
+			vm_frames_push(state, Frame {
 				function      = function_index,
 				ip            = callee.code_offset,
 				register_base = callee_base,
@@ -1076,13 +1178,15 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				vm_fail(state, "E_DISPATCH", "function index is invalid")
 				break
 			}
-			callee := program.functions[instr.b]
+			callee := &program.functions[instr.b]
 			callee_base := len(state.registers)
-			resize(&state.registers, callee_base + callee.register_count)
+			callee_top := callee_base + callee.register_count
+			vm_registers_open(state, callee_top)
 			if !vm_bind_params(state, callee, args, callee_base) {
 				break
 			}
-			append(&state.frames, Frame {
+			vm_zero_locals(state, callee_base, callee.param_count, callee_top)
+			vm_frames_push(state, Frame {
 				function      = int(instr.b),
 				ip            = callee.code_offset,
 				register_base = callee_base,
@@ -1148,10 +1252,11 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			if !args_ok {
 				break
 			}
-			callee := program.functions[function_index]
+			callee := &program.functions[function_index]
 			capture_count := len(callable.captures)
 			callee_base := len(state.registers)
-			resize(&state.registers, callee_base + callee.register_count)
+			callee_top := callee_base + callee.register_count
+			vm_registers_open(state, callee_top)
 			for capture, index in callable.captures {
 				state.registers[callee_base + index] = capture
 			}
@@ -1163,7 +1268,13 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			) {
 				break
 			}
-			append(&state.frames, Frame {
+			vm_zero_locals(
+				state,
+				callee_base + capture_count,
+				callee.param_count,
+				callee_top,
+			)
+			vm_frames_push(state, Frame {
 				function      = function_index,
 				ip            = callee.code_offset,
 				register_base = callee_base,
@@ -1200,8 +1311,8 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				}
 				pop(&state.pending_returns)
 				vm_remove_frame_handlers(state, top)
-				returned := pop(&state.frames)
-				resize(&state.registers, base)
+				returned := vm_frames_pop(state)
+				vm_registers_close(state, base)
 				if len(state.frames) == 0 {
 					state.result = pending.value
 					state.status = .Halted
@@ -1263,6 +1374,13 @@ vm_finally_handler :: proc(state: ^VM, frame: int) -> int {
 // window.
 @(private)
 vm_remove_frame_handlers :: proc(state: ^VM, frame: int) {
+	// Most returns retire no handler at all; the three scans below are only
+	// worth starting when there is something to retire.
+	if len(state.handlers) == 0 &&
+	   len(state.pending_returns) == 0 &&
+	   len(state.pending_raises) == 0 {
+		return
+	}
 	write := 0
 	for handler in state.handlers {
 		if handler.frame == frame {
@@ -1328,7 +1446,7 @@ vm_unwind :: proc(state: ^VM) -> bool {
 	if handler.frame >= len(state.frames) {
 		return false
 	}
-	resize(&state.frames, handler.frame + 1)
+	vm_frames_close(state, handler.frame + 1)
 	frame := state.frames[handler.frame]
 	state.frames[handler.frame].ip = int(handler.target)
 	// Drop the dead frames' registers, mirroring Return: only the handler
@@ -1337,7 +1455,7 @@ vm_unwind :: proc(state: ^VM) -> bool {
 	if frame.function >= 0 && frame.function < len(state.program.functions) {
 		function := state.program.functions[frame.function]
 		if frame.register_base + function.register_count < len(state.registers) {
-			resize(&state.registers, frame.register_base + function.register_count)
+			vm_registers_close(state, frame.register_base + function.register_count)
 		}
 	}
 	if handler_is_finally {
@@ -1994,17 +2112,24 @@ vm_call_function :: proc(
 		return false
 	}
 	program := state.program
-	callee := program.functions[function_index]
+	callee := &program.functions[function_index]
 	capture_count := len(captures)
 	callee_base := len(state.registers)
-	resize(&state.registers, callee_base + callee.register_count)
+	callee_top := callee_base + callee.register_count
+	vm_registers_open(state, callee_top)
 	for capture, index in captures {
 		state.registers[callee_base + index] = capture
 	}
 	if !vm_bind_params(state, callee, args, callee_base + capture_count) {
 		return false
 	}
-	append(&state.frames, Frame {
+	vm_zero_locals(
+		state,
+		callee_base + capture_count,
+		callee.param_count,
+		callee_top,
+	)
+	vm_frames_push(state, Frame {
 		function      = function_index,
 		ip            = callee.code_offset,
 		register_base = callee_base,
@@ -2320,8 +2445,9 @@ vm_raised_error :: proc(state: ^VM, base: int, instr: Instruction) -> v.Value {
 }
 
 // Fails the VM when the frame stack is at the configured call-depth limit.
+// Inlined: every call opcode tests it and calls are hot.
 @(private)
-vm_depth_exceeded :: proc(state: ^VM) -> bool {
+vm_depth_exceeded :: #force_inline proc(state: ^VM) -> bool {
 	if state.max_call_depth > 0 && len(state.frames) >= state.max_call_depth {
 		vm_fail(state, "E_DEPTH", "call depth exceeded")
 		return true
@@ -2346,9 +2472,15 @@ vm_none_value :: proc(state: ^VM) -> v.Value {
 // Binds parameters from a caller register range. Equivalent to collecting
 // `count` values starting at `source_base` into a slice and calling
 // `vm_bind_params`, without the slice or the copy for the common no-rest case.
+//
+// The common case supplies every non-rest parameter, so each one is a straight
+// copy from the caller window and no default or empty-relation padding can
+// apply. That case is a tight copy loop; only calls that omit optional
+// parameters take the general path.
+@(private)
 vm_bind_params_range :: proc(
 	state: ^VM,
-	callee: Function,
+	callee: ^Function,
 	source_base: int,
 	count: int,
 	param_base: int,
@@ -2363,18 +2495,28 @@ vm_bind_params_range :: proc(
 		vm_fail(state, "E_ARITY", "wrong number of arguments for function call")
 		return false
 	}
-	for index in 0 ..< non_rest {
-		value: v.Value
-		if index < count {
-			value = state.registers[source_base + index]
-		} else if callee.defaults != nil &&
-		   index < len(callee.defaults) &&
-		   callee.defaults[index] >= 0 {
-			value = program.constants[callee.defaults[index]]
-		} else {
-			value = vm_none_value(state)
+	// Every parameter is supplied, so no default or empty-relation padding can
+	// apply: a straight copy. (Emitted programs always carry a defaults slice,
+	// so testing it for nil would miss this path.)
+	if count >= non_rest {
+		registers := state.registers
+		for index in 0 ..< non_rest {
+			registers[param_base + index] = registers[source_base + index]
 		}
-		state.registers[param_base + index] = value
+	} else {
+		for index in 0 ..< non_rest {
+			value: v.Value
+			if index < count {
+				value = state.registers[source_base + index]
+			} else if callee.defaults != nil &&
+			   index < len(callee.defaults) &&
+			   callee.defaults[index] >= 0 {
+				value = program.constants[callee.defaults[index]]
+			} else {
+				value = vm_none_value(state)
+			}
+			state.registers[param_base + index] = value
+		}
 	}
 	if callee.has_rest {
 		rest_count := count - non_rest
@@ -2393,7 +2535,7 @@ vm_bind_params_range :: proc(
 @(private)
 vm_bind_params :: proc(
 	state: ^VM,
-	callee: Function,
+	callee: ^Function,
 	args: []v.Value,
 	param_base: int,
 ) -> bool {
@@ -2407,18 +2549,27 @@ vm_bind_params :: proc(
 		vm_fail(state, "E_ARITY", "wrong number of arguments for function call")
 		return false
 	}
-	for index in 0 ..< non_rest {
-		value: v.Value
-		if index < len(args) {
-			value = args[index]
-		} else if callee.defaults != nil &&
-		   index < len(callee.defaults) &&
-		   callee.defaults[index] >= 0 {
-			value = program.constants[callee.defaults[index]]
-		} else {
-			value = vm_none_value(state)
+	// Every parameter is supplied, so no default or empty-relation padding can
+	// apply: a straight copy.
+	if len(args) >= non_rest {
+		registers := state.registers
+		for index in 0 ..< non_rest {
+			registers[param_base + index] = args[index]
 		}
-		state.registers[param_base + index] = value
+	} else {
+		for index in 0 ..< non_rest {
+			value: v.Value
+			if index < len(args) {
+				value = args[index]
+			} else if callee.defaults != nil &&
+			   index < len(callee.defaults) &&
+			   callee.defaults[index] >= 0 {
+				value = program.constants[callee.defaults[index]]
+			} else {
+				value = vm_none_value(state)
+			}
+			state.registers[param_base + index] = value
+		}
 	}
 	if callee.has_rest {
 		rest_count := len(args) - non_rest
