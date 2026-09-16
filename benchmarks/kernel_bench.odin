@@ -263,6 +263,36 @@ bench_store_apply_delta :: proc(user: rawptr, chunk: int, _: int) {
 	state.sink.value = mm.black_box(accumulator)
 }
 
+// One assert applied to the 16k-row indexed block. #100: the secondary index
+// is materialized on first query, not on commit, so this should track the
+// unindexed apply_delta_16k rather than paying O(n log n) per commit.
+@(private)
+bench_store_apply_delta_indexed :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Store_State)(user)
+
+	entry_identity, _ := v.value_identity_raw(10_000_000)
+	item_identity, _ := v.identity_new(0)
+	entry_tuple := v.tuple_new(context.temp_allocator, []v.Value {
+		entry_identity,
+		v.value_identity(item_identity),
+		v.value_symbol(v.symbol_intern("bench_kind")),
+	})
+	entries := []k.Pending_Write{{tuple = entry_tuple, kind = .Assert}}
+
+	accumulator := u64(0)
+	for _ in 0 ..< chunk {
+		block := k.relation_block_apply(
+			&state.kernel,
+			state.index_block,
+			state.index_metadata,
+			entries,
+		)
+		accumulator += u64(uintptr(block))
+		k.relation_block_release(block)
+	}
+	state.sink.value = mm.black_box(accumulator)
+}
+
 @(private)
 bench_store_rebuild :: proc(user: rawptr, chunk: int, _: int) {
 	state := (^Store_State)(user)
@@ -844,6 +874,7 @@ register_kernel_benches :: proc(runner: ^mm.Runner) {
 	mm.bench_capped(store_group, "deep_copy_128_per_tuple", store_state, bench_deep_copy_per_tuple, 512)
 	mm.bench_capped(store_group, "chunk_create_128", store_state, bench_chunk_create, 512)
 	mm.bench_capped(store_group, "apply_delta_16k", store_state, bench_store_apply_delta, 8)
+	mm.bench_capped(store_group, "apply_delta_indexed_16k", store_state, bench_store_apply_delta_indexed, 8)
 	mm.bench_capped(store_group, "rebuild_16k", store_state, bench_store_rebuild, 8)
 
 	txn_state := txn_state_init()

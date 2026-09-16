@@ -472,3 +472,76 @@ test_concurrent_relation_creation :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, kernel.current.version, u64(THREADS))
 }
+
+// Readers racing to materialize a block's secondary index for the first time.
+// The one-time build is guarded by a sync.Once on the block; without it,
+// concurrent first readers could observe a half-built index.
+@(private)
+Index_Reader :: struct {
+	block:      ^Relation_Block,
+	bindings:   []v.Binding,
+	expected:   int,
+	iterations: int,
+	failures:   int,
+}
+
+@(private)
+index_reader :: proc(data: rawptr) {
+	context = runtime.default_context()
+	worker := (^Index_Reader)(data)
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	for _ in 0 ..< worker.iterations {
+		clear(&rows)
+		relation_block_scan_into(worker.block, worker.bindings, &rows)
+		if len(rows) != worker.expected {
+			worker.failures += 1
+		}
+	}
+}
+
+@(test)
+test_concurrent_first_index_materialization :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	// 4096 rows in four groups of 1024; index over the group column. The
+	// pooled block gives the readers a thread-safe allocator for the one-time
+	// index build.
+	metadata := relation_metadata(Relation_ID(1), v.symbol_intern("IndexRace"), 2)
+	metadata.indexes = []Index_Spec{index_spec([]u16{0})}
+	rows := make([]v.Tuple, 4096, context.temp_allocator)
+	for i in 0 ..< len(rows) {
+		group, _ := v.identity_new(u64(i / 1024))
+		item, _ := v.identity_new(u64(i))
+		rows[i] = tuple_of(v.value_identity(group), v.value_identity(item))
+	}
+	block := relation_block_build_pooled(&kernel, metadata, rows)
+	defer relation_block_release(block)
+
+	group, _ := v.identity_new(1)
+	bindings := []v.Binding{v.binding_of(v.value_identity(group)), {}}
+
+	READERS :: 4
+	ITERATIONS :: 200
+	readers: [READERS]Index_Reader
+	threads: [READERS]^thread.Thread
+	for index in 0 ..< READERS {
+		readers[index] = Index_Reader {
+			block      = block,
+			bindings   = bindings,
+			expected   = 1024,
+			iterations = ITERATIONS,
+		}
+		threads[index] = thread.create_and_start_with_data(&readers[index], index_reader)
+	}
+	for index in 0 ..< len(threads) {
+		thread.join(threads[index])
+		thread.destroy(threads[index])
+	}
+	for reader in readers {
+		testing.expect_value(t, reader.failures, 0)
+		testing.expect_value(t, reader.iterations, ITERATIONS)
+	}
+}

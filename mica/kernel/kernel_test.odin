@@ -435,6 +435,52 @@ test_secondary_index_scan_returns_matching_rows :: proc(t: ^testing.T) {
 	delete(rows)
 }
 
+@(private)
+scan_count_for_key :: proc(kernel: ^Kernel, relation: Relation_ID, key: v.Value) -> int {
+	bindings := []v.Binding{{}, v.binding_of(key), {}}
+	rows: [dynamic]v.Tuple
+	defer delete(rows)
+	kernel_scan_into(kernel, relation, bindings, &rows)
+	return len(rows)
+}
+
+// #100: indexes are materialized lazily on first query and rebuilt per block,
+// so results must stay identical across incremental commits and retracts.
+@(test)
+test_index_correct_across_incremental_commits :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	indexes := [1]Index_Spec{index_spec([]u16{1})}
+	relation := create_relation_with(&kernel, 1, "Located", 3, conflict_set(), indexes[:])
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, relation, tuple_of(must_identity(1), must_identity(10), must_int(0)))
+	transaction_assert(&tx, relation, tuple_of(must_identity(2), must_identity(20), must_int(1)))
+	commit_transaction(t, &tx)
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, must_identity(10)), 1)
+
+	// An incremental commit onto the indexed block must not serve stale rows.
+	tx2 := kernel_begin(&kernel)
+	transaction_assert(&tx2, relation, tuple_of(must_identity(3), must_identity(10), must_int(2)))
+	transaction_assert(&tx2, relation, tuple_of(must_identity(4), must_identity(30), must_int(3)))
+	commit_transaction(t, &tx2)
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, must_identity(10)), 2)
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, must_identity(20)), 1)
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, must_identity(30)), 1)
+
+	// A retract must drop the row from index results too.
+	tx3 := kernel_begin(&kernel)
+	transaction_retract(
+		&tx3,
+		relation,
+		tuple_of(must_identity(1), must_identity(10), must_int(0)),
+	)
+	commit_transaction(t, &tx3)
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, must_identity(10)), 1)
+}
+
 @(test)
 test_rule_rejects_atom_and_head_arity_mismatch :: proc(t: ^testing.T) {
 	kernel: Kernel

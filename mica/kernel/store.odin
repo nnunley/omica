@@ -49,13 +49,16 @@ Relation_Block :: struct {
 	chunks:      []^Relation_Chunk,
 	chunk_rows:  []u32,
 	count:       int,
-	// Flat row view, built only when the relation declares indexes.
-	flat_rows:   []v.Tuple,
-	indexes:     []Secondary_Index,
-	refs:        i32,
-	arena:       ^Frame_Arena,
-	pool:        ^Arena_Pool,
-	storage:     mem.Allocator,
+	// Flat row view and secondary indexes, built lazily by the first
+	// index-backed query. Blocks are immutable, so the cache cannot go stale;
+	// deferring the build keeps the commit path O(span) instead of O(n log n).
+	flat_rows:    []v.Tuple,
+	indexes:      []Secondary_Index,
+	indexes_once: sync.Once,
+	refs:         i32,
+	arena:        ^Frame_Arena,
+	pool:         ^Arena_Pool,
+	storage:      mem.Allocator,
 }
 
 // A sorted row-index array over selected argument positions.
@@ -213,7 +216,6 @@ relation_block_build :: proc(
 	block.chunks = chunks_from_rows(nil, rows, alloc)
 	block.chunk_rows = make([]u32, len(block.chunks), alloc)
 	fill_chunk_rows(block)
-	build_block_indexes(block, alloc)
 	return block
 }
 
@@ -241,7 +243,6 @@ relation_block_build_pooled :: proc(
 	block.arena = block_arena
 	block.pool = kernel.arena_pool
 	fill_chunk_rows(block)
-	build_block_indexes(block, block_alloc)
 	return block
 }
 
@@ -321,7 +322,6 @@ relation_block_apply :: proc(
 	block.pool = kernel.arena_pool
 	block.chunk_rows = make([]u32, len(spine), block_alloc)
 	fill_chunk_rows(block)
-	build_block_indexes(block, block_alloc)
 	return block
 }
 
@@ -540,18 +540,24 @@ relation_block_visit :: proc(
 	primary_count := bound_count
 	best_index := -1
 	best_count := 0
-	for index, i in block.indexes {
-		count := index_leading_bound_count(Index_Spec{positions = index.positions}, bindings)
+	packed := 0
+	for spec in block.metadata.indexes {
+		if index_is_natural_full_tuple(spec, block.metadata.arity) {
+			continue
+		}
+		count := index_leading_bound_count(spec, bindings)
 		if count > best_count {
-			best_index = i
+			best_index = packed
 			best_count = count
 		}
+		packed += 1
 	}
 
 	// A secondary index wins ties, matching the Rust kernel. Otherwise the
 	// primary store's sorted order serves the leading prefix.
 	use_index := best_count > 0 && best_count >= primary_count
 	if use_index {
+		relation_block_ensure_indexes(block)
 		index := &block.indexes[best_index]
 		lo := index_lower_bound(block, index, bindings, best_count)
 		hi := index_upper_bound(block, index, bindings, best_count)
@@ -705,8 +711,25 @@ compare_tuple_values :: proc(row: v.Tuple, key: []v.Value) -> v.Ordering {
 
 // --- Secondary indexes -----------------------------------------------------
 
+// Returns the allocator that owns the block's structures. Pooled blocks use
+// their frame arena, whose allocator is mutex-protected, so the lazy index
+// build is safe from any reader thread.
 @(private)
-build_block_indexes :: proc(block: ^Relation_Block, alloc: mem.Allocator) {
+relation_block_allocator :: proc(block: ^Relation_Block) -> mem.Allocator {
+	if block.pool != nil {
+		return frame_arena_allocator(block.arena)
+	}
+	if block.storage.procedure != nil {
+		return block.storage
+	}
+	return context.allocator
+}
+
+// Materializes `flat_rows` and the secondary indexes from the block's chunks.
+// Idempotent; runs through `relation_block_ensure_indexes`.
+@(private)
+build_block_indexes :: proc(block: ^Relation_Block) {
+	alloc := relation_block_allocator(block)
 	index_count := 0
 	for spec in block.metadata.indexes {
 		if !index_is_natural_full_tuple(spec, block.metadata.arity) {
@@ -747,6 +770,17 @@ build_block_indexes :: proc(block: ^Relation_Block, alloc: mem.Allocator) {
 		block.indexes[write] = index
 		write += 1
 	}
+}
+
+// Builds the block's secondary indexes on first use. Blocks are immutable, so
+// one build is enough for the block's lifetime, and a commit pays nothing for
+// an index no query has asked for. `indexes_once` serializes concurrent
+// first readers.
+@(private)
+relation_block_ensure_indexes :: proc(block: ^Relation_Block) {
+	sync.once_do(&block.indexes_once, proc(data: rawptr) {
+		build_block_indexes((^Relation_Block)(data))
+	}, block)
 }
 
 @(private)
