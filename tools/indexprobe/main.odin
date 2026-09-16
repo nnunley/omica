@@ -13,12 +13,17 @@ import "core:time"
 import k "../../mica/kernel"
 import v "../../mica/var"
 
+ARITY :: 3
+
 main :: proc() {
 	position := u16(1)
 	if len(os.args) > 1 {
-		if parsed, ok := strconv.parse_int(os.args[1]); ok {
-			position = u16(parsed)
+		parsed, parsed_ok := strconv.parse_int(os.args[1])
+		if !parsed_ok || parsed < 0 || parsed >= ARITY {
+			fmt.eprintf("indexprobe: position must be 0..<%d\n", ARITY)
+			os.exit(2)
 		}
+		position = u16(parsed)
 	}
 
 	kernel: k.Kernel
@@ -32,12 +37,16 @@ main :: proc() {
 	metadata := k.relation_metadata(k.Relation_ID(1), v.symbol_intern("Store"), 3)
 	metadata.indexes = index_specs
 
+	// Disjoint id spaces: group and item columns must not share values, or a
+	// probe on one column could match on the other by accident.
+	ITEMS_OFFSET :: 0x1000
+
 	ROWS :: 16384
 	rows := make([]v.Tuple, ROWS, context.allocator)
 	for group in 0 ..< 128 {
 		for item in 0 ..< 128 {
 			group_id, _ := v.identity_new(u64(group))
-			item_id, _ := v.identity_new(u64(item))
+			item_id, _ := v.identity_new(ITEMS_OFFSET + u64(item))
 			rows[group * 128 + item] = v.tuple_new(
 				context.allocator,
 				[]v.Value {
@@ -49,7 +58,7 @@ main :: proc() {
 		}
 	}
 
-	item_id, _ := v.identity_new(7)
+	item_id, _ := v.identity_new(ITEMS_OFFSET + 7)
 	group_id, _ := v.identity_new(42)
 	bindings := make([]v.Binding, 3, context.allocator)
 	bindings[position] = v.binding_of(v.value_identity(position == 0 ? group_id : item_id))

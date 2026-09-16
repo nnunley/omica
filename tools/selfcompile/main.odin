@@ -3,6 +3,9 @@
 // small target instead). Reports world load time and the best and median
 // `emit_source` time over the joined compiler source.
 //
+// Run from the repository root: the compiler sources are read from
+// `apps/compiler/` by relative path.
+//
 //   odin build tools/selfcompile -o:speed -out:/tmp/selfcompile
 //   /tmp/selfcompile [iterations]
 package main
