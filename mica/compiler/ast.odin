@@ -465,6 +465,8 @@ Verb_Item :: struct {
 	params:      []Param,
 	result_type: string,
 	body:        []^Expr,
+	// The verb's own source text, a slice into the parsed program text.
+	source: string,
 }
 
 Rule_Item :: struct {

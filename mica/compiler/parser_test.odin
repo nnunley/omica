@@ -407,6 +407,19 @@ test_parse_qualified_verb_name :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_parse_verb_source_span :: proc(t: ^testing.T) {
+	source := "verb first(a)\n  return a\nend\n\nverb second(b)\n  return b\nend"
+	program := parse_ok(t, source)
+	first, first_ok := program.items[0].(Verb_Item)
+	second, second_ok := program.items[1].(Verb_Item)
+	testing.expect(t, first_ok && second_ok)
+	// MethodSource facts are built from each verb's own span, not the unit,
+	// so a unit's source is stored once rather than once per method.
+	testing.expect_value(t, first.source, "verb first(a)\n  return a\nend")
+	testing.expect_value(t, second.source, "verb second(b)\n  return b\nend")
+}
+
+@(test)
 test_parse_typed_for :: proc(t: ^testing.T) {
 	source := "for part: string in parts\n  emit(part)\nend"
 	program := parse_ok(t, source)

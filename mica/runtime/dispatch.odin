@@ -70,14 +70,22 @@ install_methods :: proc(
 	function_index := 1
 
 	for ast, ast_index in asts {
-		source_text := ""
+		// Fallback for hand-built ASTs that carry no per-verb span.
+		unit_source := ""
 		if ast_index < len(sources) {
-			source_text = strings.trim_space(sources[ast_index])
+			unit_source = strings.trim_space(sources[ast_index])
 		}
 		for item in ast.items {
 			verb, is_verb := item.(c.Verb_Item)
 			if !is_verb {
 				continue
+			}
+			// Record the verb's own text, not the whole unit: a unit source
+			// per method duplicates the file once per verb and the kernel
+			// deep-copies every copy on write.
+			source_text := verb.source
+			if source_text == "" {
+				source_text = unit_source
 			}
 			method_value, identity_ok := v.value_identity_raw(declarations.next_identity)
 			if !identity_ok {

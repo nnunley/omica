@@ -2547,7 +2547,7 @@ let m = methods[0][:mm]
 let sources = MethodSource(m, ?src)
 require(len(sources) == 1)
 let text = sources[0][:src]
-require(text != "")
+require(text == "verb greet(name)\n  assert Out(1)\nend")
 assert Out(2)
 `
 	path, path_ok := write_temp_source(t, "mica_reflection_facts_test.mica", source)

@@ -299,6 +299,7 @@ parse_grant :: proc(parser: ^Parser) -> Item {
 
 @(private)
 parse_verb :: proc(parser: ^Parser) -> Item {
+	start := peek(parser).offset
 	advance(parser)
 	name_token := expect(parser, .Ident, "expected verb name")
 	verb_name := parse_qualified_name(parser, name_token)
@@ -313,11 +314,20 @@ parse_verb :: proc(parser: ^Parser) -> Item {
 	skip_separators(parser)
 	body := parse_block_until(parser, []Token_Kind{.End})
 	expect(parser, .End, "expected 'end' to close verb")
+	end := len(parser.source)
+	if parser.pos < len(parser.tokens) {
+		end = parser.tokens[parser.pos].offset
+	}
+	verb_source := ""
+	if start >= 0 && end <= len(parser.source) && start < end {
+		verb_source = strings.trim_space(parser.source[start:end])
+	}
 	return Verb_Item {
 		name        = verb_name,
 		params      = params,
 		result_type = result_type,
 		body        = body,
+		source      = verb_source,
 	}
 }
 
