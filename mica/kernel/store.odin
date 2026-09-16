@@ -43,6 +43,11 @@ next_chunk_generation :: proc() -> u64 {
 }
 
 // A relation's materialized tuple state.
+//
+// Constructors must assign a full struct literal: frame-arena memory is not
+// zeroed on allocation, so a field left to `new` holds the previous occupant's
+// value, which for `indexes`/`indexes_once` means serving a stale index (see
+// `frame.odin`).
 Relation_Block :: struct {
 	metadata:    Relation_Metadata,
 	chunks:      []^Relation_Chunk,
@@ -65,11 +70,14 @@ Secondary_Index :: struct {
 	positions: []u16,
 	rows:      []u32,
 	// Raw order keys parallel to `rows`, one column per position, for indexes
-	// whose values all have a raw word order (see `v.value_order_key`). Bounds
+	// whose values all have a sort key (see `v.value_sort_key`). Bounds
 	// searches then compare one word per position instead of decoding two
 	// values, and the build sorts words with a radix pass rather than a
 	// comparison sort over tuples. Nil when any value falls outside that set;
 	// the canonical comparator is used instead.
+	//
+	// Block-lifetime arena memory: reclaiming individual columns is neither
+	// possible nor wanted here, they die with the block.
 	keys: [][]u64,
 }
 
@@ -832,7 +840,7 @@ build_index_keys :: proc(
 		column := make([]u64, block.count, alloc)
 		for row in 0 ..< block.count {
 			value := v.tuple_values(block.flat_rows[row])[int(position)]
-			key, key_ok := v.value_order_key(value)
+			key, key_ok := v.value_sort_key(value)
 			if !key_ok {
 				delete(column, alloc)
 				return false
@@ -1120,7 +1128,7 @@ index_probe_keys :: proc(
 		return false
 	}
 	for i in 0 ..< count {
-		key, key_ok := v.value_order_key(bindings[int(index.positions[i])].value)
+		key, key_ok := v.value_sort_key(bindings[int(index.positions[i])].value)
 		if !key_ok {
 			return false
 		}

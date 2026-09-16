@@ -488,6 +488,35 @@ test_secondary_index_string_keys :: proc(t: ^testing.T) {
 	testing.expect_value(t, scan_count_for_key(&kernel, relation, red), 0)
 }
 
+// Floats carry a monotone sort key too: constructors reject non-finite values
+// and canonicalize negative zero, so bit-pattern order is total.
+@(test)
+test_secondary_index_float_keys :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	indexes := [1]Index_Spec{index_spec([]u16{1})}
+	relation := create_relation_with(&kernel, 1, "Measured", 3, conflict_set(), indexes[:])
+
+	values := [?]f32{-3.5, -0.5, 0, 0.25, 2.75}
+	tx := kernel_begin(&kernel)
+	for value, row in values {
+		transaction_assert(
+			&tx,
+			relation,
+			tuple_of(must_identity(u64(row)), must_float(value), must_int(0)),
+		)
+	}
+	commit_transaction(t, &tx)
+
+	for value in values {
+		count := scan_count_for_key(&kernel, relation, must_float(value))
+		testing.expectf(t, count == 1, "float %v matched %d rows", value, count)
+	}
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, must_float(1.5)), 0)
+}
+
 // A recycled pool arena must not hand a new block the previous block's index:
 // the frame allocator returns non-zeroed memory, so the constructors must
 // clear the fields `new` would otherwise have zeroed.
