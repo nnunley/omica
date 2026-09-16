@@ -49,6 +49,12 @@ Kernel :: struct {
 	// the retire lock entirely.
 	retire_pending: i32,
 
+	// While true, commits apply extensional writes but skip derived-relation
+	// maintenance. Bulk ingest suspends the fixpoint and resumes once at the
+	// end instead of re-deriving per batch. Atomic: written by a controlling
+	// task, read on every commit path.
+	derivation_suspended: bool,
+
 	// Relation metadata and rule definitions live here for the life of the
 	// kernel; blocks and snapshots reference their slices.
 	world:           ^virtual.Arena,
@@ -643,7 +649,7 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 				snapshot_set_block(merged, block)
 			}
 		}
-		snapshot_compute_derived(merged)
+		kernel_compute_derived(kernel, merged)
 
 		previous, published := kernel_try_publish(kernel, base, merged)
 		if published {
@@ -753,7 +759,7 @@ kernel_create_relation :: proc(
 
 		next := snapshot_fork(kernel, current)
 		snapshot_add_relation(next, metadata_clone(kernel.world_allocator, metadata))
-		snapshot_compute_derived(next)
+		kernel_compute_derived(kernel, next)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -785,6 +791,53 @@ kernel_advance_version :: proc(kernel: ^Kernel, minimum: u64) -> bool {
 		}
 		next := snapshot_fork(kernel, current)
 		next.version = minimum
+		kernel_compute_derived(kernel, next)
+		previous, published := kernel_try_publish(kernel, current, next)
+		if published {
+			kernel_retire(kernel, previous)
+			kernel_store_persist(kernel, 0, next.version, next, nil)
+			snapshot_release(current)
+			return true
+		}
+		snapshot_release(next)
+		snapshot_release(current)
+	}
+}
+
+// Whether derived-relation maintenance is currently suspended. Read on every
+// commit path; the atomic keeps the flag visible without a lock.
+@(private)
+kernel_derivation_suspended :: proc(kernel: ^Kernel) -> bool {
+	return sync.atomic_load_explicit(&kernel.derivation_suspended, .Acquire)
+}
+
+// Recomputes a snapshot's derived relations unless maintenance is suspended.
+@(private)
+kernel_compute_derived :: proc(kernel: ^Kernel, snapshot: ^Snapshot) {
+	if kernel_derivation_suspended(kernel) {
+		return
+	}
+	snapshot_compute_derived(snapshot)
+}
+
+// Enables or suspends derived-relation maintenance. While suspended, commits
+// apply extensional writes only: derived relations stay empty (a fork starts
+// with none) and the fixpoint runs on resume, once, over every installed rule
+// instead of once per commit. Resuming publishes a snapshot with the derived
+// rows materialized and returns false only when it cannot win a publication.
+kernel_set_derivation :: proc(kernel: ^Kernel, enabled: bool) -> bool {
+	if !enabled {
+		sync.atomic_store_explicit(&kernel.derivation_suspended, true, .Release)
+		return true
+	}
+
+	// Clear the flag before publishing: a commit that races the resume then
+	// maintains derived state itself instead of publishing a fork with none.
+	// The loop retries until it publishes on top of the winner.
+	sync.atomic_store_explicit(&kernel.derivation_suspended, false, .Release)
+	for {
+		current := kernel_snapshot(kernel)
+		next := snapshot_fork(kernel, current)
 		snapshot_compute_derived(next)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
@@ -846,7 +899,7 @@ kernel_install_rule :: proc(
 			return nil, .Unstratified_Negation
 		}
 
-		snapshot_compute_derived(next)
+		kernel_compute_derived(kernel, next)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -902,7 +955,7 @@ kernel_set_rule_active :: proc(
 				definition.active = active
 			}
 		}
-		snapshot_compute_derived(next)
+		kernel_compute_derived(kernel, next)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)

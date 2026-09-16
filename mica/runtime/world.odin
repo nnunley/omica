@@ -398,6 +398,14 @@ world_checkpoint :: proc(world: ^World) -> bool {
 	return s.store_checkpoint(world.store, world.kernel)
 }
 
+// Suspends or resumes derived-relation maintenance. Bulk ingest suspends it to
+// avoid re-running the rule fixpoint once per commit; the resume materializes
+// every installed rule once and returns false only when it cannot publish.
+// Reads of derived relations while suspended see the empty derived set.
+world_set_derivation :: proc(world: ^World, enabled: bool) -> bool {
+	return k.kernel_set_derivation(world.kernel, enabled)
+}
+
 // Creates a host-owned mailbox. The returned receiver and sender are
 // capability handles; the host drains the receiver and passes the sender to
 // `world_subscribe_changes`.

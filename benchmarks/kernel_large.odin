@@ -362,6 +362,178 @@ bench_mem_grow :: proc(user: rawptr, chunk: int, _: int) {
 	state.sink.value = mm.black_box(u64(state.rows))
 }
 
+// --- Rule fixpoint at scale -------------------------------------------------
+//
+// One sample commits `batches` transactions of `rows / batches` facts each.
+// With derivation enabled every commit re-runs the whole fixpoint; suspended,
+// the batches apply extensional writes only and the resume derives once. Both
+// variants reset the extensional relation to an empty block first, so samples
+// are independent.
+Rule_Load_State :: struct {
+	kernel:          k.Kernel,
+	arena:           virtual.Arena,
+	alloc:           mem.Allocator,
+	edge:            k.Relation_ID,
+	reach:           k.Relation_ID,
+	edge_metadata:   k.Relation_Metadata,
+	root:            v.Value,
+	batches:         int,
+	edges_per_batch: int,
+	// Chain edges (i -> i + 1) instead of star edges (root -> i). A chain
+	// makes the transitive closure grow quadratically.
+	chain:           bool,
+	next_leaf:       u64,
+	sink:            Sink,
+}
+
+@(private)
+rule_load_state_init :: proc(rows: int, batches: int, chain: bool) -> ^Rule_Load_State {
+	state := new(Rule_Load_State)
+	if err := virtual.arena_init_growing(&state.arena); err != nil {
+		panic("failed to initialize rule load arena")
+	}
+	state.alloc = virtual.arena_allocator(&state.arena)
+	k.kernel_init(&state.kernel)
+
+	state.edge = create_relation_with(
+		&state.kernel,
+		1,
+		"RuleEdge",
+		2,
+		k.conflict_set(),
+		nil,
+	)
+	state.reach = create_relation_with(
+		&state.kernel,
+		2,
+		"RuleReach",
+		2,
+		k.conflict_set(),
+		nil,
+	)
+	current := k.kernel_snapshot(&state.kernel)
+	state.edge_metadata, _ = k.snapshot_relation_metadata(current, state.edge)
+	k.snapshot_release(current)
+
+	from := v.symbol_intern("From")
+	to := v.symbol_intern("To")
+	mid := v.symbol_intern("Mid")
+	base_rule := k.rule_new(
+		state.reach,
+		[]k.Term{k.term_var(from), k.term_var(to)},
+		[]k.Rule_Body_Item {
+			k.body_atom(k.atom_positive(state.edge, []k.Term{k.term_var(from), k.term_var(to)})),
+		},
+	)
+	installed, install_err := k.kernel_install_rule(&state.kernel, v.Identity(100), base_rule, "base")
+	assert(install_err == .None)
+	k.snapshot_release(installed)
+	if chain {
+		recursive_rule := k.rule_new(
+			state.reach,
+			[]k.Term{k.term_var(from), k.term_var(to)},
+			[]k.Rule_Body_Item {
+				k.body_atom(k.atom_positive(state.edge, []k.Term{k.term_var(from), k.term_var(mid)})),
+				k.body_atom(k.atom_positive(state.reach, []k.Term{k.term_var(mid), k.term_var(to)})),
+			},
+		)
+		installed, install_err = k.kernel_install_rule(&state.kernel, v.Identity(101), recursive_rule, "recursive")
+		assert(install_err == .None)
+		k.snapshot_release(installed)
+	}
+
+	root, _ := v.identity_new(0)
+	state.root = v.value_identity(root)
+	state.batches = batches
+	state.edges_per_batch = rows / batches
+	state.chain = chain
+	state.next_leaf = 1
+	return state
+}
+
+// Empties the extensional relation without recomputing derived facts. The next
+// commit (derived variant) or resume (suspended variant) brings them up to
+// date, so samples start from equivalent state.
+@(private)
+rule_load_reset :: proc(state: ^Rule_Load_State) {
+	empty := k.relation_block_build_pooled(&state.kernel, state.edge_metadata, nil)
+	replaced, err := k.kernel_replace_relation_block(&state.kernel, empty)
+	if err == .None {
+		k.snapshot_release(replaced)
+	}
+}
+
+// One load: optionally suspend derivation, commit `batches` transactions, then
+// optionally resume. Returns the number of facts committed.
+@(private)
+rule_load_run :: proc(state: ^Rule_Load_State, suspended: bool) -> u64 {
+	rule_load_reset(state)
+	if suspended {
+		k.kernel_set_derivation(&state.kernel, false)
+	}
+
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		panic("failed to initialize rule load op arena")
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	facts := u64(0)
+	for _ in 0 ..< state.batches {
+		tx := k.kernel_begin(&state.kernel)
+		for _ in 0 ..< state.edges_per_batch {
+			leaf, _ := v.identity_new(state.next_leaf)
+			state.next_leaf += 1
+			source := state.root
+			target := v.value_identity(leaf)
+			if state.chain {
+				source = target
+				next, _ := v.identity_new(state.next_leaf)
+				state.next_leaf += 1
+				target = v.value_identity(next)
+			}
+			edge_tuple := v.tuple_new(alloc, []v.Value{source, target})
+			if err := k.transaction_assert(&tx, state.edge, edge_tuple); err != .None {
+				k.transaction_destroy(&tx)
+				return facts
+			}
+			facts += 1
+		}
+		committed, commit_err := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		if commit_err != .None {
+			return facts
+		}
+		k.snapshot_release(committed)
+	}
+
+	if suspended {
+		k.kernel_set_derivation(&state.kernel, true)
+	}
+	return facts
+}
+
+@(private)
+bench_rule_load_suspended :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Rule_Load_State)(user)
+	total := u64(0)
+	for _ in 0 ..< chunk {
+		total += rule_load_run(state, true)
+	}
+	state.sink.value = mm.black_box(total)
+}
+
+@(private)
+bench_rule_load_derived :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Rule_Load_State)(user)
+	total := u64(0)
+	for _ in 0 ..< chunk {
+		total += rule_load_run(state, false)
+	}
+	state.sink.value = mm.black_box(total)
+}
+
 // --- Registration -----------------------------------------------------------
 
 // Builds a state for each row count, registers the corresponding bench, and
@@ -452,6 +624,44 @@ row_name :: proc(rows: int) -> string {
 	return fmt.aprintf("%d", rows)
 }
 
+@(private)
+register_rules_large :: proc(runner: ^mm.Runner) {
+	group := mm.group(runner, "kernel/rules/large", mm.throughput_per_op(1, "load"))
+
+	// Per-batch fixpoint repetition with a non-recursive rule: ten 2k-fact
+	// batches. Suspended, the fixpoint runs once; derived, once per batch.
+	mm.bench_capped(
+		group,
+		"suspended_load_20k",
+		rule_load_state_init(20_000, 10, false),
+		bench_rule_load_suspended,
+		1,
+	)
+	mm.bench_capped(
+		group,
+		"derived_load_20k",
+		rule_load_state_init(20_000, 10, false),
+		bench_rule_load_derived,
+		1,
+	)
+	// Transitive closure growth: four 100-edge batches over a chain. The
+	// closure reaches ~80k rows, so the derived variant re-pays it per batch.
+	mm.bench_capped(
+		group,
+		"suspended_chain_400",
+		rule_load_state_init(400, 4, true),
+		bench_rule_load_suspended,
+		1,
+	)
+	mm.bench_capped(
+		group,
+		"derived_chain_400",
+		rule_load_state_init(400, 4, true),
+		bench_rule_load_derived,
+		1,
+	)
+}
+
 // Registers every large-scale bench. Called from `register_kernel_benches` in
 // kernel_bench.odin so the `-suite=kernel` run picks them up.
 register_kernel_large_benches :: proc(runner: ^mm.Runner) {
@@ -459,4 +669,5 @@ register_kernel_large_benches :: proc(runner: ^mm.Runner) {
 	register_bulk_load(runner)
 	register_closure_large(runner)
 	register_mem_growth(runner)
+	register_rules_large(runner)
 }

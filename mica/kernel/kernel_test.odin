@@ -585,6 +585,75 @@ test_transitive_rule_derives_reachable :: proc(t: ^testing.T) {
 	delete(rows)
 }
 
+// #97: suspending derivation defers the fixpoint to the resume. While
+// suspended, committed facts are extensional only and derived relations read
+// empty; the resume computes every installed rule once and yields the same
+// closure the unsuspended path would.
+@(test)
+test_suspended_derivation_defers_fixpoint_to_resume :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	edge := create_relation(&kernel, 1, "Edge", 2)
+	reach := create_relation(&kernel, 2, "Reach", 2)
+
+	from := v.symbol_intern("from")
+	to := v.symbol_intern("to")
+	mid := v.symbol_intern("mid")
+	base_rule := rule_new(
+		reach,
+		[]Term{term_var(from), term_var(to)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(edge, []Term{term_var(from), term_var(to)})),
+		},
+	)
+	recursive_rule := rule_new(
+		reach,
+		[]Term{term_var(from), term_var(to)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(edge, []Term{term_var(from), term_var(mid)})),
+			body_atom(atom_positive(reach, []Term{term_var(mid), term_var(to)})),
+		},
+	)
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(100), base_rule, "base")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+	snapshot, err = kernel_install_rule(&kernel, v.Identity(101), recursive_rule, "recursive")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	a := must_identity(1)
+	b := must_identity(2)
+	c := must_identity(3)
+	d := must_identity(4)
+
+	testing.expect(t, kernel_set_derivation(&kernel, false))
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, edge, tuple_of(a, b))
+	transaction_assert(&tx, edge, tuple_of(b, c))
+	commit_transaction(t, &tx)
+
+	tx2 := kernel_begin(&kernel)
+	transaction_assert(&tx2, edge, tuple_of(c, d))
+	commit_transaction(t, &tx2)
+
+	// Suspended commits materialize nothing.
+	rows := kernel_rows(&kernel, reach, 2)
+	testing.expect_value(t, len(rows), 0)
+	delete(rows)
+
+	// The resume derives the whole chain once: six pairs.
+	testing.expect(t, kernel_set_derivation(&kernel, true))
+	rows = kernel_rows(&kernel, reach, 2)
+	testing.expect_value(t, len(rows), 6)
+	testing.expect(t, has_tuple(rows[:], tuple_of(a, b)))
+	testing.expect(t, has_tuple(rows[:], tuple_of(a, d)))
+	testing.expect(t, has_tuple(rows[:], tuple_of(b, d)))
+	delete(rows)
+}
+
 // A transaction that has staged no writes sees exactly its base snapshot's
 // derived facts, so reads must reuse the snapshot's already-materialized rows
 // rather than re-running the fixpoint. Read-only transactions are the common
