@@ -672,12 +672,7 @@ verb template/render_value(value @ #template/substitution<_>, bindings @ #map, v
 end
 
 verb template/render_value(value @ #list, bindings @ #map, viewer)
-  let rendered = []
-
-  for part in value
-    rendered = [@rendered, template/render_value(part, bindings, viewer)]
-  end
-
+  let rendered = map(value, fn(part) => template/render_value(part, bindings, viewer))
   return string_join(rendered, "")
 end
 
@@ -686,12 +681,9 @@ verb template/render_value(value, bindings @ #map, viewer)
 end
 
 verb template/render(template @ #template/substitution<_>, bindings @ #map, viewer)
-  let rendered = []
-
-  for part in frob_value(template)
-    rendered = [@rendered, template/render_value(part, bindings, viewer)]
-  end
-
+  // The frob's value iterates but is not necessarily a #list, so this stays a
+  // comprehension rather than map.
+  let rendered = [template/render_value(part, bindings, viewer) for part in frob_value(template)]
   return string_join(rendered, "")
 end
 

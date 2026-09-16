@@ -65,6 +65,7 @@ a telnet-oriented MUD session:
 ```sh
 cargo run --bin mica-daemon -- \
   --filein apps/shared/string.mica \
+  --filein apps/shared/list.mica \
   --filein apps/shared/events.mica \
   --filein apps/mud/core.mica \
   --filein apps/mud/auth.mica \
@@ -92,6 +93,7 @@ Run the browser fixture with a plain HTTP host:
 cargo run --bin mica-daemon -- \
   --filein apps/shared/sync-host.mica \
   --filein apps/shared/string.mica \
+  --filein apps/shared/list.mica \
   --filein apps/shared/events.mica \
   --filein apps/mud/core.mica \
   --filein apps/mud/event-substitutions.mica \

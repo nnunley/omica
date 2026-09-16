@@ -170,10 +170,7 @@ verb ui/area_panel_node(actor @ #player, room @ #room)
     return dom <span></span>
   end
 
-  let rows = []
-  for found in RoomInArea(?area_room, area)
-    rows = [@rows, ui/area_room_row_node(actor, room, found[:area_room])]
-  end
+  let rows = [ui/area_room_row_node(actor, room, found[:area_room]) for found in RoomInArea(?area_room, area)]
 
   return dom <details class="area-panel" aria-label="Area map">
     <summary>{ui/icon_label_node("route", string_concat("Area: ", ui/actor_name(area)))}</summary>

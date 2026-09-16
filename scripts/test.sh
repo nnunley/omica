@@ -96,6 +96,7 @@ mkdir -p "${bin_dir}" "${log_dir}"
 # The fileins that make up the browser MUD (mirror of scripts/mud.sh).
 mud_fileins=(
   apps/shared/string.mica
+  apps/shared/list.mica
   apps/shared/events.mica
   apps/shared/retrieval.mica
   apps/shared/sync-host.mica

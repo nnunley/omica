@@ -4139,6 +4139,57 @@ end
 	}
 }
 
+// The shared list library: higher-order verbs over #list, called directly and
+// through receiver dispatch, alongside a `-> map` annotation to prove the verb
+// name does not shadow the type.
+@(test)
+test_run_list_functional_verbs :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	library := corpus_relative("apps/shared/list.mica")
+	if library == "" {
+		testing.expect(t, false, "apps/shared/list.mica not found")
+		return
+	}
+
+	source := `make_relation(:Result, 2)
+assert Result(1, map([1, 2, 3], fn(x) => x * 2) == [2, 4, 6])
+assert Result(2, filter([1, 2, 3, 4], fn(x) => x == 2) == [2])
+assert Result(3, fold([1, 2, 3], 0, fn(acc, x) => acc + x) == 6)
+assert Result(4, find([1, 2, 3], fn(x) => x > 1) == 2)
+assert Result(5, find([1, 2, 3], fn(x) => x > 9) == none)
+assert Result(6, any([1, 2, 3], fn(x) => x == 3))
+assert Result(7, all([1, 2, 3], fn(x) => x > 0))
+assert Result(8, !all([1, 2, 3], fn(x) => x > 1))
+assert Result(9, flat_map([[1, 2], [3]], fn(xs) => xs) == [1, 2, 3])
+assert Result(10, zip([1, 2], ["a", "b"]) == [[1, "a"], [2, "b"]])
+assert Result(11, take([1, 2, 3], 2) == [1, 2])
+assert Result(12, drop([1, 2, 3], 1) == [2, 3])
+assert Result(13, [1, 2, 3, 4] :filter(fn(x) => x != 2) :map(fn(x) => x * 10) == [10, 30, 40])
+assert Result(14, len(each([1, 2], fn(x) => x)) == 2)
+
+verb annotate() -> map
+  return {:answer -> 42}
+end
+
+assert Result(15, annotate()[:answer] == 42)
+assert Result(16, [row[:k] for row in __relation_literal([:k], [[1], [2]])] == [1, 2])
+`
+	path, path_ok := write_temp_source(t, "mica_list_functional_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{library, path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Result", 16)
+}
+
 @(test)
 test_query_value_filter :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)

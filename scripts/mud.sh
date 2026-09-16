@@ -27,6 +27,7 @@ bind="${MICA_WEB_BIND:-0.0.0.0:8080}"
 
 fileins=(
   apps/shared/string.mica
+  apps/shared/list.mica
   apps/shared/events.mica
   apps/shared/retrieval.mica
   apps/shared/sync-host.mica

@@ -72,6 +72,7 @@ This path exercises command parsing and routed effects without the browser sync 
 ```sh
 cargo run --bin mica-daemon -- \
   --filein apps/shared/string.mica \
+  --filein apps/shared/list.mica \
   --filein apps/shared/events.mica \
   --filein apps/mud/core.mica \
   --filein apps/mud/event-substitutions.mica \
@@ -93,6 +94,7 @@ Run the router demo with an explicit filein list so it replaces the default HTTP
 ```sh
 cargo run --bin mica-daemon -- \
   --filein apps/shared/string.mica \
+  --filein apps/shared/list.mica \
   --filein apps/shared/events.mica \
   --filein apps/mud/core.mica \
   --filein apps/mud/event-substitutions.mica \

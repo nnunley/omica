@@ -83,6 +83,7 @@ main :: proc() {
 			name  = "mud core: loads and answers",
 			files = []string{
 				"apps/shared/string.mica",
+				"apps/shared/list.mica",
 				"apps/shared/events.mica",
 				"apps/mud/core.mica",
 				"apps/mud/command-parser.mica",
@@ -94,6 +95,7 @@ main :: proc() {
 			name  = "mud scenarios: substitutions only",
 			files = []string{
 				"apps/shared/string.mica",
+				"apps/shared/list.mica",
 				"apps/shared/events.mica",
 				"apps/mud/core.mica",
 				"apps/mud/event-substitutions.mica",
@@ -105,6 +107,7 @@ main :: proc() {
 			name  = "mud scenarios: command parser and substitutions",
 			files = []string{
 				"apps/shared/string.mica",
+				"apps/shared/list.mica",
 				"apps/shared/events.mica",
 				"apps/mud/core.mica",
 				"apps/mud/command-parser.mica",
@@ -117,6 +120,7 @@ main :: proc() {
 			name  = "mud scenarios: social commands",
 			files = []string{
 				"apps/shared/string.mica",
+				"apps/shared/list.mica",
 				"apps/shared/events.mica",
 				"apps/mud/core.mica",
 				"apps/mud/command-parser.mica",
