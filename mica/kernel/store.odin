@@ -150,8 +150,12 @@ relation_chunk_release :: proc(chunk: ^Relation_Chunk) {
 		arena_pool_return(chunk.pool, chunk.arena)
 		return
 	}
-	frame_arena_destroy(chunk.arena)
-	free(chunk.arena, runtime.default_allocator())
+	// The chunk struct lives inside its own arena, so the arena pointer must
+	// be read before the arena is destroyed: a second `chunk.arena` read here
+	// would read freed memory (ThreadSanitizer flags it).
+	arena := chunk.arena
+	frame_arena_destroy(arena)
+	free(arena, runtime.default_allocator())
 }
 
 @(private)
