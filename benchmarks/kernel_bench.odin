@@ -61,8 +61,11 @@ Store_State :: struct {
 	sink: Sink,
 }
 
+// `index_position` selects the indexed column. Position 0 (the group) ends up
+// sorted already after the block's natural-order build, so an index there never
+// exercises its own sort; position 1 (the item) interleaves across groups.
 @(private)
-setup_store_state :: proc(state: ^Store_State) {
+setup_store_state :: proc(state: ^Store_State, index_position: u16 = 0) {
 	k.kernel_init(&state.kernel)
 
 	GROUPS :: 128
@@ -79,7 +82,7 @@ setup_store_state :: proc(state: ^Store_State) {
 		3,
 	)
 	index_positions := make([]u16, 1, state.alloc)
-	index_positions[0] = 0
+	index_positions[0] = index_position
 	index_specs := make([]k.Index_Spec, 1, state.alloc)
 	index_specs[0] = k.index_spec(index_positions)
 	state.index_metadata.indexes = index_specs
@@ -134,11 +137,17 @@ setup_store_state :: proc(state: ^Store_State) {
 	state.prefix[0] = v.binding_of(v.value_identity(group_id))
 
 	state.index = make([]v.Binding, 3, state.alloc)
-	state.index[0] = v.binding_of(v.value_identity(group_id))
+	switch index_position {
+	case 0:
+		state.index[0] = v.binding_of(v.value_identity(group_id))
+	case:
+		item_id, _ := v.identity_new(7)
+		state.index[1] = v.binding_of(v.value_identity(item_id))
+	}
 }
 
 @(private)
-store_state_init :: proc() -> ^Store_State {
+store_state_init :: proc(index_position: u16 = 0) -> ^Store_State {
 	state := new(Store_State)
 	if err := virtual.arena_init_growing(&state.arena); err != nil {
 		panic("failed to initialize store benchmark arena")
@@ -148,7 +157,7 @@ store_state_init :: proc() -> ^Store_State {
 	}
 	state.alloc = virtual.arena_allocator(&state.arena)
 	state.scratch_alloc = virtual.arena_allocator(&state.scratch)
-	setup_store_state(state)
+	setup_store_state(state, index_position)
 	return state
 }
 
@@ -195,6 +204,35 @@ bench_scan_index :: proc(user: rawptr, chunk: int, _: int) {
 		k.relation_block_visit(state.index_block, state.index, scan_visit, &state.sink)
 	}
 	state.sink.value = mm.black_box(state.sink.value)
+}
+
+// Builds a fresh block per operation so the lazily materialized index,
+// including its sort, is part of the measurement. `scan_index_16k` runs after
+// that build and so measures only the warmed lookup.
+@(private)
+bench_scan_index_first :: proc(user: rawptr, chunk: int, _: int) {
+	state := (^Store_State)(user)
+	accumulator := u64(0)
+	for _ in 0 ..< chunk {
+		block := k.relation_block_build_pooled(
+			&state.kernel,
+			state.index_metadata,
+			state.rows,
+		)
+		k.relation_block_visit(block, state.index, scan_visit, &state.sink)
+		if block.count != 16384 {
+			panic("bench_scan_index_first: unexpected row count")
+		}
+		if len(block.indexes) != 1 || len(block.indexes[0].rows) != block.count {
+			panic("bench_scan_index_first: index was not built")
+		}
+		if len(block.indexes[0].keys) != 1 {
+			panic("bench_scan_index_first: raw key column missing")
+		}
+		k.relation_block_release(block)
+		accumulator += u64(uintptr(block))
+	}
+	state.sink.value = mm.black_box(accumulator)
 }
 
 @(private)
@@ -870,12 +908,21 @@ register_kernel_benches :: proc(runner: ^mm.Runner) {
 	mm.bench(store_group, "scan_prefix_16k", store_state, bench_scan_prefix)
 	mm.bench(store_group, "scan_prefix_checksum_16k", store_state, bench_scan_prefix_checksum)
 	mm.bench(store_group, "scan_index_16k", store_state, bench_scan_index)
+	mm.bench_capped(store_group, "scan_index_first_16k", store_state, bench_scan_index_first, 8)
 	mm.bench_capped(store_group, "deep_copy_128_contiguous", store_state, bench_deep_copy_contiguous, 512)
 	mm.bench_capped(store_group, "deep_copy_128_per_tuple", store_state, bench_deep_copy_per_tuple, 512)
 	mm.bench_capped(store_group, "chunk_create_128", store_state, bench_chunk_create, 512)
 	mm.bench_capped(store_group, "apply_delta_16k", store_state, bench_store_apply_delta, 8)
 	mm.bench_capped(store_group, "apply_delta_indexed_16k", store_state, bench_store_apply_delta_indexed, 8)
 	mm.bench_capped(store_group, "rebuild_16k", store_state, bench_store_rebuild, 8)
+
+	// Index on the item column, whose order is interleaved by the block's
+	// natural (group, item) row order, so the lazy index build must sort.
+	item_state := store_state_init(1)
+	item_group := mm.group(runner, "kernel/store/item_index")
+	mm.bench_capped(item_group, "rebuild_16k", item_state, bench_store_rebuild, 8)
+	mm.bench_capped(item_group, "scan_index_first_16k", item_state, bench_scan_index_first, 8)
+	mm.bench(item_group, "scan_index_16k", item_state, bench_scan_index)
 
 	txn_state := txn_state_init()
 	txn_group := mm.group(runner, "kernel/txn")

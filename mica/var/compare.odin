@@ -250,3 +250,28 @@ value_cmp :: proc(left, right: Value) -> Ordering {
 	return value_cmp_same_kind(left, right, left_kind)
 }
 
+// Returns a word whose unsigned order equals `value_cmp`'s order, for values
+// whose canonical order is decided by kind and raw payload. The kind occupies
+// the top byte, so words of different kinds order by kind, and within a kind
+// the payload is transformed into unsigned order.
+//
+// Callers can then sort and search a column of such values with plain word
+// compares instead of decoding two values per comparison.
+//
+// Reports false for values whose order needs their storage: heap kinds such as
+// strings, collections, and relations, and floats, whose canonical order
+// treats -0 and +0 as equal while their raw bits differ.
+value_order_key :: proc(value: Value) -> (u64, bool) {
+	tag := value_tag(value)
+	#partial switch tag {
+	case .Bool, .Identity, .Symbol, .Error_Code, .Capability, .Function:
+		return (u64(tag) << TAG_SHIFT) | value_payload(value), true
+	case .Int:
+		// The payload is a 56-bit two's complement integer. Flipping its sign
+		// bit makes unsigned word order match numeric order.
+		payload := value_payload(value) ~ (u64(1) << (INT_BITS - 1))
+		return (u64(tag) << TAG_SHIFT) | payload, true
+	}
+	return 0, false
+}
+

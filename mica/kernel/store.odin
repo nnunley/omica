@@ -14,7 +14,6 @@ import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
-import "core:sort"
 import "core:sync"
 import v "../var"
 
@@ -65,6 +64,13 @@ Relation_Block :: struct {
 Secondary_Index :: struct {
 	positions: []u16,
 	rows:      []u32,
+	// Raw order keys parallel to `rows`, one column per position, for indexes
+	// whose values all have a raw word order (see `v.value_order_key`). Bounds
+	// searches then compare one word per position instead of decoding two
+	// values, and the build sorts words with a radix pass rather than a
+	// comparison sort over tuples. Nil when any value falls outside that set;
+	// the canonical comparator is used instead.
+	keys: [][]u64,
 }
 
 // --- Chunks ----------------------------------------------------------------
@@ -785,9 +791,260 @@ build_block_indexes :: proc(block: ^Relation_Block) {
 			positions = spec.positions,
 			rows      = rows,
 		}
-		sort_secondary_index(block, &index)
+		build_secondary_index(block, &index, alloc)
 		block.indexes[write] = index
 		write += 1
+	}
+}
+
+// Orders `index` by its key positions. When every value at those positions has
+// a raw order key, the rows are radix-sorted by word and the index keeps the
+// key columns for bounds searches. Otherwise a direct comparison sort uses the
+// canonical comparator. Radix is stable, which preserves the row-ordinal
+// tiebreak the comparison sort applies.
+@(private)
+build_secondary_index :: proc(
+	block: ^Relation_Block,
+	index: ^Secondary_Index,
+	alloc: mem.Allocator,
+) {
+	if build_index_keys(block, index, alloc) {
+		radix_sort_index_rows(index, alloc)
+		order_index_keys(index, alloc)
+		return
+	}
+	sort_index_rows(block, index)
+}
+
+// Materializes one raw key column per indexed position, in row order. Returns
+// false without touching `index.keys` when any value lacks a raw order key.
+@(private)
+build_index_keys :: proc(
+	block: ^Relation_Block,
+	index: ^Secondary_Index,
+	alloc: mem.Allocator,
+) -> bool {
+	if len(index.positions) == 0 {
+		return false
+	}
+	columns := make([][]u64, len(index.positions), alloc)
+	for position, column_index in index.positions {
+		column := make([]u64, block.count, alloc)
+		for row in 0 ..< block.count {
+			value := v.tuple_values(block.flat_rows[row])[int(position)]
+			key, key_ok := v.value_order_key(value)
+			if !key_ok {
+				delete(column, alloc)
+				return false
+			}
+			column[row] = key
+		}
+		columns[column_index] = column
+	}
+	index.keys = columns
+	return true
+}
+
+@(private)
+index_key_digit :: #force_inline proc(key: u64, shift: uint) -> u8 {
+	return u8((key >> shift) & 0xff)
+}
+
+// Stable LSD radix sort of the row permutation over every key column, least
+// significant position first. A pass whose keys all share one digit is skipped,
+// which for small identities leaves two or three passes per column.
+@(private)
+radix_sort_index_rows :: proc(index: ^Secondary_Index, alloc: mem.Allocator) {
+	n := len(index.rows)
+	if n < 2 || len(index.keys) == 0 {
+		return
+	}
+	tmp := make([]u32, n, alloc)
+	defer delete(tmp, alloc)
+	src, dst := index.rows, tmp
+	for column_index := len(index.keys) - 1; column_index >= 0; column_index -= 1 {
+		keys := index.keys[column_index]
+		for shift := uint(0); shift < 64; shift += 8 {
+			counts: [256]u32
+			for row in src {
+				counts[index_key_digit(keys[row], shift)] += 1
+			}
+			if counts[index_key_digit(keys[src[0]], shift)] == u32(n) {
+				continue
+			}
+			sum := u32(0)
+			for count, bucket in counts {
+				counts[bucket] = sum
+				sum += count
+			}
+			for row in src {
+				digit := index_key_digit(keys[row], shift)
+				dst[counts[digit]] = row
+				counts[digit] += 1
+			}
+			src, dst = dst, src
+		}
+	}
+	if &src[0] != &index.rows[0] {
+		copy(index.rows, src)
+	}
+}
+
+// Rewrites the row-order key columns into `rows` order so bounds searches touch
+// them directly.
+@(private)
+order_index_keys :: proc(index: ^Secondary_Index, alloc: mem.Allocator) {
+	ordered := make([][]u64, len(index.keys), alloc)
+	for keys, column in index.keys {
+		sorted := make([]u64, len(keys), alloc)
+		for row, i in index.rows {
+			sorted[i] = keys[row]
+		}
+		ordered[column] = sorted
+	}
+	index.keys = ordered
+}
+
+// Direct comparison sort for indexes that cannot use raw keys. The comparator
+// walks tuples, so unlike an interface-based sort this keeps the comparison
+// inline instead of calling through function pointers per comparison.
+@(private)
+sort_index_rows :: proc(block: ^Relation_Block, index: ^Secondary_Index) {
+	rows := index.rows
+	if len(rows) < 2 {
+		return
+	}
+	depth: u32 = 0
+	for n := len(rows); n > 1; n >>= 1 {
+		depth += 2
+	}
+	index_intro_sort(block, index.positions, rows, 0, len(rows) - 1, depth)
+}
+
+// Ranges shorter than this are insertion-sorted: the comparator is expensive,
+// so the quadratic scan only pays on short runs.
+INDEX_INSERTION_LIMIT :: 16
+
+@(private)
+index_intro_sort :: proc(
+	block: ^Relation_Block,
+	positions: []u16,
+	rows: []u32,
+	low, high: int,
+	depth: u32,
+) {
+	if high <= low {
+		return
+	}
+	if high - low < INDEX_INSERTION_LIMIT {
+		index_insertion_sort(block, positions, rows, low, high)
+		return
+	}
+	if depth == 0 {
+		index_heap_sort(block, positions, rows, low, high)
+		return
+	}
+	// Hoare partitioning: `pivot` is the last index of the lower partition.
+	pivot := index_partition(block, positions, rows, low, high)
+	index_intro_sort(block, positions, rows, low, pivot, depth - 1)
+	index_intro_sort(block, positions, rows, pivot + 1, high, depth - 1)
+}
+
+@(private)
+index_insertion_sort :: proc(
+	block: ^Relation_Block,
+	positions: []u16,
+	rows: []u32,
+	low, high: int,
+) {
+	for index in low + 1 ..= high {
+		current := rows[index]
+		position := index
+		for position > low &&
+		    compare_index_rows(block, positions, current, rows[position - 1]) == .Less {
+			rows[position] = rows[position - 1]
+			position -= 1
+		}
+		rows[position] = current
+	}
+}
+
+@(private)
+index_partition :: proc(
+	block: ^Relation_Block,
+	positions: []u16,
+	rows: []u32,
+	low, high: int,
+) -> int {
+	// Median of three, then Hoare-style partitioning around the pivot value.
+	mid := low + (high - low) / 2
+	if compare_index_rows(block, positions, rows[mid], rows[low]) == .Less {
+		rows[low], rows[mid] = rows[mid], rows[low]
+	}
+	if compare_index_rows(block, positions, rows[high], rows[low]) == .Less {
+		rows[low], rows[high] = rows[high], rows[low]
+	}
+	if compare_index_rows(block, positions, rows[high], rows[mid]) == .Less {
+		rows[mid], rows[high] = rows[high], rows[mid]
+	}
+	pivot := rows[mid]
+	left := low
+	right := high
+	for {
+		for compare_index_rows(block, positions, rows[left], pivot) == .Less {
+			left += 1
+		}
+		for compare_index_rows(block, positions, rows[right], pivot) == .Greater {
+			right -= 1
+		}
+		if left >= right {
+			return right
+		}
+		rows[left], rows[right] = rows[right], rows[left]
+		left += 1
+		right -= 1
+	}
+}
+
+@(private)
+index_heap_sort :: proc(
+	block: ^Relation_Block,
+	positions: []u16,
+	rows: []u32,
+	low, high: int,
+) {
+	count := high - low + 1
+	for start := count / 2 - 1; start >= 0; start -= 1 {
+		index_sift_down(block, positions, rows, low, start, count)
+	}
+	for end := count - 1; end > 0; end -= 1 {
+		rows[low], rows[low + end] = rows[low + end], rows[low]
+		index_sift_down(block, positions, rows, low, 0, end)
+	}
+}
+
+@(private)
+index_sift_down :: proc(
+	block: ^Relation_Block,
+	positions: []u16,
+	rows: []u32,
+	low, start, count: int,
+) {
+	root := start
+	for {
+		child := 2 * root + 1
+		if child >= count {
+			return
+		}
+		if child + 1 < count &&
+		   compare_index_rows(block, positions, rows[low + child], rows[low + child + 1]) == .Less {
+			child += 1
+		}
+		if compare_index_rows(block, positions, rows[low + root], rows[low + child]) != .Less {
+			return
+		}
+		rows[low + root], rows[low + child] = rows[low + child], rows[low + root]
+		root = child
 	}
 }
 
@@ -800,50 +1057,6 @@ relation_block_ensure_indexes :: proc(block: ^Relation_Block) {
 	sync.once_do(&block.indexes_once, proc(data: rawptr) {
 		build_block_indexes((^Relation_Block)(data))
 	}, block)
-}
-
-@(private)
-Index_Sort_Context :: struct {
-	block:     ^Relation_Block,
-	positions: []u16,
-	rows:      []u32,
-}
-
-@(private)
-index_sort_len :: proc(it: sort.Interface) -> int {
-	return len((^Index_Sort_Context)(it.collection).rows)
-}
-
-@(private)
-index_sort_less :: proc(it: sort.Interface, i, j: int) -> bool {
-	ctx := (^Index_Sort_Context)(it.collection)
-	return compare_index_rows(
-		ctx.block,
-		ctx.positions,
-		ctx.rows[i],
-		ctx.rows[j],
-	) == .Less
-}
-
-@(private)
-index_sort_swap :: proc(it: sort.Interface, i, j: int) {
-	ctx := (^Index_Sort_Context)(it.collection)
-	ctx.rows[i], ctx.rows[j] = ctx.rows[j], ctx.rows[i]
-}
-
-@(private)
-sort_secondary_index :: proc(block: ^Relation_Block, index: ^Secondary_Index) {
-	ctx := Index_Sort_Context {
-		block     = block,
-		positions = index.positions,
-		rows      = index.rows,
-	}
-	sort.sort(sort.Interface {
-		collection = &ctx,
-		len = index_sort_len,
-		less = index_sort_less,
-		swap = index_sort_swap,
-	})
 }
 
 @(private)
@@ -889,6 +1102,51 @@ compare_index_prefix :: proc(
 	return .Equal
 }
 
+// A bounds search compares at most this many leading positions with raw keys.
+// Wider probes fall back to the canonical comparator.
+INDEX_PROBE_MAX :: 8
+
+// Fills `out` with the raw order key of each leading binding. Returns false
+// when the index keeps no key columns or any binding value lacks a raw order
+// key, so the search must use the canonical comparator.
+@(private)
+index_probe_keys :: proc(
+	index: ^Secondary_Index,
+	bindings: []v.Binding,
+	count: int,
+	out: []u64,
+) -> bool {
+	if len(index.keys) == 0 || count > INDEX_PROBE_MAX || count > len(index.keys) {
+		return false
+	}
+	for i in 0 ..< count {
+		key, key_ok := v.value_order_key(bindings[int(index.positions[i])].value)
+		if !key_ok {
+			return false
+		}
+		out[i] = key
+	}
+	return true
+}
+
+@(private)
+compare_index_key_prefix :: proc(
+	index: ^Secondary_Index,
+	row: int,
+	probe: []u64,
+) -> v.Ordering {
+	for column in 0 ..< len(probe) {
+		key := index.keys[column][row]
+		if key < probe[column] {
+			return .Less
+		}
+		if key > probe[column] {
+			return .Greater
+		}
+	}
+	return .Equal
+}
+
 @(private)
 index_lower_bound :: proc(
 	block: ^Relation_Block,
@@ -896,6 +1154,21 @@ index_lower_bound :: proc(
 	bindings: []v.Binding,
 	count: int,
 ) -> int {
+	if count <= INDEX_PROBE_MAX {
+		probe: [INDEX_PROBE_MAX]u64
+		if index_probe_keys(index, bindings, count, probe[:count]) {
+			lo, hi := 0, len(index.rows)
+			for lo < hi {
+				mid := (lo + hi) / 2
+				if compare_index_key_prefix(index, mid, probe[:count]) == .Less {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			return lo
+		}
+	}
 	lo, hi := 0, len(index.rows)
 	for lo < hi {
 		mid := (lo + hi) / 2
@@ -916,6 +1189,21 @@ index_upper_bound :: proc(
 	bindings: []v.Binding,
 	count: int,
 ) -> int {
+	if count <= INDEX_PROBE_MAX {
+		probe: [INDEX_PROBE_MAX]u64
+		if index_probe_keys(index, bindings, count, probe[:count]) {
+			lo, hi := 0, len(index.rows)
+			for lo < hi {
+				mid := (lo + hi) / 2
+				if compare_index_key_prefix(index, mid, probe[:count]) != .Greater {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			return lo
+		}
+	}
 	lo, hi := 0, len(index.rows)
 	for lo < hi {
 		mid := (lo + hi) / 2

@@ -435,6 +435,59 @@ test_secondary_index_scan_returns_matching_rows :: proc(t: ^testing.T) {
 	delete(rows)
 }
 
+// Exercises the raw key columns: int keys include negatives, whose sign bit is
+// flipped so word order matches numeric order.
+@(test)
+test_secondary_index_raw_int_keys :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	indexes := [1]Index_Spec{index_spec([]u16{1})}
+	relation := create_relation_with(&kernel, 1, "Scored", 3, conflict_set(), indexes[:])
+
+	tx := kernel_begin(&kernel)
+	for row in 0 ..< 8 {
+		transaction_assert(
+			&tx,
+			relation,
+			tuple_of(must_identity(u64(row)), must_int(i64(row) * 7 - 20), must_int(0)),
+		)
+	}
+	commit_transaction(t, &tx)
+
+	// Keys: -20, -13, -6, 1, 8, 15, 22, 29.
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, must_int(-20)), 1)
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, must_int(8)), 1)
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, must_int(7)), 0)
+}
+
+// String keys have no raw word order, so the index takes the canonical
+// comparison sort and the canonical bounds search.
+@(test)
+test_secondary_index_string_keys :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	indexes := [1]Index_Spec{index_spec([]u16{1})}
+	relation := create_relation_with(&kernel, 1, "Tagged", 3, conflict_set(), indexes[:])
+
+	blue := v.value_string(context.temp_allocator, "blue")
+	green := v.value_string(context.temp_allocator, "green")
+	red := v.value_string(context.temp_allocator, "red")
+
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, relation, tuple_of(must_identity(1), blue, must_int(0)))
+	transaction_assert(&tx, relation, tuple_of(must_identity(2), green, must_int(0)))
+	transaction_assert(&tx, relation, tuple_of(must_identity(3), blue, must_int(0)))
+	commit_transaction(t, &tx)
+
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, blue), 2)
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, green), 1)
+	testing.expect_value(t, scan_count_for_key(&kernel, relation, red), 0)
+}
+
 // A recycled pool arena must not hand a new block the previous block's index:
 // the frame allocator returns non-zeroed memory, so the constructors must
 // clear the fields `new` would otherwise have zeroed.
