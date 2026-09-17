@@ -18,6 +18,7 @@ import "core:strings"
 import "core:time"
 
 import "core:mem/virtual"
+import dom "../../mica/dom"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
 import s "../../mica/store"
@@ -329,20 +330,22 @@ run_load :: proc(
 		}
 	}
 	for limit <= 0 || subjects_done < limit {
-		tag, ok := next_tag(xml_text, pos)
+		tag, ok := dom.dom_xml_next_tag(xml_text, pos)
 		if !ok {
 			break
 		}
 		pos = tag.end
-		if !tag.is_subject {
+		if !is_subject(tag) {
 			continue
 		}
-		about, about_ok := attr_value(tag.head, ABOUT_ATTR)
+		about, about_ok := dom.dom_xml_attr_value(tag.head, ABOUT_ATTR)
 		frag := frag_of(about)
 		if !about_ok || frag == "" || !is_guid(frag) {
 			// owl:Ontology, AnnotationProperty declarations, etc.
 			ld.stats.skipped += 1
-			skip_subject(xml_text, &pos, tag)
+			if end, skip_ok := dom.dom_xml_skip_element(xml_text, tag); skip_ok {
+				pos = end
+			}
 			continue
 		}
 		subj := intern_guid(&ld, frag)
@@ -523,26 +526,6 @@ preseed_identities :: proc(ld: ^Loader) {
 	}
 	if len(rows) > 0 {
 		fmt.eprintf("  ... pre-seeded %d committed identities\n", len(ld.identities))
-	}
-}
-
-// Skips from just past a subject's open tag to just past its matching close
-// tag. A self-closing subject has no body, so there is nothing to skip.
-skip_subject :: proc(xml_text: string, pos: ^int, subject: Tag) {
-	depth := subject.kind == .Self_Close ? 0 : 1
-	for depth > 0 {
-		tag, ok := next_tag(xml_text, pos^)
-		if !ok {
-			return
-		}
-		pos^ = tag.end
-		switch tag.kind {
-		case .Open:
-			depth += 1
-		case .Close:
-			depth -= 1
-		case .Self_Close:
-		}
 	}
 }
 
@@ -731,10 +714,10 @@ save_resume_state :: proc(ld: ^Loader, owl_path: string, pos: int, subjects: int
 
 // Scans one subject's children, queueing one assertion per triple. Advances
 // *pos past the subject's close tag. A self-closing subject has no children.
-scan_subject_children :: proc(ld: ^Loader, xml_text: string, pos: ^int, subject: Tag, subj: v.Value) {
+scan_subject_children :: proc(ld: ^Loader, xml_text: string, pos: ^int, subject: dom.Dom_Xml_Tag, subj: v.Value) {
 	depth := subject.kind == .Self_Close ? 0 : 1
 	for depth > 0 {
-		tag, ok := next_tag(xml_text, pos^)
+		tag, ok := dom.dom_xml_next_tag(xml_text, pos^)
 		if !ok {
 			return
 		}
@@ -751,12 +734,12 @@ scan_subject_children :: proc(ld: ^Loader, xml_text: string, pos: ^int, subject:
 		if field == .None {
 			continue
 		}
-		resource, has_resource := attr_value(tag.head, RESOURCE_ATTR)
+		resource, has_resource := dom.dom_xml_attr_value(tag.head, RESOURCE_ATTR)
 		if has_resource || tag.kind != .Open {
 			queue_triple(ld, subj, field, "", false, resource, has_resource)
 			continue
 		}
-		literal, is_cdata, end, text_ok := element_text(xml_text, tag)
+		literal, is_cdata, end, text_ok := dom.dom_xml_element_text(xml_text, tag)
 		if !text_ok {
 			return
 		}
@@ -766,49 +749,6 @@ scan_subject_children :: proc(ld: ^Loader, xml_text: string, pos: ^int, subject:
 		depth -= 1
 		queue_triple(ld, subj, field, literal, is_cdata, "", false)
 	}
-}
-
-CDATA_OPEN :: "<![CDATA["
-CDATA_CLOSE :: "]]>"
-
-// Returns the text between an open tag and its matching close, and the
-// offset just past that close. A CDATA section is unwrapped and taken
-// verbatim: OpenCyc comments are CDATA holding HTML (<a href=...>), which is
-// content, not structure, and need not be balanced.
-element_text :: proc(xml_text: string, open: Tag) -> (text: string, is_cdata: bool, end: int, ok: bool) {
-	body := xml_text[open.end:]
-	if strings.has_prefix(body, CDATA_OPEN) {
-		stop := strings.index(body, CDATA_CLOSE)
-		if stop < 0 {
-			return "", false, 0, false
-		}
-		text = body[len(CDATA_OPEN):stop]
-		close, close_ok := next_tag(xml_text, open.end + stop + len(CDATA_CLOSE))
-		if !close_ok || close.kind != .Close {
-			return "", false, 0, false
-		}
-		return text, true, close.end, true
-	}
-	depth := 1
-	pos := open.end
-	for depth > 0 {
-		tag, tag_ok := next_tag(xml_text, pos)
-		if !tag_ok {
-			return "", false, 0, false
-		}
-		pos = tag.end
-		switch tag.kind {
-		case .Open:
-			depth += 1
-		case .Close:
-			depth -= 1
-			if depth == 0 {
-				return xml_text[open.end:tag.start], false, tag.end, true
-			}
-		case .Self_Close:
-		}
-	}
-	return "", false, 0, false
 }
 
 // Queues one assertion for a triple. Resource objects that are GUIDs become
@@ -837,9 +777,11 @@ queue_triple :: proc(
 		}
 		return
 	}
+	// CDATA is written verbatim by the source (OpenCyc comments hold HTML),
+	// so only plain text is entity-decoded.
 	text := strings.trim_space(literal)
 	if !is_cdata {
-		text = decode_entities(text, ld.batch_alloc)
+		text = dom.dom_xml_decode_entities_into(text, ld.batch_alloc)
 	}
 	if text == "" {
 		ld.stats.skipped += 1
