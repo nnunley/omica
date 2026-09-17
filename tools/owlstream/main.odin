@@ -22,13 +22,13 @@ package main
 
 import "core:bytes"
 import "core:compress/gzip"
-import "core:encoding/entity"
 import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:time"
 
+import dom "../../mica/dom"
 import s "../../mica/store"
 
 // GUID predicates in opencyc-latest.owl, mapped to bycycle relations.
@@ -222,12 +222,12 @@ run_census :: proc(xml_text: string) {
 	pos := 0
 	n_subjects := 0
 	for {
-		tag, ok := next_tag(xml_text, pos)
+		tag, ok := dom.dom_xml_next_tag(xml_text, pos)
 		if !ok {
 			break
 		}
 		pos = tag.end
-		if !tag.is_subject {
+		if !is_subject(tag) {
 			continue
 		}
 		n_subjects += 1
@@ -235,7 +235,7 @@ run_census :: proc(xml_text: string) {
 		// scan children until matching close
 		depth := tag.kind == .Self_Close ? 0 : 1
 		for depth > 0 {
-			child, child_ok := next_tag(xml_text, pos)
+			child, child_ok := dom.dom_xml_next_tag(xml_text, pos)
 			if !child_ok {
 				break
 			}
@@ -248,7 +248,7 @@ run_census :: proc(xml_text: string) {
 				depth += 1
 			case .Self_Close:
 			}
-			if !child.is_subject {
+			if !is_subject(child) {
 				preds[child.name] = (preds[child.name] or_else 0) + 1
 			}
 		}
@@ -288,104 +288,14 @@ print_top :: proc(counts: map[string]int, n: int) {
 	}
 }
 
-// --- line-oriented streaming scanner --------------------------------------
-//
 // The OWL is machine-generated: one element per line, children indented
-// under their subject. We scan for `<tag ...>` / `</tag>` / `<tag .../>`
-// boundaries without building a DOM. Attribute values needed: rdf:about and
-// rdf:resource. Text content is entity-decoded via core:encoding/entity.
+// under their subject. mica/dom's streaming scanner finds the tag boundaries;
+// a tag carrying rdf:about opens a subject.
 
-Tag_Kind :: enum {
-	Open,
-	Close,
-	Self_Close,
-}
+ABOUT_ATTR :: "rdf:about"
+RESOURCE_ATTR :: "rdf:resource"
 
-// One `<...>` in the input. Comments and processing instructions never
-// surface as tags.
-Tag :: struct {
-	kind:       Tag_Kind,
-	// Byte offsets of `<` and just past `>`.
-	start, end: int,
-	// Raw tag name (with namespace prefix); empty for a close tag.
-	name:       string,
-	// text[start:end], for attribute lookup.
-	head:       string,
-	// Whether the tag carries rdf:about, i.e. opens a subject.
-	is_subject: bool,
-}
-
-// Attribute needles for attr_value, in the form the input writes them.
-ABOUT_ATTR :: `rdf:about="`
-RESOURCE_ATTR :: `rdf:resource="`
-
-// Finds the next tag at or after pos. Returns ok=false at end of input or on
-// an unterminated tag.
 @(private)
-next_tag :: proc(text: string, pos: int) -> (tag: Tag, ok: bool) {
-	i := max(pos, 0)
-	for i < len(text) {
-		rel := strings.index_byte(text[i:], '<')
-		if rel < 0 || i + rel + 1 >= len(text) {
-			return {}, false
-		}
-		i += rel
-		switch text[i + 1] {
-		case '?', '!':
-			i += 2
-			continue
-		case '/':
-			tag.kind = .Close
-		case:
-			tag.kind = .Open
-		}
-		gt := strings.index_byte(text[i:], '>')
-		if gt < 0 {
-			return {}, false
-		}
-		tag.start = i
-		tag.end = i + gt + 1
-		tag.head = text[tag.start:tag.end]
-		if tag.kind == .Open {
-			if text[tag.end - 2] == '/' {
-				tag.kind = .Self_Close
-			}
-			// tag name ends at whitespace, /, or >
-			j := 1
-			for j < len(tag.head) && strings.index_byte(" \t\n\r/>", tag.head[j]) < 0 {
-				j += 1
-			}
-			tag.name = tag.head[1:j]
-			tag.is_subject = strings.contains(tag.head, ABOUT_ATTR)
-		}
-		return tag, true
-	}
-	return {}, false
-}
-
-// Extracts the value of an attribute from a tag head; needle is the attribute
-// name followed by `="`.
-@(private)
-attr_value :: proc(head: string, needle: string) -> (string, bool) {
-	at := strings.index(head, needle)
-	if at < 0 {
-		return "", false
-	}
-	rest := head[at + len(needle):]
-	end := strings.index_byte(rest, '"')
-	if end < 0 {
-		return "", false
-	}
-	return rest[:end], true
-}
-
-// Decodes XML entities in literal text (&amp; &#65; &#x42; &quot; ...) into
-// allocator. Malformed entities pass through untouched.
-@(private)
-decode_entities :: proc(text: string, allocator := context.allocator) -> string {
-	out, err := entity.decode_xml(text, {.Comment_Strip}, allocator)
-	if err != .None {
-		return strings.clone(text, allocator)
-	}
-	return out
+is_subject :: proc(tag: dom.Dom_Xml_Tag) -> bool {
+	return tag.kind != .Close && strings.contains(tag.head, ABOUT_ATTR + `="`)
 }
