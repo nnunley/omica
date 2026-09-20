@@ -14,6 +14,7 @@ import "core:mem"
 import "core:os"
 import "core:path/filepath"
 import "core:sync"
+import buf "../buffer"
 import k "../kernel"
 import v "../var"
 
@@ -56,6 +57,8 @@ wal_encode_metadata :: proc(out: ^[dynamic]u8, metadata: k.Relation_Metadata) ->
 		codec_write_u32(out, u32(position))
 	}
 	codec_write_u8(out, u8(metadata.durability))
+	codec_write_u8(out, u8(metadata.storage))
+	codec_write_u8(out, metadata.tombstoned ? 1 : 0)
 	return .None
 }
 
@@ -127,7 +130,7 @@ wal_decode_metadata :: proc(
 	if conflict_error != .None {
 		return {}, conflict_error
 	}
-	if conflict_byte > u8(k.Conflict_Kind.Event_Append) {
+	if conflict_byte > u8(k.Conflict_Kind.Whole) {
 		return {}, .Bad_Tag
 	}
 	key_count, key_error := codec_read_u32(reader)
@@ -152,6 +155,17 @@ wal_decode_metadata :: proc(
 	if durability_byte > u8(k.Relation_Durability.Volatile) {
 		return {}, .Bad_Tag
 	}
+	storage_byte, storage_error := codec_read_u8(reader)
+	if storage_error != .None {
+		return {}, storage_error
+	}
+	if storage_byte > u8(k.Storage_Kind.Buffer) {
+		return {}, .Bad_Tag
+	}
+	tombstoned_byte, tombstoned_error := codec_read_u8(reader)
+	if tombstoned_error != .None {
+		return {}, tombstoned_error
+	}
 	return k.Relation_Metadata {
 			id = k.Relation_ID(id),
 			name = v.symbol_intern(name),
@@ -163,6 +177,8 @@ wal_decode_metadata :: proc(
 				key_positions = key_positions,
 			},
 			durability = k.Relation_Durability(durability_byte),
+			storage = k.Storage_Kind(storage_byte),
+			tombstoned = tombstoned_byte != 0,
 		},
 		.None
 }
@@ -187,6 +203,19 @@ wal_encode_record :: proc(out: ^[dynamic]u8, record: ^Wal_Record) -> Codec_Error
 	for catalog in record.catalog {
 		if error := wal_encode_metadata(&payload, catalog.metadata); error != .None {
 			return error
+		}
+	}
+	codec_write_u32(&payload, u32(len(record.buffers)))
+	for buffer in record.buffers {
+		codec_write_u32(&payload, u32(buffer.relation))
+		codec_write_u64(&payload, buffer.base_revision)
+		codec_write_u64(&payload, buffer.new_revision)
+		codec_write_u64(&payload, buffer.epoch)
+		codec_write_u32(&payload, u32(len(buffer.replacements)))
+		for replacement in buffer.replacements {
+			codec_write_u32(&payload, u32(replacement.start))
+			codec_write_u32(&payload, u32(replacement.end))
+			codec_write_string(&payload, replacement.text)
 		}
 	}
 	codec_write_u32(out, u32(len(payload)))
@@ -272,11 +301,77 @@ wal_decode_record :: proc(
 		}
 		catalog[index] = Wal_Catalog{metadata = metadata}
 	}
+	buffer_count, buffer_error := codec_read_u32(&reader)
+	if buffer_error != .None {
+		return {}, buffer_error
+	}
+	if !codec_count_allowed(&reader, buffer_count, 9) {
+		return {}, .Truncated
+	}
+	buffers := make([]Wal_Buffer, int(buffer_count), allocator)
+	for index in 0 ..< int(buffer_count) {
+		relation, relation_error := codec_read_u32(&reader)
+		if relation_error != .None {
+			return {}, relation_error
+		}
+		base_revision, base_error := codec_read_u64(&reader)
+		if base_error != .None {
+			return {}, base_error
+		}
+		new_revision, new_error := codec_read_u64(&reader)
+		if new_error != .None {
+			return {}, new_error
+		}
+		epoch, epoch_error := codec_read_u64(&reader)
+		if epoch_error != .None {
+			return {}, epoch_error
+		}
+		replacement_count, replacement_error := codec_read_u32(&reader)
+		if replacement_error != .None {
+			return {}, replacement_error
+		}
+		if !codec_count_allowed(&reader, replacement_count, 9) {
+			return {}, .Truncated
+		}
+		replacements := make([]Wal_Replacement, int(replacement_count), allocator)
+		for replacement_index in 0 ..< int(replacement_count) {
+			start, start_error := codec_read_u32(&reader)
+			if start_error != .None {
+				return {}, start_error
+			}
+			end, end_error := codec_read_u32(&reader)
+			if end_error != .None {
+				return {}, end_error
+			}
+			text, text_error := codec_read_string(&reader, allocator)
+			if text_error != .None {
+				return {}, text_error
+			}
+			replacements[replacement_index] = Wal_Replacement {
+				start = int(start),
+				end   = int(end),
+				text  = text,
+			}
+		}
+		buffers[index] = Wal_Buffer {
+			relation = k.Relation_ID(relation),
+			base_revision = base_revision,
+			new_revision = new_revision,
+			epoch = epoch,
+			replacements = replacements,
+		}
+	}
 	if reader.cursor != len(payload) {
 		return {}, .Bad_Tag
 	}
 	cursor^ = position + 8 + int(length)
-	return Wal_Record{version = version, writes = writes, catalog = catalog}, .None
+	return Wal_Record {
+			version = version,
+			writes = writes,
+			catalog = catalog,
+			buffers = buffers,
+		},
+		.None
 }
 
 // Opens (or creates) the WAL under `path` and recovers its records. Returns
@@ -392,6 +487,7 @@ store_wal_append_batch :: proc(store: ^Store, entries: []Queue_Entry) -> bool {
 			version = entry.version,
 			writes  = entry.writes,
 			catalog = entry.catalog,
+			buffers = entry.buffers,
 		}
 		clear(&buffer)
 		if encode_error := wal_encode_record(&buffer, &record); encode_error != .None {
@@ -578,6 +674,15 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 
 		for record_index in group_start ..< group_end {
 			for catalog in records[record_index].catalog {
+				if catalog.metadata.tombstoned {
+					if tombstone_error := k.kernel_tombstone_relation(
+						kernel,
+						catalog.metadata,
+					); tombstone_error != .None {
+						return false
+					}
+					continue
+				}
 				created, create_error := k.kernel_create_relation(kernel, catalog.metadata)
 				if create_error == .Duplicate_Relation_Name || create_error == .Invalid_Metadata {
 					continue
@@ -616,6 +721,38 @@ store_restore :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 				}
 			}
 		}
+		// Buffer content recorded at this version. It joins the same
+		// transaction as the relation writes, so a version replays atomically.
+		for record_index in group_start ..< group_end {
+			for buffer in records[record_index].buffers {
+				replacements := make(
+					[]buf.Replacement,
+					len(buffer.replacements),
+					context.temp_allocator,
+				)
+				for replacement, index in buffer.replacements {
+					replacements[index] = buf.Replacement {
+						start = replacement.start,
+						end   = replacement.end,
+						text  = replacement.text,
+					}
+				}
+				apply_error := k.transaction_buffer_apply_delta(
+					&transaction,
+					buffer.relation,
+					buffer.base_revision,
+					buffer.new_revision,
+					buffer.epoch,
+					buf.Delta{replacements = replacements},
+				)
+				if apply_error != .None {
+					k.transaction_destroy(&transaction)
+					return false
+				}
+				has_writes = true
+			}
+		}
+
 		if !has_writes {
 			k.transaction_destroy(&transaction)
 		} else {

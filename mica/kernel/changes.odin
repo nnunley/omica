@@ -7,7 +7,9 @@
 package kernel
 
 import "core:mem"
+import "core:strings"
 import "core:sync"
+import buf "../buffer"
 import v "../var"
 
 // What kind of catalog change a record carries.
@@ -26,12 +28,27 @@ Catalog_Change :: struct {
 	name:     v.Symbol,
 }
 
+// A buffer content change visible at a version.
+//
+// The delta is the committed base-relative change -- the same one recorded in
+// the log -- so an observer can apply it to its own copy of the text without
+// holding a snapshot. `epoch` is carried because a compaction publishes an empty
+// delta and a new epoch: the content is unchanged, but the chunk lineage moved.
+Buffer_Change :: struct {
+	relation:      Relation_ID,
+	base_revision: u64,
+	new_revision:  u64,
+	epoch:         u64,
+	delta:         buf.Delta,
+}
+
 Change_Record :: struct {
 	version:   u64,
 	relation:  Relation_ID,
 	asserted:  []v.Tuple,
 	retracted: []v.Tuple,
 	catalogue: []Catalog_Change,
+	buffers:   []Buffer_Change,
 }
 
 Change_Feed :: struct {
@@ -55,24 +72,54 @@ changes_init :: proc(
 }
 
 changes_destroy :: proc(feed: ^Change_Feed) {
-	for record in feed.records {
-		for tuple in record.asserted {
-			tuple_deep_free(feed.allocator, tuple)
-		}
-		for tuple in record.retracted {
-			tuple_deep_free(feed.allocator, tuple)
-		}
-		if record.asserted != nil {
-			delete(record.asserted, feed.allocator)
-		}
-		if record.retracted != nil {
-			delete(record.retracted, feed.allocator)
-		}
-		if record.catalogue != nil {
-			delete(record.catalogue, feed.allocator)
-		}
+	for &record in feed.records {
+		change_record_free(feed, &record)
 	}
 	delete(feed.records)
+}
+
+// Releases everything a record owns: deep-copied tuples, the catalogue slice,
+// and deep-copied buffer delta texts.
+@(private)
+change_record_free :: proc(feed: ^Change_Feed, record: ^Change_Record) {
+	for tuple in record.asserted {
+		tuple_deep_free(feed.allocator, tuple)
+	}
+	for tuple in record.retracted {
+		tuple_deep_free(feed.allocator, tuple)
+	}
+	if record.asserted != nil {
+		delete(record.asserted, feed.allocator)
+	}
+	if record.retracted != nil {
+		delete(record.retracted, feed.allocator)
+	}
+	if record.catalogue != nil {
+		delete(record.catalogue, feed.allocator)
+	}
+	for &change in record.buffers {
+		for replacement in change.delta.replacements {
+			if replacement.text != "" {
+				delete(replacement.text, feed.allocator)
+			}
+		}
+		if change.delta.replacements != nil {
+			delete(change.delta.replacements, feed.allocator)
+		}
+	}
+	if record.buffers != nil {
+		delete(record.buffers, feed.allocator)
+	}
+}
+
+// Drops the oldest records until the feed fits its capacity. Subscribers that
+// fall behind resynchronize from the current snapshot.
+@(private)
+changes_trim :: proc(feed: ^Change_Feed) {
+	for len(feed.records) > feed.capacity {
+		change_record_free(feed, &feed.records[0])
+		ordered_remove_first(&feed.records)
+	}
 }
 
 // Notes a published version even when it carries no fact changes.
@@ -120,21 +167,56 @@ changes_record_writes :: proc(
 	}
 	// Evict the oldest records beyond capacity. Subscribers that fall behind
 	// resynchronize from the current snapshot.
-	for len(feed.records) > feed.capacity {
-		record := feed.records[0]
-		for tuple in record.asserted {
-			tuple_deep_free(feed.allocator, tuple)
-		}
-		for tuple in record.retracted {
-			tuple_deep_free(feed.allocator, tuple)
-		}
-		delete(record.asserted, feed.allocator)
-		delete(record.retracted, feed.allocator)
-		if record.catalogue != nil {
-			delete(record.catalogue, feed.allocator)
-		}
-		ordered_remove_first(&feed.records)
+	changes_trim(feed)
+}
+
+// Records the buffer content changes that became visible at `version`.
+//
+// A buffer write carries no tuples: its payload is the committed base-relative
+// delta, which is deep-copied into the feed so an observer can apply it to its
+// own copy of the text. A compaction publishes an empty delta and a new epoch,
+// and is recorded too, because the lineage change is observable.
+changes_record_buffers :: proc(
+	feed: ^Change_Feed,
+	version: u64,
+	writes: []Buffer_Writes,
+) {
+	sync.mutex_lock(&feed.lock)
+	defer sync.mutex_unlock(&feed.lock)
+	if version > feed.latest {
+		feed.latest = version
 	}
+	for buffer_writes in writes {
+		if !buffer_writes.committed {
+			continue
+		}
+		replacements := make(
+			[]buf.Replacement,
+			len(buffer_writes.delta.replacements),
+			feed.allocator,
+		)
+		for replacement, index in buffer_writes.delta.replacements {
+			text := replacement.text
+			if text != "" {
+				text = strings.clone(replacement.text, feed.allocator)
+			}
+			replacements[index] = buf.Replacement {
+				start = replacement.start,
+				end   = replacement.end,
+				text  = text,
+			}
+		}
+		buffers := make([]Buffer_Change, 1, feed.allocator)
+		buffers[0] = Buffer_Change {
+			relation      = buffer_writes.relation,
+			base_revision = buffer_writes.base_revision,
+			new_revision  = buffer_writes.new_revision,
+			epoch         = buffer_writes.epoch,
+			delta         = buf.Delta{replacements = replacements},
+		}
+		append(&feed.records, Change_Record{version = version, buffers = buffers})
+	}
+	changes_trim(feed)
 }
 
 // Records catalog changes that became visible at `version`: relation creation,
@@ -155,21 +237,7 @@ changes_record_catalog :: proc(
 	copied := make([]Catalog_Change, len(changes), feed.allocator)
 	copy(copied, changes)
 	append(&feed.records, Change_Record{version = version, catalogue = copied})
-	for len(feed.records) > feed.capacity {
-		record := feed.records[0]
-		for tuple in record.asserted {
-			tuple_deep_free(feed.allocator, tuple)
-		}
-		for tuple in record.retracted {
-			tuple_deep_free(feed.allocator, tuple)
-		}
-		delete(record.asserted, feed.allocator)
-		delete(record.retracted, feed.allocator)
-		if record.catalogue != nil {
-			delete(record.catalogue, feed.allocator)
-		}
-		ordered_remove_first(&feed.records)
-	}
+	changes_trim(feed)
 }
 
 // Visits records with a version greater than `cursor`. Returns the newest

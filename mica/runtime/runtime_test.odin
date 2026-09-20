@@ -2415,6 +2415,82 @@ end
 }
 
 @(test)
+test_run_buffer_subscription_changes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Seen, 1)
+make_buffer(:notes, :durable)
+buffer_insert(:notes, 0, "hello")
+commit()
+let [receiver, sender] = mailbox()
+let sub = subscribe_changes(sender, :buffer, some(:notes), [], :changes)
+buffer_insert(:notes, 5, " world")
+commit()
+let ready = mailbox_recv([receiver])
+let message = ready[0][1][0]
+require(index_or(message, :kind, none) == :changes)
+require(index_or(message, :subject, none) == :buffer)
+let changes = index_or(message, :changes, [])
+require(len(changes) == 1)
+let change = changes[0]
+require(change[:base_revision] == 1)
+require(change[:new_revision] == 2)
+let edits = change[:edits]
+require(len(edits) == 1)
+require(edits[0][:at] == 5)
+require(edits[0][:remove] == 0)
+require(edits[0][:text] == " world")
+cancel_subscription(sub)
+assert Seen(1)
+`
+	path, path_ok := write_temp_source(t, "mica_buffer_subscription_changes_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Seen", 1)
+}
+
+@(test)
+test_run_buffer_subscription_snapshot :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Seen, 1)
+make_buffer(:notes, :durable)
+buffer_insert(:notes, 0, "current text")
+commit()
+let [receiver, sender] = mailbox()
+let sub = subscribe_changes(sender, :buffer, some(:notes), [], :snapshot)
+let ready = mailbox_recv([receiver])
+let message = ready[0][1][0]
+require(index_or(message, :kind, none) == :snapshot)
+require(index_or(message, :subject, none) == :buffer)
+require(index_or(message, :revision, none) == 1)
+require(index_or(message, :text, none) == "current text")
+cancel_subscription(sub)
+assert Seen(1)
+`
+	path, path_ok := write_temp_source(t, "mica_buffer_subscription_snapshot_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Seen", 1)
+}
+
+@(test)
 test_run_json_roundtrip :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:Out, 1)
@@ -6674,4 +6750,198 @@ mica_parser_matches_odin :: proc(
 		return false
 	}
 	return true
+}
+
+// Locates the in-Mica buffer scenarios from whichever directory the test runs
+// in.
+@(private)
+buffer_scenario_path :: proc() -> string {
+	candidates := []string{
+		"apps/buffers/tests/buffer-scenarios.mica",
+		"../apps/buffers/tests/buffer-scenarios.mica",
+		"../../apps/buffers/tests/buffer-scenarios.mica",
+	}
+	for candidate in candidates {
+		if os.is_file(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// The buffer surface is a runtime feature, so its acceptance tests are written
+// in Mica and driven here. Each scenario verb runs as its own task, and
+// therefore its own transaction.
+@(test)
+test_buffer_builtins_mica_scenarios :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := buffer_scenario_path()
+	if path == "" {
+		testing.expect(t, false, "buffer scenario filein not found")
+		return
+	}
+
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(&kernel, []string{path}, alloc)
+	if !start.ok {
+		testing.expectf(t, false, "buffer scenarios failed to load: %s", start.message)
+		return
+	}
+	defer world_destroy(world)
+	started := world_wait(world, world.entry)
+	if started.kind != .Complete {
+		testing.expectf(
+			t,
+			false,
+			"buffer scenario load task did not complete: %s",
+			started.message,
+		)
+		return
+	}
+
+	verbs := []string {
+		"test/buffer_insert_read_and_measure",
+		"test/buffer_offsets_are_view_relative",
+		"test/buffer_replace_and_delete",
+		"test/buffer_line_accounting",
+		"test/buffer_scalars_not_bytes",
+		"test/buffers_are_independent",
+		"test/make_buffer_is_idempotent",
+		"test/buffer_unknown_name_is_rejected",
+		"test/buffer_revision_starts_at_zero_before_commit",
+		"test/buffer_compaction_is_accepted",
+		"test/buffer_apply_checks_revision_and_order",
+		"test/buffer_conflict_policy_is_selectable",
+		"test/kill_buffer_retires_the_name",
+		// Order matters: the first stages with a token, the second reads it.
+		"test/buffer_apply_records_completion",
+		"test/buffer_apply_completion_is_readable",
+		// Reversion needs committed history, so these publish three revisions
+		// before reverting to the first.
+		"test/buffer_revert_seed",
+		"test/buffer_revert_second_version",
+		"test/buffer_revert_third_version",
+		"test/buffer_revert_restores_an_earlier_revision",
+		"test/buffer_revert_reports_status",
+		// Compaction describes committed content, so these reach a committed
+		// buffer before exercising it.
+		"test/buffer_compaction_seed",
+		"test/buffer_compaction_refuses_a_moved_view",
+		"test/buffer_compaction_seals_the_view",
+		"test/buffer_find_locates_and_windows",
+		"test/buffer_lines_projects_spans",
+	}
+	for verb in verbs {
+		outcome := world_call(world, verb, nil)
+		detail := outcome.message
+		if error_value, is_error := v.value_as_error(outcome.error); is_error {
+			detail = error_value.message
+		}
+		testing.expectf(
+			t,
+			outcome.kind == .Complete,
+			"%s: kind=%v message=%s",
+			verb,
+			outcome.kind,
+			detail,
+		)
+	}
+}
+
+// Locates a file under `apps/` from whichever directory the test runs in.
+@(private)
+scenario_source_path :: proc(relative: string) -> string {
+	candidates := []string {
+		relative,
+		fmt.aprintf("../%s", relative, allocator = context.temp_allocator),
+		fmt.aprintf("../../%s", relative, allocator = context.temp_allocator),
+	}
+	for candidate in candidates {
+		if os.is_file(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// The marker and annotation layer is a library over world relations, so its
+// acceptance tests load the library and drive it the way an application would.
+// Each verb is its own task and therefore its own transaction; the sequence runs
+// from seeding through a token-tagged apply to rebasing by the committed delta.
+@(test)
+test_marker_builtins_mica_scenarios :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	library := scenario_source_path("apps/shared/buffers.mica")
+	scenarios := scenario_source_path("apps/buffers/tests/marker-scenarios.mica")
+	if library == "" || scenarios == "" {
+		testing.expect(t, false, "marker scenario sources not found")
+		return
+	}
+
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(&kernel, []string{library, scenarios}, alloc)
+	if !start.ok {
+		testing.expectf(t, false, "marker scenarios failed to load: %s", start.message)
+		return
+	}
+	defer world_destroy(world)
+	started := world_wait(world, world.entry)
+	if started.kind != .Complete {
+		testing.expectf(
+			t,
+			false,
+			"marker scenario load task did not complete: %s",
+			started.message,
+		)
+		return
+	}
+
+	verbs := []string {
+		"test/marker_rebase_insertion_types",
+		"test/marker_rebase_shifts_and_collapses",
+		// Order matters: seed publishes revision 1, the token apply publishes
+		// revision 2, and the rebase reads that change back.
+		"test/marker_seed",
+		"test/marker_apply_with_token",
+		"test/marker_rebases_from_the_recorded_delta",
+		"test/annotation_follows_its_markers",
+		"test/annotation_drop_collapsed",
+	}
+	for verb in verbs {
+		outcome := world_call(world, verb, nil)
+		detail := outcome.message
+		if error_value, is_error := v.value_as_error(outcome.error); is_error {
+			detail = error_value.message
+		}
+		testing.expectf(
+			t,
+			outcome.kind == .Complete,
+			"%s: kind=%v message=%s",
+			verb,
+			outcome.kind,
+			detail,
+		)
+	}
 }

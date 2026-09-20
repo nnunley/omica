@@ -7,6 +7,16 @@ import v "../var"
 // Stable relation identity.
 Relation_ID :: distinct u32
 
+// What kind of storage backs a catalogue entry.
+//
+// A relation is a set of tuples; a buffer is a sequence of scalars. They share
+// the catalogue, the transaction, snapshots, durability, and authority, and
+// nothing else. See `docs/buffers-design.md`.
+Storage_Kind :: enum {
+	Tuple,
+	Buffer,
+}
+
 // How concurrent changes to a relation are validated at commit.
 Conflict_Kind :: enum {
 	// Tuples form a set; a concurrent retraction of an asserted tuple conflicts.
@@ -15,6 +25,13 @@ Conflict_Kind :: enum {
 	Functional,
 	// Appends never conflict.
 	Event_Append,
+	// A buffer: any concurrent content change conflicts. The conservative
+	// default until span merging is available.
+	Reject,
+	// A buffer: provenance merge, so disjoint base ranges merge.
+	Span,
+	// A buffer: last-writer-wins over the whole buffer. Destructive; opt-in.
+	Whole,
 }
 
 // Relation conflict validation policy.
@@ -79,7 +96,10 @@ index_leading_bound_count :: proc(spec: Index_Spec, bindings: []v.Binding) -> in
 	return count
 }
 
-// Relation schema and storage metadata.
+// Catalogue-entry schema and storage metadata.
+//
+// `storage` discriminates a tuple relation from a buffer. A buffer declares
+// arity 0: it genuinely has no columns, so nothing is being ignored.
 Relation_Metadata :: struct {
 	id:              Relation_ID,
 	name:            v.Symbol,
@@ -88,6 +108,10 @@ Relation_Metadata :: struct {
 	indexes:         []Index_Spec,
 	conflict:        Conflict_Policy,
 	durability:      Relation_Durability,
+	storage:         Storage_Kind,
+	// A killed entry. The id and name are never reused, so a stale reference
+	// fails cleanly instead of aliasing a new object. Its content is released.
+	tombstoned:      bool,
 }
 
 // Creates metadata for a relation with a natural full-tuple index and set
@@ -101,6 +125,7 @@ relation_metadata :: proc(id: Relation_ID, name: v.Symbol, arity: u16) -> Relati
 		indexes = nil,
 		conflict = conflict_set(),
 		durability = .Durable,
+		storage = .Tuple,
 	}
 }
 
@@ -121,6 +146,16 @@ metadata_with_conflict :: proc(
 ) -> Relation_Metadata {
 	result := metadata
 	result.conflict = conflict
+	return result
+}
+
+// Returns metadata with the given storage kind.
+metadata_with_storage :: proc(
+	metadata: Relation_Metadata,
+	storage: Storage_Kind,
+) -> Relation_Metadata {
+	result := metadata
+	result.storage = storage
 	return result
 }
 
@@ -156,6 +191,26 @@ validate_relation_metadata :: proc(metadata: Relation_Metadata) -> Kernel_Error 
 			if position >= metadata.arity {
 				return .Invalid_Metadata
 			}
+		}
+	}
+
+	// A buffer has no columns, no indexes, and no tuple conflict policy.
+	if metadata.storage == .Buffer {
+		if metadata.arity != 0 || len(metadata.indexes) != 0 {
+			return .Invalid_Metadata
+		}
+		switch metadata.conflict.kind {
+		case .Reject, .Span, .Whole:
+		// A buffer's conflict policy is span- or whole-buffer based.
+		case .Set, .Functional, .Event_Append:
+			return .Invalid_Metadata
+		}
+	} else {
+		// A tuple relation cannot carry a buffer conflict policy.
+		switch metadata.conflict.kind {
+		case .Set, .Functional, .Event_Append:
+		case .Reject, .Span, .Whole:
+			return .Invalid_Metadata
 		}
 	}
 	return .None

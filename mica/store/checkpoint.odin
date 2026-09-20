@@ -17,13 +17,14 @@ import "core:mem"
 import "core:os"
 import "core:path/filepath"
 import "core:sync"
+import buf "../buffer"
 import k "../kernel"
 import v "../var"
 
 PAGE_MAGIC :: "MICAPG01"
 PAGE_HEADER_SIZE :: 28
 MANIFEST_MAGIC :: "MICAMF01"
-MANIFEST_VERSION :: u32(2)
+MANIFEST_VERSION :: u32(4)
 // Retained manifest generations beyond the current one.
 MANIFEST_RETENTION :: 4
 // Compact pages only when at least this many are dead and they are a
@@ -42,6 +43,14 @@ Checkpoint_Relation :: struct {
 	metadata:   k.Relation_Metadata,
 	page_ids:   []u32,
 	row_counts: []u32,
+	// Buffer content is stored as one text page. `has_buffer` distinguishes a
+	// tuple relation from a buffer, because page id 0 is a valid page.
+	// Revision and epoch are preserved so a restored buffer keeps its content
+	// version and lineage.
+	has_buffer:      bool,
+	buffer_page:     u32,
+	buffer_revision: u64,
+	buffer_epoch:    u64,
 }
 
 @(private)
@@ -239,6 +248,15 @@ store_pages_open :: proc(store: ^Store) -> bool {
 }
 
 // Encodes a manifest.
+// Appends a page holding raw buffer text. The page frame is unchanged: the text
+// travels as a single byte-string cell, so page framing, checksums, and the page
+// index are reused exactly.
+store_page_append_text :: proc(store: ^Store, relation: k.Relation_ID, text: string) -> (u32, bool) {
+	bytes := v.value_bytes(context.temp_allocator, transmute([]u8)text)
+	row := v.tuple_new(context.temp_allocator, []v.Value{bytes})
+	return store_page_append(store, relation, []v.Tuple{row})
+}
+
 @(private)
 store_manifest_encode :: proc(out: ^[dynamic]u8, data: ^Manifest_Data) -> bool {
 	manifest_magic: string = MANIFEST_MAGIC
@@ -256,6 +274,10 @@ store_manifest_encode :: proc(out: ^[dynamic]u8, data: ^Manifest_Data) -> bool {
 			codec_write_u32(out, page_id)
 			codec_write_u32(out, relation.row_counts[index])
 		}
+		codec_write_u8(out, relation.has_buffer ? 1 : 0)
+		codec_write_u32(out, relation.buffer_page)
+		codec_write_u64(out, relation.buffer_revision)
+		codec_write_u64(out, relation.buffer_epoch)
 	}
 	return true
 }
@@ -324,10 +346,30 @@ store_manifest_read :: proc(store: ^Store, path: string) -> (Manifest_Data, bool
 			page_ids[chunk_index] = page_id
 			row_counts[chunk_index] = rows
 		}
+		has_buffer_byte, has_buffer_error := codec_read_u8(&reader)
+		if has_buffer_error != .None {
+			return {}, false
+		}
+		buffer_page, buffer_page_error := codec_read_u32(&reader)
+		if buffer_page_error != .None {
+			return {}, false
+		}
+		buffer_revision, buffer_revision_error := codec_read_u64(&reader)
+		if buffer_revision_error != .None {
+			return {}, false
+		}
+		buffer_epoch, buffer_epoch_error := codec_read_u64(&reader)
+		if buffer_epoch_error != .None {
+			return {}, false
+		}
 		relations[index] = Checkpoint_Relation {
 			metadata   = metadata,
 			page_ids   = page_ids,
 			row_counts = row_counts,
+			has_buffer = has_buffer_byte != 0,
+			buffer_page = buffer_page,
+			buffer_revision = buffer_revision,
+			buffer_epoch = buffer_epoch,
 		}
 	}
 	return Manifest_Data {
@@ -451,6 +493,19 @@ store_checkpoint_internal :: proc(store: ^Store, kernel: ^k.Kernel, wait: bool) 
 			delete(page_ids)
 			delete(row_counts)
 		}
+		if metadata.storage == .Buffer && metadata.durability == .Durable {
+			if block, has_buffer := k.snapshot_buffer(snapshot, metadata.id); has_buffer {
+				text := k.snapshot_buffer_text(snapshot, metadata.id, context.temp_allocator)
+				page_id, appended := store_page_append_text(store, metadata.id, text)
+				if !appended {
+					return false
+				}
+				relation.has_buffer = true
+				relation.buffer_page = page_id
+				relation.buffer_revision = block.revision
+				relation.buffer_epoch = block.epoch
+			}
+		}
 		append(&relations, relation)
 	}
 
@@ -500,7 +555,45 @@ store_materialize_checkpoint :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 	entries = make([dynamic]k.Checkpoint_Relation, context.temp_allocator)
 	defer delete(entries)
 
+	buffers: [dynamic]k.Buffer_Checkpoint
+	buffers = make([dynamic]k.Buffer_Checkpoint, context.temp_allocator)
+	defer delete(buffers)
+
 	for relation in store.manifest_relations {
+		if relation.metadata.storage == .Buffer {
+			// A buffer's catalogue entry and content are installed together
+			// below; it has no tuple block. An empty buffer has no page and
+			// restores with a nil root at revision 0.
+			root: ^buf.Piece_Node = nil
+			if relation.has_buffer {
+				page_rows, page_error := store_page_read(
+					store,
+					relation.buffer_page,
+					store.copy_allocator,
+				)
+				if page_error != .None || len(page_rows) != 1 {
+					return false
+				}
+				cells := v.tuple_values(page_rows[0])
+				if len(cells) != 1 {
+					return false
+				}
+				bytes, bytes_ok := v.value_as_bytes(cells[0])
+				if !bytes_ok {
+					return false
+				}
+				text := string(bytes)
+				root = buf.tree_from_text(&kernel.buffer_store, text, .Original)
+			}
+			append(&buffers, k.Buffer_Checkpoint {
+				metadata = relation.metadata,
+				root     = root,
+				revision = relation.buffer_revision,
+				epoch    = relation.buffer_epoch,
+			})
+			continue
+		}
+
 		rows: [dynamic]v.Tuple
 		rows = make([dynamic]v.Tuple, context.temp_allocator)
 		if relation.metadata.durability == .Durable {
@@ -524,7 +617,15 @@ store_materialize_checkpoint :: proc(store: ^Store, kernel: ^k.Kernel) -> bool {
 		})
 		delete(rows)
 	}
-	return k.kernel_install_checkpoint(kernel, entries[:])
+	if !k.kernel_install_checkpoint(kernel, entries[:]) {
+		return false
+	}
+	if len(buffers) > 0 {
+		if !k.kernel_install_buffer_checkpoint(kernel, buffers[:]) {
+			return false
+		}
+	}
+	return true
 }
 
 store_page_count :: proc(store: ^Store) -> int {

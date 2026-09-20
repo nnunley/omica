@@ -316,6 +316,39 @@ test_kernel_admission_overload :: proc(t: ^testing.T) {
 	testing.expect_value(t, kernel.current.version, before)
 }
 
+// A durable buffer edit is durable work, so it is admitted against the store's
+// budget exactly as a relation write is. When buffer writes were left out of the
+// estimate, a paste could run the log past its budget without ever blocking.
+@(test)
+test_kernel_buffer_admission_overload :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	store: Store
+	store_init(&store, Store_Options{budget_bytes = 1, timeout = 10 * time.Millisecond})
+	defer store_destroy(&store)
+	store_attach(&store, &kernel)
+
+	tx := k.kernel_begin(&kernel)
+	metadata := k.relation_metadata(1, v.symbol_intern("TooBig"), 0)
+	metadata.storage = .Buffer
+	metadata.conflict = k.Conflict_Policy{kind = .Reject}
+	notes, create_error := k.transaction_create_relation(&tx, metadata)
+	testing.expect_value(t, create_error, k.Kernel_Error.None)
+	k.transaction_buffer_edit(&tx, notes, 0, 0, "a large paste")
+
+	before := kernel.current.version
+	committed, commit_error := k.transaction_commit(&tx)
+	k.transaction_destroy(&tx)
+	if committed != nil {
+		k.snapshot_release(committed)
+	}
+	testing.expect_value(t, commit_error, k.Kernel_Error.Overloaded)
+	testing.expect_value(t, kernel.current.version, before)
+}
+
 @(private)
 temp_store_path :: proc(t: ^testing.T, name: string) -> string {
 	directory, directory_error := os.temp_dir(context.temp_allocator)
@@ -1102,4 +1135,602 @@ test_file_checkpoint_survives_chunk_reuse :: proc(t: ^testing.T) {
 		expected, _ := v.value_int(i64(value_count - 1))
 		testing.expect(t, v.value_eq(v.tuple_values(rows[0])[0], expected))
 	}
+}
+
+// A buffer's storage kind is catalogue state and must survive a store round
+// trip. If the metadata codec dropped it, recovery would silently recreate the
+// buffer as a tuple relation.
+@(test)
+test_checkpoint_preserves_buffer_storage :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_buffer_storage")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+
+		metadata := k.relation_metadata(k.Relation_ID(7), v.symbol_intern("Notes"), 0)
+		metadata.storage = .Buffer
+		metadata.conflict = k.Conflict_Policy{kind = .Reject}
+		published, create_error := k.kernel_create_relation(&kernel, metadata)
+		testing.expect_value(t, create_error, k.Kernel_Error.None)
+		if published != nil {
+			k.snapshot_release(published)
+		}
+
+		testing.expect(t, store_checkpoint(&store, &kernel))
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_restore(&store, &kernel))
+
+	snapshot := k.kernel_snapshot(&kernel)
+	defer k.snapshot_release(snapshot)
+	restored, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("Notes"))
+	testing.expect(t, found)
+	if found {
+		testing.expect_value(t, restored.storage, k.Storage_Kind.Buffer)
+		testing.expect_value(t, restored.conflict.kind, k.Conflict_Kind.Reject)
+		testing.expect_value(t, restored.arity, u16(0))
+	}
+}
+
+// Buffer content is durable through the log alone. No checkpoint is written, so
+// restore depends entirely on replaying the recorded deltas into a fresh
+// kernel, including a replacement (not just an append) so the delta is
+// exercised as more than an insertion.
+@(test)
+test_wal_replays_buffer_content :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_buffer_wal")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+
+		tx := k.kernel_begin(&kernel)
+		metadata := k.relation_metadata(0, v.symbol_intern("Notes"), 0)
+		metadata.storage = .Buffer
+		metadata.conflict = k.Conflict_Policy{kind = .Reject}
+		notes, create_error := k.transaction_create_relation(&tx, metadata)
+		testing.expect_value(t, create_error, k.Kernel_Error.None)
+		testing.expect_value(
+			t,
+			k.transaction_buffer_edit(&tx, notes, 0, 0, "hello"),
+			k.Kernel_Error.None,
+		)
+		first, first_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect_value(t, first_error, k.Kernel_Error.None)
+		if first != nil {
+			k.snapshot_release(first)
+		}
+
+		tx2 := k.kernel_begin(&kernel)
+		testing.expect_value(
+			t,
+			k.transaction_buffer_edit(&tx2, notes, 0, 5, "goodbye"),
+			k.Kernel_Error.None,
+		)
+		second, second_error := k.transaction_commit(&tx2)
+		k.transaction_destroy(&tx2)
+		testing.expect_value(t, second_error, k.Kernel_Error.None)
+		if second != nil {
+			store_wait_durable(&store, second.version)
+			k.snapshot_release(second)
+		}
+
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_restore(&store, &kernel))
+
+	snapshot := k.kernel_snapshot(&kernel)
+	defer k.snapshot_release(snapshot)
+
+	restored, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("Notes"))
+	testing.expect(t, found)
+	if !found {
+		return
+	}
+	testing.expect_value(t, restored.storage, k.Storage_Kind.Buffer)
+	block, has_block := k.snapshot_buffer(snapshot, restored.id)
+	testing.expect(t, has_block)
+	if has_block {
+		testing.expect_value(t, block.revision, u64(2))
+		testing.expect_value(
+			t,
+			k.snapshot_buffer_text(snapshot, restored.id, context.temp_allocator),
+			"goodbye",
+		)
+	}
+}
+
+// The real durability path: content before a checkpoint comes back from the
+// checkpoint page, and content after it comes back from the replayed log. A
+// checkpoint truncates the log, so a buffer that is only in the log would be
+// lost here.
+@(test)
+test_checkpoint_persists_buffer_content :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_buffer_checkpoint")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+
+		tx := k.kernel_begin(&kernel)
+		metadata := k.relation_metadata(0, v.symbol_intern("Notes"), 0)
+		metadata.storage = .Buffer
+		metadata.conflict = k.Conflict_Policy{kind = .Reject}
+		notes, create_error := k.transaction_create_relation(&tx, metadata)
+		testing.expect_value(t, create_error, k.Kernel_Error.None)
+		k.transaction_buffer_edit(&tx, notes, 0, 0, "hello")
+		first, first_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect_value(t, first_error, k.Kernel_Error.None)
+		if first != nil {
+			store_wait_durable(&store, first.version)
+			k.snapshot_release(first)
+		}
+
+		// History: the pre-checkpoint state is snapshotted into pages.
+		testing.expect(t, store_checkpoint(&store, &kernel))
+
+		// Tail: only in the log.
+		tx2 := k.kernel_begin(&kernel)
+		k.transaction_buffer_edit(&tx2, notes, 5, 0, " world")
+		second, second_error := k.transaction_commit(&tx2)
+		k.transaction_destroy(&tx2)
+		testing.expect_value(t, second_error, k.Kernel_Error.None)
+		if second != nil {
+			store_wait_durable(&store, second.version)
+			k.snapshot_release(second)
+		}
+
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_restore(&store, &kernel))
+
+	snapshot := k.kernel_snapshot(&kernel)
+	defer k.snapshot_release(snapshot)
+	restored, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("Notes"))
+	testing.expect(t, found)
+	if !found {
+		return
+	}
+	testing.expect_value(t, restored.storage, k.Storage_Kind.Buffer)
+	block, has_block := k.snapshot_buffer(snapshot, restored.id)
+	testing.expect(t, has_block)
+	if has_block {
+		testing.expect_value(t, block.revision, u64(2))
+		testing.expect_value(
+			t,
+			k.snapshot_buffer_text(snapshot, restored.id, context.temp_allocator),
+			"hello world",
+		)
+	}
+}
+
+// A compaction changes no content, so its log record carries an empty delta --
+// but it still has to carry the new epoch, or a restarted world would compare
+// provenance across a boundary it no longer knows about.
+@(test)
+test_wal_replays_buffer_compaction_epoch :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_buffer_compaction")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+
+		tx := k.kernel_begin(&kernel)
+		metadata := k.relation_metadata(0, v.symbol_intern("Notes"), 0)
+		metadata.storage = .Buffer
+		metadata.conflict = k.Conflict_Policy{kind = .Reject}
+		notes, create_error := k.transaction_create_relation(&tx, metadata)
+		testing.expect_value(t, create_error, k.Kernel_Error.None)
+		k.transaction_buffer_edit(&tx, notes, 0, 0, "abc")
+		first, first_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect_value(t, first_error, k.Kernel_Error.None)
+		if first != nil {
+			store_wait_durable(&store, first.version)
+			k.snapshot_release(first)
+		}
+
+		compact := k.kernel_begin(&kernel)
+		testing.expect_value(t, k.transaction_buffer_compact(&compact, notes), k.Kernel_Error.None)
+		second, second_error := k.transaction_commit(&compact)
+		k.transaction_destroy(&compact)
+		testing.expect_value(t, second_error, k.Kernel_Error.None)
+		if second != nil {
+			store_wait_durable(&store, second.version)
+			k.snapshot_release(second)
+		}
+		testing.expect_value(t, k.kernel_buffer_epoch(&kernel, notes), u64(1))
+
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_restore(&store, &kernel))
+
+	snapshot := k.kernel_snapshot(&kernel)
+	defer k.snapshot_release(snapshot)
+	restored, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("Notes"))
+	testing.expect(t, found)
+	if !found {
+		return
+	}
+	block, has_block := k.snapshot_buffer(snapshot, restored.id)
+	testing.expect(t, has_block)
+	if has_block {
+		testing.expect_value(t, block.revision, u64(1))
+		testing.expect_value(t, block.epoch, u64(1))
+		testing.expect_value(
+			t,
+			k.snapshot_buffer_text(snapshot, restored.id, context.temp_allocator),
+			"abc",
+		)
+	}
+}
+
+// A kill is catalogue state, so it has to survive a restart: the entry comes
+// back as a tombstone with no content, and its id and name stay retired.
+@(test)
+test_wal_replays_buffer_kill :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_buffer_kill")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+
+		tx := k.kernel_begin(&kernel)
+		metadata := k.relation_metadata(0, v.symbol_intern("Notes"), 0)
+		metadata.storage = .Buffer
+		metadata.conflict = k.Conflict_Policy{kind = .Reject}
+		notes, create_error := k.transaction_create_relation(&tx, metadata)
+		testing.expect_value(t, create_error, k.Kernel_Error.None)
+		k.transaction_buffer_edit(&tx, notes, 0, 0, "temporary")
+		first, first_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect_value(t, first_error, k.Kernel_Error.None)
+		if first != nil {
+			store_wait_durable(&store, first.version)
+			k.snapshot_release(first)
+		}
+
+		kill := k.kernel_begin(&kernel)
+		testing.expect_value(t, k.transaction_kill_relation(&kill, notes), k.Kernel_Error.None)
+		second, second_error := k.transaction_commit(&kill)
+		k.transaction_destroy(&kill)
+		testing.expect_value(t, second_error, k.Kernel_Error.None)
+		if second != nil {
+			store_wait_durable(&store, second.version)
+			k.snapshot_release(second)
+		}
+
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_restore(&store, &kernel))
+
+	snapshot := k.kernel_snapshot(&kernel)
+	defer k.snapshot_release(snapshot)
+	restored, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("Notes"))
+	testing.expect(t, found)
+	if !found {
+		return
+	}
+	testing.expect(t, restored.tombstoned)
+	testing.expect_value(
+		t,
+		k.snapshot_buffer_text(snapshot, restored.id, context.temp_allocator),
+		"",
+	)
+}
+
+// A reversion is recorded as an ordinary base-relative delta, so replay
+// reconstructs the spliced text and the new structure epoch. The replacement
+// covers the whole buffer, which is what makes the record self-contained: it
+// needs nothing from the version it discarded.
+@(test)
+test_wal_replays_buffer_reversion :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_buffer_reversion")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+
+		tx := k.kernel_begin(&kernel)
+		metadata := k.relation_metadata(0, v.symbol_intern("Notes"), 0)
+		metadata.storage = .Buffer
+		metadata.conflict = k.Conflict_Policy{kind = .Reject}
+		notes, create_error := k.transaction_create_relation(&tx, metadata)
+		testing.expect_value(t, create_error, k.Kernel_Error.None)
+		k.transaction_buffer_edit(&tx, notes, 0, 0, "one")
+		first, first_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect_value(t, first_error, k.Kernel_Error.None)
+		if first != nil {
+			store_wait_durable(&store, first.version)
+			k.snapshot_release(first)
+		}
+
+		second_tx := k.kernel_begin(&kernel)
+		k.transaction_buffer_edit(&second_tx, notes, 0, 3, "two")
+		second, second_error := k.transaction_commit(&second_tx)
+		k.transaction_destroy(&second_tx)
+		testing.expect_value(t, second_error, k.Kernel_Error.None)
+		if second != nil {
+			store_wait_durable(&store, second.version)
+			k.snapshot_release(second)
+		}
+
+		revert := k.kernel_begin(&kernel)
+		testing.expect_value(
+			t,
+			k.transaction_buffer_revert(&revert, notes, 1, 2),
+			k.Revert_Status.Reverted,
+		)
+		third, third_error := k.transaction_commit(&revert)
+		k.transaction_destroy(&revert)
+		testing.expect_value(t, third_error, k.Kernel_Error.None)
+		if third != nil {
+			store_wait_durable(&store, third.version)
+			k.snapshot_release(third)
+		}
+		testing.expect_value(t, k.kernel_buffer_revision(&kernel, notes), u64(3))
+		testing.expect_value(t, k.kernel_buffer_epoch(&kernel, notes), u64(1))
+		testing.expect_value(t, k.kernel_buffer_text(&kernel, notes, context.temp_allocator), "one")
+
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_restore(&store, &kernel))
+
+	snapshot := k.kernel_snapshot(&kernel)
+	defer k.snapshot_release(snapshot)
+	restored, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("Notes"))
+	testing.expect(t, found)
+	if !found {
+		return
+	}
+	block, has_block := k.snapshot_buffer(snapshot, restored.id)
+	testing.expect(t, has_block)
+	if has_block {
+		// The reversion published a new content revision and started a new
+		// chunk lineage.
+		testing.expect_value(t, block.revision, u64(3))
+		testing.expect_value(t, block.epoch, u64(1))
+		testing.expect_value(
+			t,
+			k.snapshot_buffer_text(snapshot, restored.id, context.temp_allocator),
+			"one",
+		)
+	}
+}
+
+// A volatile buffer is scratch state. Its catalogue entry is durable, so its
+// name and id stay stable across a restart, but its text is never written: a
+// file-backed editor buffer can keep its working content out of the world's
+// log while still using the world transactionally.
+@(test)
+test_volatile_buffer_content_is_not_persisted :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_buffer_volatile")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		store: Store
+		testing.expect(
+			t,
+			store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+		)
+		store_attach(&store, &kernel)
+
+		tx := k.kernel_begin(&kernel)
+		metadata := k.relation_metadata(0, v.symbol_intern("Scratch"), 0)
+		metadata.storage = .Buffer
+		metadata.durability = .Volatile
+		metadata.conflict = k.Conflict_Policy{kind = .Reject}
+		notes, create_error := k.transaction_create_relation(&tx, metadata)
+		testing.expect_value(t, create_error, k.Kernel_Error.None)
+		k.transaction_buffer_edit(&tx, notes, 0, 0, "scratch text")
+		first, first_error := k.transaction_commit(&tx)
+		k.transaction_destroy(&tx)
+		testing.expect_value(t, first_error, k.Kernel_Error.None)
+		if first != nil {
+			store_wait_durable(&store, first.version)
+			k.snapshot_release(first)
+		}
+
+		// A later edit is a volatile-only publish: it advances the in-memory
+		// snapshot but writes no content record.
+		second_tx := k.kernel_begin(&kernel)
+		k.transaction_buffer_edit(&second_tx, notes, 0, 7, "edited")
+		second, second_error := k.transaction_commit(&second_tx)
+		k.transaction_destroy(&second_tx)
+		testing.expect_value(t, second_error, k.Kernel_Error.None)
+		if second != nil {
+			store_wait_durable(&store, second.version)
+			k.snapshot_release(second)
+		}
+		testing.expect_value(
+			t,
+			k.kernel_buffer_text(&kernel, notes, context.temp_allocator),
+			"edited text",
+		)
+
+		k.kernel_detach_store(&kernel)
+		store_destroy(&store)
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	store: Store
+	testing.expect(
+		t,
+		store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}),
+	)
+	defer store_destroy(&store)
+	testing.expect(t, store_restore(&store, &kernel))
+
+	snapshot := k.kernel_snapshot(&kernel)
+	defer k.snapshot_release(snapshot)
+	restored, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("Scratch"))
+	testing.expect(t, found)
+	if !found {
+		return
+	}
+	testing.expect_value(t, restored.durability, k.Relation_Durability.Volatile)
+	// The name and id survived; the working text did not.
+	testing.expect_value(
+		t,
+		k.snapshot_buffer_text(snapshot, restored.id, context.temp_allocator),
+		"",
+	)
 }

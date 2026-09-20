@@ -10,6 +10,7 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:sync"
 import v "../var"
+import buf "../buffer"
 
 // Published world state.
 //
@@ -67,6 +68,21 @@ Kernel :: struct {
 
 	// Bearer capabilities minted for this world. Ephemeral; not persisted.
 	capabilities: Capability_Store,
+
+	// Chunk and piece-node pools shared by every buffer in this world.
+	buffer_store: buf.Store,
+
+	// Bounded per-buffer reversion history: the retained versions a
+	// `buffer_revert` can splice back in.
+	buffer_history: Buffer_History,
+
+	// Recent client-tagged buffer completions, read back after publication.
+	buffer_results: Buffer_Result_Ring,
+
+	// Highest id reserved by a transaction for a staged catalogue creation.
+	// Reservations are never reused, so an aborted transaction merely leaves a
+	// gap, which is preferable to two concurrent creators colliding.
+	staged_id_high: u32,
 
 	// Bounded window of committed fact changes for subscriptions.
 	changes: Change_Feed,
@@ -307,6 +323,9 @@ kernel_init :: proc(kernel: ^Kernel) {
 	kernel.pending_commits = make([dynamic]^Commit_Entry)
 	capability_store_init(&kernel.capabilities)
 	changes_init(&kernel.changes)
+	buf.store_init(&kernel.buffer_store, runtime.default_allocator())
+	buffer_history_init(&kernel.buffer_history, runtime.default_allocator())
+	buffer_result_ring_init(&kernel.buffer_results, runtime.default_allocator())
 	kernel.current = snapshot_create(kernel, 0, nil)
 }
 
@@ -324,6 +343,13 @@ kernel_destroy :: proc(kernel: ^Kernel) {
 	delete(kernel.pending_commits)
 	capability_store_destroy(&kernel.capabilities)
 	changes_destroy(&kernel.changes)
+	buffer_result_ring_destroy(&kernel.buffer_results)
+	// Retained history blocks keep piece trees alive, so release them before
+	// the pools that own those chunks and nodes.
+	buffer_history_destroy(&kernel.buffer_history)
+	// Every snapshot that referenced a buffer block has been released, so the
+	// pools are safe to tear down.
+	buf.store_destroy(&kernel.buffer_store)
 
 	if kernel.arena_pool != nil {
 		arena_pool_destroy(kernel.arena_pool)
@@ -469,6 +495,21 @@ kernel_begin :: proc(kernel: ^Kernel) -> Transaction {
 }
 
 // Returns the next unused relation id.
+// Reserves a catalogue id for a staged creation. Ids are monotonic and never
+// reused; `kernel_next_relation_id` keeps its scan semantics for callers that
+// want the next free slot rather than a reservation.
+kernel_reserve_relation_id :: proc(kernel: ^Kernel) -> Relation_ID {
+	sync.mutex_lock(&kernel.catalog_lock)
+	defer sync.mutex_unlock(&kernel.catalog_lock)
+
+	next := u32(kernel_next_relation_id(kernel))
+	if kernel.staged_id_high + 1 > next {
+		next = kernel.staged_id_high + 1
+	}
+	kernel.staged_id_high = next
+	return Relation_ID(next)
+}
+
 kernel_next_relation_id :: proc(kernel: ^Kernel) -> Relation_ID {
 	current := kernel_snapshot(kernel)
 	defer snapshot_release(current)
@@ -599,14 +640,22 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 					entry.candidate.version,
 					entry.transaction.writes[:],
 				)
+				changes_record_buffers(
+					&kernel.changes,
+					entry.candidate.version,
+					entry.transaction.buffer_writes[:],
+				)
 				kernel_store_persist(
 					kernel,
 					entry.ticket,
 					entry.candidate.version,
 					entry.candidate,
 					entry.transaction.writes[:],
+					entry.transaction.buffer_writes[:],
 				)
 				entry.ticket = 0
+				kernel_record_buffer_completions(kernel, entry.transaction)
+				kernel_sync_buffer_history(kernel, entry.candidate, entry.transaction)
 				return
 			}
 			winner := kernel_snapshot(kernel)
@@ -630,6 +679,11 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 				entry.transaction,
 				entry.base,
 			)
+			if entry.transaction.catalog_conflict || entry.transaction.buffer_conflict {
+				// A staged entry now collides, or a buffer change could not be
+				// reconciled; give up and let the owner re-read and retry.
+				break
+			}
 		}
 		// Give up rather than spin; the owner retries the transaction.
 		snapshot_release(entry.candidate)
@@ -643,10 +697,47 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 	for {
 		base := kernel_snapshot(kernel)
 		merged := snapshot_fork(kernel, base)
+
+		// A candidate whose staged catalogue entry now collides with a name
+		// created concurrently is excluded from this publication. It is left
+		// unpublished, so its owner retries and re-checks against the new base.
+		publishable: [dynamic]^Commit_Entry
+		publishable = make([dynamic]^Commit_Entry, context.temp_allocator)
 		for entry in batch {
+			collides := false
+			for change in entry.transaction.catalog_changes {
+				if _, exists := snapshot_relation_metadata_named(merged, change.metadata.name); exists {
+					collides = true
+					break
+				}
+			}
+			if !collides {
+				append(&publishable, entry)
+			}
+		}
+		if len(publishable) == 0 {
+			snapshot_release(merged)
+			snapshot_release(base)
+			return
+		}
+
+		for entry in publishable {
 			for block in entry.candidate.blocks {
 				relation_block_retain(block)
 				snapshot_set_block(merged, block)
+			}
+			for block in entry.candidate.buffers {
+				buffer_block_retain(block)
+				snapshot_set_buffer(merged, block)
+			}
+			// Catalogue entries staged by a batched transaction ride along.
+			for metadata in entry.candidate.catalog {
+				if _, exists := snapshot_relation_metadata(merged, metadata.id); !exists {
+					snapshot_add_relation(
+						merged,
+						metadata_clone(merged.allocator, metadata),
+					)
+				}
 			}
 		}
 		kernel_compute_derived(kernel, merged)
@@ -656,8 +747,11 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 			kernel_retire(kernel, previous)
 			merged_writes: [dynamic]Relation_Writes
 			defer delete(merged_writes)
-			for entry in batch {
+			merged_buffers: [dynamic]Buffer_Writes
+			defer delete(merged_buffers)
+			for entry in publishable {
 				append(&merged_writes, ..entry.transaction.writes[:])
+				append(&merged_buffers, ..entry.transaction.buffer_writes[:])
 				snapshot_retain(merged)
 				entry.published = merged
 				snapshot_release(entry.candidate)
@@ -669,15 +763,32 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 				merged.version,
 				merged_writes[:],
 			)
-			for entry in batch {
-				kernel_store_persist(
-					kernel,
-					entry.ticket,
-					merged.version,
-					merged,
-					entry.transaction.writes[:],
-				)
+			changes_record_buffers(
+				&kernel.changes,
+				merged.version,
+				merged_buffers[:],
+			)
+			// One record per published version: relation writes, buffer
+			// writes, and catalogue changes from every batched transaction are
+			// aggregated into a single durable record, so a torn tail can never
+			// leave half a version applied. The remaining reservations are
+			// released against that one publish.
+			kernel_store_persist(
+				kernel,
+				publishable[0].ticket,
+				merged.version,
+				merged,
+				merged_writes[:],
+				merged_buffers[:],
+			)
+			publishable[0].ticket = 0
+			for entry in publishable[1:] {
+				kernel_release_persist(kernel, entry.ticket)
 				entry.ticket = 0
+			}
+			for entry in publishable {
+				kernel_record_buffer_completions(kernel, entry.transaction)
+				kernel_sync_buffer_history(kernel, merged, entry.transaction)
 			}
 			snapshot_release(base)
 			return
@@ -759,6 +870,11 @@ kernel_create_relation :: proc(
 
 		next := snapshot_fork(kernel, current)
 		snapshot_add_relation(next, metadata_clone(kernel.world_allocator, metadata))
+		if metadata.storage == .Buffer {
+			// A buffer starts empty; its first edit publishes revision 1.
+			block := buffer_block_create(&kernel.buffer_store, metadata.id, nil, 0, 0)
+			snapshot_set_buffer(next, block)
+		}
 		kernel_compute_derived(kernel, next)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
@@ -769,7 +885,7 @@ kernel_create_relation :: proc(
 				relation = metadata.id,
 				name     = metadata.name,
 			}})
-			kernel_store_persist(kernel, 0, next.version, next, nil)
+			kernel_store_persist(kernel, 0, next.version, next, nil, nil)
 			return next, .None
 		}
 		snapshot_release(next)
@@ -795,7 +911,7 @@ kernel_advance_version :: proc(kernel: ^Kernel, minimum: u64) -> bool {
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
-			kernel_store_persist(kernel, 0, next.version, next, nil)
+			kernel_store_persist(kernel, 0, next.version, next, nil, nil)
 			snapshot_release(current)
 			return true
 		}
@@ -842,7 +958,7 @@ kernel_set_derivation :: proc(kernel: ^Kernel, enabled: bool) -> bool {
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
-			kernel_store_persist(kernel, 0, next.version, next, nil)
+			kernel_store_persist(kernel, 0, next.version, next, nil, nil)
 			snapshot_release(current)
 			return true
 		}
@@ -909,7 +1025,7 @@ kernel_install_rule :: proc(
 				relation = rule.head_relation,
 				rule     = id,
 			}})
-			kernel_store_persist(kernel, 0, next.version, next, nil)
+			kernel_store_persist(kernel, 0, next.version, next, nil, nil)
 			return next, .None
 		}
 		snapshot_release(next)
@@ -969,7 +1085,7 @@ kernel_set_rule_active :: proc(
 				relation = head_relation,
 				rule     = rule_id,
 			}})
-			kernel_store_persist(kernel, 0, next.version, next, nil)
+			kernel_store_persist(kernel, 0, next.version, next, nil, nil)
 			return next, .None
 		}
 		snapshot_release(next)

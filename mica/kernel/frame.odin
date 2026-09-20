@@ -120,7 +120,13 @@ frame_alloc_proc :: proc(
 		}
 
 	case .Free:
-		return nil, .Mode_Not_Implemented
+		// A bump arena reclaims everything at reset, so a freed allocation
+		// simply stops being used. Reporting '.Mode_Not_Implemented' here would
+		// break Odin's growth path for a `[dynamic]` built on this allocator:
+		// when `.Resize` is unimplemented the runtime allocates a new block,
+		// copies, and frees the old one, and an error from that free makes the
+		// whole resize fail even though the copy already happened.
+		return nil, nil
 
 	case .Free_All:
 		frame_arena_reset(arena)
@@ -132,7 +138,7 @@ frame_alloc_proc :: proc(
 	case .Query_Features:
 		set := (^runtime.Allocator_Mode_Set)(old_memory)
 		if set != nil {
-			set^ = {.Alloc, .Alloc_Non_Zeroed, .Free_All}
+			set^ = {.Alloc, .Alloc_Non_Zeroed, .Free, .Free_All}
 		}
 		return nil, nil
 

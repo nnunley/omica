@@ -34,6 +34,29 @@ runtime_builtins := [?]Builtin_Spec {
 	{"destroy_identity", 1, builtin_destroy_identity},
 	{"make_relation", 2, builtin_relation},
 	{"make_functional_relation", 3, builtin_relation},
+	// Variadic: the third argument is the conflict policy.
+	{"make_buffer", -1, builtin_make_buffer},
+	{"buffer_insert", 3, builtin_buffer_insert},
+	{"buffer_delete", 3, builtin_buffer_delete},
+	{"buffer_replace", 4, builtin_buffer_replace},
+	{"buffer_len", 1, builtin_buffer_len},
+	{"buffer_line_count", 1, builtin_buffer_line_count},
+	{"buffer_revision", 1, builtin_buffer_revision},
+	{"buffer_compact", 1, builtin_buffer_compact},
+	// Variadic: the optional fourth argument is a client token whose completion
+	// can be read back with `buffer_apply_result`.
+	{"buffer_apply", -1, builtin_buffer_apply},
+	{"buffer_apply_result", 1, builtin_buffer_apply_result},
+	// Reversion is its own builtin so a world can grant it separately from
+	// ordinary writes: it discards every edit committed since the target.
+	{"buffer_revert", 3, builtin_buffer_revert},
+	// A pure helper over a committed delta: move a position through it.
+	{"buffer_marker_rebase", 3, builtin_buffer_marker_rebase},
+	{"kill_buffer", 1, builtin_kill_buffer},
+	{"buffer_text", 1, builtin_buffer_text},
+	{"buffer_slice", 3, builtin_buffer_slice},
+	{"buffer_find", 4, builtin_buffer_find},
+	{"buffer_lines", 3, builtin_buffer_lines},
 	{"__set_field", 3, builtin_set_field},
 	{"__get_field", 2, builtin_get_field},
 	// `emit` is a no-op in this port: effects are not recorded (see
@@ -1761,6 +1784,8 @@ builtin_subscribe_changes :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 		subject = .Facts
 	case "relation":
 		subject = .Relation
+	case "buffer":
+		subject = .Buffer
 	case "catalogue":
 		subject = .Catalogue
 	case:
@@ -1795,6 +1820,14 @@ builtin_subscribe_changes :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 		if !found {
 			return builtin_error(state, "E_INVARG", "unknown subscription relation")
 		}
+		if subject == .Buffer {
+			snapshot := k.kernel_snapshot(env.kernel)
+			metadata, known := k.snapshot_relation_metadata(snapshot, k.Relation_ID(relation))
+			k.snapshot_release(snapshot)
+			if !known || metadata.storage != .Buffer {
+				return builtin_error(state, "E_INVARG", "the name is not a buffer")
+			}
+		}
 		if !k.authority_can_read(state.authority, k.Relation_ID(relation)) {
 			return builtin_error(state, "E_PERMISSION", "subscription relation read denied")
 		}
@@ -1807,6 +1840,9 @@ builtin_subscribe_changes :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, b
 	}
 	if subject == .Catalogue && len(binding_list) != 0 {
 		return builtin_error(state, "E_INVARG", "catalogue subscriptions take no bindings")
+	}
+	if subject == .Buffer && len(binding_list) != 0 {
+		return builtin_error(state, "E_INVARG", "buffer subscriptions take no bindings")
 	}
 	bindings := make([]v.Binding, len(binding_list), context.temp_allocator)
 	for item, index in binding_list {

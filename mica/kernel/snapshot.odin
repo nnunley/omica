@@ -36,6 +36,7 @@ Snapshot :: struct {
 	allocator: mem.Allocator,
 	catalog:   []Relation_Metadata,
 	blocks:    []^Relation_Block,
+	buffers:   []^Buffer_Block,
 	rules:     []Rule_Definition,
 	derived:   []Derived_Relation,
 }
@@ -55,6 +56,7 @@ snapshot_create :: proc(kernel: ^Kernel, version: u64, parent: ^Snapshot) -> ^Sn
 	// avoids four allocator round-trips per snapshot.
 	snapshot.catalog = nil
 	snapshot.blocks = nil
+	snapshot.buffers = nil
 	snapshot.rules = nil
 	snapshot.derived = nil
 	return snapshot
@@ -89,6 +91,10 @@ snapshot_release :: proc(snapshot: ^Snapshot) {
 		relation_block_release(block)
 	}
 	snapshot.blocks = nil
+	for block in snapshot.buffers {
+		buffer_block_release(block)
+	}
+	snapshot.buffers = nil
 	if snapshot.arena != nil {
 		arena_pool_return(snapshot.pool, snapshot.arena)
 		snapshot.arena = nil
@@ -107,6 +113,11 @@ snapshot_fork :: proc(kernel: ^Kernel, parent: ^Snapshot) -> ^Snapshot {
 	for block, index in parent.blocks {
 		relation_block_retain(block)
 		snapshot.blocks[index] = block
+	}
+	snapshot.buffers = make([]^Buffer_Block, len(parent.buffers), snapshot.allocator)
+	for block, index in parent.buffers {
+		buffer_block_retain(block)
+		snapshot.buffers[index] = block
 	}
 	snapshot.rules = make([]Rule_Definition, len(parent.rules), snapshot.allocator)
 	copy(snapshot.rules, parent.rules)
@@ -350,4 +361,54 @@ snapshot_compute_derived :: proc(snapshot: ^Snapshot) {
 		return
 	}
 	snapshot.derived = derived_relations_from(snapshot.allocator, &derived)
+}
+
+// Returns the buffer block for a relation, if any.
+snapshot_buffer :: proc(
+	snapshot: ^Snapshot,
+	relation: Relation_ID,
+) -> (
+	^Buffer_Block,
+	bool,
+) {
+	for block in snapshot.buffers {
+		if block.relation == relation {
+			return block, true
+		}
+	}
+	return nil, false
+}
+
+// Replaces a buffer block in a snapshot's buffer list, inserting in relation id
+// order. Mirrors `snapshot_set_block`.
+snapshot_set_buffer :: proc(snapshot: ^Snapshot, block: ^Buffer_Block) {
+	replaced := false
+	for existing, i in snapshot.buffers {
+		if existing.relation == block.relation {
+			snapshot.buffers[i] = block
+			buffer_block_release(existing)
+			replaced = true
+			break
+		}
+	}
+	if replaced {
+		return
+	}
+
+	buffers := make([]^Buffer_Block, len(snapshot.buffers) + 1, snapshot.allocator)
+	write := 0
+	inserted := false
+	for existing in snapshot.buffers {
+		if !inserted && existing.relation > block.relation {
+			buffers[write] = block
+			write += 1
+			inserted = true
+		}
+		buffers[write] = existing
+		write += 1
+	}
+	if !inserted {
+		buffers[write] = block
+	}
+	snapshot.buffers = buffers
 }

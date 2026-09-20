@@ -31,6 +31,11 @@ Case :: struct {
 	files: []string,
 	setup: string,
 	call:  string,
+	// Verbs run in order, each in its own task and therefore its own
+	// transaction, after `setup` and instead of `call`; the last result is
+	// compared. A scenario that spans commits -- such as buffer reversion,
+	// which needs published history -- needs more than one transaction.
+	calls: []string,
 	roles: []Role_Name,
 }
 
@@ -115,6 +120,112 @@ main :: proc() {
 				"apps/mud/tests/event-scenarios.mica",
 			},
 			call = "test/command_parser_records_structured_utility_events",
+		},
+		{
+			name  = "buffers: insert, read, measure",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_insert_read_and_measure",
+		},
+		{
+			name  = "buffers: view-relative offsets",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_offsets_are_view_relative",
+		},
+		{
+			name  = "buffers: line accounting",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_line_accounting",
+		},
+		{
+			name  = "buffers: scalars not bytes",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_scalars_not_bytes",
+		},
+		{
+			name  = "buffers: independent buffers",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffers_are_independent",
+		},
+		{
+			name  = "buffers: compaction is accepted",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_compaction_is_accepted",
+		},
+		{
+			name  = "buffers: apply checks revision and order",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_apply_checks_revision_and_order",
+		},
+		{
+			name  = "buffers: conflict policy is selectable",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_conflict_policy_is_selectable",
+		},
+		{
+			name  = "buffers: kill retires the name",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/kill_buffer_retires_the_name",
+		},
+		{
+			// The completion is read on a later turn, so only the staging half
+			// is comparable here; the runtime suite covers the pair.
+			name  = "buffers: apply records a completion",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_apply_records_completion",
+		},
+		{
+			// Reversion needs published history, so this runs a sequence of
+			// verbs, each its own transaction: three versions, a reversion, and
+			// a summary read on a later turn.
+			name  = "buffers: reversion splices an earlier revision",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			calls = []string{
+				"test/buffer_revert_seed",
+				"test/buffer_revert_second_version",
+				"test/buffer_revert_third_version",
+				"test/buffer_revert_restores_an_earlier_revision",
+				"test/buffer_revert_reports_status",
+			},
+		},
+		{
+			// Compaction describes committed content, so the sequence reaches a
+			// committed buffer before checking that it may not share a
+			// transaction with a change.
+			name  = "buffers: compaction seals the view",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			calls = []string{
+				"test/buffer_compaction_seed",
+				"test/buffer_compaction_refuses_a_moved_view",
+				"test/buffer_compaction_seals_the_view",
+			},
+		},
+		{
+			name  = "buffers: find locates and windows",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_find_locates_and_windows",
+		},
+		{
+			name  = "buffers: the line projection",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call  = "test/buffer_lines_projects_spans",
+		},
+		{
+			// The marker and annotation library spans commits: seed, a
+			// token-tagged apply, then a rebase by the committed delta.
+			name  = "buffers: markers rebase through a committed delta",
+			files = []string{
+				"apps/shared/buffers.mica",
+				"apps/buffers/tests/marker-scenarios.mica",
+			},
+			calls = []string{
+				"test/marker_rebase_insertion_types",
+				"test/marker_rebase_shifts_and_collapses",
+				"test/marker_seed",
+				"test/marker_apply_with_token",
+				"test/marker_rebases_from_the_recorded_delta",
+				"test/annotation_follows_its_markers",
+				"test/annotation_drop_collapsed",
+			},
 		},
 		{
 			name  = "mud scenarios: social commands",
@@ -256,6 +367,29 @@ run_case :: proc(entry: Case, artifact: []u8) -> (v.Value, bool) {
 		if setup := r.world_call(world, entry.setup, nil); setup.kind != .Complete {
 			return v.Value(0), false
 		}
+	}
+	if len(entry.calls) > 0 {
+		result: v.Value
+		for call in entry.calls {
+			outcome := r.world_call(world, call, nil)
+			if outcome.kind != .Complete {
+				detail := outcome.message
+				if error_value, is_error := v.value_as_error(outcome.error); is_error {
+					detail = error_value.message
+				}
+				fmt.eprintf(
+					"  [%s] %s failed: kind=%v message=%s error=%s\n",
+					entry.name,
+					call,
+					outcome.kind,
+					outcome.message,
+					detail,
+				)
+				return v.Value(0), false
+			}
+			result = outcome.value
+		}
+		return result, true
 	}
 	if entry.call == "" {
 		return v.Value(0), true

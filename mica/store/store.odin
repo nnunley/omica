@@ -4,6 +4,7 @@ package store
 
 import "core:fmt"
 import "core:mem"
+import "core:strings"
 import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
@@ -52,6 +53,23 @@ DEFAULT_STORE_TIMEOUT :: 10 * time.Second
 // Bytes of WAL allowed before a checkpoint is written automatically.
 DEFAULT_CHECKPOINT_BYTES :: i64(64) << 20
 
+// A fingerprint over the metadata fields that can change after creation. A new
+// relation and a changed one look the same to the log: both need a catalogue
+// record.
+@(private)
+metadata_fingerprint :: proc(metadata: k.Relation_Metadata) -> u64 {
+	hash := u64(metadata.id) * 1099511628211
+	hash = (hash ~ u64(metadata.name)) * 1099511628211
+	hash = (hash ~ u64(metadata.arity)) * 1099511628211
+	hash = (hash ~ u64(metadata.durability)) * 1099511628211
+	hash = (hash ~ u64(metadata.storage)) * 1099511628211
+	hash = (hash ~ u64(metadata.conflict.kind)) * 1099511628211
+	if metadata.tombstoned {
+		hash = (hash ~ 0x9e37_79b9_7f4a_7c15) * 1099511628211
+	}
+	return hash
+}
+
 // One persisted fact change.
 Wal_Write :: struct {
 	relation: k.Relation_ID,
@@ -64,11 +82,30 @@ Wal_Catalog :: struct {
 	metadata: k.Relation_Metadata,
 }
 
+// One persisted replacement inside a buffer's delta: remove base scalars
+// `[start, end)` and insert `text` at `start`.
+Wal_Replacement :: struct {
+	start: int,
+	end:   int,
+	text:  string,
+}
+
+// One persisted buffer change. Replay applies the delta to the buffer's
+// replayed state, which is already at `base_revision`.
+Wal_Buffer :: struct {
+	relation:      k.Relation_ID,
+	base_revision: u64,
+	new_revision:  u64,
+	epoch:         u64,
+	replacements:  []Wal_Replacement,
+}
+
 // A durable write-ahead record for one published version.
 Wal_Record :: struct {
 	version: u64,
 	writes:  []Wal_Write,
 	catalog: []Wal_Catalog,
+	buffers: []Wal_Buffer,
 }
 
 @(private)
@@ -78,6 +115,7 @@ Queue_Entry :: struct {
 	bytes:   i64,
 	writes:  []Wal_Write,
 	catalog: []Wal_Catalog,
+	buffers: []Wal_Buffer,
 }
 
 Store :: struct {
@@ -97,7 +135,10 @@ Store :: struct {
 	// True while the writer holds a batch whose payloads live in the copy
 	// arena; arena rebasing must not free them.
 	writer_busy: bool,
-	known:   map[k.Relation_ID]bool,
+	// Fingerprint of the last persisted metadata per relation, so a change to
+	// an existing entry (a tombstone) is re-emitted rather than assumed new
+	// only once.
+	known:   map[k.Relation_ID]u64,
 	durable: u64,
 	// Highest version known to be fully persisted or to have had nothing to
 	// persist. Empty publishes advance it; `wait_durable` accepts either.
@@ -233,7 +274,7 @@ store_setup :: proc(store: ^Store, options: Store_Options) {
 		store.checkpoint_bytes = DEFAULT_CHECKPOINT_BYTES
 	}
 	store.tickets = make(map[k.Persist_Ticket]i64, store.allocator)
-	store.known = make(map[k.Relation_ID]bool, store.allocator)
+	store.known = make(map[k.Relation_ID]u64, store.allocator)
 	store.persisted = make(map[u64]u32, store.allocator)
 	store.page_index = make(map[u32]Page_Index, store.allocator)
 	store.queue = make([dynamic]Queue_Entry, store.allocator)
@@ -616,6 +657,7 @@ store_publish_hook :: proc(
 	version: u64,
 	snapshot: ^k.Snapshot,
 	writes: []k.Relation_Writes,
+	buffers: []k.Buffer_Writes,
 ) {
 	store := (^Store)(user)
 	entry := Queue_Entry{version = version, ticket = ticket}
@@ -660,12 +702,13 @@ store_publish_hook :: proc(
 	catalog_list: [dynamic]Wal_Catalog
 	sync.mutex_lock(&store.lock)
 	for metadata in snapshot.catalog {
-		if store.known[metadata.id] {
+		fingerprint := metadata_fingerprint(metadata)
+		if persisted, found := store.known[metadata.id]; found && persisted == fingerprint {
 			continue
 		}
 		// Claim the entry while holding the lock so two concurrent writers
 		// cannot both decide it is new.
-		store.known[metadata.id] = true
+		store.known[metadata.id] = fingerprint
 		append(&catalog_list, Wal_Catalog{metadata = clone_metadata(store.copy_allocator, metadata)})
 	}
 	sync.mutex_unlock(&store.lock)
@@ -675,7 +718,46 @@ store_publish_hook :: proc(
 		delete(catalog_list)
 	}
 
-	if len(entry.writes) == 0 && len(entry.catalog) == 0 {
+	buffer_list: [dynamic]Wal_Buffer
+	buffer_list = make([dynamic]Wal_Buffer, context.temp_allocator)
+	for buffer_writes in buffers {
+		if !buffer_writes.committed {
+			continue
+		}
+		metadata, found := k.snapshot_relation_metadata(snapshot, buffer_writes.relation)
+		if !found || metadata.durability == .Volatile {
+			continue
+		}
+		replacements := make(
+			[]Wal_Replacement,
+			len(buffer_writes.delta.replacements),
+			store.copy_allocator,
+		)
+		for replacement, index in buffer_writes.delta.replacements {
+			replacements[index] = Wal_Replacement {
+				start = replacement.start,
+				end   = replacement.end,
+				text  = strings.clone(replacement.text, store.copy_allocator),
+			}
+		}
+		append(
+			&buffer_list,
+			Wal_Buffer {
+				relation = buffer_writes.relation,
+				base_revision = buffer_writes.base_revision,
+				new_revision = buffer_writes.new_revision,
+				epoch = buffer_writes.epoch,
+				replacements = replacements,
+			},
+		)
+	}
+	if len(buffer_list) > 0 {
+		entry.buffers = make([]Wal_Buffer, len(buffer_list), store.copy_allocator)
+		copy(entry.buffers, buffer_list[:])
+	}
+	delete(buffer_list)
+
+	if len(entry.writes) == 0 && len(entry.catalog) == 0 && len(entry.buffers) == 0 {
 		// Nothing durable in this publish (for example a read-only commit or
 		// a volatile-only write set); return the reservation untouched. When
 		// no earlier write is in flight, this version is covered.
@@ -772,6 +854,7 @@ store_writer_proc :: proc(data: rawptr) {
 					version = entry.version,
 					writes  = entry.writes,
 					catalog = entry.catalog,
+					buffers = entry.buffers,
 				})
 				if entry.version > store.durable {
 					store.durable = entry.version

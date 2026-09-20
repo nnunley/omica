@@ -9,6 +9,7 @@
 // Subjects:
 //   - :facts     matches extensional fact changes for a relation pattern.
 //   - :relation  matches the full relation result, including derived rows.
+//   - :buffer    matches buffer content changes for one buffer.
 //   - :catalogue matches relation and rule catalog changes; requires root.
 package mica_runtime
 
@@ -24,6 +25,7 @@ DEFAULT_SUBSCRIPTION_QUEUE_BUDGET :: 64
 Subscription_Subject :: enum {
 	Facts,
 	Relation,
+	Buffer,
 	Catalogue,
 }
 
@@ -194,6 +196,21 @@ subscription_send_snapshot :: proc(env: ^Builtin_Env, subscription: ^Subscriptio
 			subscription_subject_name(subscription.subject),
 			version,
 			row_values[:],
+		)
+		_ = scheduler_mailbox_send(env.scheduler, subscription.sender, message)
+	case .Buffer:
+		revision := u64(0)
+		if block, has_buffer := k.snapshot_buffer(snapshot, subscription.relation); has_buffer {
+			revision = block.revision
+		}
+		text := k.snapshot_buffer_text(snapshot, subscription.relation, env.allocator)
+		defer delete(text, env.allocator)
+		message := subscription_buffer_snapshot_message(
+			env,
+			subscription.capability,
+			version,
+			revision,
+			text,
 		)
 		_ = scheduler_mailbox_send(env.scheduler, subscription.sender, message)
 	}
@@ -403,6 +420,9 @@ Subscription_Collector :: struct {
 	asserted:     [dynamic]v.Value,
 	retracted:    [dynamic]v.Value,
 	catalogue:    [dynamic]k.Catalog_Change,
+	// Buffer change values are built inside the feed's visit callback, while its
+	// lock is still held, so no borrowed delta outlives the callback.
+	buffers:      [dynamic]v.Value,
 }
 
 @(private)
@@ -417,6 +437,7 @@ subscription_deliver :: proc(env: ^Builtin_Env, subscription: ^Subscription) -> 
 	defer delete(collector.asserted)
 	defer delete(collector.retracted)
 	defer delete(collector.catalogue)
+	defer delete(collector.buffers)
 
 	latest, within_window := k.changes_visit(
 		&env.kernel.changes,
@@ -501,6 +522,19 @@ subscription_deliver :: proc(env: ^Builtin_Env, subscription: ^Subscription) -> 
 			latest,
 			len(assertions) + len(retractions),
 		)
+
+	case .Buffer:
+		if len(collector.buffers) == 0 {
+			subscription.cursor = latest
+			return true
+		}
+		message := subscription_buffer_changes_message(
+			env,
+			subscription.capability,
+			latest,
+			collector.buffers[:],
+		)
+		return subscription_enqueue(env, subscription, message, latest, len(collector.buffers))
 	}
 	return true
 }
@@ -544,6 +578,28 @@ subscription_resynchronize :: proc(env: ^Builtin_Env, subscription: ^Subscriptio
 			subscription_subject_name(subscription.subject),
 			version,
 			row_values[:],
+		)
+		ok = scheduler_mailbox_replace_subscription(
+			env.scheduler,
+			subscription.sender,
+			subscription.capability,
+			message,
+		)
+	case .Buffer:
+		// A buffer cannot be diffed from a window like a row set, so the
+		// resynchronization is the whole text at its current revision.
+		revision := u64(0)
+		if block, has_buffer := k.snapshot_buffer(snapshot, subscription.relation); has_buffer {
+			revision = block.revision
+		}
+		text := k.snapshot_buffer_text(snapshot, subscription.relation, env.allocator)
+		defer delete(text, env.allocator)
+		message := subscription_buffer_snapshot_message(
+			env,
+			subscription.capability,
+			version,
+			revision,
+			text,
 		)
 		ok = scheduler_mailbox_replace_subscription(
 			env.scheduler,
@@ -602,6 +658,13 @@ subscription_collect :: proc(user: rawptr, record: ^k.Change_Record) -> bool {
 	case .Catalogue:
 		for change in record.catalogue {
 			append(&collector.catalogue, change)
+		}
+		return true
+	case .Buffer:
+		for change in record.buffers {
+			if change.relation == collector.subscription.relation {
+				append(&collector.buffers, subscription_buffer_change_value(collector.env, change))
+			}
 		}
 		return true
 	case .Facts:
@@ -664,6 +727,8 @@ subscription_subject_name :: proc(subject: Subscription_Subject) -> string {
 		return "facts"
 	case .Relation:
 		return "relation"
+	case .Buffer:
+		return "buffer"
 	case .Catalogue:
 		return "catalogue"
 	}
@@ -849,9 +914,77 @@ subscription_changes_message :: proc(
 	})
 }
 
+// One buffer change as a message value: the revisions it spans and the
+// base-relative edits an observer applies to its own copy of the text.
 @(private)
-subscription_snapshot_message :: proc(
+subscription_buffer_change_value :: proc(env: ^Builtin_Env, change: k.Buffer_Change) -> v.Value {
+	edits := make([]v.Value, len(change.delta.replacements), env.allocator)
+	for replacement, index in change.delta.replacements {
+		edits[index] = v.value_map(env.allocator, []v.Map_Entry {
+			{key = subscription_message_key("at"), value = value_int_must(i64(replacement.start))},
+			{
+				key   = subscription_message_key("remove"),
+				value = value_int_must(i64(replacement.end - replacement.start)),
+			},
+			{
+				key   = subscription_message_key("text"),
+				value = v.value_string(env.allocator, replacement.text),
+			},
+		})
+	}
+	return v.value_map(env.allocator, []v.Map_Entry {
+		{
+			key   = subscription_message_key("base_revision"),
+			value = value_int_must(i64(change.base_revision)),
+		},
+		{
+			key   = subscription_message_key("new_revision"),
+			value = value_int_must(i64(change.new_revision)),
+		},
+		{key = subscription_message_key("epoch"), value = value_int_must(i64(change.epoch))},
+		{key = subscription_message_key("edits"), value = v.value_list(env.allocator, edits)},
+	})
+}
+
+@(private)
+subscription_buffer_changes_message :: proc(
 	env: ^Builtin_Env,
+	capability: v.Value,
+	cursor: u64,
+	changes: []v.Value,
+) -> v.Value {
+	return subscription_message(env, capability, "changes", cursor, []v.Map_Entry {
+		{
+			key   = subscription_message_key("subject"),
+			value = v.value_symbol(v.symbol_intern("buffer")),
+		},
+		{
+			key   = subscription_message_key("changes"),
+			value = v.value_list(env.allocator, changes),
+		},
+	})
+}
+
+@(private)
+subscription_buffer_snapshot_message :: proc(
+	env: ^Builtin_Env,
+	capability: v.Value,
+	cursor: u64,
+	revision: u64,
+	text: string,
+) -> v.Value {
+	return subscription_message(env, capability, "snapshot", cursor, []v.Map_Entry {
+		{
+			key   = subscription_message_key("subject"),
+			value = v.value_symbol(v.symbol_intern("buffer")),
+		},
+		{key = subscription_message_key("revision"), value = value_int_must(i64(revision))},
+		{key = subscription_message_key("text"), value = v.value_string(env.allocator, text)},
+	})
+}
+
+@(private)
+subscription_snapshot_message :: proc(	env: ^Builtin_Env,
 	capability: v.Value,
 	subject: string,
 	cursor: u64,

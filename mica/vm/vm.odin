@@ -2262,6 +2262,10 @@ kernel_error_code :: proc(err: k.Kernel_Error) -> string {
 		return "E_FUNCTIONAL_KEY"
 	case .Read_Only:
 		return "E_READ_ONLY"
+	case .Already_Applied:
+		return "E_STATE"
+	case .Killed:
+		return "E_KILLED"
 	case .Conflict:
 		return "E_CONFLICT"
 	case .Overloaded:

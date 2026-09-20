@@ -13,6 +13,7 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
 import "core:sync"
+import buf "../buffer"
 import v "../var"
 
 // The kind of a staged write.
@@ -61,9 +62,32 @@ Transaction :: struct {
 	arena:         ^Frame_Arena,
 	allocator:     mem.Allocator,
 	writes:        [dynamic]Relation_Writes,
-	derived:       []Derived_Relation,
-	derived_valid: bool,
-	read_only:     bool,
+	buffer_writes: [dynamic]Buffer_Writes,
+	// Catalogue entries this transaction stages for creation. They become
+	// visible only at publication, together with the facts and buffer content
+	// written against them.
+	catalog_changes: [dynamic]Staged_Catalog_Change,
+	// Set when a staged entry cannot be published, for example because a
+	// concurrent transaction claimed the same name.
+	catalog_conflict: bool,
+	// Set when a buffer change could not be reconciled: overlapping edits, a
+	// compaction boundary, or the rebase budget exhausted.
+	buffer_conflict: bool,
+	derived:          []Derived_Relation,
+	derived_valid:    bool,
+	read_only:        bool,
+}
+
+// What a staged catalogue change does.
+Staged_Change_Kind :: enum {
+	Create,
+	Kill,
+}
+
+// A catalogue change staged by a transaction.
+Staged_Catalog_Change :: struct {
+	kind:     Staged_Change_Kind,
+	metadata: Relation_Metadata,
 }
 
 // Creates a transaction over the kernel's current snapshot. The transaction
@@ -92,6 +116,19 @@ transaction_destroy :: proc(transaction: ^Transaction) {
 	delete(transaction.writes)
 	transaction.writes = nil
 
+	// A client waiting on a tagged apply must learn that it never published.
+	transaction_record_abandoned_applies(transaction)
+	for &buffer_writes in transaction.buffer_writes {
+		delete(buffer_writes.edits)
+		// The staged private root and the retained base block are owned by the
+		// write set, whether or not the transaction published.
+		transaction_release_buffer_writes(transaction, &buffer_writes)
+	}
+	delete(transaction.buffer_writes)
+	transaction.buffer_writes = nil
+	delete(transaction.catalog_changes)
+	transaction.catalog_changes = nil
+
 	if transaction.arena != nil {
 		kernel_return_arena(transaction.kernel, transaction.arena)
 		transaction.arena = nil
@@ -103,6 +140,166 @@ transaction_destroy :: proc(transaction: ^Transaction) {
 // Returns the base version of the transaction.
 transaction_base_version :: proc(transaction: ^Transaction) -> u64 {
 	return transaction.base.version
+}
+
+// Resolves a relation's metadata, consulting staged creations first so a
+// transaction can use an entry it just staged.
+transaction_relation_metadata :: proc(
+	transaction: ^Transaction,
+	relation: Relation_ID,
+) -> (
+	Relation_Metadata,
+	bool,
+) {
+	// A kill later in the list wins over an earlier creation, so an entry
+	// created and killed in one transaction reads as killed.
+	metadata: Relation_Metadata
+	found := false
+	for change in transaction.catalog_changes {
+		if change.metadata.id != relation {
+			continue
+		}
+		metadata = change.metadata
+		found = true
+		if change.kind == .Kill {
+			metadata.tombstoned = true
+			return metadata, true
+		}
+	}
+	if found {
+		return metadata, true
+	}
+	return snapshot_relation_metadata(transaction.base, relation)
+}
+
+// Resolves metadata by name, consulting staged creations first. A transaction
+// that already staged `name` must adopt its own entry rather than create a
+// second one.
+transaction_relation_metadata_named :: proc(
+	transaction: ^Transaction,
+	name: v.Symbol,
+) -> (
+	Relation_Metadata,
+	bool,
+) {
+	metadata: Relation_Metadata
+	found := false
+	for change in transaction.catalog_changes {
+		if change.metadata.name != name {
+			continue
+		}
+		metadata = change.metadata
+		found = true
+		if change.kind == .Kill {
+			metadata.tombstoned = true
+			return metadata, true
+		}
+	}
+	if found {
+		return metadata, true
+	}
+	return snapshot_relation_metadata_named(transaction.base, name)
+}
+
+// Returns true when the transaction staged `relation` for creation.
+transaction_has_staged_relation :: proc(
+	transaction: ^Transaction,
+	relation: Relation_ID,
+) -> bool {
+	for change in transaction.catalog_changes {
+		if change.metadata.id == relation {
+			return true
+		}
+	}
+	return false
+}
+
+// Stages a new catalogue entry.
+//
+// The creating transaction can use the entry immediately: its metadata is
+// resolved from the staged list, its facts stage normally, and a staged buffer
+// can be edited. Nothing is visible to other transactions until publication.
+// An id of 0 asks the kernel to reserve one. A duplicate name, against either
+// the base catalogue or another staged entry, is rejected here; a duplicate
+// that appears concurrently is detected at commit and reported as a conflict.
+transaction_create_relation :: proc(
+	transaction: ^Transaction,
+	metadata: Relation_Metadata,
+) -> (
+	Relation_ID,
+	Kernel_Error,
+) {
+	if err := validate_relation_metadata(metadata); err != .None {
+		return 0, err
+	}
+
+	id := metadata.id
+	if id == 0 {
+		id = kernel_reserve_relation_id(transaction.kernel)
+	}
+
+	if _, exists := snapshot_relation_metadata_named(transaction.base, metadata.name); exists {
+		return 0, .Duplicate_Relation_Name
+	}
+	for change in transaction.catalog_changes {
+		if change.metadata.name == metadata.name {
+			return 0, .Duplicate_Relation_Name
+		}
+		if change.metadata.id == id {
+			return 0, .Invalid_Metadata
+		}
+	}
+	if snapshot_has_relation(transaction.base, id) {
+		return 0, .Invalid_Metadata
+	}
+
+	staged := metadata_clone(transaction.allocator, metadata)
+	staged.id = id
+	append(
+		&transaction.catalog_changes,
+		Staged_Catalog_Change{kind = .Create, metadata = staged},
+	)
+	return id, .None
+}
+
+// Stages a kill: the entry is tombstoned and its content released at
+// publication. The id and name are not reused.
+transaction_kill_relation :: proc(
+	transaction: ^Transaction,
+	relation: Relation_ID,
+) -> Kernel_Error {
+	metadata, known := transaction_relation_metadata(transaction, relation)
+	if !known {
+		return .Unknown_Relation
+	}
+	if metadata.tombstoned {
+		return .None
+	}
+
+	append(
+		&transaction.catalog_changes,
+		Staged_Catalog_Change {
+			kind = .Kill,
+			metadata = metadata_clone(transaction.allocator, metadata),
+		},
+	)
+	return .None
+}
+
+// Releases the references a staged buffer write holds.
+@(private)
+transaction_release_buffer_writes :: proc(
+	transaction: ^Transaction,
+	writes: ^Buffer_Writes,
+) {
+	if writes.private_root != nil {
+		buf.tree_release(&transaction.kernel.buffer_store, writes.private_root)
+		writes.private_root = nil
+	}
+	if writes.base_block != nil {
+		buffer_block_release(writes.base_block)
+		writes.base_block = nil
+	}
 }
 
 @(private)
@@ -123,7 +320,7 @@ transaction_relation_writes :: proc(
 		return nil, false
 	}
 	writes := Relation_Writes{relation = relation}
-	if metadata, ok := snapshot_relation_metadata(transaction.base, relation); ok &&
+	if metadata, ok := transaction_relation_metadata(transaction, relation); ok &&
 	   metadata.conflict.kind == .Functional {
 		writes.functional = true
 		writes.key_positions = metadata.conflict.key_positions
@@ -299,7 +496,7 @@ transaction_assert :: proc(
 	if transaction.read_only {
 		return .Read_Only
 	}
-	metadata, ok := snapshot_relation_metadata(transaction.base, relation)
+	metadata, ok := transaction_relation_metadata(transaction, relation)
 	if !ok {
 		return .Unknown_Relation
 	}
@@ -341,7 +538,7 @@ transaction_retract :: proc(
 	if transaction.read_only {
 		return .Read_Only
 	}
-	metadata, ok := snapshot_relation_metadata(transaction.base, relation)
+	metadata, ok := transaction_relation_metadata(transaction, relation)
 	if !ok {
 		return .Unknown_Relation
 	}
@@ -561,6 +758,10 @@ transaction_validate_conflicts :: proc(
 	transaction: ^Transaction,
 	current: ^Snapshot,
 ) -> Kernel_Error {
+	if err := transaction_buffer_validate(transaction, current); err != .None {
+		return err
+	}
+
 	for &writes in transaction.writes {
 		metadata, ok := snapshot_relation_metadata(transaction.base, writes.relation)
 		if !ok {
@@ -568,6 +769,10 @@ transaction_validate_conflicts :: proc(
 		}
 		switch metadata.conflict.kind {
 		case .Event_Append:
+			continue
+		case .Reject, .Span, .Whole:
+			// Buffer conflict is validated separately, against block
+			// revisions; buffer writes never appear in `writes`.
 			continue
 		case .Set:
 			for entry in writes.entries {
@@ -665,7 +870,9 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 	// A transaction that made no writes has nothing to publish. Forking would
 	// advance the snapshot version, which makes read-only CLI `--eval` queries
 	// grow the store on the shutdown checkpoint.
-	if len(transaction.writes) == 0 {
+	if len(transaction.writes) == 0 &&
+	   len(transaction.buffer_writes) == 0 &&
+	   len(transaction.catalog_changes) == 0 {
 		return kernel_snapshot(kernel), .None
 	}
 
@@ -712,6 +919,12 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 
 		transaction_prepare_writes(transaction)
 		candidate := transaction_build_candidate(kernel, transaction, current)
+		if transaction.catalog_conflict || transaction.buffer_conflict {
+			snapshot_release(candidate)
+			snapshot_release(current)
+			kernel_release_persist(kernel, persist_ticket)
+			return nil, .Conflict
+		}
 
 		// The entry owns its own reference to the base so the committer can
 		// replace it while rebasing; the task keeps its `current` reference.
@@ -738,6 +951,19 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 		kernel_release_persist(kernel, persist_ticket)
 		return nil, .Conflict
 	}
+
+	// Announce staged creations to subscribers once they are durable-visible.
+	if len(transaction.catalog_changes) > 0 {
+		changes := make([]Catalog_Change, len(transaction.catalog_changes), context.temp_allocator)
+		for change, index in transaction.catalog_changes {
+			changes[index] = Catalog_Change {
+				kind     = .Relation_Created,
+				relation = change.metadata.id,
+				name     = change.metadata.name,
+			}
+		}
+		changes_record_catalog(&kernel.changes, published.version, changes)
+	}
 	return published, .None
 }
 
@@ -746,6 +972,9 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 transaction_write_stripes :: proc(transaction: ^Transaction) -> [RELATION_LOCK_STRIPES]bool {
 	stripes: [RELATION_LOCK_STRIPES]bool
 	for writes in transaction.writes {
+		stripes[int(writes.relation) % RELATION_LOCK_STRIPES] = true
+	}
+	for writes in transaction.buffer_writes {
 		stripes[int(writes.relation) % RELATION_LOCK_STRIPES] = true
 	}
 	return stripes
@@ -768,11 +997,58 @@ transaction_build_candidate :: proc(
 		relation_block_retain(block)
 		fork.blocks[index] = block
 	}
+	fork.buffers = make([]^Buffer_Block, len(current.buffers), fork.allocator)
+	for block, index in current.buffers {
+		buffer_block_retain(block)
+		fork.buffers[index] = block
+	}
 	fork.rules = make([]Rule_Definition, len(current.rules), fork.allocator)
 	copy(fork.rules, current.rules)
 
+	// Apply staged catalogue creations before any write is materialized, so a
+	// relation created and written in the same transaction is built against the
+	// candidate's own catalogue.
+	transaction.catalog_conflict = false
+	transaction.buffer_conflict = false
+	for change in transaction.catalog_changes {
+		switch change.kind {
+		case .Create:
+			if _, exists := snapshot_relation_metadata_named(
+				current,
+				change.metadata.name,
+			); exists {
+				transaction.catalog_conflict = true
+				return fork
+			}
+			if snapshot_has_relation(current, change.metadata.id) {
+				transaction.catalog_conflict = true
+				return fork
+			}
+			snapshot_add_relation(fork, metadata_clone(fork.allocator, change.metadata))
+		case .Kill:
+			// Tombstone the entry in the candidate and release its content.
+			for &metadata in fork.catalog {
+				if metadata.id != change.metadata.id {
+					continue
+				}
+				metadata.tombstoned = true
+				if metadata.storage == .Buffer {
+					block := buffer_block_create(
+						&kernel.buffer_store,
+						metadata.id,
+						nil,
+						0,
+						0,
+					)
+					snapshot_set_buffer(fork, block)
+				}
+				break
+			}
+		}
+	}
+
 	for &writes in transaction.writes {
-		metadata, ok := snapshot_relation_metadata(current, writes.relation)
+		metadata, ok := snapshot_relation_metadata(fork, writes.relation)
 		if !ok {
 			continue
 		}
@@ -783,6 +1059,8 @@ transaction_build_candidate :: proc(
 		block := relation_block_apply(kernel, current_block, metadata, writes.entries[:])
 		snapshot_set_block(fork, block)
 	}
+
+	transaction_buffer_materialize(transaction, current, fork)
 
 	kernel_compute_derived(kernel, fork)
 	return fork
@@ -803,6 +1081,9 @@ transaction_rebase_in_place :: proc(
 	if len(candidate.catalog) != len(winner.catalog) ||
 	   len(candidate.rules) != len(winner.rules) ||
 	   len(candidate.blocks) != len(winner.blocks) {
+		return false
+	}
+	if !transaction_buffer_adopt(transaction, candidate, winner) {
 		return false
 	}
 

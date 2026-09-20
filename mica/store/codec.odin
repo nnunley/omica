@@ -8,7 +8,11 @@ package store
 import "core:mem"
 import v "../var"
 
-CODEC_VERSION :: 1
+// Version history:
+//   1 - initial
+//   2 - relation metadata carries a storage kind byte (tuple vs buffer)
+//   3 - relation metadata carries a tombstone byte
+CODEC_VERSION :: 3
 
 Codec_Error :: enum {
 	None,

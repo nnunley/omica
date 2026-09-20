@@ -1,0 +1,134 @@
+// The region layer around a buffer: markers and annotations.
+//
+// A buffer's *content* is not relational, but the durable state around it is.
+// A marker is a stable identity with a position that moves with edits, and an
+// annotation references markers rather than raw offsets. An edit then moves the
+// small marker table and leaves the annotation set untouched, which is the whole
+// reason to prefer this over rewriting every annotation after the edit point.
+//
+// Coordinates are anchored to a revision. Carrying them forward is the same
+// provenance delta the buffer layer already computes, applied to points instead
+// of text: `buffer_marker_rebase` takes the delta a caller holds (from
+// `buffer_apply_result` or the `:buffer` change feed) and returns the new
+// position. The buffer stays pure -- it never knows markers exist -- and rebasing
+// is an explicit step here.
+//
+// A marker inside deleted material collapses to the deletion point rather than
+// vanishing; whether an annotation whose span collapses is dropped or kept as a
+// point annotation is the caller's decision, so `annotation_drop_collapsed` is a
+// separate step.
+
+make_relation(:Marker, 1)
+make_functional_relation(:MarkerBuffer, 2, [0])
+make_functional_relation(:MarkerPosition, 2, [0])
+make_functional_relation(:MarkerInsertionType, 2, [0])
+
+make_relation(:Annotation, 1)
+make_functional_relation(:AnnotationBuffer, 2, [0])
+make_functional_relation(:AnnotationSpan, 3, [0])
+make_functional_relation(:AnnotationKind, 2, [0])
+make_functional_relation(:AnnotationText, 2, [0])
+
+// Creates a marker anchored at `position` in `buffer`.
+//
+// `insertion_type` is `:stick_after` or `:stick_before`: it decides only what happens to
+// text inserted exactly at the marker's position, which is what makes a marker
+// "sticky".
+verb buffers/marker_create(id, buffer, position, insertion_type)
+  assert Marker(id)
+  assert MarkerBuffer(id, buffer)
+  assert MarkerPosition(id, position)
+  assert MarkerInsertionType(id, insertion_type)
+  return id
+end
+
+// The current position of one marker.
+verb buffers/marker_position(id)
+  let exactly {:position -> position} = MarkerPosition(id, ?position)
+  return position
+end
+
+// Moves one marker through a committed delta and returns its new position.
+verb buffers/marker_rebase(id, edits)
+  let exactly {:position -> position} = MarkerPosition(id, ?position)
+  let exactly {:insertion -> insertion} = MarkerInsertionType(id, ?insertion)
+  let moved = buffer_marker_rebase(edits, position, insertion)
+  if moved != position
+    retract MarkerPosition(id, _)
+    assert MarkerPosition(id, moved)
+  end
+  return moved
+end
+
+// Moves every marker of `buffer` through one delta, and returns how many moved.
+verb buffers/markers_rebase(buffer, edits)
+  let markers = MarkerBuffer(?id, buffer)
+  let moved = 0
+  for marker in markers
+    buffers/marker_rebase(marker[:id], edits)
+    moved = moved + 1
+  end
+  return moved
+end
+
+// Creates an annotation spanning two markers of the same buffer.
+verb buffers/annotation_create(id, buffer, start_marker, stop_marker, kind, text @ #string)
+  assert Annotation(id)
+  assert AnnotationBuffer(id, buffer)
+  assert AnnotationSpan(id, start_marker, stop_marker)
+  assert AnnotationKind(id, kind)
+  assert AnnotationText(id, text)
+  return id
+end
+
+// Rebases an annotation by moving both of its markers, and returns its current
+// span as `[start, stop]`.
+verb buffers/annotation_rebase(id, edits)
+  let exactly {:start -> start_marker, :stop -> stop_marker} = AnnotationSpan(id, ?start, ?stop)
+  buffers/marker_rebase(start_marker, edits)
+  buffers/marker_rebase(stop_marker, edits)
+  return [buffers/marker_position(start_marker), buffers/marker_position(stop_marker)]
+end
+
+// The current span and payload of an annotation, joined through its markers.
+verb buffers/annotation_view(id)
+  let start = buffers/annotation_start_marker(id)
+  let stop = buffers/annotation_stop_marker(id)
+  let exactly {:text -> text} = AnnotationText(id, ?text)
+  return {
+    :start -> buffers/marker_position(start),
+    :stop -> buffers/marker_position(stop),
+    :text -> text
+  }
+end
+
+verb buffers/annotation_start_marker(id)
+  let exactly {:start -> start} = AnnotationSpan(id, ?start, ?stop)
+  return start
+end
+
+verb buffers/annotation_stop_marker(id)
+  let exactly {:stop -> stop} = AnnotationSpan(id, ?start, ?stop)
+  return stop
+end
+
+// Retracts every annotation of `buffer` whose span has collapsed to a point.
+// A caller that wants point annotations instead simply does not call this.
+verb buffers/annotation_drop_collapsed(buffer)
+  let annotations = AnnotationBuffer(?id, buffer)
+  let dropped = 0
+  for annotation in annotations
+    let id = annotation[:id]
+    let start = buffers/marker_position(buffers/annotation_start_marker(id))
+    let stop = buffers/marker_position(buffers/annotation_stop_marker(id))
+    if start == stop
+      retract Annotation(id, _)
+      retract AnnotationBuffer(id, _)
+      retract AnnotationSpan(id, _, _)
+      retract AnnotationKind(id, _)
+      retract AnnotationText(id, _)
+      dropped = dropped + 1
+    end
+  end
+  return dropped
+end

@@ -1,0 +1,141 @@
+// In-Mica scenarios for the marker and annotation layer.
+//
+// These load `apps/shared/buffers.mica` first, so the world relations and verbs
+// are the ones an application would use. The rebase cases run end to end: a
+// token-tagged apply commits a change, and the marker table is moved by the
+// authoritative delta the change produced, not by a hand-written one.
+
+verb test/assert_equal(actual, expected, label @ #string)
+  if actual != expected
+    raise E_INVARG, string_concat(label, " failed")
+  end
+
+  return true
+end
+
+verb test/assert_true(value, label @ #string)
+  if value != true
+    raise E_INVARG, string_concat(label, " failed")
+  end
+
+  return true
+end
+
+// --- The rebase step, as a pure function ------------------------------------
+
+// Text inserted at a marker's position lands according to the insertion type.
+verb test/marker_rebase_insertion_types()
+  let edits = [{:at -> 3, :remove -> 0, :text -> "!!"}]
+
+  test/assert_equal(buffer_marker_rebase(edits, 3, :stick_after), 5, "after moves past")
+  test/assert_equal(buffer_marker_rebase(edits, 3, :stick_before), 3, "before stays put")
+
+  return true
+end
+
+// Edits before the marker shift it; a deletion that covers it collapses it.
+verb test/marker_rebase_shifts_and_collapses()
+  // Base "abcdef": insert "XY" at 1.
+  let insertion = [{:at -> 1, :remove -> 0, :text -> "XY"}]
+  test/assert_equal(buffer_marker_rebase(insertion, 5, :stick_before), 7, "shifted right")
+
+  // Base "abcdef": delete [0, 2).
+  let deletion = [{:at -> 0, :remove -> 2, :text -> ""}]
+  test/assert_equal(buffer_marker_rebase(deletion, 4, :stick_before), 2, "shifted left")
+
+  // Base "abcdef": delete [2, 5), which covers position 3.
+  let covering = [{:at -> 2, :remove -> 3, :text -> ""}]
+  test/assert_equal(buffer_marker_rebase(covering, 3, :stick_before), 2, "collapsed to the deletion")
+  test/assert_equal(buffer_marker_rebase(covering, 5, :stick_before), 2, "collapsed from the end")
+  test/assert_equal(buffer_marker_rebase(covering, 1, :stick_before), 1, "unmoved before the deletion")
+
+  // An empty delta changes nothing.
+  test/assert_equal(buffer_marker_rebase([], 4, :stick_after), 4, "empty delta")
+
+  return true
+end
+
+// --- Markers and annotations over a real buffer -----------------------------
+
+verb test/marker_seed()
+  make_buffer(:notes, :durable)
+  buffer_insert(:notes, 0, "hello world")
+
+  buffers/marker_create(:mb, :notes, 5, :stick_before)
+  buffers/marker_create(:ma, :notes, 5, :stick_after)
+  buffers/annotation_create(:a1, :notes, :mb, :ma, :comment, "the space")
+
+  test/assert_equal(buffers/marker_position(:mb), 5, "seeded marker")
+  test/assert_equal(buffers/marker_position(:ma), 5, "seeded marker")
+  test/assert_equal(buffers/annotation_view(:a1)[:start], 5, "seeded annotation start")
+  test/assert_equal(buffers/annotation_view(:a1)[:stop], 5, "seeded annotation stop")
+
+  return true
+end
+
+// One task, one transaction: the buffer edit stages under a token. The next
+// verb reads the committed change back and moves the markers by it.
+verb test/marker_apply_with_token()
+  let staged = buffer_apply(:notes, 1, [{:at -> 5, :remove -> 0, :text -> " big"}], 777)
+  test/assert_equal(staged, :staged, "token apply")
+  test/assert_equal(buffer_text(:notes), "hello big world", "view after the apply")
+
+  return true
+end
+
+// The authoritative delta is what moves the markers, and the insertion type is
+// the only thing that decides the tie.
+verb test/marker_rebases_from_the_recorded_delta()
+  let result = buffer_apply_result(777)
+  test/assert_equal(result[:status], :ok, "completion")
+  test/assert_equal(result[:revision], 2, "committed revision")
+
+  let edits = result[:applied]
+  test/assert_equal(len(edits), 1, "one authoritative replacement")
+
+  let moved = buffers/markers_rebase(:notes, edits)
+  test/assert_equal(moved, 2, "both markers rebased")
+  // :stick_before stays at the insertion point; :stick_after moves past the inserted text.
+  test/assert_equal(buffers/marker_position(:mb), 5, "before marker")
+  test/assert_equal(buffers/marker_position(:ma), 9, "after marker")
+
+  return true
+end
+
+// The annotation follows its markers without being rewritten.
+verb test/annotation_follows_its_markers()
+  let view = buffers/annotation_view(:a1)
+  test/assert_equal(view[:start], 5, "annotation start")
+  test/assert_equal(view[:stop], 9, "annotation stop")
+  test/assert_equal(view[:text], "the space", "annotation text")
+
+  // Rebasing the annotation moves both of its markers through a further change.
+  let edits = [{:at -> 0, :remove -> 0, :text -> ">> "}]
+  let span = buffers/annotation_rebase(:a1, edits)
+  test/assert_equal(span[0], 8, "rebased start")
+  test/assert_equal(span[1], 12, "rebased stop")
+
+  return true
+end
+
+// A span that collapses can be dropped; the caller decides, so it is a separate
+// step from rebasing.
+verb test/annotation_drop_collapsed()
+  buffers/marker_create(:c1, :notes, 0, :stick_before)
+  buffers/marker_create(:c2, :notes, 0, :stick_after)
+  buffers/annotation_create(:gone, :notes, :c1, :c2, :comment, "empty")
+
+  // Deleting [0, 3) collapses both markers onto the deletion point.
+  let edits = [{:at -> 0, :remove -> 3, :text -> ""}]
+  let span = buffers/annotation_rebase(:gone, edits)
+  test/assert_equal(span[0], 0, "collapsed start")
+  test/assert_equal(span[1], 0, "collapsed stop")
+
+  let dropped = buffers/annotation_drop_collapsed(:notes)
+  test/assert_equal(dropped, 1, "one collapsed annotation dropped")
+
+  // The annotation that still spans text survives the sweep.
+  test/assert_equal(buffers/annotation_view(:a1)[:text], "the space", "live annotation kept")
+
+  return true
+end
