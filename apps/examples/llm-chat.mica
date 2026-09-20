@@ -15,7 +15,7 @@
 //
 // Environment:
 //   MICA_OPENAI_BASE_URL   API base URL; defaults to OpenRouter.
-//   MICA_LLM_DEMO_MODEL    Model name; defaults to deepseek/deepseek-v4-pro.
+//   MICA_LLM_DEMO_MODEL    Model name; defaults to deepseek/deepseek-v4.1-flash.
 //   MICA_LLM_DEMO_PROMPT   Prompt; defaults to a short greeting request.
 
 make_identity(:llm/demo)
@@ -41,7 +41,7 @@ verb llm/demo_model()
   if let some(model) = configured
     return model
   end
-  return "deepseek/deepseek-v4-pro"
+  return "deepseek/deepseek-v4.1-flash"
 end
 
 verb llm/demo_prompt()

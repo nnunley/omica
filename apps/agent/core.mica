@@ -87,7 +87,7 @@ assert Delegates(#target/task, #InspectorTarget, 0)
 
 assert Agent(#agent/default)
 assert Description(#agent/default, "default")
-assert AgentModel(#agent/default, "deepseek/deepseek-v4-pro")
+assert AgentModel(#agent/default, "deepseek/deepseek-v4.1-flash")
 assert AgentApi(#agent/default, "responses")
 assert AgentMaxToolRounds(#agent/default, 4)
 assert Delegates(#agent/default, #agent, 0)
@@ -292,7 +292,7 @@ verb agent/resolve_model(agent @ #agent)
     return default
   end
 
-  return "deepseek/deepseek-v4-pro"
+  return "deepseek/deepseek-v4.1-flash"
 end
 
 verb agent/system_prompt(agent @ #agent)

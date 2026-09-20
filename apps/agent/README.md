@@ -80,7 +80,7 @@ There is no login on this app, so anyone who can route to the bound address can 
 spend the configured API key.
 
 Set `OPENROUTER_API_KEY` in the environment for LLM access. The default model is
-`deepseek/deepseek-v4-pro`; override it with `MICA_AGENT_MODEL`. Responses is the default request
+`deepseek/deepseek-v4.1-flash`; override it with `MICA_AGENT_MODEL`. Responses is the default request
 shape. Set `MICA_AGENT_API=chat_completions` to use the explicit Chat Completions adapter.
 
 The workspace tools read the `source/*` computed relations, which the Rust source provider

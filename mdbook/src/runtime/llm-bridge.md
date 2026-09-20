@@ -20,7 +20,7 @@ HTTPS endpoints such as OpenRouter and the OpenAI API work directly.
 let [receiver, sender] = mailbox()
 
 llm/chat_stream(
-  "deepseek/deepseek-v4-pro",
+  "deepseek/deepseek-v4.1-flash",
   [llm/user_message("Say hello in one short sentence.")],
   {:stream -> true},
   [],          // tools
