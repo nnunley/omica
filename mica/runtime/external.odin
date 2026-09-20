@@ -74,19 +74,7 @@ external_worker_proc :: proc(data: rawptr) {
 			spawn     = world_external_spawn,
 			stopping  = world_external_stopping,
 		}
-		result: v.Value
-		if world.external_handler != nil {
-			result = world.external_handler(ctx, job.service, job.payload)
-		} else {
-			result = v.value_error(
-				world.allocator,
-				v.symbol_intern("ExternalUnavailable"),
-				"no external request handler is configured",
-				true,
-				v.Value(0),
-				false,
-			)
-		}
+		result := world.external_handler(ctx, job.service, job.payload)
 		scheduler_resume(&world.scheduler, job.task_id, result)
 		if has_temp_arena {
 			virtual.arena_free_all(&temp_arena)
@@ -162,11 +150,15 @@ world_external_stopping :: proc(user: rawptr) -> bool {
 	return sync.atomic_load(&world.external_stopping) != 0
 }
 
-// Starts the external worker pool. One worker is always started so requests
-// are answered even when no handler is configured.
+// Starts the external worker pool. Worlds without a handler stay inert: the
+// scheduler answers external requests inline, so this allocates nothing and
+// starts no thread.
 @(private)
 world_start_external :: proc(world: ^World, config: World_Config) {
 	world.external_handler = config.external_handler
+	if world.external_handler == nil {
+		return
+	}
 	world.external_streams = make([dynamic]^External_Stream, world.allocator)
 	world.external_workers = make([dynamic]^thread.Thread, world.allocator)
 
@@ -187,6 +179,9 @@ world_start_external :: proc(world: ^World, config: World_Config) {
 // scheduler must outlive them.
 @(private)
 world_stop_external :: proc(world: ^World) {
+	if world.external_handler == nil {
+		return
+	}
 	sync.atomic_store(&world.external_stopping, 1)
 	scheduler_stop_external(&world.scheduler)
 

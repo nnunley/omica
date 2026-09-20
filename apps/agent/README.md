@@ -65,17 +65,30 @@ syntax, symbol, definition, references, and VCS history as computed relations fo
 scripts/agent.sh
 ```
 
-The wrapper starts `mica-daemon` with the agent filein set and points `MICA_SOURCE_ROOTS` at the
-repository root so the source-provider computed relations can see the workspace. Open the printed
-`/agent` URL in a browser.
+The wrapper builds `tools/webhost`, loads the agent filein set, points `MICA_SOURCE_ROOTS` at the
+repository root, and prints the local `/agent` URL to open. Override the bind address with
+`MICA_AGENT_BIND` (default `127.0.0.1:8081`). To reach it from another device, bind all interfaces
+or the tailnet address and open the printed URL:
+
+```sh
+MICA_AGENT_BIND=0.0.0.0:8081 scripts/agent.sh
+# or only the tailnet interface:
+MICA_AGENT_BIND="$(tailscale ip -4):8081" scripts/agent.sh
+```
+
+There is no login on this app, so anyone who can route to the bound address can use the agent and
+spend the configured API key.
 
 Set `OPENROUTER_API_KEY` in the environment for LLM access. The default model is
 `deepseek/deepseek-v4-pro`; override it with `MICA_AGENT_MODEL`. Responses is the default request
 shape. Set `MICA_AGENT_API=chat_completions` to use the explicit Chat Completions adapter.
 
-Without auth enabled, the host renders the workspace view directly. Set `MICA_AUTH_LOCAL_PASSWORD=1`
-or `MICA_AUTH_GITHUB_CLIENT_ID` to require sign-in first; the shell currently renders a sign-in link
-rather than a login form, so leave auth off for the shell demo.
+The workspace tools read the `source/*` computed relations, which the Rust source provider
+populates; this port declares them but does not populate them yet, so the panels are empty. The
+agent loop, transcript, and streaming views work.
+
+Auth is off for the shell demo: the agent world does not declare the MUD person schema, so the
+host renders the workspace view directly.
 
 ## UI Shape
 

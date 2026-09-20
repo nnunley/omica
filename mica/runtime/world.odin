@@ -732,6 +732,7 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 			workers            = workers,
 			instruction_budget = config.instruction_budget,
 			time_limit         = config.time_limit,
+			external_enabled   = config.external_handler != nil,
 		},
 		allocator,
 	)
@@ -906,6 +907,7 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 			workers            = workers,
 			instruction_budget = config.instruction_budget,
 			time_limit         = config.time_limit,
+			external_enabled   = config.external_handler != nil,
 		},
 		allocator,
 	)

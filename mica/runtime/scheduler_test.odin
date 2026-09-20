@@ -647,17 +647,17 @@ test_scheduler_external_request :: proc(t: ^testing.T) {
 	})
 
 	scheduler: Scheduler
-	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1, external_enabled = true})
 	defer scheduler_destroy(&scheduler)
 
 	id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
 	testing.expect(t, scheduler_wait_suspended(&scheduler, id, .External_Request))
 
-	sync.mutex_lock(&scheduler.lock)
-	entry := scheduler.entries[id]
-	request_service, service_ok := v.value_as_symbol(entry.task.state.request_value)
-	request_payload, payload_ok := v.value_as_int(entry.task.state.request_payload)
-	sync.mutex_unlock(&scheduler.lock)
+	job: External_Job
+	testing.expect(t, scheduler_take_external(&scheduler, &job))
+	testing.expect_value(t, job.task_id, id)
+	request_service, service_ok := v.value_as_symbol(job.service)
+	request_payload, payload_ok := v.value_as_int(job.payload)
 	testing.expect(t, service_ok)
 	name, name_ok := v.symbol_name(request_service)
 	testing.expect(t, name_ok)
@@ -671,6 +671,45 @@ test_scheduler_external_request :: proc(t: ^testing.T) {
 	value, value_ok := v.value_as_int(outcome.value)
 	testing.expect(t, value_ok)
 	testing.expect_value(t, value, i64(99))
+}
+
+// Without a handler the scheduler answers an external request inline: the task
+// resumes with an `ExternalUnavailable` error value and never parks.
+@(test)
+test_scheduler_external_unavailable_without_handler :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	program := compile_task_program(t, proc(builder: ^vm.Builder) {
+		service := i32(vm.builder_add_constant(
+			builder,
+			v.value_symbol(v.symbol_intern("svc")),
+		))
+		payload := i32(vm.builder_add_constant(builder, value_int_must(5)))
+		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 3, true)
+		vm.builder_emit(builder, .Load_Const, 0, 0, service, 0)
+		vm.builder_emit(builder, .Load_Const, 0, 1, payload, 0)
+		vm.builder_emit(builder, .External_Request, 0, 2, 0, 1)
+		vm.builder_emit(builder, .Return, 0, 2, 0, 0)
+		vm.builder_end_function(builder)
+	})
+
+	scheduler: Scheduler
+	scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 1})
+	defer scheduler_destroy(&scheduler)
+
+	id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
+	outcome := scheduler_wait(&scheduler, id)
+	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
+	error_value, is_error := v.value_as_error(outcome.value)
+	testing.expect(t, is_error)
+	if !is_error {
+		return
+	}
+	code, code_ok := v.symbol_name(error_value.code)
+	testing.expect(t, code_ok)
+	testing.expect_value(t, code, "ExternalUnavailable")
 }
 
 // Two delayed tasks must both wake: the timer service must remove the timer it

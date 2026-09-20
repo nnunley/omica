@@ -471,7 +471,8 @@ The [guide](mdbook/src/SUMMARY.md) walks through the examples, the language, and
   vendored browser `sync-client.js`.
 - [`tools/filein`](tools/filein): filein and eval CLI.
 - [`tools/repl`](tools/repl): interactive evaluation against a live world or store.
-- [`tools/webhost`](tools/webhost): web host binary used by `scripts/mud.sh`.
+- [`tools/webhost`](tools/webhost): web host binary used by `scripts/mud.sh` and
+  `scripts/agent.sh`.
 - [`tools/parse_corpus`](tools/parse_corpus): corpus parser report.
 - [`apps/shared`](apps/shared): shared Mica fileins for capabilities, strings, events, retrieval,
   and browser DOM sync helpers.
@@ -490,6 +491,8 @@ The [guide](mdbook/src/SUMMARY.md) walks through the examples, the language, and
     lower-fidelity numbers — use them only for local spot checks, not for updating the
     baseline.
 - [`scripts/mud.sh`](scripts/mud.sh): builds and runs the web host with the MUD fileins.
+- [`scripts/agent.sh`](scripts/agent.sh): builds and runs the web host with the agent fileins;
+  model access needs `OPENROUTER_API_KEY`.
 - [`mdbook`](mdbook): The Mica Guide, a tutorial and language/runtime reference.
 
 ## Contributing

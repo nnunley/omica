@@ -1211,7 +1211,10 @@ builtin_set_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		vm.vm_set_error(state, "E_FIELD", "unknown field")
 		return v.Value(0), false
 	}
-	info, found := env.fields[name]
+	// Field declarations register the lowercased last path segment
+	// (`session/SteeringQueue` is stored as `session/steeringQueue`), so the
+	// access does the same normalization.
+	info, found := env.fields[lower_first(name, context.temp_allocator)]
 	if !found || len(info.key_positions) == 0 {
 		vm.vm_set_error(state, "E_FIELD", fmt.aprintf(
 			"unknown functional field: %s",
@@ -1306,7 +1309,7 @@ builtin_get_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 			return option_none_value(state.allocator), true
 		}
 	}
-	info, found := env.fields[name]
+	info, found := env.fields[lower_first(name, context.temp_allocator)]
 	if !found || len(info.key_positions) != 1 || info.key_positions[0] != 0 {
 		vm.vm_set_error(state, "E_FIELD", fmt.aprintf(
 			"unknown functional field: %s",

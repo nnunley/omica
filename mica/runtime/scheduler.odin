@@ -27,6 +27,10 @@ Scheduler_Config :: struct {
 	// `World_Config.instruction_budget` and `World_Config.time_limit`.
 	instruction_budget: u64,
 	time_limit:         time.Duration,
+	// True when a host external-request handler is configured. When false,
+	// external requests are answered inline with an `ExternalUnavailable`
+	// error value, and no external queue or worker is needed.
+	external_enabled: bool,
 }
 
 DEFAULT_SCHEDULER_WORKERS :: 8
@@ -100,13 +104,14 @@ Scheduler :: struct {
 	done_cond: sync.Cond,
 	stop:      bool,
 
-	// External host requests. Tasks parked on `.External_Request` queue here;
-	// the world's external workers take jobs and resume the tasks. Kept apart
-	// from `cond` so an external wakeup cannot be consumed by a scheduler
-	// worker.
-	external_cond:  sync.Cond,
-	external_stop:  bool,
-	external_queue: [dynamic]External_Job,
+	// External host requests. Tasks parked on `.External_Request` queue here
+	// when a handler is enabled; the world's external workers take jobs and
+	// resume the tasks. Kept apart from `cond` so an external wakeup cannot
+	// be consumed by a scheduler worker.
+	external_enabled: bool,
+	external_cond:    sync.Cond,
+	external_stop:    bool,
+	external_queue:   [dynamic]External_Job,
 
 	ready:   [dynamic]Task_ID,
 	timers:  [dynamic]Timer_Entry,
@@ -132,11 +137,14 @@ scheduler_init :: proc(
 	scheduler.allocator = allocator
 	scheduler.instruction_budget = config.instruction_budget
 	scheduler.time_limit = config.time_limit
+	scheduler.external_enabled = config.external_enabled
 	scheduler.ready = make([dynamic]Task_ID, allocator)
 	scheduler.timers = make([dynamic]Timer_Entry, allocator)
 	scheduler.entries = make(map[Task_ID]^Scheduler_Entry, allocator)
 	scheduler.mailboxes = make(map[u64]^Mailbox, allocator)
-	scheduler.external_queue = make([dynamic]External_Job, allocator)
+	if scheduler.external_enabled {
+		scheduler.external_queue = make([dynamic]External_Job, allocator)
+	}
 	scheduler.threads = make([dynamic]^thread.Thread, allocator)
 	scheduler.next_id = 1
 
@@ -350,12 +358,31 @@ scheduler_finish_locked :: proc(
 		case .Mailbox_Recv:
 			scheduler_park_mailbox_locked(scheduler, id, entry, outcome.millis)
 		case .External_Request:
-			append(&scheduler.external_queue, External_Job {
-				task_id = id,
-				service = outcome.service,
-				payload = outcome.payload,
-			})
-			sync.cond_signal(&scheduler.external_cond)
+			if scheduler.external_enabled {
+				append(&scheduler.external_queue, External_Job {
+					task_id = id,
+					service = outcome.service,
+					payload = outcome.payload,
+				})
+				sync.cond_signal(&scheduler.external_cond)
+			} else {
+				// No host bridge: resume the task with an unavailable value.
+				// The caller holds the lock, so requeue the way
+				// `scheduler_resume` does instead of calling it.
+				error_value := v.value_error(
+					scheduler.allocator,
+					v.symbol_intern("ExternalUnavailable"),
+					"no external request handler is configured",
+					true,
+					v.Value(0),
+					false,
+				)
+				entry.generation += 1
+				entry.has_pending = true
+				entry.pending_value = error_value
+				append(&scheduler.ready, id)
+				sync.cond_signal(&scheduler.cond)
+			}
 		case .Host_Request, .Spawn, .Commit, .None:
 			// Parked until a host resumes the task.
 		}

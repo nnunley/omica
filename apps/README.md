@@ -57,10 +57,10 @@ The MUD app is described in more detail in [`mud/README.md`](./mud/README.md).
 The agent web app is a coding agent shell that reuses the MUD's sync and tool-window patterns for a
 transcript, workspace, inspector, and command bar.
 
-> **Not implemented in the Odin port.** The LLM host bridge
-> (`llm_responses_stream` / `llm_chat_stream_to`) does not exist here, so the shell loads but cannot
-> call a model: those verbs raise `E_NOT_IMPLEMENTED`. The `scripts/agent.sh` runner and
-> `mica-daemon` instructions below belong to the Rust implementation. See issue
+> **Port status.** The LLM host bridge is implemented in the Odin port, so
+> `scripts/agent.sh` runs the shell and the agent loop can call a model. The Rust source provider's
+> computed relations are not ported, so the workspace tools and panels are empty. The
+> `mica-daemon` instructions in the Rust sections do not apply here. See issue
 > [#8](https://github.com/rdaum/omica/issues/8).
 
 The shell is described in more detail in [`agent/README.md`](./agent/README.md).
