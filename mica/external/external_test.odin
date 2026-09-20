@@ -391,6 +391,137 @@ test_stream_without_terminal_reports_error :: proc(t: ^testing.T) {
 	testing.expect_value(t, test_event_kind(last), "error")
 }
 
+// A provider that leaks DSML tool calls as streamed text: the markup can be
+// split across deltas, and the recovered call must arrive before `completed`.
+@(test)
+test_chat_stream_dsml_recovery :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	payloads := []string {
+		`{"choices":[{"delta":{"content":"Let me look. "}}]}`,
+		`{"choices":[{"delta":{"content":"<｜DSML｜tool_calls><｜DSML｜invoke name=\"ls\"><｜DSML｜param"}}]}`,
+		`{"choices":[{"delta":{"content":"eter name=\"path\" string=\"true\">.</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"}}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`[DONE]`,
+	}
+	events := test_decoder(t, .Chat_Completions, payloads)
+	defer delete(events)
+
+	kinds := test_event_kinds_flat(events[:], context.temp_allocator)
+	testing.expect_value(t, len(kinds), 4)
+	if len(kinds) != 4 {
+		return
+	}
+	testing.expect_value(t, kinds[0], "started")
+	testing.expect_value(t, kinds[1], "text_delta")
+	testing.expect_value(t, kinds[2], "tool_call_ready")
+	testing.expect_value(t, kinds[3], "completed")
+	for event in events {
+		switch test_event_kind(event) {
+		case "text_delta":
+			delta := test_lookup_text(t, event, "delta")
+			testing.expectf(t, !strings.contains(delta, "DSML"), "leaked DSML: %s", delta)
+			testing.expect_value(t, delta, "Let me look. ")
+		case "tool_call_ready":
+			testing.expect_value(t, test_lookup_text(t, event, "call_id"), "dsml_tool_1")
+			testing.expect_value(t, test_lookup_text(t, event, "name"), "ls")
+			arguments := test_lookup_text(t, event, "arguments")
+			testing.expectf(
+				t,
+				strings.contains(arguments, "\"path\""),
+				"arguments: %s",
+				arguments,
+			)
+		}
+	}
+}
+
+@(test)
+test_responses_stream_dsml_recovery :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	payloads := []string {
+		`{"type":"response.output_text.delta","delta":"Working","item_id":"i1","output_index":0,"content_index":0}`,
+		`{"type":"response.output_text.delta","delta":" < | DSML | tool_calls>< | DSML | invoke name=\"read\">< | DSML | parameter name=\"path\" string=\"true\">a.mica</ | DSML | parameter></ | DSML | invoke></ | DSML | tool_calls>","item_id":"i1","output_index":0,"content_index":0}`,
+		`{"type":"response.output_text.delta","delta":" after","item_id":"i1","output_index":0,"content_index":0}`,
+		`{"type":"response.completed","response":{"output":[]}}`,
+	}
+	events := test_decoder(t, .Responses, payloads)
+	defer delete(events)
+
+	kinds := test_event_kinds_flat(events[:], context.temp_allocator)
+	// The space before the marker is its own delta, then the held " after".
+	testing.expect_value(t, len(kinds), 6)
+	if len(kinds) != 6 {
+		return
+	}
+	testing.expect_value(t, kinds[0], "started")
+	testing.expect_value(t, kinds[1], "text_delta")
+	testing.expect_value(t, kinds[2], "text_delta")
+	testing.expect_value(t, kinds[3], "tool_call_ready")
+	testing.expect_value(t, kinds[4], "text_delta")
+	testing.expect_value(t, kinds[5], "completed")
+
+	builder: strings.Builder
+	strings.builder_init(&builder, context.temp_allocator)
+	defer strings.builder_destroy(&builder)
+	for event in events {
+		if test_event_kind(event) == "text_delta" {
+			strings.write_string(&builder, test_lookup_text(t, event, "delta"))
+		}
+		if test_event_kind(event) == "tool_call_ready" {
+			testing.expect_value(t, test_lookup_text(t, event, "name"), "read")
+			arguments := test_lookup_text(t, event, "arguments")
+			testing.expectf(t, strings.contains(arguments, "a.mica"), "arguments: %s", arguments)
+		}
+	}
+	// The space before the marker and the leading space of the trailing text
+	// are both real stream content.
+	testing.expect_value(t, strings.to_string(builder), "Working  after")
+}
+
+// A block the model never closes still produces its call before `completed`.
+@(test)
+test_chat_stream_dsml_without_close :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	payloads := []string {
+		`{"choices":[{"delta":{"content":"<｜DSML｜tool_calls><｜DSML｜invoke name=\"look\"><｜DSML｜parameter name=\"at\" string=\"true\">here</｜DSML｜parameter></｜DSML｜invoke>"}}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+	}
+	events := test_decoder(t, .Chat_Completions, payloads)
+	defer delete(events)
+
+	kinds := test_event_kinds_flat(events[:], context.temp_allocator)
+	testing.expect_value(t, len(kinds), 3)
+	if len(kinds) != 3 {
+		return
+	}
+	testing.expect_value(t, kinds[0], "started")
+	testing.expect_value(t, kinds[1], "tool_call_ready")
+	testing.expect_value(t, kinds[2], "completed")
+}
+
+// Ordinary text with an angle bracket is not mistaken for markup.
+@(test)
+test_chat_stream_plain_angle_text :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	payloads := []string {
+		`{"choices":[{"delta":{"content":"a < b"}}]}`,
+		`{"choices":[{"delta":{"content":" c"}}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+	}
+	events := test_decoder(t, .Chat_Completions, payloads)
+	defer delete(events)
+
+	builder: strings.Builder
+	strings.builder_init(&builder, context.temp_allocator)
+	defer strings.builder_destroy(&builder)
+	for event in events {
+		if test_event_kind(event) == "text_delta" {
+			strings.write_string(&builder, test_lookup_text(t, event, "delta"))
+		}
+	}
+	testing.expect_value(t, strings.to_string(builder), "a < b c")
+}
+
 // --- DSML ------------------------------------------------------------------
 
 @(test)

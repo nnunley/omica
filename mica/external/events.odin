@@ -112,6 +112,16 @@ Event_Decoder :: struct {
 	chat_tool_calls:  map[int]^Tool_Call_Accumulator,
 	ready_tool_calls: map[string]bool,
 	allocator:        mem.Allocator,
+
+	// DSML recovery. Some providers leak tool calls as DSML markup in streamed
+	// text instead of native tool-call deltas. Text that may contain a marker
+	// waits in `text_hold`; once a marker is recognized the markup accumulates
+	// in `dsml_buffer` until its closing tag, then becomes `tool_call_ready`
+	// events.
+	dsml_active: bool,
+	dsml_calls:  int,
+	dsml_buffer: [dynamic]u8,
+	text_hold:   [dynamic]u8,
 }
 
 @(private)
@@ -126,6 +136,8 @@ event_decoder_init :: proc(
 	decoder.allocator = allocator
 	decoder.chat_tool_calls = make(map[int]^Tool_Call_Accumulator, allocator)
 	decoder.ready_tool_calls = make(map[string]bool, allocator)
+	decoder.dsml_buffer = make([dynamic]u8, 0, 256, allocator)
+	decoder.text_hold = make([dynamic]u8, 0, 256, allocator)
 	sse_decoder_init(&decoder.sse, allocator)
 }
 
@@ -139,6 +151,8 @@ event_decoder_destroy :: proc(decoder: ^Event_Decoder) {
 	}
 	delete(decoder.chat_tool_calls)
 	delete(decoder.ready_tool_calls)
+	delete(decoder.dsml_buffer)
+	delete(decoder.text_hold)
 }
 
 // Appends the events encoded by `bytes`. Returns an error message when a frame
@@ -175,6 +189,15 @@ event_decoder_finish :: proc(
 	sse_decoder_finish(&decoder.sse, &frames)
 	if message, ok := event_decoder_frames(decoder, frames[:], events); !ok {
 		return message, false
+	}
+	// Flush a DSML block or held text that the stream ended without closing.
+	if decoder.dsml_active && len(decoder.dsml_buffer) > 0 {
+		decoder_dsml_flush(decoder, len(decoder.dsml_buffer), events)
+	}
+	if len(decoder.text_hold) > 0 {
+		text := string(decoder.text_hold[:])
+		clear(&decoder.text_hold)
+		emit_text_delta(decoder, text, nil, events)
 	}
 	if !decoder.terminal {
 		append(
@@ -271,6 +294,238 @@ event_decoder_frames :: proc(
 	return "", true
 }
 
+// --- DSML stream recovery --------------------------------------------------
+
+@(private)
+is_dsml_separator :: proc(byte: byte) -> bool {
+	// The fullwidth bar is multi-byte UTF-8; treat any high byte as a
+	// separator so both `< | DSML |` and `<｜DSML｜` match.
+	return byte == ' ' || byte == '\t' || byte == '|' || byte >= 0x80
+}
+
+@(private)
+common_prefix_len :: proc(a, b: string) -> int {
+	count := 0
+	for count < len(a) && count < len(b) && a[count] == b[count] {
+		count += 1
+	}
+	return count
+}
+
+// Finds a complete DSML start tag: `<`, separators, `DSML`, separators, then
+// `tool_calls` or `invoke`. Returns the index of `<`, or -1.
+@(private)
+find_dsml_start :: proc(text: string) -> int {
+	for index := 0; index + 5 <= len(text); index += 1 {
+		if text[index] != '<' {
+			continue
+		}
+		cursor := index + 1
+		separators := 0
+		for cursor < len(text) && is_dsml_separator(text[cursor]) && separators < 8 {
+			cursor += 1
+			separators += 1
+		}
+		if cursor + 4 > len(text) || text[cursor:cursor + 4] != "DSML" {
+			continue
+		}
+		cursor += 4
+		separators = 0
+		for cursor < len(text) && is_dsml_separator(text[cursor]) && separators < 8 {
+			cursor += 1
+			separators += 1
+		}
+		if cursor >= len(text) {
+			continue
+		}
+		if strings.has_prefix(text[cursor:], "tool_calls") ||
+		   strings.has_prefix(text[cursor:], "invoke") {
+			return index
+		}
+	}
+	return -1
+}
+
+// Reports whether `tail` (starting at a `<`) could still grow into a DSML
+// start tag. Held text is re-examined on the next delta.
+@(private)
+could_be_dsml_prefix :: proc(tail: string) -> bool {
+	if len(tail) == 0 || tail[0] != '<' {
+		return false
+	}
+	cursor := 1
+	separators := 0
+	for cursor < len(tail) && is_dsml_separator(tail[cursor]) && separators < 8 {
+		cursor += 1
+		separators += 1
+	}
+	rest := tail[cursor:]
+	matched := common_prefix_len(rest, "DSML")
+	if matched < len("DSML") {
+		return matched == len(rest)
+	}
+	cursor += len("DSML")
+	separators = 0
+	for cursor < len(tail) && is_dsml_separator(tail[cursor]) && separators < 8 {
+		cursor += 1
+		separators += 1
+	}
+	rest = tail[cursor:]
+	if strings.has_prefix(rest, "tool_calls") || strings.has_prefix(rest, "invoke") {
+		return true
+	}
+	for word in ([]string{"tool_calls", "invoke"}) {
+		if strings.has_prefix(word, rest) {
+			return true
+		}
+	}
+	return false
+}
+
+// Emits ordinary streamed text. `fields` carries provider ids alongside the
+// delta when the caller has them.
+@(private)
+emit_text_delta :: proc(
+	decoder: ^Event_Decoder,
+	text: string,
+	fields: []v.Map_Entry,
+	events: ^[dynamic]v.Value,
+) {
+	if text == "" {
+		return
+	}
+	entries := make([dynamic]v.Map_Entry, 0, len(fields) + 2, context.temp_allocator)
+	append(&entries, symbol_entry("type", v.value_symbol(v.symbol_intern("text_delta"))))
+	append(&entries, symbol_entry("delta", v.value_string(decoder.allocator, text)))
+	append(&entries, ..fields)
+	append(events, v.value_map(decoder.allocator, entries[:]))
+}
+
+// Routes streamed text through DSML recovery. Text is emitted as-is until a
+// marker appears; from then on the markup is buffered.
+@(private)
+decoder_text_delta :: proc(
+	decoder: ^Event_Decoder,
+	text: string,
+	fields: []v.Map_Entry,
+	events: ^[dynamic]v.Value,
+) {
+	if decoder.dsml_active {
+		append(&decoder.dsml_buffer, ..transmute([]byte)text)
+		decoder_dsml_maybe_flush(decoder, events)
+		return
+	}
+	append(&decoder.text_hold, ..transmute([]byte)text)
+	decoder_flush_text(decoder, fields, events)
+}
+
+@(private)
+decoder_flush_text :: proc(
+	decoder: ^Event_Decoder,
+	fields: []v.Map_Entry,
+	events: ^[dynamic]v.Value,
+) {
+	for {
+		hold := string(decoder.text_hold[:])
+		if hold == "" {
+			return
+		}
+		start := find_dsml_start(hold)
+		if start < 0 {
+			// Emit everything except a tail that could still become a marker.
+			safe := len(hold)
+			if last_lt := strings.last_index_byte(hold, '<'); last_lt >= 0 {
+				if could_be_dsml_prefix(hold[last_lt:]) {
+					safe = last_lt
+				}
+			}
+			if safe > 0 {
+				emit_text_delta(decoder, hold[:safe], fields, events)
+				remove_range(&decoder.text_hold, 0, safe)
+			}
+			return
+		}
+		if start > 0 {
+			emit_text_delta(decoder, hold[:start], fields, events)
+			remove_range(&decoder.text_hold, 0, start)
+			continue
+		}
+		// The hold starts with a marker: switch to DSML buffering.
+		decoder.dsml_active = true
+		clear(&decoder.text_hold)
+		append(&decoder.dsml_buffer, ..transmute([]byte)hold)
+		decoder_dsml_maybe_flush(decoder, events)
+		return
+	}
+}
+
+@(private)
+decoder_dsml_maybe_flush :: proc(decoder: ^Event_Decoder, events: ^[dynamic]v.Value) {
+	end := find_dsml_close(string(decoder.dsml_buffer[:]))
+	if end < 0 {
+		return
+	}
+	decoder_dsml_flush(decoder, end, events)
+}
+
+// End index just past a closing `...tool_calls>` tag, or -1. The opening tag
+// also contains `tool_calls>`, so a `/` must appear just before it.
+@(private)
+find_dsml_close :: proc(text: string) -> int {
+	cursor := 0
+	for {
+		relative := strings.index(text[cursor:], "tool_calls>")
+		if relative < 0 {
+			return -1
+		}
+		index := cursor + relative
+		back := max(index - 16, 0)
+		if strings.contains(text[back:index], "/") {
+			return index + len("tool_calls>")
+		}
+		cursor = index + len("tool_calls>")
+	}
+}
+
+// Converts the buffered markup up to `end` into `tool_call_ready` events.
+// Any text after the closing tag returns to the ordinary text path.
+@(private)
+decoder_dsml_flush :: proc(decoder: ^Event_Decoder, end: int, events: ^[dynamic]v.Value) {
+	segment := string(decoder.dsml_buffer[:end])
+	calls, count := parse_dsml_tool_calls(segment, decoder.allocator, decoder.dsml_calls + 1)
+	calls_list, _ := v.value_as_list(calls)
+	for call, index in calls_list {
+		call_id, _ := lookup_text(call, "id")
+		function, has_function := lookup(call, "function")
+		name, arguments: string
+		if has_function {
+			name, _ = lookup_text(function, "name")
+			arguments, _ = lookup_text(function, "arguments")
+		}
+		output_index, _ := v.value_int(i64(index))
+		fields := []v.Map_Entry {
+			symbol_entry("output_index", output_index),
+			symbol_entry("call_id", v.value_string(decoder.allocator, call_id)),
+			symbol_entry("name", v.value_string(decoder.allocator, name)),
+			symbol_entry("arguments", v.value_string(decoder.allocator, arguments)),
+		}
+		append(
+			events,
+			event_value(decoder.allocator, "tool_call_ready", fields, v.Value(0), false),
+		)
+	}
+	decoder.dsml_calls += count
+
+	remainder := make([]u8, len(decoder.dsml_buffer) - end, context.temp_allocator)
+	copy(remainder, decoder.dsml_buffer[end:])
+	clear(&decoder.dsml_buffer)
+	decoder.dsml_active = false
+	if len(remainder) > 0 {
+		append(&decoder.text_hold, ..remainder)
+		decoder_flush_text(decoder, nil, events)
+	}
+}
+
 // --- Normalizers -----------------------------------------------------------
 
 @(private)
@@ -292,13 +547,16 @@ normalize_responses_event :: proc(
 		// The `started` event already covers this.
 
 	case "response.output_text.delta", "response.refusal.delta":
+		delta_text, has_delta := lookup_text(json, "delta")
+		if !has_delta {
+			return "", true
+		}
 		fields: [dynamic]v.Map_Entry
-		fields = make([dynamic]v.Map_Entry, 0, 4, context.temp_allocator)
-		copy_field(&fields, json, "delta", "delta")
+		fields = make([dynamic]v.Map_Entry, 0, 3, context.temp_allocator)
 		copy_field(&fields, json, "item_id", "item_id")
 		copy_field(&fields, json, "output_index", "output_index")
 		copy_field(&fields, json, "content_index", "content_index")
-		append(events, event_value(allocator, "text_delta", fields[:], v.Value(0), false))
+		decoder_text_delta(decoder, delta_text, fields[:], events)
 
 	case "response.output_item.added":
 		item, found := lookup(json, "item")
@@ -347,6 +605,9 @@ normalize_responses_event :: proc(
 		}
 
 	case "response.completed":
+		if decoder.dsml_active {
+			decoder_dsml_flush(decoder, len(decoder.dsml_buffer), events)
+		}
 		response, found := lookup(json, "response")
 		if found {
 			if output, is_list := lookup(response, "output"); is_list {
@@ -370,6 +631,9 @@ normalize_responses_event :: proc(
 		decoder.terminal = true
 
 	case "response.incomplete":
+		if decoder.dsml_active {
+			decoder_dsml_flush(decoder, len(decoder.dsml_buffer), events)
+		}
 		event, ok := response_terminal_event(allocator, "incomplete", json)
 		if ok {
 			append(events, event)
@@ -450,18 +714,7 @@ normalize_chat_event :: proc(
 			continue
 		}
 		if content, has_content := lookup_text(delta, "content"); has_content {
-			append(
-				events,
-				event_value(
-					allocator,
-					"text_delta",
-					[]v.Map_Entry {
-						symbol_entry("delta", v.value_string(allocator, content)),
-					},
-					v.Value(0),
-					false,
-				),
-			)
+			decoder_text_delta(decoder, content, nil, events)
 		}
 		if tool_calls_value, has_tool_calls := lookup(delta, "tool_calls"); has_tool_calls {
 			tool_calls, is_tool_list := v.value_as_list(tool_calls_value)
@@ -521,6 +774,11 @@ normalize_chat_event :: proc(
 			}
 		}
 		if reason, has_reason := lookup_text(choice, "finish_reason"); has_reason {
+			// A model that never closed its DSML block still gets its tool
+			// calls, and they must arrive before `completed`.
+			if decoder.dsml_active {
+				decoder_dsml_flush(decoder, len(decoder.dsml_buffer), events)
+			}
 			for index, accumulator in decoder.chat_tool_calls {
 				index_value, _ := v.value_int(i64(index))
 				append(

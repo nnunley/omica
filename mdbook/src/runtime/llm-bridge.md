@@ -68,6 +68,13 @@ Events batched to keep up with a fast provider arrive as
 | `:error` | `:message`, `:raw` when the provider sent one |
 | `:batch` | `:events` |
 
+Some OpenAI-compatible providers stream tool calls as DSML markup inside the
+text instead of native tool-call deltas. The bridge recognizes both the
+`< | DSML | ...>` and `<｜DSML｜...>` forms in streamed text, withholds the
+markup from `:text_delta` events, and synthesizes `:tool_call_ready` before the
+terminal event. The non-streaming path rewrites the response's `tool_calls`
+instead.
+
 `apps/examples/llm-chat.mica` is a complete streaming example that logs the
 deltas and records the assembled answer as a fact.
 

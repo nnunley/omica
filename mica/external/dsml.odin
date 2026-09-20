@@ -106,10 +106,13 @@ map_set :: proc(
 }
 
 // Parses DSML markup into a list of tool-call maps and the number found.
+// `first_index` numbers the generated call ids, so a stream that flushes
+// several DSML blocks keeps its ids unique.
 @(private)
 parse_dsml_tool_calls :: proc(
 	content: string,
 	allocator: mem.Allocator,
+	first_index := 1,
 ) -> (
 	v.Value,
 	int,
@@ -155,7 +158,10 @@ parse_dsml_tool_calls :: proc(
 		call := v.value_map(allocator, []v.Map_Entry {
 			symbol_entry(
 				"id",
-				v.value_string(allocator, fmt_aprintf_temp("dsml_tool_%d", len(calls) + 1)),
+				v.value_string(
+					allocator,
+					fmt_aprintf_temp("dsml_tool_%d", first_index + len(calls)),
+				),
 			),
 			symbol_entry("type", v.value_string(allocator, "function")),
 			symbol_entry("function", function),
