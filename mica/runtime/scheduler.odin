@@ -68,6 +68,13 @@ Scheduler_Entry :: struct {
 	done:          bool,
 }
 
+// A task parked on an `External_Request` boundary, waiting for a host handler.
+External_Job :: struct {
+	task_id: Task_ID,
+	service: v.Value,
+	payload: v.Value,
+}
+
 Scheduler :: struct {
 	kernel:    ^k.Kernel,
 	allocator: mem.Allocator,
@@ -92,6 +99,14 @@ Scheduler :: struct {
 	// versa; without that split `cond` had to be broadcast everywhere.
 	done_cond: sync.Cond,
 	stop:      bool,
+
+	// External host requests. Tasks parked on `.External_Request` queue here;
+	// the world's external workers take jobs and resume the tasks. Kept apart
+	// from `cond` so an external wakeup cannot be consumed by a scheduler
+	// worker.
+	external_cond:  sync.Cond,
+	external_stop:  bool,
+	external_queue: [dynamic]External_Job,
 
 	ready:   [dynamic]Task_ID,
 	timers:  [dynamic]Timer_Entry,
@@ -121,6 +136,7 @@ scheduler_init :: proc(
 	scheduler.timers = make([dynamic]Timer_Entry, allocator)
 	scheduler.entries = make(map[Task_ID]^Scheduler_Entry, allocator)
 	scheduler.mailboxes = make(map[u64]^Mailbox, allocator)
+	scheduler.external_queue = make([dynamic]External_Job, allocator)
 	scheduler.threads = make([dynamic]^thread.Thread, allocator)
 	scheduler.next_id = 1
 
@@ -157,6 +173,7 @@ scheduler_destroy :: proc(scheduler: ^Scheduler) {
 	delete(scheduler.ready)
 	delete(scheduler.timers)
 	delete(scheduler.threads)
+	delete(scheduler.external_queue)
 }
 
 // Stops the worker and timer threads and waits for them.
@@ -169,6 +186,7 @@ scheduler_shutdown :: proc(scheduler: ^Scheduler) {
 	sync.cond_broadcast(&scheduler.cond)
 	sync.cond_broadcast(&scheduler.timer_cond)
 	sync.cond_broadcast(&scheduler.done_cond)
+	sync.cond_broadcast(&scheduler.external_cond)
 	sync.mutex_unlock(&scheduler.lock)
 
 	for worker in scheduler.threads {
@@ -282,6 +300,31 @@ scheduler_resume :: proc(scheduler: ^Scheduler, id: Task_ID, value: v.Value) -> 
 	return true
 }
 
+// Takes the next parked external request, blocking until one arrives or the
+// scheduler stops. Returns false when the scheduler is stopping.
+scheduler_take_external :: proc(scheduler: ^Scheduler, job: ^External_Job) -> bool {
+	sync.mutex_lock(&scheduler.lock)
+	defer sync.mutex_unlock(&scheduler.lock)
+	for len(scheduler.external_queue) == 0 && !scheduler.external_stop {
+		sync.cond_wait(&scheduler.external_cond, &scheduler.lock)
+	}
+	if len(scheduler.external_queue) == 0 {
+		return false
+	}
+	job^ = scheduler.external_queue[0]
+	ordered_remove(&scheduler.external_queue, 0)
+	return true
+}
+
+// Wakes every external worker and makes further takes fail. Called before the
+// scheduler is destroyed so external threads are joined first.
+scheduler_stop_external :: proc(scheduler: ^Scheduler) {
+	sync.mutex_lock(&scheduler.lock)
+	scheduler.external_stop = true
+	sync.cond_broadcast(&scheduler.external_cond)
+	sync.mutex_unlock(&scheduler.lock)
+}
+
 // Applies a task outcome and parks, requeues, or finishes the entry. The
 // caller must hold the scheduler lock.
 @(private)
@@ -306,7 +349,14 @@ scheduler_finish_locked :: proc(
 			})
 		case .Mailbox_Recv:
 			scheduler_park_mailbox_locked(scheduler, id, entry, outcome.millis)
-		case .Host_Request, .External_Request, .Spawn, .Commit, .None:
+		case .External_Request:
+			append(&scheduler.external_queue, External_Job {
+				task_id = id,
+				service = outcome.service,
+				payload = outcome.payload,
+			})
+			sync.cond_signal(&scheduler.external_cond)
+		case .Host_Request, .Spawn, .Commit, .None:
 			// Parked until a host resumes the task.
 		}
 	case .Complete, .Aborted:

@@ -11,6 +11,8 @@ import "core:mem"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 import "core:time"
 import c "../compiler"
 import s "../store"
@@ -59,6 +61,11 @@ World_Config :: struct {
 	// time in kernel work, so the budget alone trips too slowly to tell a hang
 	// from a slow test.
 	time_limit: time.Duration,
+	// Host-side handler for `External_Request` boundaries. Nil answers every
+	// request with an `ExternalUnavailable` error value.
+	external_handler: External_Handler,
+	// External worker threads. Values below one become one.
+	external_workers: int,
 }
 
 // The `World_Config` a harness uses for the program under test. A harness must
@@ -95,6 +102,13 @@ World :: struct {
 	store:     ^s.Store,
 	entry:     Task_ID,
 	started:   bool,
+	// External host bridge. Stream workers are tracked here so world shutdown
+	// can join them before the scheduler they deliver through is destroyed.
+	external_handler:  External_Handler,
+	external_workers:  [dynamic]^thread.Thread,
+	external_streams:  [dynamic]^External_Stream,
+	external_lock:     sync.Mutex,
+	external_stopping: i32,
 }
 
 // Loads a world and starts its scheduler. The entry task is submitted but not
@@ -146,6 +160,7 @@ world_start :: proc(
 			world_destroy(world)
 			return nil, result
 		}
+		world_start_external(world, config)
 		return world, result
 	}
 
@@ -154,6 +169,7 @@ world_start :: proc(
 		world_destroy(world)
 		return nil, result
 	}
+	world_start_external(world, config)
 	return world, result
 }
 
@@ -164,6 +180,7 @@ world_destroy :: proc(world: ^World) {
 		return
 	}
 	if world.started {
+		world_stop_external(world)
 		scheduler_destroy(&world.scheduler)
 	}
 	if world.store != nil {

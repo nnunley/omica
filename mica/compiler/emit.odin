@@ -36,6 +36,70 @@ Compiled_Program :: struct {
 	errors:  []Compile_Error,
 }
 
+// A compiler-recognized host request. These names lower to an
+// `.External_Request` whose service symbol and payload map fields match the
+// Rust host-request function table, so the runtime and hosts share one
+// vocabulary.
+@(private)
+host_request :: proc(text: string) -> (service: string, field_count: int, ok: bool) {
+	switch text {
+	case "openai_chat_completion":
+		return "openai", 2, true
+	case "openai_chat_completion_with_options":
+		return "openai", 3, true
+	case "llm_chat_stream_to":
+		return "openai", 5, true
+	case "llm_responses_stream":
+		return "openai_responses", 6, true
+	}
+	return "", 0, false
+}
+
+// The payload field name for argument `index` of a host request. Only called
+// with indices below the count `host_request` returned.
+@(private)
+host_request_field :: proc(text: string, index: int) -> string {
+	switch text {
+	case "openai_chat_completion":
+		return index == 0 ? "model" : "messages"
+	case "openai_chat_completion_with_options":
+		switch index {
+		case 0:
+			return "model"
+		case 1:
+			return "messages"
+		}
+		return "options"
+	case "llm_chat_stream_to":
+		switch index {
+		case 0:
+			return "model"
+		case 1:
+			return "messages"
+		case 2:
+			return "options"
+		case 3:
+			return "tools"
+		}
+		return "stream_to"
+	case "llm_responses_stream":
+		switch index {
+		case 0:
+			return "model"
+		case 1:
+			return "input"
+		case 2:
+			return "instructions"
+		case 3:
+			return "options"
+		case 4:
+			return "tools"
+		}
+		return "stream_to"
+	}
+	return ""
+}
+
 @(private)
 Local :: struct {
 	name:     string,
@@ -1696,6 +1760,55 @@ emit_call :: proc(emitter: ^Emitter, call: Call) -> (int, bool) {
 			0,
 			i32(destination),
 			i32(service),
+			i32(payload),
+		)
+		return destination, true
+	}
+
+	if service_name, field_count, is_host_request := host_request(text); is_host_request {
+		if len(call.args) != field_count {
+			push_error(emitter, fmt.aprintf(
+				"%s expects %d arguments",
+				text,
+				field_count,
+				allocator = emitter.allocator,
+			))
+			return -1, false
+		}
+		pairs := make([dynamic]int, 0, field_count * 2, emitter.allocator)
+		defer delete(pairs)
+		for argument, index in call.args {
+			value_register, value_ok := emit_expr(emitter, argument.expr)
+			if !value_ok {
+				return -1, false
+			}
+			key_register := emit_constant(
+				emitter,
+				v.value_symbol(v.symbol_intern(host_request_field(text, index))),
+			)
+			append(&pairs, key_register, value_register)
+		}
+		first := marshal_arguments(emitter, pairs[:])
+		payload := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.Build_Map,
+			0,
+			i32(payload),
+			i32(first),
+			i32(field_count),
+		)
+		service_register := emit_constant(
+			emitter,
+			v.value_symbol(v.symbol_intern(service_name)),
+		)
+		destination := alloc_register(emitter)
+		vm.builder_emit(
+			emitter.builder,
+			.External_Request,
+			0,
+			i32(destination),
+			i32(service_register),
 			i32(payload),
 		)
 		return destination, true

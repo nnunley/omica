@@ -55,6 +55,7 @@
 - [Tasks and Transactions](./runtime/tasks-and-transactions.md)
 - [Task Control](./runtime/task-control.md)
 - [Subscriptions](./runtime/subscriptions.md)
+- [The LLM Host Bridge](./runtime/llm-bridge.md)
 - [Catalogue and Introspection](./runtime/catalogue-and-introspection.md)
 - [Retrieval and Embeddings](./runtime/retrieval-and-embeddings.md)
 - [Filein and Fileout](./runtime/filein-fileout.md)

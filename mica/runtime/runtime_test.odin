@@ -5670,36 +5670,6 @@ end
 	world_release(world, id)
 }
 
-// The LLM host bridge is not implemented in the Odin port. The entry points
-// must fail with a clear, catchable E_NOT_IMPLEMENTED rather than compiling to
-// positional dispatch and failing as "no applicable method" at runtime.
-@(test)
-test_llm_bridge_reports_not_implemented :: proc(t: ^testing.T) {
-	defer free_all(context.temp_allocator)
-	ctx := c.Compile_Context {
-		builtins   = make(map[string]bool),
-		relations  = make(map[string]u32),
-		identities = make(map[string]v.Value),
-	}
-	defer delete(ctx.builtins)
-	defer delete(ctx.relations)
-	defer delete(ctx.identities)
-	install_builtin_names(&ctx)
-
-	expect_builtin_error(
-		t,
-		&ctx,
-		`llm_responses_stream("model", [], none, {:stream -> true}, [], none)`,
-		"E_NOT_IMPLEMENTED",
-	)
-	expect_builtin_error(
-		t,
-		&ctx,
-		`llm_chat_stream_to("model", [], {:stream -> true}, [], none)`,
-		"E_NOT_IMPLEMENTED",
-	)
-}
-
 // Decoding a JSON string allocates a copy; the decode must not also leak the
 // temporary builder buffer used to unescape it.
 @(test)

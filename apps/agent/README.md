@@ -13,10 +13,11 @@ is available for providers without suitable Responses support. Read-only tools (
 `glob`, `ls`) query the source-provider crate's computed relations. The source-provider also exposes
 syntax, symbol, definition, references, and VCS history as computed relations for future tools.
 
-> **Port status:** the LLM host bridge is not implemented in the Odin port. `llm_responses_stream`
-> and `llm_chat_stream_to` raise `E_NOT_IMPLEMENTED`, so the shell loads but cannot call a model.
-> The run instructions below (`scripts/agent.sh`, `mica-daemon`, `MICA_AGENT_*`) describe the Rust
-> implementation. See issue [#8](https://github.com/rdaum/omica/issues/8).
+> **Port status:** the LLM host bridge is implemented in the Odin port (`mica/external`), so the
+> agent loop can call a model. The source-provider computed relations (`source/*`) come from a Rust
+> host crate that is still not ported, so the read-only workspace tools return nothing yet. The run
+> instructions below (`scripts/agent.sh`, `mica-daemon`) describe the Rust implementation; the shell
+> fileins load in `tools/webhost` or `tools/filein`.
 
 ## What It Demonstrates
 

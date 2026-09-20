@@ -12,6 +12,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
+import ext "../../mica/external"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
 import s "../../mica/store"
@@ -170,9 +171,11 @@ main :: proc() {
 		paths[:],
 		context.allocator,
 		r.World_Config {
-			actor      = actor,
-			store_path = store_path,
-			durability = durability,
+			actor            = actor,
+			store_path       = store_path,
+			durability       = durability,
+			external_handler = ext.handle_request,
+			external_workers = 2,
 		},
 	)
 	if !start.ok {

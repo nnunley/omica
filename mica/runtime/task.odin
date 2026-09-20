@@ -40,6 +40,10 @@ Task_Outcome :: struct {
 	millis:  i64,
 	// The metadata supplied to a `read` suspension, zero when absent.
 	request: v.Value,
+	// An external request's service symbol and payload, zero unless `suspend`
+	// is `.External_Request`.
+	service: v.Value,
+	payload: v.Value,
 }
 
 Task :: struct {
@@ -301,8 +305,14 @@ task_run :: proc(task: ^Task) -> Task_Outcome {
 				}
 				millis := task.state.request_millis
 				request := v.Value(0)
+				service := v.Value(0)
+				payload := v.Value(0)
 				if suspend == .Host_Request {
 					request = task.state.request_value
+				}
+				if suspend == .External_Request {
+					service = task.state.request_value
+					payload = task.state.request_payload
 				}
 				task_end_tx(task)
 				task.state.request = .None
@@ -312,6 +322,8 @@ task_run :: proc(task: ^Task) -> Task_Outcome {
 					suspend = suspend,
 					millis  = millis,
 					request = request,
+					service = service,
+					payload = payload,
 				}
 				return task.outcome
 

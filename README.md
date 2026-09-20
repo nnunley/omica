@@ -416,6 +416,8 @@ This repository is the Odin port. It includes:
 - logical persistence with a write-ahead log, budget admission, chunk-page checkpoints,
   retained history, and store-backed boot;
 - the in-process HTTP/1.1 and SSE host with the browser sync client;
+- the outbound LLM bridge for OpenAI-compatible APIs, including streamed Responses and
+  Chat Completions calls, in `mica/external`;
 - the browser MUD in `apps/mud/`, launched with `scripts/mud.sh`.
 
 The port runs on the interpreter only: there is no JIT or GPU query acceleration. See the
@@ -427,6 +429,13 @@ It shows the current shape of Mica better than a subsystem checklist does: a run
 facts, rules, verbs, browser UI, and live inspection views are all authored inside the same system.
 
 ## Getting Started
+
+On Linux, install the libcurl development packages first (the outbound LLM bridge links the
+system libcurl); macOS uses the SDK copy:
+
+```sh
+sudo apt-get install libcurl4-openssl-dev libmbedtls-dev   # Debian/Ubuntu
+```
 
 Build the CLI and load a filein into a store:
 
@@ -453,6 +462,8 @@ The [guide](mdbook/src/SUMMARY.md) walks through the examples, the language, and
 - [`mica/compiler`](mica/compiler): lexer, parser, lowering, and bytecode compilation.
 - [`mica/runtime`](mica/runtime): world API, scheduler, task layer, builtins, and method
   installation.
+- [`mica/external`](mica/external): outbound HTTP services and the LLM bridge: Chat Completions
+  and Responses requests, SSE decoding, and streamed events.
 - [`mica/store`](mica/store): persistence: value codec, write-ahead log, chunk pages, manifests,
   retained history, and compaction.
 - [`mica/dom`](mica/dom): DOM model, JSON encoding, XML conversion, and structural diffing.

@@ -129,8 +129,10 @@ runtime_builtins := [?]Builtin_Spec {
 	{"mailbox_close", 1, builtin_mailbox_close},
 	{"mailbox_recv", 1, builtin_mailbox_recv},
 	{"external_request", 2, builtin_external_request},
-	{"llm_responses_stream", 6, builtin_not_implemented},
-	{"llm_chat_stream_to", 5, builtin_not_implemented},
+	{"openai_chat_completion", 2, builtin_host_request},
+	{"openai_chat_completion_with_options", 3, builtin_host_request},
+	{"llm_chat_stream_to", 5, builtin_host_request},
+	{"llm_responses_stream", 6, builtin_host_request},
 }
 
 @(private)
@@ -1045,17 +1047,12 @@ builtin_external_request :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bo
 	return builtin_error(state, "E_VM_FAULT", "external_request must be lowered to a VM op")
 }
 
-// LLM host-bridge entry points. Implemented in the original Rust runtime but
-// not yet in the Odin port (issue #8). Registering them here means a call
-// fails with a clear, catchable error instead of compiling to positional
-// dispatch and failing later as "no applicable method" (E_NO_SOURCE).
+// Host-request builtins such as `llm_responses_stream`. The compiler lowers
+// them to `.External_Request`; reaching this body means the call was not
+// recognized (for example because the name was invoked dynamically).
 @(private)
-builtin_not_implemented :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
-	return builtin_error(
-		state,
-		"E_NOT_IMPLEMENTED",
-		"the LLM host bridge is not implemented in the Odin port (see issue #8)",
-	)
+builtin_host_request :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	return builtin_error(state, "E_VM_FAULT", "host request must be lowered to a VM op")
 }
 
 @(private)

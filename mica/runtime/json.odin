@@ -113,6 +113,18 @@ json_encode_value :: proc(builder: ^strings.Builder, value: v.Value) -> bool {
 	}
 }
 
+// Encodes a Mica value as JSON text. The caller owns the result and frees it
+// with the same allocator. Exported for host use.
+json_encode_text :: proc(allocator: mem.Allocator, value: v.Value) -> (string, bool) {
+	builder: strings.Builder
+	strings.builder_init(&builder, allocator)
+	if !json_encode_value(&builder, value) {
+		strings.builder_destroy(&builder)
+		return "", false
+	}
+	return strings.to_string(builder), true
+}
+
 @(private)
 json_key_text :: proc(key: v.Value) -> (string, bool) {
 	if text, is_string := v.value_as_string(key); is_string {

@@ -10,6 +10,7 @@ package main
 import "core:fmt"
 import "core:os"
 
+import ext "../../mica/external"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
 import s "../../mica/store"
@@ -134,10 +135,12 @@ main :: proc() {
 		paths[:],
 		context.allocator,
 		r.World_Config {
-			actor      = actor,
-			unit       = unit,
-			store_path = store_path,
-			durability = durability,
+			actor            = actor,
+			unit             = unit,
+			store_path       = store_path,
+			durability       = durability,
+			external_handler = ext.handle_request,
+			external_workers = 2,
 		},
 	)
 	if !start.ok {

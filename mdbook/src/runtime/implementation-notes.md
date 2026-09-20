@@ -21,9 +21,12 @@ implementation; they are collected here.
   compilation tier.
 - The HTTP/1.1 + SSE host in `host/web` serves the browser client. There is no
   WebTransport or ZeroMQ transport.
-- The LLM host bridge (`llm_responses_stream`, `llm_chat_stream_to`) is not
-  implemented in this port. The agent app shell loads, but model calls raise
-  `E_NOT_IMPLEMENTED` (issue #8).
+- The LLM host bridge (`llm_responses_stream`, `llm_chat_stream_to`,
+  `openai_chat_completion`, `openai_chat_completion_with_options`) is
+  implemented in `mica/external` on top of libcurl. See
+  [The LLM Host Bridge](../runtime/llm-bridge.md). The agent shell can call a
+  model; the Rust source-provider computed relations its tools use are still
+  not ported.
 - `emit` is not implemented in this port: it is a no-op and committed effects
   are not recorded. Delivery remains future work.
 - `world_eval` compiles source against a live world for command-line use, which

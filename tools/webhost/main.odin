@@ -17,6 +17,7 @@ import "core:thread"
 import "core:time"
 
 import web "../../host/web"
+import ext "../../mica/external"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
 import s "../../mica/store"
@@ -109,10 +110,12 @@ main :: proc() {
 			fileins[:],
 			context.allocator,
 			r.World_Config {
-				actor      = actor,
-				workers    = DEFAULT_WORKERS,
-				store_path = store_path,
-				durability = parse_durability(durability_text),
+				actor            = actor,
+				workers          = DEFAULT_WORKERS,
+				store_path       = store_path,
+				durability       = parse_durability(durability_text),
+				external_handler = ext.handle_request,
+				external_workers = 2,
 			},
 		)
 		if !result.ok {
