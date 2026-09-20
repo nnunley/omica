@@ -6,9 +6,6 @@ or a growing log. Mica can edit a large buffer without copying all its text afte
 Buffers take part in the same transactions as relations. A task can change text and facts together.
 Other tasks see both changes after the transaction commits.
 
-> **Status.** The features on this page are implemented. The test suites cover editing,
-> transactions, persistence, shared editing, history, computed projections, and markers.
-
 ## Start with a buffer
 
 This example creates a durable buffer and edits it:
