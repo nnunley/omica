@@ -495,6 +495,12 @@ verb agent/execute_tool_calls(agent @ #agent, assistant_message, calls)
   return executed
 end
 
+// Tool results are untrusted data. The delimiters and the system prompt's
+// data-not-instructions rule keep injected text from being followed.
+verb agent/wrap_tool_result(content @ #string)
+  return string_concat("<tool_result>\n", content, "\n</tool_result>")
+end
+
 verb agent/llm_messages_with_tools(transcript)
   // TODO(Stage 7): assemble per-agent/per-workspace system prompt from
   // Skill/ContextFile relations instead of using the constant default.
@@ -535,9 +541,9 @@ verb agent/llm_messages_with_tools(transcript)
         if tool_content == none
           tool_content = "(missing content)"
         end
-        messages = [@messages, llm/tool_message(tool_call_id, tool_content)]
+        messages = [@messages, llm/tool_message(tool_call_id, agent/wrap_tool_result(tool_content))]
       else
-        messages = [@messages, llm/tool_message("unknown", string_concat("(malformed tool result: ", content, ")"))]
+        messages = [@messages, llm/tool_message("unknown", agent/wrap_tool_result(string_concat("(malformed tool result: ", content, ")")))]
       end
     elseif role == "system"
       messages = [@messages, llm/system_message(content)]
@@ -583,7 +589,7 @@ verb agent/llm_responses_input(transcript)
         let call_id = index_or(value, :tool_call_id, none)
         let output = index_or(value, :content, none)
         if call_id != none && output != none
-          input = [@input, {:type -> "function_call_output", :call_id -> call_id, :output -> output}]
+          input = [@input, {:type -> "function_call_output", :call_id -> call_id, :output -> agent/wrap_tool_result(output)}]
         end
       end
     end

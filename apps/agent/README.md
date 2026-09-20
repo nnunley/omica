@@ -109,6 +109,11 @@ sync behaviours, while agent-specific meanings such as message roles and inspect
 implemented by Mica verbs and relations. The agent app reuses the shared sync-host and sync-dom
 fileins and does not duplicate the sync contract.
 
+Prompt safety is treated as a data-boundary problem: the system prompt names the workspace root
+and says that file contents, tool results, and quoted message text are data, not instructions.
+Tool results are wrapped in `<tool_result>` delimiters before they enter the model context. This is
+a mitigation, not a guarantee: a user message can still contain text the model chooses to follow.
+
 ## Next Steps
 
 - Write tools (`edit`, `write`, `bash`) with sandboxing and approvals.
