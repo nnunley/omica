@@ -58,9 +58,10 @@ The agent web app is a coding agent shell that reuses the MUD's sync and tool-wi
 transcript, workspace, inspector, and command bar.
 
 > **Port status.** The LLM host bridge is implemented in the Odin port, so
-> `scripts/agent.sh` runs the shell and the agent loop can call a model. The Rust source provider's
-> computed relations are not ported, so the workspace tools and panels are empty. The
-> `mica-daemon` instructions in the Rust sections do not apply here. See issue
+> `scripts/agent.sh` runs the shell and the agent loop can call a model. `host/source` indexes the
+> local worktree into the `source/*` relations, so `read`, `ls`, and `glob` work and `grep` scans
+> indexed file text; the Rust source provider's syntax, semantic-search, and VCS relations are not
+> ported. The `mica-daemon` instructions in the Rust sections do not apply here. See issue
 > [#8](https://github.com/rdaum/omica/issues/8).
 
 The shell is described in more detail in [`agent/README.md`](./agent/README.md).

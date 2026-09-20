@@ -124,8 +124,15 @@ end
 
 verb tool/args_int(arguments, key)
   let value = index_or(arguments, key, none)
-  if value == none
+  if value == none || value == ""
     return 0
+  end
+  // Models send JSON numbers, but a tool call may also carry a numeric
+  // string; accept either.
+  try
+    return to_int(value)
+  catch
+    // Not a number or numeric string; fall through to text parsing.
   end
   let parsed = parse_ordinal(value)
   return match parsed
@@ -191,6 +198,37 @@ verb tool/grep(agent @ #agent, arguments @ #map)
   for found in source/TextSearch(repository, revision, pattern, limit, "all", ?subject, ?score, ?path, ?start_line, ?end_line, ?kind, ?title, ?snippet, ?provider, ?source_version)
     matches = [@matches, {:path -> found[:path], :start_line -> found[:start_line], :end_line -> found[:end_line], :snippet -> found[:snippet]}]
     count = count + 1
+  end
+
+  if count == 0
+    // No computed search index in this port: scan the indexed file text.
+    for file in source/FileText(repository, revision, ?file_path, ?file_provider, ?file_text, ?file_hash, ?file_version)
+      if count >= limit
+        break
+      end
+      let text = file[:file_text]
+      let file_lines = string_len(text)
+      let pos = 0
+      let line_no = 1
+      while pos <= file_lines && count < limit
+        let newline = string_find_any(text, pos, "\n")
+        let line_end = file_lines
+        if newline >= 0
+          line_end = newline
+        end
+        let line = string_slice(text, pos, line_end)
+        if string_contains(line, pattern)
+          matches = [@matches, {:path -> file[:file_path], :start_line -> line_no, :end_line -> line_no, :snippet -> line}]
+          count = count + 1
+        end
+        if newline < 0
+          pos = file_lines + 1
+        else
+          pos = newline + 1
+          line_no = line_no + 1
+        end
+      end
+    end
   end
 
   if count == 0

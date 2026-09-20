@@ -14,10 +14,11 @@ is available for providers without suitable Responses support. Read-only tools (
 syntax, symbol, definition, references, and VCS history as computed relations for future tools.
 
 > **Port status:** the LLM host bridge is implemented in the Odin port (`mica/external`), so the
-> agent loop can call a model. The source-provider computed relations (`source/*`) come from a Rust
-> host crate that is still not ported, so the read-only workspace tools return nothing yet. The run
-> instructions below (`scripts/agent.sh`, `mica-daemon`) describe the Rust implementation; the shell
-> fileins load in `tools/webhost` or `tools/filein`.
+> agent loop can call a model, and `host/source` indexes `MICA_SOURCE_ROOTS` at startup so `read`,
+> `ls`, and `glob` work over a local worktree; `grep` scans the indexed file text. The Rust source
+> provider's syntax, semantic-search, and VCS relations are still not ported, so those views stay
+> sparse. The `mica-daemon` instructions below describe the Rust implementation; the shell fileins
+> run under `tools/webhost` via `scripts/agent.sh`.
 
 ## What It Demonstrates
 
@@ -83,9 +84,13 @@ Set `OPENROUTER_API_KEY` in the environment for LLM access. The default model is
 `deepseek/deepseek-v4.1-flash`; override it with `MICA_AGENT_MODEL`. Responses is the default request
 shape. Set `MICA_AGENT_API=chat_completions` to use the explicit Chat Completions adapter.
 
-The workspace tools read the `source/*` computed relations, which the Rust source provider
-populates; this port declares them but does not populate them yet, so the panels are empty. The
-agent loop, transcript, and streaming views work.
+The workspace tools read the `source/*` relations. In this port `host/source` indexes the first
+`MICA_SOURCE_ROOTS` root at startup into `RepositoryEntry`, `FileText`, `FileLineCount`, and
+`IndexedFile` facts, so `read`, `ls`, and `glob` work over the local worktree and the workspace
+panel lists its files. `grep` falls back to scanning indexed file text because the Rust
+semantic-search index is not ported; neither are syntax, definition, reference, and VCS relations.
+Indexing follows `workspaces.mica`: only the first root (up to the first `:`) is used, and files
+larger than 1 MiB or containing NUL bytes are listed but not indexed for content.
 
 Auth is off for the shell demo: the agent world does not declare the MUD person schema, so the
 host renders the workspace view directly.

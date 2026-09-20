@@ -16,6 +16,7 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
+import sourcelib "../../host/source"
 import web "../../host/web"
 import ext "../../mica/external"
 import k "../../mica/kernel"
@@ -129,6 +130,20 @@ main :: proc() {
 			if entry.kind != .Complete {
 				fmt.eprintf("webhost: world entry task did not finish: %s\n", entry.message)
 				os.exit(1)
+			}
+		}
+		// A world that declares the source schema gets a local index of
+		// MICA_SOURCE_ROOTS, so the agent's file tools have data.
+		if indexed, attempted := sourcelib.index_from_env(world); attempted {
+			if indexed.ok {
+				fmt.printf(
+					"indexed %d files (%d directories, %d skipped)\n",
+					indexed.files,
+					indexed.directories,
+					indexed.skipped,
+				)
+			} else {
+				fmt.eprintf("source index skipped: %s\n", indexed.message)
 			}
 		}
 		web.documents_init(&host.documents, world)

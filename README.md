@@ -469,6 +469,8 @@ The [guide](mdbook/src/SUMMARY.md) walks through the examples, the language, and
 - [`mica/dom`](mica/dom): DOM model, JSON encoding, XML conversion, and structural diffing.
 - [`host/web`](host/web): in-process HTTP/1.1 and SSE host, authentication, view sync, and the
   vendored browser `sync-client.js`.
+- [`host/source`](host/source): local-worktree source provider: indexes a workspace root into the
+  agent's `source/*` relations at startup.
 - [`tools/filein`](tools/filein): filein and eval CLI.
 - [`tools/repl`](tools/repl): interactive evaluation against a live world or store.
 - [`tools/webhost`](tools/webhost): web host binary used by `scripts/mud.sh` and

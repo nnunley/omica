@@ -8,9 +8,10 @@
 # MICA_OPENAI_BASE_URL). MICA_AGENT_MODEL selects the model and
 # MICA_AGENT_API selects "responses" (default) or "chat_completions".
 #
-# The workspace panel reads MICA_SOURCE_ROOTS, which defaults to this
-# repository. The source-provider computed relations are not ported yet, so
-# the read-only tools return nothing; the agent loop and transcript work.
+# MICA_SOURCE_ROOTS defaults to this repository. The web host indexes that
+# root into the source relations at startup, so the agent's read/ls/glob tools
+# work and grep scans the indexed text. Syntax and VCS relations are not
+# ported.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

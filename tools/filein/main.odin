@@ -10,6 +10,7 @@ package main
 import "core:fmt"
 import "core:os"
 
+import sourcelib "../../host/source"
 import ext "../../mica/external"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
@@ -152,6 +153,18 @@ main :: proc() {
 		outcome := r.world_wait(world, world.entry)
 		if outcome.kind != .Complete {
 			ok = print_outcome(world, outcome)
+		}
+	}
+	if indexed, attempted := sourcelib.index_from_env(world); attempted {
+		if indexed.ok {
+			fmt.printf(
+				"indexed %d files (%d directories, %d skipped)\n",
+				indexed.files,
+				indexed.directories,
+				indexed.skipped,
+			)
+		} else {
+			fmt.eprintf("source index skipped: %s\n", indexed.message)
 		}
 	}
 	for source in evals {
