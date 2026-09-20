@@ -58,4 +58,5 @@
 - [The LLM Host Bridge](./runtime/llm-bridge.md)
 - [Catalogue and Introspection](./runtime/catalogue-and-introspection.md)
 - [Retrieval and Embeddings](./runtime/retrieval-and-embeddings.md)
+- [Buffers](./runtime/buffers.md)
 - [Filein and Fileout](./runtime/filein-fileout.md)
