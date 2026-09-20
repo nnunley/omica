@@ -6,6 +6,11 @@
 // `world_submit_call`.
 package mica_runtime
 
+import c "../compiler"
+import k "../kernel"
+import s "../store"
+import v "../var"
+import vm "../vm"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -14,11 +19,6 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
-import c "../compiler"
-import s "../store"
-import k "../kernel"
-import vm "../vm"
-import v "../var"
 
 // Limits for conformance and differential harnesses. A mis-emitted loop is
 // unbounded, so a finite limit turns a hang into a failure at a known case.
@@ -36,19 +36,19 @@ HARNESS_TIME_LIMIT :: 10 * time.Second
 World_Config :: struct {
 	// Name of the declared identity that submitted tasks run as. Empty keeps
 	// every task at root.
-	actor:   string,
+	actor:              string,
 	// Worker threads. Clamped to at least one.
-	workers: int,
+	workers:            int,
 	// Filein unit name for `fileout`. Empty derives one unit per file from
 	// the file's base name without its extension.
-	unit:    string,
+	unit:               string,
 	// Durable store directory. When set and non-empty, the world boots from
 	// the store; otherwise the given sources load and persist into it.
-	store_path: string,
+	store_path:         string,
 	// Store fsync policy. Defaults to group commit.
-	durability: s.Durability,
+	durability:         s.Durability,
 	// WAL bytes before an automatic checkpoint. Zero uses the store default.
-	checkpoint_bytes: i64,
+	checkpoint_bytes:   i64,
 	// Per-task instruction budget. A task that executes this many instructions
 	// fails with `E_BUDGET` instead of running forever. Zero means unlimited,
 	// which is the production default; the differential and conformance
@@ -60,12 +60,12 @@ World_Config :: struct {
 	// the instruction budget: a commit-heavy runaway loop spends most of its
 	// time in kernel work, so the budget alone trips too slowly to tell a hang
 	// from a slow test.
-	time_limit: time.Duration,
+	time_limit:         time.Duration,
 	// Host-side handler for `External_Request` boundaries. Nil answers every
 	// request with an `ExternalUnavailable` error value.
-	external_handler: External_Handler,
+	external_handler:   External_Handler,
 	// External worker threads. Values below one become one.
-	external_workers: int,
+	external_workers:   int,
 }
 
 // The `World_Config` a harness uses for the program under test. A harness must
@@ -90,18 +90,18 @@ World_Call_Options :: struct {
 }
 
 World :: struct {
-	kernel:    ^k.Kernel,
-	allocator: mem.Allocator,
-	ctx:       c.Compile_Context,
-	env:       Builtin_Env,
-	scheduler: Scheduler,
-	program:   ^vm.Program,
+	kernel:            ^k.Kernel,
+	allocator:         mem.Allocator,
+	ctx:               c.Compile_Context,
+	env:               Builtin_Env,
+	scheduler:         Scheduler,
+	program:           ^vm.Program,
 	// Final expanded source text. Compile-context keys are views into it.
-	sources:   [dynamic]string,
+	sources:           [dynamic]string,
 	// Attached durable store. Owned by the world.
-	store:     ^s.Store,
-	entry:     Task_ID,
-	started:   bool,
+	store:             ^s.Store,
+	entry:             Task_ID,
+	started:           bool,
 	// External host bridge. Stream workers are tracked here so world shutdown
 	// can join them before the scheduler they deliver through is destroyed.
 	external_handler:  External_Handler,
@@ -129,32 +129,37 @@ world_start :: proc(
 
 	if config.store_path != "" {
 		durable := new(s.Store, allocator)
-		if !s.store_open(durable, s.Store_Options {
-			mode             = .File,
-			path             = config.store_path,
-			durability       = config.durability,
-			checkpoint_bytes = config.checkpoint_bytes,
-		}) {
+		if !s.store_open(
+			durable,
+			s.Store_Options {
+				mode = .File,
+				path = config.store_path,
+				durability = config.durability,
+				checkpoint_bytes = config.checkpoint_bytes,
+			},
+		) {
 			detail := s.store_last_error(durable)
 			if detail == "" {
 				detail = "unknown error"
 			}
 			free(durable, allocator)
 			world_destroy(world)
-			return nil, Run_Result{ok = false, message = fmt.aprintf(
-				"cannot open the store at %s: %s",
-				config.store_path,
-				detail,
-				allocator = allocator,
-			)}
+			return nil, Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"cannot open the store at %s: %s",
+					config.store_path,
+					detail,
+					allocator = allocator,
+				),
+			}
 		}
 		world.store = durable
 		s.store_attach(durable, kernel)
 	}
 
 	if world.store != nil &&
-	   (s.store_durable_version(world.store) > 0 ||
-		   s.store_checkpoint_version(world.store) > 0) {
+	   (s.store_durable_version(world.store) > 0 || s.store_checkpoint_version(world.store) > 0) {
 		result := world_boot(world, world.store, config)
 		if !result.ok {
 			world_destroy(world)
@@ -182,6 +187,9 @@ world_destroy :: proc(world: ^World) {
 	if world.started {
 		world_stop_external(world)
 		scheduler_destroy(&world.scheduler)
+	}
+	if world.env.kernel != nil {
+		k.kernel_unregister_computed_relations_by_user(world.env.kernel, rawptr(&world.env))
 	}
 	if world.store != nil {
 		k.kernel_detach_store(world.kernel)
@@ -213,6 +221,7 @@ world_destroy :: proc(world: ^World) {
 		delete(key, world.allocator)
 	}
 	delete(world.env.fields)
+	delete(world.env.marker_index_points)
 	delete(world.ctx.builtins)
 	delete(world.ctx.relations)
 	delete(world.ctx.identities)
@@ -334,11 +343,7 @@ world_value_literal :: proc(
 // removed so verb function indices match the persisted MethodProgram facts,
 // then the eval source is appended as the program's entry. The outcome borrows
 // world-allocator values.
-world_eval :: proc(
-	world: ^World,
-	source: string,
-	allocator := context.allocator,
-) -> Task_Outcome {
+world_eval :: proc(world: ^World, source: string, allocator := context.allocator) -> Task_Outcome {
 	id, failure, submitted := world_eval_submit(world, source, allocator)
 	if !submitted {
 		return failure
@@ -529,18 +534,13 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	for path in paths {
 		data, read_err := os.read_entire_file(path, allocator)
 		if read_err != nil {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"cannot read %s",
-				path,
-				allocator = allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf("cannot read %s", path, allocator = allocator),
+			}
 		}
 		text := string(data)
-		expanded, expand_result := substitute_include_text(
-			text,
-			filepath.dir(path),
-			allocator,
-		)
+		expanded, expand_result := substitute_include_text(text, filepath.dir(path), allocator)
 		if !expand_result.ok {
 			return expand_result
 		}
@@ -557,14 +557,17 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 		ast, parse_errors := c.parse_program(granted, allocator)
 		if len(parse_errors) > 0 {
 			first := parse_errors[0]
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"%s:%d:%d: %s",
-				path,
-				first.line,
-				first.column,
-				first.message,
-				allocator = allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"%s:%d:%d: %s",
+					path,
+					first.line,
+					first.column,
+					first.message,
+					allocator = allocator,
+				),
+			}
 		}
 		append(&asts, ast)
 		append(&world.sources, granted)
@@ -573,11 +576,10 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 			unit_name = source_unit_name(path)
 		}
 		if unit_name != "" {
-			append(&unit_entries, Unit_Entry {
-				name    = unit_name,
-				source  = granted,
-				ordinal = i64(len(unit_entries)),
-			})
+			append(
+				&unit_entries,
+				Unit_Entry{name = unit_name, source = granted, ordinal = i64(len(unit_entries))},
+			)
 		}
 	}
 
@@ -600,20 +602,20 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	defer delete(unit_facts)
 	for entry in unit_entries {
 		if existing, found := world.env.unit_sources[entry.name]; found {
-			combined := strings.concatenate(
-				[]string{existing, "\n\n", entry.source},
-				allocator,
-			)
+			combined := strings.concatenate([]string{existing, "\n\n", entry.source}, allocator)
 			delete(existing, allocator)
 			world.env.unit_sources[entry.name] = combined
 		} else {
 			world.env.unit_sources[entry.name] = strings.clone(entry.source, allocator)
 		}
-		append(&unit_facts, Unit_Source_Fact {
-			ordinal = entry.ordinal,
-			unit    = v.symbol_intern(entry.name),
-			source  = entry.source,
-		})
+		append(
+			&unit_facts,
+			Unit_Source_Fact {
+				ordinal = entry.ordinal,
+				unit = v.symbol_intern(entry.name),
+				source = entry.source,
+			},
+		)
 	}
 	subscriptions_init(&world.env.subscriptions, allocator)
 
@@ -643,6 +645,10 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 			return result
 		}
 	}
+	computed_result := install_runtime_computed_relations(&world.env)
+	if !computed_result.ok {
+		return computed_result
+	}
 	identity_result := assert_named_identities(&world.env, declarations.named_identities[:])
 	if !identity_result.ok {
 		return identity_result
@@ -655,11 +661,14 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	if config.actor != "" {
 		actor_value, actor_found := world.ctx.identities[config.actor]
 		if !actor_found {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"unknown authority actor: %s",
-				config.actor,
-				allocator = allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"unknown authority actor: %s",
+					config.actor,
+					allocator = allocator,
+				),
+			}
 		}
 		world.env.actor = actor_value
 		world.env.principal = actor_value
@@ -670,25 +679,13 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 		if index < len(world.sources) {
 			source = world.sources[index]
 		}
-		result := install_rules(
-			&world.env,
-			world.kernel,
-			asts[index],
-			&declarations,
-			path,
-			source,
-		)
+		result := install_rules(&world.env, world.kernel, asts[index], &declarations, path, source)
 		if !result.ok {
 			return result
 		}
 	}
 
-	method_result := install_methods(
-		&world.env,
-		asts[:],
-		world.sources[:],
-		&declarations,
-	)
+	method_result := install_methods(&world.env, asts[:], world.sources[:], &declarations)
 	if !method_result.ok {
 		return method_result
 	}
@@ -729,10 +726,10 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 		&world.scheduler,
 		world.kernel,
 		Scheduler_Config {
-			workers            = workers,
+			workers = workers,
 			instruction_budget = config.instruction_budget,
-			time_limit         = config.time_limit,
-			external_enabled   = config.external_handler != nil,
+			time_limit = config.time_limit,
+			external_enabled = config.external_handler != nil,
 		},
 		allocator,
 	)
@@ -766,13 +763,13 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	}
 
 	world.ctx = c.Compile_Context {
-		builtins                            = make(map[string]bool, allocator),
-		relations                           = make(map[string]u32, allocator),
-		identities                          = make(map[string]v.Value, allocator),
-		dispatch_method_selector_relation   = u32(k.DISPATCH_METHOD_SELECTOR_ID),
-		dispatch_param_relation             = u32(k.DISPATCH_PARAM_ID),
-		dispatch_delegates_relation         = u32(k.DISPATCH_DELEGATES_ID),
-		dispatch_method_program_relation    = u32(k.DISPATCH_METHOD_PROGRAM_ID),
+		builtins                          = make(map[string]bool, allocator),
+		relations                         = make(map[string]u32, allocator),
+		identities                        = make(map[string]v.Value, allocator),
+		dispatch_method_selector_relation = u32(k.DISPATCH_METHOD_SELECTOR_ID),
+		dispatch_param_relation           = u32(k.DISPATCH_PARAM_ID),
+		dispatch_delegates_relation       = u32(k.DISPATCH_DELEGATES_ID),
+		dispatch_method_program_relation  = u32(k.DISPATCH_METHOD_PROGRAM_ID),
 	}
 	install_builtin_names(&world.ctx)
 	install_primitive_identities(&world.ctx)
@@ -805,6 +802,10 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 		}
 	}
 	k.snapshot_release(catalog)
+	computed_result := install_runtime_computed_relations(&world.env)
+	if !computed_result.ok {
+		return computed_result
+	}
 
 	// NamedIdentity facts supply `#name` resolution.
 	name_rows: [dynamic]v.Tuple
@@ -864,11 +865,14 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	if config.actor != "" {
 		actor_value, actor_found := world.ctx.identities[config.actor]
 		if !actor_found {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"unknown authority actor: %s",
-				config.actor,
-				allocator = allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"unknown authority actor: %s",
+					config.actor,
+					allocator = allocator,
+				),
+			}
 		}
 		world.env.actor = actor_value
 		world.env.principal = actor_value
@@ -904,10 +908,10 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 		&world.scheduler,
 		world.kernel,
 		Scheduler_Config {
-			workers            = workers,
+			workers = workers,
 			instruction_budget = config.instruction_budget,
-			time_limit         = config.time_limit,
-			external_enabled   = config.external_handler != nil,
+			time_limit = config.time_limit,
+			external_enabled = config.external_handler != nil,
 		},
 		allocator,
 	)
@@ -938,11 +942,14 @@ world_boot_program :: proc(world: ^World, store: ^s.Store) -> Run_Result {
 		for source in world.sources {
 			ast, parse_errors := c.parse_program(source, allocator)
 			if len(parse_errors) > 0 {
-				return Run_Result{ok = false, message = fmt.aprintf(
-					"cannot reparse stored source: %s",
-					parse_errors[0].message,
-					allocator = allocator,
-				)}
+				return Run_Result {
+					ok = false,
+					message = fmt.aprintf(
+						"cannot reparse stored source: %s",
+						parse_errors[0].message,
+						allocator = allocator,
+					),
+				}
 			}
 			for item in ast.items {
 				append(&items, item)
@@ -959,11 +966,14 @@ world_boot_program :: proc(world: ^World, store: ^s.Store) -> Run_Result {
 		return assert_program_bytes(&world.env, world.program)
 	}
 	if len(rows) > 1 {
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"multiple program artifacts: expected one, found %d",
-			len(rows),
-			allocator = allocator,
-		)}
+		return Run_Result {
+			ok = false,
+			message = fmt.aprintf(
+				"multiple program artifacts: expected one, found %d",
+				len(rows),
+				allocator = allocator,
+			),
+		}
 	}
 	artifact, artifact_ok := v.value_as_bytes(v.tuple_values(rows[0])[1])
 	if !artifact_ok {
@@ -971,19 +981,25 @@ world_boot_program :: proc(world: ^World, store: ^s.Store) -> Run_Result {
 	}
 	program, decode_error := vm.program_from_bytes(artifact, allocator)
 	if decode_error != .None {
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"cannot decode program artifact: %v",
-			decode_error,
-			allocator = allocator,
-		)}
+		return Run_Result {
+			ok = false,
+			message = fmt.aprintf(
+				"cannot decode program artifact: %v",
+				decode_error,
+				allocator = allocator,
+			),
+		}
 	}
 	if validation := vm.program_validate(program); validation != .None {
 		vm.program_destroy(program, allocator)
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"program artifact failed validation: %v",
-			validation,
-			allocator = allocator,
-		)}
+		return Run_Result {
+			ok = false,
+			message = fmt.aprintf(
+				"program artifact failed validation: %v",
+				validation,
+				allocator = allocator,
+			),
+		}
 	}
 	world.program = program
 	return Run_Result{ok = true, message = "loaded"}
@@ -1021,11 +1037,14 @@ restore_rules :: proc(world: ^World) -> Run_Result {
 		}
 		ast, parse_errors := c.parse_program(source, world.allocator)
 		if len(parse_errors) > 0 {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"cannot reparse stored rule: %s",
-				parse_errors[0].message,
-				allocator = world.allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"cannot reparse stored rule: %s",
+					parse_errors[0].message,
+					allocator = world.allocator,
+				),
+			}
 		}
 		rule_item: c.Rule_Item
 		found_rule := false
@@ -1047,18 +1066,16 @@ restore_rules :: proc(world: ^World) -> Run_Result {
 		if !identity_ok {
 			continue
 		}
-		installed, install_error := k.kernel_install_rule(
-			world.kernel,
-			identity,
-			rule,
-			source,
-		)
+		installed, install_error := k.kernel_install_rule(world.kernel, identity, rule, source)
 		if install_error != k.Kernel_Error.None {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"cannot restore rule: %v",
-				install_error,
-				allocator = world.allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"cannot restore rule: %v",
+					install_error,
+					allocator = world.allocator,
+				),
+			}
 		}
 		k.snapshot_release(installed)
 

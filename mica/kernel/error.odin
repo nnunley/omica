@@ -17,6 +17,11 @@ Kernel_Error :: enum {
 	Unsafe_Guard,
 	Unbound_Head_Variable,
 	Read_Only,
+	// A computed scan tried to read underlying state that the caller cannot
+	// read.
+	Permission_Denied,
+	// A computed relation was scanned without its required access key.
+	Computed_Binding_Required,
 	// A revision-checked buffer apply already happened for this buffer in this
 	// transaction, so later mutations would address offsets it invalidated.
 	Already_Applied,

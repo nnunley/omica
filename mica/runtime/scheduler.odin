@@ -1049,6 +1049,7 @@ scheduler_submit_dispatch :: proc(
 	snapshot := k.kernel_snapshot(scheduler.kernel)
 	defer k.snapshot_release(snapshot)
 	source := k.Relation_Source {
+		kernel             = scheduler.kernel,
 		snapshot           = snapshot,
 		use_stored_derived = true,
 	}

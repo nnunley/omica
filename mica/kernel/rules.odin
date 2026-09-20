@@ -8,10 +8,10 @@
 // variable is bound by a positive body atom.
 package kernel
 
+import v "../var"
 import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
-import v "../var"
 
 // A term in an atom, guard, or rule head.
 Term_Kind :: enum {
@@ -179,8 +179,8 @@ Rule_Derived :: struct {
 rules_derived_create :: proc(alloc: mem.Allocator) -> Rule_Derived {
 	return Rule_Derived {
 		relations = make([dynamic]Relation_ID, 0, alloc),
-		rows      = make([dynamic][dynamic]v.Tuple, 0, alloc),
-		buckets   = make([dynamic]map[u64][dynamic]int, 0, alloc),
+		rows = make([dynamic][dynamic]v.Tuple, 0, alloc),
+		buckets = make([dynamic]map[u64][dynamic]int, 0, alloc),
 	}
 }
 
@@ -426,12 +426,17 @@ rules_evaluate :: proc(
 	alloc: mem.Allocator,
 	definitions: []Rule_Definition,
 	snapshot: ^Snapshot,
+	kernel: ^Kernel = nil,
 ) -> (
 	Rule_Derived,
 	Kernel_Error,
 ) {
 	result := rules_derived_create(alloc)
-	source := Relation_Source{snapshot = snapshot, derived = &result}
+	source := Relation_Source {
+		kernel   = kernel,
+		snapshot = snapshot,
+		derived  = &result,
+	}
 	if err := rules_evaluate_source(alloc, definitions, &source, &result); err != .None {
 		return Rule_Derived{}, err
 	}
@@ -547,7 +552,8 @@ slot_map_init :: proc(mapping: ^Slot_Map, rule: Rule, alloc: mem.Allocator) {
 			if item.guard.left.kind == .Var && !slot_map_has(symbols[:], item.guard.left.symbol) {
 				append(&symbols, item.guard.left.symbol)
 			}
-			if item.guard.right.kind == .Var && !slot_map_has(symbols[:], item.guard.right.symbol) {
+			if item.guard.right.kind == .Var &&
+			   !slot_map_has(symbols[:], item.guard.right.symbol) {
 				append(&symbols, item.guard.right.symbol)
 			}
 		case .Atom:
@@ -649,6 +655,9 @@ apply_positive_atom :: proc(
 			alloc   = alloc,
 		}
 		relation_source_visit(source, atom.relation, scan_bindings, unify_visit, &unify)
+		if source.error != .None {
+			return {}, source.error
+		}
 	}
 	return out, .None
 }
@@ -666,11 +675,7 @@ term_is_bound :: proc(term: Term, binding: []v.Binding, slots: ^Slot_Map) -> boo
 }
 
 @(private)
-binding_all_bound :: proc(
-	terms: []Term,
-	bindings: [][]v.Binding,
-	slots: ^Slot_Map,
-) -> bool {
+binding_all_bound :: proc(terms: []Term, bindings: [][]v.Binding, slots: ^Slot_Map) -> bool {
 	for binding in bindings {
 		for term in terms {
 			if !term_is_bound(term, binding, slots) {
@@ -682,7 +687,14 @@ binding_all_bound :: proc(
 }
 
 @(private)
-term_evaluate :: proc(term: Term, binding: []v.Binding, slots: ^Slot_Map) -> (v.Value, Kernel_Error) {
+term_evaluate :: proc(
+	term: Term,
+	binding: []v.Binding,
+	slots: ^Slot_Map,
+) -> (
+	v.Value,
+	Kernel_Error,
+) {
 	if term.kind == .Value {
 		return term.value, .None
 	}
@@ -755,6 +767,9 @@ apply_negated_atom :: proc(
 		}
 		state := Negated_Visit_Context{}
 		relation_source_visit(source, atom.relation, scan_bindings, negated_visit, &state)
+		if source.error != .None {
+			return {}, source.error
+		}
 		if !state.found {
 			next := make([]v.Binding, len(binding), alloc)
 			copy(next, binding)
@@ -843,6 +858,22 @@ pick_body_item :: proc(
 		if item.kind != .Atom || item.atom.negated {
 			continue
 		}
+		if required, computed := kernel_computed_required_bindings(
+			relation_source_kernel(source),
+			item.atom.relation,
+		); computed {
+			ready := true
+			for position in required {
+				if int(position) >= len(item.atom.terms) ||
+				   !binding_all_bound([]Term{item.atom.terms[position]}, bindings, slots) {
+					ready = false
+					break
+				}
+			}
+			if !ready {
+				continue
+			}
+		}
 		bound := atom_bound_count(&item.atom, bindings, slots)
 		rows := rules_source_cardinality(source, item.atom.relation)
 		if best < 0 || bound > best_bound || (bound == best_bound && rows < best_rows) {
@@ -853,6 +884,21 @@ pick_body_item :: proc(
 	}
 	if best >= 0 {
 		return best, .None
+	}
+
+	// A remaining positive computed atom has an access pattern that prior
+	// atoms did not satisfy. Report that contract directly instead of calling
+	// the scanner with an unbound key.
+	for item, i in rule.body {
+		if used[i] || item.kind != .Atom || item.atom.negated {
+			continue
+		}
+		if _, computed := kernel_computed_required_bindings(
+			relation_source_kernel(source),
+			item.atom.relation,
+		); computed {
+			return -1, .Computed_Binding_Required
+		}
 	}
 
 	for item, i in rule.body {
@@ -886,7 +932,8 @@ atom_bound_count :: proc(atom: ^Atom, bindings: [][]v.Binding, slots: ^Slot_Map)
 // during semi-naive evaluation, otherwise the visible block length.
 @(private)
 rules_source_cardinality :: proc(source: ^Relation_Source, relation: Relation_ID) -> int {
-	if source != nil && source.delta_active &&
+	if source != nil &&
+	   source.delta_active &&
 	   source.delta != nil &&
 	   relation == source.delta_relation {
 		return len(rules_derived_rows(source.delta, relation))
@@ -941,9 +988,21 @@ rules_apply :: proc(
 		switch item.kind {
 		case .Atom:
 			if item.atom.negated {
-				next, apply_err = apply_negated_atom(&item.atom, bindings[:], &slots, source, alloc)
+				next, apply_err = apply_negated_atom(
+					&item.atom,
+					bindings[:],
+					&slots,
+					source,
+					alloc,
+				)
 			} else {
-				next, apply_err = apply_positive_atom(&item.atom, bindings[:], &slots, source, alloc)
+				next, apply_err = apply_positive_atom(
+					&item.atom,
+					bindings[:],
+					&slots,
+					source,
+					alloc,
+				)
 			}
 		case .Guard:
 			next, apply_err = apply_guard(item.guard, bindings[:], &slots, alloc)

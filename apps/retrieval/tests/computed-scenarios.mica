@@ -1,0 +1,50 @@
+// Acceptance scenarios for the exact NearestEmbedding computed relation.
+
+verb test/retrieval_assert_equal(actual, expected, label @ #string)
+  if actual != expected
+    raise E_INVARG, string_concat(label, " failed")
+  end
+  return true
+end
+
+verb test/retrieval_seed()
+  assert VectorIndexContains(:manuals, :calibration_vector)
+  assert VectorIndexContains(:manuals, :cleaning_vector)
+  assert EmbeddingOf(:calibration_vector, "calibration")
+  assert EmbeddingOf(:cleaning_vector, "cleaning")
+  assert EmbeddingVector(:calibration_vector, [1.0, 0.0])
+  assert EmbeddingVector(:cleaning_vector, [0.0, 1.0])
+  return true
+end
+
+verb test/retrieval_exact_computed_relation()
+  let exactly {:subject -> subject, :score -> score, :snapshot_version -> version} = NearestEmbedding(:manuals, [1.0, 0.0], 1, ?subject, ?score, ?snapshot_version)
+  test/retrieval_assert_equal(subject, "calibration", "nearest subject")
+  test/retrieval_assert_equal(score, 1.0, "nearest score")
+  if version <= 0
+    raise E_INVARG, "snapshot version was not reported"
+  end
+
+  test/retrieval_assert_equal(
+    NearestEmbedding(:manuals, [1.0, 0.0], 1, "cleaning", _, _),
+    false,
+    "bound output filters the selected set"
+  )
+
+  let missing_key = try
+    NearestEmbedding(?index, [1.0, 0.0], 1, ?subject, _, _)
+    false
+  catch E_DB
+    true
+  end
+  test/retrieval_assert_equal(missing_key, true, "nearest search requires its index")
+
+  let read_only = try
+    assert NearestEmbedding(:manuals, [1.0, 0.0], 1, "calibration", 1.0, version)
+    false
+  catch E_READ_ONLY
+    true
+  end
+  test/retrieval_assert_equal(read_only, true, "nearest search is read-only")
+  return true
+end

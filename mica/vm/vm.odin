@@ -6,6 +6,8 @@
 // and builtin calls are added on top of this core.
 package vm
 
+import k "../kernel"
+import v "../var"
 import "base:intrinsics"
 import "base:runtime"
 import "core:fmt"
@@ -16,8 +18,6 @@ import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:time"
-import k "../kernel"
-import v "../var"
 
 VM_Status :: enum {
 	Ready,
@@ -78,10 +78,10 @@ Handler_Kind :: enum {
 }
 
 Handler :: struct {
-	frame:          int,
-	target:         i32,
-	error_register: i32,
-	kind:           Handler_Kind,
+	frame:             int,
+	target:            i32,
+	error_register:    i32,
+	kind:              Handler_Kind,
 	// A catch-body finally routes exceptions through itself before they
 	// propagate outward; a try-body finally only intercepts returns.
 	routes_exceptions: bool,
@@ -101,41 +101,41 @@ Pending_Raise :: struct {
 }
 
 VM :: struct {
-	program:     ^Program,
-	allocator:   mem.Allocator,
-	registers:   [dynamic]v.Value,
-	frames:      [dynamic]Frame,
-	result:      v.Value,
-	error:       v.Value,
-	status:      VM_Status,
-	source:      ^k.Relation_Source,
-	transaction: ^k.Transaction,
-	builtins:    [dynamic]VM_Builtin,
-	request:     VM_Request,
+	program:                      ^Program,
+	allocator:                    mem.Allocator,
+	registers:                    [dynamic]v.Value,
+	frames:                       [dynamic]Frame,
+	result:                       v.Value,
+	error:                        v.Value,
+	status:                       VM_Status,
+	source:                       ^k.Relation_Source,
+	transaction:                  ^k.Transaction,
+	builtins:                     [dynamic]VM_Builtin,
+	request:                      VM_Request,
 	// Sleep duration in milliseconds when `request == .Sleep`, or the child
 	// start delay when `request == .Spawn`.
-	request_millis: i64,
+	request_millis:               i64,
 	// Dispatch spec index for a `.Spawn` request.
-	request_spec: i32,
+	request_spec:                 i32,
 	// Primary request value: the receiver list for `.Mailbox_Recv`, or the
 	// service symbol for `.External_Request`.
-	request_value: v.Value,
+	request_value:                v.Value,
 	// Secondary request value: the payload for `.External_Request`.
-	request_payload: v.Value,
+	request_payload:              v.Value,
 	// Register (frame-relative) that receives the resume value.
-	pending_resume: i32,
+	pending_resume:               i32,
 	// Active exception handlers, innermost last.
-	handlers: [dynamic]Handler,
+	handlers:                     [dynamic]Handler,
 	// Returns diverted through a finally body, innermost last.
-	pending_returns: [dynamic]Pending_Return,
-	pending_raises:  [dynamic]Pending_Raise,
+	pending_returns:              [dynamic]Pending_Return,
+	pending_raises:               [dynamic]Pending_Raise,
 	// Execution limits. Zero means unlimited.
-	max_call_depth:     int,
-	instruction_budget: u64,
+	max_call_depth:               int,
+	instruction_budget:           u64,
 	// The budget as configured, restored by `vm_reset`. Without it a reset
 	// after a run that consumed the budget would leave zero, which means
 	// unlimited, silently disabling the limit.
-	configured_budget: u64,
+	configured_budget:            u64,
 	// Set once the budget reaches zero, so a caught E_BUDGET cannot silently
 	// turn the exhausted budget (0) into "unlimited".
 	instruction_budget_exhausted: bool,
@@ -144,40 +144,40 @@ VM :: struct {
 	// calls (relation writes, for one) can burn little instruction budget per
 	// second, so a deadline bounds it when the budget would trip only after
 	// minutes. `has_deadline` false means unlimited.
-	deadline:     time.Tick,
-	has_deadline: bool,
+	deadline:                     time.Tick,
+	has_deadline:                 bool,
 	// Counts instructions down to the next deadline check.
-	deadline_countdown: u32,
+	deadline_countdown:           u32,
 	// Runtime context identities: endpoint, actor, and principal.
-	endpoint:  v.Value,
-	actor:     v.Value,
-	principal: v.Value,
+	endpoint:                     v.Value,
+	actor:                        v.Value,
+	principal:                    v.Value,
 	// Task authority. Nil means root access.
-	authority: ^k.Authority,
+	authority:                    ^k.Authority,
 	// Optional validator run before a Mailbox_Recv suspends, so an invalid
 	// receiver fails inside the interpreter and can be caught.
-	mailbox_validator:      proc(user: rawptr, receivers: []v.Value) -> bool,
-	mailbox_validator_user: rawptr,
+	mailbox_validator:            proc(user: rawptr, receivers: []v.Value) -> bool,
+	mailbox_validator_user:       rawptr,
 	// Free slot for host data, for example a builtin environment.
-	user:        rawptr,
+	user:                         rawptr,
 	// Values copied into the entry function's parameter registers before the
 	// first run. The caller keeps them alive.
-	entry_arguments: []v.Value,
+	entry_arguments:              []v.Value,
 	// When non-negative, the function index to start at instead of the program
 	// entry. Used to start spawned method tasks.
-	entry_function: i32,
+	entry_function:               i32,
 	// The owning task, when the VM runs as part of one. Used by task-scoped
 	// builtins to stage effects until the task commits.
-	owner: rawptr,
+	owner:                        rawptr,
 	// VM-local scratch arena for per-instruction temporaries. Reset at the top
 	// of each instruction so a long-running task does not grow the thread's
 	// temp arena without bound.
-	scratch:           ^virtual.Arena,
-	scratch_allocator: mem.Allocator,
+	scratch:                      ^virtual.Arena,
+	scratch_allocator:            mem.Allocator,
 	// Builtin dispatch table: program builtin index -> VM_Builtin index, or -1
 	// when the name is not registered. Resolved once at init so a builtin call
 	// does not scan the registration list.
-	builtin_index: []int,
+	builtin_index:                []int,
 }
 
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
@@ -390,16 +390,14 @@ vm_set_deadline :: proc(state: ^VM, limit: time.Duration) {
 // Sets the authority used for permission checks. Nil means root access.
 vm_set_authority :: proc(state: ^VM, authority: ^k.Authority) {
 	state.authority = authority
+	if state.source != nil {
+		state.source.authority = authority
+	}
 }
 
 // Sets the runtime context identities returned by `endpoint`, `actor`, and
 // `principal`.
-vm_set_identities :: proc(
-	state: ^VM,
-	endpoint: v.Value,
-	actor: v.Value,
-	principal: v.Value,
-) {
+vm_set_identities :: proc(state: ^VM, endpoint: v.Value, actor: v.Value, principal: v.Value) {
 	state.endpoint = endpoint
 	state.actor = actor
 	state.principal = principal
@@ -435,12 +433,7 @@ vm_frame_base :: proc(state: ^VM) -> int {
 }
 
 // Registers a builtin procedure under `name`. Returns its index.
-vm_register_builtin :: proc(
-	state: ^VM,
-	name: v.Symbol,
-	argc: int,
-	run: Builtin_Proc,
-) -> int {
+vm_register_builtin :: proc(state: ^VM, name: v.Symbol, argc: int, run: Builtin_Proc) -> int {
 	append(&state.builtins, VM_Builtin{name = name, argc = argc, run = run})
 	return len(state.builtins) - 1
 }
@@ -470,13 +463,12 @@ vm_resolve_builtins :: proc(state: ^VM) {
 
 // Sets the relation read source and write transaction for relation
 // instructions. Either may be nil when the program does not use them.
-vm_set_workspace :: proc(
-	state: ^VM,
-	source: ^k.Relation_Source,
-	transaction: ^k.Transaction,
-) {
+vm_set_workspace :: proc(state: ^VM, source: ^k.Relation_Source, transaction: ^k.Transaction) {
 	state.source = source
 	state.transaction = transaction
+	if source != nil {
+		source.authority = state.authority
+	}
 }
 
 // Runs the program from its entry function until it returns. Read
@@ -514,13 +506,16 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			return .Failed
 		}
 		entry_function := program.functions[entry]
-		vm_frames_push(state, Frame {
-			function      = entry,
-			ip            = entry_function.code_offset,
-			register_base = 0,
-			caller_base   = 0,
-			caller_dst    = -1,
-		})
+		vm_frames_push(
+			state,
+			Frame {
+				function = entry,
+				ip = entry_function.code_offset,
+				register_base = 0,
+				caller_base = 0,
+				caller_dst = -1,
+			},
+		)
 		vm_registers_open(state, entry_function.register_count)
 		vm_zero_locals(state, 0, 0, entry_function.register_count)
 		if len(state.entry_arguments) > len(state.registers) {
@@ -785,13 +780,16 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				break
 			}
 			vm_zero_locals(state, callee_base, callee.param_count, callee_top)
-			vm_frames_push(state, Frame {
-				function      = int(instr.b),
-				ip            = callee.code_offset,
-				register_base = callee_base,
-				caller_base   = base,
-				caller_dst    = instr.a,
-			})
+			vm_frames_push(
+				state,
+				Frame {
+					function = int(instr.b),
+					ip = callee.code_offset,
+					register_base = callee_base,
+					caller_base = base,
+					caller_dst = instr.a,
+				},
+			)
 
 		case .Return:
 			value := state.registers[base + int(instr.a)]
@@ -801,10 +799,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				if handler_index := vm_finally_handler(state, top); handler_index >= 0 {
 					handler := state.handlers[handler_index]
 					ordered_remove(&state.handlers, handler_index)
-					append(&state.pending_returns, Pending_Return {
-						frame = top,
-						value = value,
-					})
+					append(&state.pending_returns, Pending_Return{frame = top, value = value})
 					state.frames[top].ip = int(handler.target)
 					break
 				}
@@ -980,11 +975,10 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			break
 
 		case .Push_Handler:
-			append(&state.handlers, Handler {
-				frame          = top,
-				target         = instr.a,
-				error_register = instr.b,
-			})
+			append(
+				&state.handlers,
+				Handler{frame = top, target = instr.a, error_register = instr.b},
+			)
 
 		case .Pop_Handler:
 			if len(state.handlers) > 0 {
@@ -1078,10 +1072,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			captures[capture_count - 1] = v.Value(0)
 			sync.mutex_lock(&program.callables_mutex)
 			callable_id := i32(len(program.callables))
-			append(&program.callables, Callable_Info {
-				function = instr.b,
-				captures = captures,
-			})
+			append(&program.callables, Callable_Info{function = instr.b, captures = captures})
 			value, value_ok := v.value_function_raw(u64(callable_id))
 			if value_ok {
 				program.callables[int(callable_id)].captures[capture_count - 1] = value
@@ -1144,27 +1135,20 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			for capture, index in callable.captures {
 				state.registers[callee_base + index] = capture
 			}
-			if !vm_bind_params(
-				state,
-				callee,
-				args,
-				callee_base + capture_count,
-			) {
+			if !vm_bind_params(state, callee, args, callee_base + capture_count) {
 				break
 			}
-			vm_zero_locals(
+			vm_zero_locals(state, callee_base + capture_count, callee.param_count, callee_top)
+			vm_frames_push(
 				state,
-				callee_base + capture_count,
-				callee.param_count,
-				callee_top,
+				Frame {
+					function = function_index,
+					ip = callee.code_offset,
+					register_base = callee_base,
+					caller_base = base,
+					caller_dst = instr.a,
+				},
 			)
-			vm_frames_push(state, Frame {
-				function      = function_index,
-				ip            = callee.code_offset,
-				register_base = callee_base,
-				caller_base   = base,
-				caller_dst    = instr.a,
-			})
 
 		case .Call_Splice:
 			if vm_depth_exceeded(state) {
@@ -1186,13 +1170,16 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 				break
 			}
 			vm_zero_locals(state, callee_base, callee.param_count, callee_top)
-			vm_frames_push(state, Frame {
-				function      = int(instr.b),
-				ip            = callee.code_offset,
-				register_base = callee_base,
-				caller_base   = base,
-				caller_dst    = instr.a,
-			})
+			vm_frames_push(
+				state,
+				Frame {
+					function = int(instr.b),
+					ip = callee.code_offset,
+					register_base = callee_base,
+					caller_base = base,
+					caller_dst = instr.a,
+				},
+			)
 
 		case .Builtin_Call_Splice:
 			args, args_ok := vm_list_args(state, base, instr.c)
@@ -1260,36 +1247,32 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			for capture, index in callable.captures {
 				state.registers[callee_base + index] = capture
 			}
-			if !vm_bind_params(
-				state,
-				callee,
-				args,
-				callee_base + capture_count,
-			) {
+			if !vm_bind_params(state, callee, args, callee_base + capture_count) {
 				break
 			}
-			vm_zero_locals(
+			vm_zero_locals(state, callee_base + capture_count, callee.param_count, callee_top)
+			vm_frames_push(
 				state,
-				callee_base + capture_count,
-				callee.param_count,
-				callee_top,
+				Frame {
+					function = function_index,
+					ip = callee.code_offset,
+					register_base = callee_base,
+					caller_base = base,
+					caller_dst = instr.a,
+				},
 			)
-			vm_frames_push(state, Frame {
-				function      = function_index,
-				ip            = callee.code_offset,
-				register_base = callee_base,
-				caller_base   = base,
-				caller_dst    = instr.a,
-			})
 
 		case .Push_Finally:
-			append(&state.handlers, Handler {
-				frame             = top,
-				target            = instr.a,
-				error_register    = -1,
-				kind              = .Finally,
-				routes_exceptions = instr.flags & 1 != 0,
-			})
+			append(
+				&state.handlers,
+				Handler {
+					frame = top,
+					target = instr.a,
+					error_register = -1,
+					kind = .Finally,
+					routes_exceptions = instr.flags & 1 != 0,
+				},
+			)
 
 		case .Resume_Return:
 			if len(state.pending_raises) > 0 &&
@@ -1427,8 +1410,7 @@ vm_unwind :: proc(state: ^VM) -> bool {
 	handler_is_finally := false
 	for index := len(state.handlers) - 1; index >= 0; index -= 1 {
 		handler := state.handlers[index]
-		if handler.kind == .Catch ||
-		   (handler.kind == .Finally && handler.routes_exceptions) {
+		if handler.kind == .Catch || (handler.kind == .Finally && handler.routes_exceptions) {
 			handler_index = index
 			handler_is_finally = handler.kind == .Finally
 			break
@@ -1460,10 +1442,7 @@ vm_unwind :: proc(state: ^VM) -> bool {
 	}
 	if handler_is_finally {
 		// Run the finally body, then re-raise the error when it completes.
-		append(&state.pending_raises, Pending_Raise {
-			frame = handler.frame,
-			error = state.error,
-		})
+		append(&state.pending_raises, Pending_Raise{frame = handler.frame, error = state.error})
 		state.status = .Ready
 		return true
 	}
@@ -1595,7 +1574,11 @@ vm_collection_value_at :: proc(state: ^VM, base: int, instr: Instruction) -> boo
 		state.registers[base + int(instr.a)] = result
 
 	case:
-		vm_fail(state, "E_TYPE", "collection value iteration needs a list, map, relation, or string")
+		vm_fail(
+			state,
+			"E_TYPE",
+			"collection value iteration needs a list, map, relation, or string",
+		)
 		return false
 	}
 	return true
@@ -1773,10 +1756,7 @@ vm_pattern_bindings :: proc(
 // already resolved. A zero id resolves `relation_name` against the live
 // snapshot, which lets an assembled artifact name its relations rather than
 // bake ids that vary between worlds.
-vm_resolve_pattern_relation :: proc(
-	state: ^VM,
-	pattern: Scan_Pattern,
-) -> (k.Relation_ID, bool) {
+vm_resolve_pattern_relation :: proc(state: ^VM, pattern: Scan_Pattern) -> (k.Relation_ID, bool) {
 	if pattern.relation != 0 {
 		return k.Relation_ID(pattern.relation), true
 	}
@@ -1794,7 +1774,11 @@ vm_resolve_pattern_relation :: proc(
 		vm_fail(
 			state,
 			"E_UNKNOWN_RELATION",
-			fmt.aprintf("relation scan names an unknown relation: %s", name, allocator = context.temp_allocator),
+			fmt.aprintf(
+				"relation scan names an unknown relation: %s",
+				name,
+				allocator = context.temp_allocator,
+			),
 		)
 		return 0, false
 	}
@@ -1821,7 +1805,12 @@ vm_scan_rows :: proc(
 		return false
 	}
 	bindings := vm_pattern_bindings(state, base, pattern, state.scratch_allocator)
+	state.source.error = .None
 	k.relation_source_scan_into(state.source, relation, bindings, out)
+	if state.source.error != .None {
+		vm_fail(state, kernel_error_code(state.source.error), "computed relation scan failed")
+		return false
+	}
 	return true
 }
 
@@ -1916,7 +1905,12 @@ vm_scan_first :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 		base    = base,
 		pattern = &pattern,
 	}
+	state.source.error = .None
 	k.relation_source_visit(state.source, relation, bindings, first_binding_visit, &ctx)
+	if state.source.error != .None {
+		vm_fail(state, kernel_error_code(state.source.error), "computed relation scan failed")
+		return false
+	}
 	state.registers[base + int(instr.a)] = v.value_bool(ctx.found)
 	return true
 }
@@ -1955,12 +1949,7 @@ vm_scan_one :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 }
 
 @(private)
-vm_apply_write :: proc(
-	state: ^VM,
-	base: int,
-	instr: Instruction,
-	assert_write: bool,
-) -> bool {
+vm_apply_write :: proc(state: ^VM, base: int, instr: Instruction, assert_write: bool) -> bool {
 	if state.transaction == nil {
 		vm_fail(state, "E_NO_TRANSACTION", "relation write has no transaction")
 		return false
@@ -2123,19 +2112,17 @@ vm_call_function :: proc(
 	if !vm_bind_params(state, callee, args, callee_base + capture_count) {
 		return false
 	}
-	vm_zero_locals(
+	vm_zero_locals(state, callee_base + capture_count, callee.param_count, callee_top)
+	vm_frames_push(
 		state,
-		callee_base + capture_count,
-		callee.param_count,
-		callee_top,
+		Frame {
+			function = function_index,
+			ip = callee.code_offset,
+			register_base = callee_base,
+			caller_base = base,
+			caller_dst = destination,
+		},
 	)
-	vm_frames_push(state, Frame {
-		function      = function_index,
-		ip            = callee.code_offset,
-		register_base = callee_base,
-		caller_base   = base,
-		caller_dst    = destination,
-	})
 	return true
 }
 
@@ -2262,6 +2249,10 @@ kernel_error_code :: proc(err: k.Kernel_Error) -> string {
 		return "E_FUNCTIONAL_KEY"
 	case .Read_Only:
 		return "E_READ_ONLY"
+	case .Permission_Denied:
+		return "E_PERMISSION"
+	case .Computed_Binding_Required:
+		return "E_DB"
 	case .Already_Applied:
 		return "E_STATE"
 	case .Killed:
@@ -2272,7 +2263,11 @@ kernel_error_code :: proc(err: k.Kernel_Error) -> string {
 		return "E_OVERLOADED"
 	case .Duplicate_Relation_Name, .Invalid_Metadata:
 		return "E_METADATA"
-	case .No_Such_Rule, .Unstratified_Negation, .Unsafe_Negation, .Unsafe_Guard, .Unbound_Head_Variable:
+	case .No_Such_Rule,
+	     .Unstratified_Negation,
+	     .Unsafe_Negation,
+	     .Unsafe_Guard,
+	     .Unbound_Head_Variable:
 		return "E_RULE"
 	case .None:
 		return "E_NONE"
@@ -2462,11 +2457,7 @@ vm_depth_exceeded :: #force_inline proc(state: ^VM) -> bool {
 // The `none` value: an empty relation headed by `value`, matching the literal.
 @(private)
 vm_none_value :: proc(state: ^VM) -> v.Value {
-	result, _ := v.value_relation(
-		state.allocator,
-		[]v.Symbol{v.symbol_intern("value")},
-		nil,
-	)
+	result, _ := v.value_relation(state.allocator, []v.Symbol{v.symbol_intern("value")}, nil)
 	return result
 }
 
@@ -2537,12 +2528,7 @@ vm_bind_params_range :: proc(
 }
 
 @(private)
-vm_bind_params :: proc(
-	state: ^VM,
-	callee: ^Function,
-	args: []v.Value,
-	param_base: int,
-) -> bool {
+vm_bind_params :: proc(state: ^VM, callee: ^Function, args: []v.Value, param_base: int) -> bool {
 	program := state.program
 	required := int(callee.required_count)
 	non_rest := callee.param_count
@@ -2664,10 +2650,7 @@ vm_intern_callable :: proc(state: ^VM, function: i32, captures: []v.Value) -> i3
 		}
 	}
 	index := len(program.callables)
-	append(&program.callables, Callable_Info {
-		function = function,
-		captures = captures,
-	})
+	append(&program.callables, Callable_Info{function = function, captures = captures})
 	return i32(index)
 }
 

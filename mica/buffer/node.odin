@@ -19,6 +19,7 @@
 package buffer
 
 import "core:mem"
+import "core:sync"
 
 NODE_FANOUT :: 16
 
@@ -44,6 +45,7 @@ Piece_Node :: struct {
 // Slab pool for nodes. Freed nodes are recycled, so a steady edit loop does no
 // node allocation at all.
 Node_Pool :: struct {
+	lock:        sync.Mutex,
 	allocator:   mem.Allocator,
 	free:        [dynamic]^Piece_Node,
 	allocations: u64,
@@ -68,6 +70,8 @@ node_pool_destroy :: proc(pool: ^Node_Pool) {
 
 @(private)
 node_alloc :: proc(pool: ^Node_Pool) -> ^Piece_Node {
+	sync.mutex_lock(&pool.lock)
+	defer sync.mutex_unlock(&pool.lock)
 	pool.alloc_calls += 1
 	if len(pool.free) > 0 {
 		node := pop(&pool.free)
@@ -81,12 +85,14 @@ node_alloc :: proc(pool: ^Node_Pool) -> ^Piece_Node {
 
 @(private)
 node_free :: proc(pool: ^Node_Pool, node: ^Piece_Node) {
+	sync.mutex_lock(&pool.lock)
+	defer sync.mutex_unlock(&pool.lock)
 	append(&pool.free, node)
 }
 
 node_retain :: proc(node: ^Piece_Node) -> ^Piece_Node {
 	if node != nil {
-		node.refs += 1
+		sync.atomic_add_explicit(&node.refs, 1, .Relaxed)
 	}
 	return node
 }
@@ -99,8 +105,7 @@ node_release :: proc(pool: ^Node_Pool, node: ^Piece_Node) {
 	if node == nil {
 		return
 	}
-	node.refs -= 1
-	if node.refs > 0 {
+	if sync.atomic_sub_explicit(&node.refs, 1, .Acq_Rel) != 1 {
 		return
 	}
 
@@ -109,17 +114,16 @@ node_release :: proc(pool: ^Node_Pool, node: ^Piece_Node) {
 	append(&worklist, node)
 	for len(worklist) > 0 {
 		current := pop(&worklist)
-		current.refs -= 1
-		if current.refs > 0 {
-			continue
-		}
 		if current.leaf {
 			for index in 0 ..< int(current.count) {
 				chunk_release(current.pieces[index].chunk)
 			}
 		} else {
-			append(&worklist, current.children[0])
-			append(&worklist, current.children[1])
+			for child in current.children {
+				if sync.atomic_sub_explicit(&child.refs, 1, .Acq_Rel) == 1 {
+					append(&worklist, child)
+				}
+			}
 		}
 		node_free(pool, current)
 	}
@@ -173,9 +177,5 @@ node_internal :: proc(pool: ^Node_Pool, left, right: ^Piece_Node) -> ^Piece_Node
 // every piece split O(chunk), and therefore every middle edit O(document).
 @(private)
 piece_newlines :: proc(piece: Piece) -> u64 {
-	return chunk_newlines_in_range(
-		piece.chunk,
-		piece.start,
-		piece.start + piece.length,
-	)
+	return chunk_newlines_in_range(piece.chunk, piece.start, piece.start + piece.length)
 }

@@ -15,8 +15,8 @@ import "core:strings"
 
 import buf "../buffer"
 import k "../kernel"
-import vm "../vm"
 import v "../var"
+import vm "../vm"
 
 // Resolves a buffer name argument to its kernel relation id.
 @(private)
@@ -46,14 +46,7 @@ buffer_relation_arg :: proc(state: ^vm.VM, value: v.Value) -> (k.Relation_ID, bo
 
 // Resolves a name and checks it really is a buffer.
 @(private)
-buffer_argument :: proc(
-	state: ^vm.VM,
-	value: v.Value,
-	writable: bool,
-) -> (
-	k.Relation_ID,
-	bool,
-) {
+buffer_argument :: proc(state: ^vm.VM, value: v.Value, writable: bool) -> (k.Relation_ID, bool) {
 	if state.transaction == nil {
 		vm.vm_set_error(state, "E_NO_TRANSACTION", "buffer access requires a task transaction")
 		return 0, false
@@ -128,10 +121,8 @@ builtin_make_buffer :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 
 	// Re-declaring an existing buffer adopts it. A durable world re-runs its
 	// fileins on boot, so declarations must be idempotent.
-	if existing, found := k.transaction_relation_metadata_named(
-		state.transaction,
-		name_symbol,
-	); found {
+	if existing, found := k.transaction_relation_metadata_named(state.transaction, name_symbol);
+	   found {
 		if existing.storage != .Buffer {
 			vm.vm_set_error(
 				state,
@@ -182,7 +173,9 @@ builtin_make_buffer :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 
 	metadata := k.relation_metadata(k.Relation_ID(0), name_symbol, 0)
 	metadata.storage = .Buffer
-	metadata.conflict = k.Conflict_Policy{kind = conflict}
+	metadata.conflict = k.Conflict_Policy {
+		kind = conflict,
+	}
 	metadata.durability = durability
 	relation, create_error := k.transaction_create_relation(state.transaction, metadata)
 	if create_error != .None {
@@ -224,7 +217,11 @@ builtin_buffer_insert :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 @(private)
 builtin_buffer_delete :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	if len(args) != 3 {
-		vm.vm_set_error(state, "E_INVARG", "buffer_delete expects a buffer, an offset, and a count")
+		vm.vm_set_error(
+			state,
+			"E_INVARG",
+			"buffer_delete expects a buffer, an offset, and a count",
+		)
 		return v.Value(0), false
 	}
 	relation, ok := buffer_argument(state, args[0], true)
@@ -537,11 +534,7 @@ builtin_buffer_compact :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool
 @(private)
 buffer_write_error :: proc(state: ^vm.VM, err: k.Kernel_Error, what: string) {
 	if err == .Already_Applied {
-		vm.vm_set_error(
-			state,
-			"E_STATE",
-			"this buffer was already applied in this transaction",
-		)
+		vm.vm_set_error(state, "E_STATE", "this buffer was already applied in this transaction")
 		return
 	}
 	vm.vm_set_error(state, "E_WRITE", what)
@@ -651,11 +644,7 @@ builtin_buffer_apply :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 	case .Stale:
 		return v.value_symbol(v.symbol_intern("stale")), true
 	case .Already_Applied:
-		vm.vm_set_error(
-			state,
-			"E_STATE",
-			"this buffer was already applied in this transaction",
-		)
+		vm.vm_set_error(state, "E_STATE", "this buffer was already applied in this transaction")
 		return v.Value(0), false
 	case .Unknown_Relation:
 		vm.vm_set_error(state, "E_INVARG", "buffer_apply could not stage the edits")
@@ -692,20 +681,11 @@ builtin_buffer_revert :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 	revision, revision_ok := v.value_as_int(args[1])
 	expected, expected_ok := v.value_as_int(args[2])
 	if !revision_ok || !expected_ok || revision < 0 || expected < 0 {
-		vm.vm_set_error(
-			state,
-			"E_TYPE",
-			"buffer_revert revisions must be non-negative integers",
-		)
+		vm.vm_set_error(state, "E_TYPE", "buffer_revert revisions must be non-negative integers")
 		return v.Value(0), false
 	}
 
-	switch k.transaction_buffer_revert(
-		state.transaction,
-		relation,
-		u64(revision),
-		u64(expected),
-	) {
+	switch k.transaction_buffer_revert(state.transaction, relation, u64(revision), u64(expected)) {
 	case .Reverted:
 		return buffer_status("staged"), true
 	case .Stale:
@@ -713,11 +693,7 @@ builtin_buffer_revert :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 	case .Unknown_Revision:
 		return buffer_status("unknown"), true
 	case .Dirty:
-		vm.vm_set_error(
-			state,
-			"E_STATE",
-			"this buffer was already modified in this transaction",
-		)
+		vm.vm_set_error(state, "E_STATE", "this buffer was already modified in this transaction")
 		return v.Value(0), false
 	case .Unknown_Relation:
 		vm.vm_set_error(state, "E_INVARG", "buffer_revert could not stage the reversion")
@@ -813,7 +789,9 @@ builtin_buffer_marker_rebase :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value
 		}
 	}
 
-	delta := buf.Delta{replacements = replacements}
+	delta := buf.Delta {
+		replacements = replacements,
+	}
 	rebase, _ := v.value_int(i64(buf.marker_rebase(delta, int(position), insertion)))
 	return rebase, true
 }
@@ -852,16 +830,18 @@ buffer_status :: proc(name: string) -> v.Value {
 }
 
 @(private)
-buffer_status_map :: proc(state: ^vm.VM, name: string, revision: u64, entries: []v.Map_Entry) -> v.Value {
+buffer_status_map :: proc(
+	state: ^vm.VM,
+	name: string,
+	revision: u64,
+	entries: []v.Map_Entry,
+) -> v.Value {
 	fields := make([dynamic]v.Map_Entry, 0, len(entries) + 2, state.allocator)
-	append(&fields, v.Map_Entry {
-		key   = buffer_status("status"),
-		value = buffer_status(name),
-	})
-	append(&fields, v.Map_Entry {
-		key   = buffer_status("revision"),
-		value = buffer_int(i64(revision)),
-	})
+	append(&fields, v.Map_Entry{key = buffer_status("status"), value = buffer_status(name)})
+	append(
+		&fields,
+		v.Map_Entry{key = buffer_status("revision"), value = buffer_int(i64(revision))},
+	)
 	append(&fields, ..entries)
 	return v.value_map(state.allocator, fields[:])
 }
@@ -879,13 +859,21 @@ builtin_buffer_apply_result :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value,
 	}
 	token, token_ok := v.value_as_int(args[0])
 	if !token_ok || token < 0 {
-		vm.vm_set_error(state, "E_TYPE", "buffer_apply_result token must be a non-negative integer")
+		vm.vm_set_error(
+			state,
+			"E_TYPE",
+			"buffer_apply_result token must be a non-negative integer",
+		)
 		return v.Value(0), false
 	}
 
-	result, found := k.kernel_buffer_result(builtin_env(state).kernel, u64(token))
+	result, found := k.kernel_buffer_result(builtin_env(state).kernel, u64(token), state.allocator)
 	if !found {
 		return buffer_status("pending"), true
+	}
+	if !k.authority_can_read(state.authority, result.relation) {
+		vm.vm_set_error(state, "E_PERMISSION", "buffer apply result read denied")
+		return v.Value(0), false
 	}
 
 	switch result.outcome {
@@ -904,8 +892,14 @@ builtin_buffer_apply_result :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value,
 			state.allocator,
 			[]v.Map_Entry {
 				{key = buffer_status("at"), value = buffer_int(i64(replacement.start))},
-				{key = buffer_status("remove"), value = buffer_int(i64(replacement.end - replacement.start))},
-				{key = buffer_status("text"), value = v.value_string(state.allocator, replacement.text)},
+				{
+					key = buffer_status("remove"),
+					value = buffer_int(i64(replacement.end - replacement.start)),
+				},
+				{
+					key = buffer_status("text"),
+					value = v.value_string(state.allocator, replacement.text),
+				},
 			},
 		)
 	}

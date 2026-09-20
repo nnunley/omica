@@ -29,9 +29,9 @@ import "core:unicode/utf8"
 Cell :: struct {
 	// 0 for base material, otherwise the id of the insertion run that created
 	// this cell. Cells of one insertion run share an id, modelling a chunk.
-	run: u64,
+	run:    u64,
 	// Base index when `run == 0`; -1 for inserted cells.
-	base: int,
+	base:   int,
 	scalar: rune,
 }
 
@@ -143,6 +143,9 @@ Delta :: struct {
 
 Delta_Error :: enum {
 	None,
+	// A caller-supplied work budget was exhausted before normalization
+	// completed. The partial delta is never usable.
+	Budget_Exceeded,
 	// A cell claims base provenance that the base cannot account for: an index
 	// out of range, or out of order. Under splices this cannot occur, so it
 	// signals a foreign root (for example an adopted historical root), which
@@ -243,11 +246,7 @@ delta_apply :: proc(
 		rep := delta.replacements[index]
 		applied, err := edit_apply(
 			result,
-			Edit {
-				at     = rep.start,
-				remove = rep.end - rep.start,
-				text   = rep.text,
-			},
+			Edit{at = rep.start, remove = rep.end - rep.start, text = rep.text},
 			runs,
 			allocator,
 		)
@@ -286,6 +285,10 @@ revert_as_splice :: proc(
 		return base, {}, err
 	}
 	replacements := make([]Replacement, 1, allocator)
-	replacements[0] = Replacement{start = 0, end = base_len, text = old_text}
+	replacements[0] = Replacement {
+		start = 0,
+		end   = base_len,
+		text  = old_text,
+	}
 	return reverted, Delta{replacements = replacements}, .None
 }

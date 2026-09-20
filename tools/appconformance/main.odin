@@ -221,6 +221,7 @@ main :: proc() {
 				"test/marker_rebase_insertion_types",
 				"test/marker_rebase_shifts_and_collapses",
 				"test/marker_seed",
+				"test/marker_create_at_committed_revision",
 				"test/marker_apply_with_token",
 				"test/marker_rebases_from_the_recorded_delta",
 				"test/annotation_follows_its_markers",

@@ -14,6 +14,12 @@ import v "../var"
 // plus extensional facts only. This serves semi-naive rule evaluation, where
 // one body atom reads the facts derived in the previous round.
 Relation_Source :: struct {
+	// Registry owner for snapshot-only reads. Transaction sources obtain the
+	// same pointer from the transaction itself.
+	kernel:              ^Kernel,
+	// Nil means root authority. Computed scanners inherit this authority when
+	// they read their backing relations.
+	authority:           ^Authority,
 	snapshot:           ^Snapshot,
 	transaction:        ^Transaction,
 	derived:            ^Rule_Derived,
@@ -21,6 +27,19 @@ Relation_Source :: struct {
 	delta:              ^Rule_Derived,
 	delta_relation:     Relation_ID,
 	delta_active:       bool,
+	// Set when a computed scan cannot execute, for example because a required
+	// access key was unbound. Callers translate it to their query error.
+	error:              Kernel_Error,
+}
+
+relation_source_kernel :: proc(source: ^Relation_Source) -> ^Kernel {
+	if source == nil {
+		return nil
+	}
+	if source.transaction != nil {
+		return source.transaction.kernel
+	}
+	return source.kernel
 }
 
 @(private)
@@ -49,12 +68,43 @@ relation_source_visit :: proc(
 	visit: proc(user: rawptr, row: v.Tuple) -> bool,
 	user: rawptr,
 ) -> bool {
-	state := Visit_State{visit = visit, user = user}
+	if !authority_can_read(source.authority, relation) {
+		source.error = .Permission_Denied
+		return false
+	}
+	state := Visit_State {
+		visit = visit,
+		user  = user,
+	}
+	if computed, computed_error := computed_relation_visit(
+		source,
+		relation,
+		bindings,
+		visit_state_trampoline,
+		&state,
+	); computed {
+		if computed_error != .None {
+			source.error = computed_error
+		}
+		return state.stopped
+	}
 
 	if source.snapshot != nil {
-		snapshot_visit_extensional(source.snapshot, relation, bindings, visit_state_trampoline, &state)
+		snapshot_visit_extensional(
+			source.snapshot,
+			relation,
+			bindings,
+			visit_state_trampoline,
+			&state,
+		)
 	} else if source.transaction != nil {
-		transaction_visit_extensional(source.transaction, relation, bindings, visit_state_trampoline, &state)
+		transaction_visit_extensional(
+			source.transaction,
+			relation,
+			bindings,
+			visit_state_trampoline,
+			&state,
+		)
 	}
 	if state.stopped {
 		return true
@@ -110,14 +160,8 @@ relation_source_scan_into :: proc(
 	bindings: []v.Binding,
 	out: ^[dynamic]v.Tuple,
 ) {
-	relation_source_visit(
-		source,
-		relation,
-		bindings,
-		proc(user: rawptr, row: v.Tuple) -> bool {
+	relation_source_visit(source, relation, bindings, proc(user: rawptr, row: v.Tuple) -> bool {
 			append((^[dynamic]v.Tuple)(user), row)
 			return true
-		},
-		out,
-	)
+		}, out)
 }

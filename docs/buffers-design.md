@@ -1,7 +1,7 @@
 # Buffers for Mica
 
-Status: implemented through M6, plus whole-buffer reversion, the change-feed
-buffer variant, and the marker/annotation layer. M0 (semantics), M1 (piece
+Status: implemented through M7, plus whole-buffer reversion and the change-feed
+buffer variant. M0 (semantics), M1 (piece
 tree), M2 (transactional integration, atomic creation, conservative conflict),
 M3 (persistence), M4 (the client revision contract including completion results
 and feed integration), M5 (span merging), and M6 (the Mica surface and lifecycle)
@@ -9,11 +9,11 @@ are implemented and tested. Buffer content is durable across a restart through
 the log record, the checkpoint page, and compaction; `buffer_revert` splices a
 retained earlier revision back in as a whole-buffer replacement over fresh
 chunks; observers follow a buffer through the change feed; and
-`apps/shared/buffers.mica` provides markers, annotations, and rebasing through a
-committed delta. What remains of M7 is the computed-relation registry (so
-`BufferStat`/`BufferLine` are rule-visible) and the interval-indexed
-`BufferMarkers` overlap query. See `mdbook/src/runtime/buffers.md` for the
-reader-facing summary of the same material.
+`apps/shared/buffers.mica` provides markers, annotations, and revision-checked
+rebasing. The runtime registry provides `BufferStat`, bounded `BufferLine`, and
+bounded `BufferMarkers` scans. These computed rows are visible to rules but are
+not stored facts. See `mdbook/src/runtime/buffers.md` for the reader-facing
+summary.
 
 This document specifies **buffers**: durable, transactional text objects that
 share Mica's transactional substrate with relations without being relations.
@@ -59,7 +59,8 @@ entry.
 ## Non-goals (for the first versions)
 
 - **Not a value type.** Referenced by stable id, never copied into tuples.
-- **Not rule-queryable content.** Rules cannot range over buffer text.
+- **No unbounded text relation.** Rules can use explicit bounded projections,
+  but they cannot range over raw buffer content.
 - **No selective undo.** Whole-buffer reversion only, implemented as a splice.
 - **No CRDT.** Span merging is provenance-based transform over a common base, not
   convergent replication. Same-position concurrent inserts conflict.
@@ -91,7 +92,7 @@ relational operations and the tuple store rebuilds a chunk per change.
 *about regions* of a buffer — spans, annotations, markers — are relation-shaped
 and belong in relations; see [Regions, Annotations, and
 Markers](#regions-annotations-and-markers). Read this section as "a buffer's
-*content* is not a relation and its content is not rule-queryable", not as
+*content* is not a stored or freely enumerable relation", not as
 "nothing associated with a buffer may be relational". The sharpest form of the
 claim: **the buffer holds exactly the part of a document that cannot be
 relational, and that is why it is a buffer.**
@@ -115,13 +116,12 @@ relational, and that is why it is a buffer.**
 | Authority | `mica/kernel/authority.odin` (`authority_relation_by_name`, `authority_can_invoke_builtin`) | Grants name an entry, resolved to its id at mint time. |
 | Catalogue facts | `mica/runtime/runtime.odin` (`Relation`, `RelationName`, `RelationDurability`) | The registry buffers join. |
 
-**Prerequisite to verify.** Computed relations are documented
-(`mdbook/src/language/computed-relations.md`) and declared in application source,
-but no Odin registration exists: `NearestEmbedding` appears only in
-`apps/shared/retrieval.mica`, `apps/mud/ui-retrieval.mica`, and the guide, never
-in a `.odin` file, so `apps/shared/retrieval.mica:52` declares an ordinary empty
-relation and the MUD retrieval panel silently finds nothing. Computed projections
-are the only path from rules to buffer content, so this blocks that feature.
+**Computed-relation prerequisite: complete.** The kernel registry stores a
+scanner and its required bindings for each computed relation. Scans use the
+current snapshot or transaction view. Computed relations are read-only, and
+missing required bindings raise `E_DB`. Rule planning delays a computed atom
+until earlier atoms bind its required inputs. The runtime now registers the
+buffer projections and the exact `NearestEmbedding` implementation.
 
 ## Data model
 
@@ -1018,13 +1018,12 @@ model before kernel integration.
 - **M6 — Mica surface and lifecycle.** Builtins (including `buffer_find` and the
   bounded `buffer_lines` line projection), authority, `kill_buffer` and
   tombstones, `buffer_revert` over a bounded retained history, management facts.
-- **M7 — Relational projection, annotations, and editor tooling.** Done: the
-  region layer of [Regions, Annotations, and Markers](#regions-annotations-and-markers)
-  — markers with insertion types, marker rebasing through the committed delta,
-  and annotation relations over markers, in `apps/shared/buffers.mica`. Not done:
-  the computed-relation registry, `BufferStat`, bounded `BufferLine`, and the
-  bounded interval-indexed computed relation for window queries. Line/column and
-  faces stay computed, never stored.
+- **M7 — Relational projection, annotations, and editor tooling.** Done. The
+  runtime provides the computed-relation registry, `BufferStat`, bounded
+  `BufferLine`, and indexed `BufferMarkers` window scans. The region layer in
+  `apps/shared/buffers.mica` provides revision-anchored markers, insertion
+  types, explicit rebasing, and annotations over markers. Line and presentation
+  data stay computed and are never stored.
 
 `Whole` lands only as an explicitly destructive opt-in.
 
@@ -1041,16 +1040,12 @@ Editable(actor, b) :- CanWrite(actor, BufferId(b))
 relation-shaped surfaces whose rows runtime code produces when scanned; required
 bindings are an access pattern, an unsatisfied binding raises `E_DB`, and
 computed rows are visible to rules without becoming facts. Natural projections
-are `BufferStat(buffer, ?length, ?lines, ?revision)` (O(1), safe in rules) and
-`BufferLine(buffer, ?index, ?text)`, which **must require** a specific buffer and
-a bounded line range — otherwise a rule asking for every line of every buffer is
-a full document scan dressed as a query.
-
-**Prerequisite:** no computed-relation registry exists in this port, so a builtin
-returning a relation *value* is the interim fallback: `buffer_lines` returns the
-bounded line projection as a value that code can iterate and combine, but a rule
-cannot scan a value by name, so there is no rule-level access to text until the
-registry exists.
+are `BufferStat(buffer, ?length, ?lines, ?revision)` and
+`BufferLine(buffer, first, count, ?line, ?start, ?stop, ?text)`. `BufferLine`
+requires the buffer, first line, and count. This rule prevents an accidental
+scan of every line in every buffer. `buffer_lines` remains the direct builtin
+for code that needs a relation value instead of a named query. A caller needs
+read authority for both the computed relation and its underlying buffer.
 
 You cannot: write a rule head over buffer text, join two buffers, `assert`/
 `retract` content as relations, or pass a buffer where a relation is expected.
@@ -1145,15 +1140,17 @@ Properties of this shape:
   intersect the window, then the annotations that reference them (an equality
   join Mica already does well).
 
-**Implemented shape.** `apps/shared/buffers.mica` declares the relations above
-and the verbs over them: `marker_create`, `marker_position`, `marker_rebase`,
+**Implemented shape.** `apps/shared/buffers.mica` declares the relations above,
+including `MarkerRevision`. It also declares `marker_create`, `marker_position`,
+`marker_revision`, `marker_rebase`,
 `markers_rebase`, `annotation_create`, `annotation_rebase`, `annotation_view`,
 and `annotation_drop_collapsed`. The rebase step is the builtin
 `buffer_marker_rebase(edits, position, insertion_type)`, a pure function over a
-committed base-relative delta — the same `[{:at, :remove, :text}]` shape
+base-relative delta — the same `[{:at, :remove, :text}]` shape
 `buffer_apply_result` returns and the `:buffer` change feed delivers. A caller
-therefore moves markers from the delta it already has, and a span that collapses
-is dropped by a separate call rather than silently.
+therefore moves markers from the delta it already has. The revision pair makes
+delivery idempotent and rejects a missed delta. A separate call drops a
+collapsed span.
 
 The kernel never sees a marker. Had the marker table been stored as raw offsets
 on the annotation, the same observations would hold with more churn; the marker
@@ -1168,31 +1165,28 @@ So the rule is:
 
 1. An edit stages buffer content; the committed delta then describes everything
    that moved.
-2. Rebasing is explicit: `buffer_marker_rebase` over that delta, in its own
-   transaction, rather than kernel behaviour hidden behind `buffer_insert`. A
-   client rebases from the completion result of its own tagged apply, or from
-   the `:buffer` change feed if it is an observer.
+2. Rebasing is explicit, not kernel behaviour hidden behind `buffer_insert`.
+   Local code can stage an edit and its known marker transform in one
+   transaction. A remote client uses the authoritative completion result or
+   change feed. Until it applies that result, stale marker revisions are not
+   projected against newer text.
 3. If that proves too manual, a declared "anchored to this buffer" property on a
    relation could make the kernel rebase automatically. That couples annotation
    tables into every buffer edit, so it is earned later, not assumed now.
 
-### The one genuine gap: interval joins
+### Bounded marker windows
 
 Mica's relation indexes are equality- and prefix-based. The natural annotation
 query is **overlap** ("every marker or annotation intersecting this window"),
-which is a generalized join, not an equality join. Two ways to close it, and the
-second is preferred:
+which is a generalized join, not an equality join. `BufferMarkers` keeps a
+sorted position index inside the runtime. The required buffer and half-open
+window bindings keep every scan bounded:
 
-- an interval index as a new index kind for relations; or
-- keep interval indexing inside the buffer layer: a bounded computed relation
-  (`BufferMarkers(buffer, window_start, window_end, ?marker, ?start, ?end)`) uses
-  an interval tree over marker positions and returns relation-shaped rows, so
-  rules see tuples while the interval structure stays an implementation detail of
-  the buffer.
+`BufferMarkers(buffer, window_start, window_end, ?marker, ?start, ?end)`
 
-The second keeps the relation store's index model simple and matches what
-[the guide](../mdbook/src/runtime/buffers.md) already says about computed
-relations: the result is still relation-shaped; the access path is specialised.
+Markers are points, so `start` and `end` are equal. The runtime omits a marker
+when its stored revision differs from the projected buffer revision. Rules see
+relation-shaped rows while the access path stays an implementation detail.
 
 ### What you can and cannot do
 
@@ -1275,9 +1269,10 @@ relations: the result is still relation-shaped; the access path is specialised.
 | `Manifest_Data.buffers` | `mica/store/checkpoint.odin` | field |
 | `buffer_apply`, `buffer_apply_result`, `buffer_revision`, `buffer_revert`, `make_buffer`, `kill_buffer` | `mica/runtime/buffer_builtins.odin` | builtins |
 | `buffer_marker_rebase` | `mica/runtime/buffer_builtins.odin` | builtin/helper |
-| `Marker`, `MarkerBuffer`, `MarkerPosition`, `MarkerInsertionType` | `apps/shared/buffers.mica` | world relations |
+| `Marker`, `MarkerBuffer`, `MarkerPosition`, `MarkerInsertionType`, `MarkerRevision` | `apps/shared/buffers.mica` | world relations |
 | `Annotation`, `AnnotationBuffer`, `AnnotationSpan`, `AnnotationKind`, `AnnotationText` | `apps/shared/buffers.mica` | world relations |
-| `BufferMarkers` (interval-indexed, bounded) | computed relation | projection |
+| `Computed_Registry`, `kernel_register_computed_relation` | `mica/kernel/computed.odin` | registry |
+| `BufferStat`, `BufferLine`, `BufferMarkers` | `mica/runtime/buffer_computed.odin` | computed projections |
 
 ## Appendix B: recovery invariants
 

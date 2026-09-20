@@ -127,6 +127,7 @@ task_set_actor_authority :: proc(task: ^Task, actor: v.Value, allocator: mem.All
 	}
 	snapshot := k.kernel_snapshot(task.kernel)
 	source := k.Relation_Source {
+		kernel   = task.kernel,
 		snapshot = snapshot,
 	}
 	authority := k.authority_from_actor(&source, identity, allocator)

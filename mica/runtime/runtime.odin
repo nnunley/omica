@@ -7,17 +7,18 @@
 // end or at a `commit()` boundary.
 package mica_runtime
 
+import c "../compiler"
+import k "../kernel"
+import s "../store"
+import v "../var"
+import vm "../vm"
 import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
-import c "../compiler"
-import k "../kernel"
-import s "../store"
-import vm "../vm"
-import v "../var"
+import "core:sync"
 
 Run_Result :: struct {
 	ok:      bool,
@@ -32,26 +33,35 @@ Field_Info :: struct {
 
 @(private)
 Builtin_Env :: struct {
-	kernel:    ^k.Kernel,
-	ctx:       ^c.Compile_Context,
-	fields:    map[string]Field_Info,
-	allocator: mem.Allocator,
+	kernel:                   ^k.Kernel,
+	ctx:                      ^c.Compile_Context,
+	fields:                   map[string]Field_Info,
+	allocator:                mem.Allocator,
 	// The scheduler that owns this world's mailboxes. Nil for a bare task.
-	scheduler: ^Scheduler,
+	scheduler:                ^Scheduler,
 	// When true, tasks mint authority for `actor` at init. The entry task in
 	// `run_files` stays root so declarations and grants can load.
-	enforce_authority: bool,
+	enforce_authority:        bool,
 	// Change subscriptions registered by this world.
-	subscriptions:     Subscription_Store,
+	subscriptions:            Subscription_Store,
 
 	// Source text per filein unit, keyed by unit name.
-	unit_sources: map[string]string,
+	unit_sources:             map[string]string,
 
 	// Runtime context identities returned by `endpoint()`, `actor()`, and
 	// `principal()`.
-	endpoint:  v.Value,
-	actor:     v.Value,
-	principal: v.Value,
+	endpoint:                 v.Value,
+	actor:                    v.Value,
+	principal:                v.Value,
+
+	// One committed marker-position index, rebuilt lazily for the requested
+	// buffer and snapshot version. Transactional marker writes bypass it.
+	marker_index_lock:        sync.Mutex,
+	marker_index_initialized: bool,
+	marker_index_version:     u64,
+	marker_index_revision:    u64,
+	marker_index_buffer:      v.Symbol,
+	marker_index_points:      [dynamic]Marker_Point,
 }
 
 // Writes `text` as a double-quoted Mica string literal with escapes.
@@ -81,13 +91,7 @@ write_mica_string_literal :: proc(builder: ^strings.Builder, text: string) {
 // Rust source task. `read:`/`write:`/`invoke:` targets are symbols; `effect`
 // takes no targets.
 @(private)
-expand_grant_blocks :: proc(
-	source: string,
-	allocator: mem.Allocator,
-) -> (
-	string,
-	Run_Result,
-) {
+expand_grant_blocks :: proc(source: string, allocator: mem.Allocator) -> (string, Run_Result) {
 	if !strings.contains(source, "grant ") {
 		return source, Run_Result{ok = true}
 	}
@@ -122,35 +126,15 @@ expand_grant_blocks :: proc(
 			}
 			if section, rest, is_section := grant_section(body); is_section {
 				operation = section
-				if !write_grant_assertions(
-					&builder,
-					kind,
-					subject,
-					operation,
-					rest,
-					allocator,
-				) {
-					return "", Run_Result {
-						ok      = false,
-						message = "malformed grant target",
-					}
+				if !write_grant_assertions(&builder, kind, subject, operation, rest, allocator) {
+					return "", Run_Result{ok = false, message = "malformed grant target"}
 				}
 				index += 1
 				continue
 			}
 			if operation != "" {
-				if !write_grant_assertions(
-					&builder,
-					kind,
-					subject,
-					operation,
-					body,
-					allocator,
-				) {
-					return "", Run_Result {
-						ok      = false,
-						message = "malformed grant target",
-					}
+				if !write_grant_assertions(&builder, kind, subject, operation, body, allocator) {
+					return "", Run_Result{ok = false, message = "malformed grant target"}
 				}
 			}
 			index += 1
@@ -309,10 +293,7 @@ substitute_include_text :: proc(
 			end_quote += 1
 		}
 		if end_quote >= len(source) {
-			return "", Run_Result {
-				ok      = false,
-				message = "unterminated include_text path",
-			}
+			return "", Run_Result{ok = false, message = "unterminated include_text path"}
 		}
 		closing := end_quote + 1
 		for closing < len(source) && (source[closing] == ' ' || source[closing] == '\t') {
@@ -328,13 +309,10 @@ substitute_include_text :: proc(
 		full := relative
 		joined_allocated := false
 		if !filepath.is_abs(relative) {
-			joined, join_err := filepath.join(
-				[]string{base_directory, relative},
-				allocator,
-			)
+			joined, join_err := filepath.join([]string{base_directory, relative}, allocator)
 			if join_err != nil {
 				return "", Run_Result {
-					ok      = false,
+					ok = false,
 					message = "include_text cannot join the source path",
 				}
 			}
@@ -343,18 +321,11 @@ substitute_include_text :: proc(
 		}
 		contents, read_err := os.read_entire_file(full, allocator)
 		if read_err != nil {
-			message := fmt.aprintf(
-				"include_text cannot read %s",
-				full,
-				allocator = allocator,
-			)
+			message := fmt.aprintf("include_text cannot read %s", full, allocator = allocator)
 			if joined_allocated {
 				delete(full, allocator)
 			}
-			return "", Run_Result {
-				ok      = false,
-				message = message,
-			}
+			return "", Run_Result{ok = false, message = message}
 		}
 		if joined_allocated {
 			delete(full, allocator)
@@ -369,9 +340,9 @@ substitute_include_text :: proc(
 Run_Options :: struct {
 	// Name of the declared identity that spawned tasks run as. Empty keeps
 	// every task at root.
-	actor: string,
+	actor:      string,
 	// Filein unit name for `fileout`. Empty derives one unit per file.
-	unit: string,
+	unit:       string,
 	// Durable store directory; empty runs in memory.
 	store_path: string,
 	// Store fsync policy. Defaults to group commit.
@@ -392,9 +363,9 @@ run_files :: proc(
 		paths,
 		allocator,
 		World_Config {
-			actor      = options.actor,
-			unit       = options.unit,
-			workers    = 1,
+			actor = options.actor,
+			unit = options.unit,
+			workers = 1,
 			store_path = options.store_path,
 			durability = options.durability,
 		},
@@ -416,7 +387,7 @@ run_files :: proc(
 		if entry, found := world.scheduler.entries[world.entry]; found {
 			if entry.task.state.error != v.Value(0) {
 				return Run_Result {
-					ok      = false,
+					ok = false,
 					message = format_error(entry.task.state.error, allocator),
 				}
 			}
@@ -431,19 +402,15 @@ run_files :: proc(
 
 // Compiles and runs one filein against `kernel`. On success the transaction is
 // committed.
-run_filein :: proc(
-	kernel: ^k.Kernel,
-	path: string,
-	allocator := context.allocator,
-) -> Run_Result {
+run_filein :: proc(kernel: ^k.Kernel, path: string, allocator := context.allocator) -> Run_Result {
 	return run_files(kernel, []string{path}, allocator)
 }
 
 @(private)
 Declarations :: struct {
-	next_relation: u32,
-	next_identity: u64,
-	next_rule:     u64,
+	next_relation:    u32,
+	next_identity:    u64,
+	next_rule:        u64,
 	// Named identities declared by the loaded files, recorded as NamedIdentity
 	// facts once every file is prescanned.
 	named_identities: [dynamic]Named_Identity,
@@ -459,10 +426,7 @@ Named_Identity :: struct {
 // Arity. The system relations are installed empty, so the runtime records the
 // facts as the world loads.
 @(private)
-assert_relation_facts :: proc(
-	env: ^Builtin_Env,
-	relations: []k.Relation_Metadata,
-) -> Run_Result {
+assert_relation_facts :: proc(env: ^Builtin_Env, relations: []k.Relation_Metadata) -> Run_Result {
 	// NOTE: the transient tuple arrays below use the temp allocator.
 	// transaction_assert deep-copies synchronously, so nothing outlives the
 	// call; allocating them in env.allocator would leak one array per fact.
@@ -490,7 +454,10 @@ assert_relation_facts :: proc(
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_RELATION_NAME_ID,
-			v.tuple_new(context.temp_allocator, []v.Value{identity, v.value_symbol(metadata.name)}),
+			v.tuple_new(
+				context.temp_allocator,
+				[]v.Value{identity, v.value_symbol(metadata.name)},
+			),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "RelationName", err)
 		}
@@ -508,10 +475,10 @@ assert_relation_facts :: proc(
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_RELATION_DURABILITY_ID,
-			v.tuple_new(context.temp_allocator, []v.Value {
-				identity,
-				v.value_symbol(v.symbol_intern(durability_name)),
-			}),
+			v.tuple_new(
+				context.temp_allocator,
+				[]v.Value{identity, v.value_symbol(v.symbol_intern(durability_name))},
+			),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "RelationDurability", err)
 		}
@@ -523,11 +490,10 @@ assert_relation_facts :: proc(
 			if err := k.transaction_assert(
 				&tx,
 				k.SYSTEM_ARGUMENT_NAME_ID,
-				v.tuple_new(context.temp_allocator, []v.Value {
-					identity,
-					value_int_must(i64(position)),
-					v.value_symbol(name),
-				}),
+				v.tuple_new(
+					context.temp_allocator,
+					[]v.Value{identity, value_int_must(i64(position)), v.value_symbol(name)},
+				),
 			); err != k.Kernel_Error.None {
 				return catalog_error(env, "ArgumentName", err)
 			}
@@ -543,10 +509,10 @@ assert_relation_facts :: proc(
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_CONFLICT_POLICY_ID,
-			v.tuple_new(context.temp_allocator, []v.Value {
-				identity,
-				v.value_symbol(v.symbol_intern(policy_name)),
-			}),
+			v.tuple_new(
+				context.temp_allocator,
+				[]v.Value{identity, v.value_symbol(v.symbol_intern(policy_name))},
+			),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "ConflictPolicy", err)
 		}
@@ -555,11 +521,14 @@ assert_relation_facts :: proc(
 				if err := k.transaction_assert(
 					&tx,
 					k.SYSTEM_FUNCTIONAL_KEY_ID,
-					v.tuple_new(context.temp_allocator, []v.Value {
-						identity,
-						value_int_must(i64(slot)),
-						value_int_must(i64(position)),
-					}),
+					v.tuple_new(
+						context.temp_allocator,
+						[]v.Value {
+							identity,
+							value_int_must(i64(slot)),
+							value_int_must(i64(position)),
+						},
+					),
 				); err != k.Kernel_Error.None {
 					return catalog_error(env, "FunctionalKey", err)
 				}
@@ -595,11 +564,14 @@ assert_relation_facts :: proc(
 				if err := k.transaction_assert(
 					&tx,
 					k.SYSTEM_INDEX_POSITION_ID,
-					v.tuple_new(context.temp_allocator, []v.Value {
-						index_value,
-						value_int_must(i64(slot)),
-						value_int_must(i64(position)),
-					}),
+					v.tuple_new(
+						context.temp_allocator,
+						[]v.Value {
+							index_value,
+							value_int_must(i64(slot)),
+							value_int_must(i64(position)),
+						},
+					),
 				); err != k.Kernel_Error.None {
 					return catalog_error(env, "IndexPosition", err)
 				}
@@ -607,10 +579,10 @@ assert_relation_facts :: proc(
 			if err := k.transaction_assert(
 				&tx,
 				k.SYSTEM_INDEX_STORAGE_KIND_ID,
-				v.tuple_new(context.temp_allocator, []v.Value {
-					index_value,
-					v.value_symbol(v.symbol_intern(storage)),
-				}),
+				v.tuple_new(
+					context.temp_allocator,
+					[]v.Value{index_value, v.value_symbol(v.symbol_intern(storage))},
+				),
 			); err != k.Kernel_Error.None {
 				return catalog_error(env, "IndexStorageKind", err)
 			}
@@ -653,22 +625,31 @@ assert_named_identities :: proc(env: ^Builtin_Env, entries: []Named_Identity) ->
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_NAMED_IDENTITY_ID,
-			v.tuple_new(context.temp_allocator, []v.Value{entry.identity, v.value_symbol(entry.name)}),
+			v.tuple_new(
+				context.temp_allocator,
+				[]v.Value{entry.identity, v.value_symbol(entry.name)},
+			),
 		); err != k.Kernel_Error.None {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"cannot record named identity: %v",
-				err,
-				allocator = env.allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"cannot record named identity: %v",
+					err,
+					allocator = env.allocator,
+				),
+			}
 		}
 	}
 	committed, commit_err := k.transaction_commit(&tx)
 	if commit_err != k.Kernel_Error.None {
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"cannot record named identities: %v",
-			commit_err,
-			allocator = env.allocator,
-		)}
+		return Run_Result {
+			ok = false,
+			message = fmt.aprintf(
+				"cannot record named identities: %v",
+				commit_err,
+				allocator = env.allocator,
+			),
+		}
 	}
 	k.snapshot_release(committed)
 	return Run_Result{ok = true, message = "loaded"}
@@ -691,26 +672,35 @@ assert_unit_sources :: proc(env: ^Builtin_Env, entries: []Unit_Source_Fact) -> R
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_UNIT_SOURCE_ID,
-			v.tuple_new(context.temp_allocator, []v.Value{
-				ordinal,
-				v.value_symbol(entry.unit),
-				v.value_string(context.temp_allocator, entry.source),
-			}),
+			v.tuple_new(
+				context.temp_allocator,
+				[]v.Value {
+					ordinal,
+					v.value_symbol(entry.unit),
+					v.value_string(context.temp_allocator, entry.source),
+				},
+			),
 		); err != k.Kernel_Error.None {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"cannot record unit source: %v",
-				err,
-				allocator = env.allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"cannot record unit source: %v",
+					err,
+					allocator = env.allocator,
+				),
+			}
 		}
 	}
 	committed, commit_err := k.transaction_commit(&tx)
 	if commit_err != k.Kernel_Error.None {
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"cannot record unit sources: %v",
-			commit_err,
-			allocator = env.allocator,
-		)}
+		return Run_Result {
+			ok = false,
+			message = fmt.aprintf(
+				"cannot record unit sources: %v",
+				commit_err,
+				allocator = env.allocator,
+			),
+		}
 	}
 	k.snapshot_release(committed)
 	return Run_Result{ok = true, message = "loaded"}
@@ -731,11 +721,14 @@ assert_program_bytes :: proc(env: ^Builtin_Env, program: ^vm.Program) -> Run_Res
 	bytes: [dynamic]u8
 	defer delete(bytes)
 	if error := vm.program_to_bytes(program, &bytes); error != .None {
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"cannot encode program artifact: %v",
-			error,
-			allocator = env.allocator,
-		)}
+		return Run_Result {
+			ok = false,
+			message = fmt.aprintf(
+				"cannot encode program artifact: %v",
+				error,
+				allocator = env.allocator,
+			),
+		}
 	}
 	id, id_ok := vm.program_artifact_id(bytes[:])
 	if !id_ok {
@@ -746,24 +739,27 @@ assert_program_bytes :: proc(env: ^Builtin_Env, program: ^vm.Program) -> Run_Res
 	if err := k.transaction_assert(
 		&tx,
 		k.SYSTEM_PROGRAM_BYTES_ID,
-		v.tuple_new(context.temp_allocator, []v.Value {
-			id,
-			v.value_bytes(env.allocator, bytes[:]),
-		}),
+		v.tuple_new(context.temp_allocator, []v.Value{id, v.value_bytes(env.allocator, bytes[:])}),
 	); err != k.Kernel_Error.None {
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"cannot record program bytes: %v",
-			err,
-			allocator = env.allocator,
-		)}
+		return Run_Result {
+			ok = false,
+			message = fmt.aprintf(
+				"cannot record program bytes: %v",
+				err,
+				allocator = env.allocator,
+			),
+		}
 	}
 	committed, commit_err := k.transaction_commit(&tx)
 	if commit_err != k.Kernel_Error.None {
-		return Run_Result{ok = false, message = fmt.aprintf(
-			"cannot record program bytes: %v",
-			commit_err,
-			allocator = env.allocator,
-		)}
+		return Run_Result {
+			ok = false,
+			message = fmt.aprintf(
+				"cannot record program bytes: %v",
+				commit_err,
+				allocator = env.allocator,
+			),
+		}
 	}
 	k.snapshot_release(committed)
 	return Run_Result{ok = true, message = "loaded"}
@@ -803,20 +799,20 @@ assert_rule_facts :: proc(env: ^Builtin_Env, rules: []Rule_Fact) -> Run_Result {
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_RULE_SOURCE_ID,
-			v.tuple_new(context.temp_allocator, []v.Value {
-				identity,
-				v.value_string(context.temp_allocator, rule_fact.source),
-			}),
+			v.tuple_new(
+				context.temp_allocator,
+				[]v.Value{identity, v.value_string(context.temp_allocator, rule_fact.source)},
+			),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "RuleSource", err)
 		}
 		if err := k.transaction_assert(
 			&tx,
 			k.SYSTEM_ACTIVE_RULE_ID,
-			v.tuple_new(context.temp_allocator, []v.Value {
-				identity,
-				v.value_bool(rule_fact.active),
-			}),
+			v.tuple_new(
+				context.temp_allocator,
+				[]v.Value{identity, v.value_bool(rule_fact.active)},
+			),
 		); err != k.Kernel_Error.None {
 			return catalog_error(env, "ActiveRule", err)
 		}
@@ -831,12 +827,15 @@ assert_rule_facts :: proc(env: ^Builtin_Env, rules: []Rule_Fact) -> Run_Result {
 
 @(private)
 catalog_error :: proc(env: ^Builtin_Env, name: string, err: k.Kernel_Error) -> Run_Result {
-	return Run_Result{ok = false, message = fmt.aprintf(
-		"cannot record catalog facts for %s: %v",
-		name,
-		err,
-		allocator = env.allocator,
-	)}
+	return Run_Result {
+		ok = false,
+		message = fmt.aprintf(
+			"cannot record catalog facts for %s: %v",
+			name,
+			err,
+			allocator = env.allocator,
+		),
+	}
 }
 
 // Pre-scans one file's top-level declarations into the shared compile context.
@@ -896,10 +895,10 @@ prescan_file :: proc(
 			if identity_ok {
 				ctx.identities[symbol_name] = identity_value
 				declarations.next_identity += 1
-				append(&declarations.named_identities, Named_Identity {
-					identity = identity_value,
-					name     = v.symbol_intern(symbol_name),
-				})
+				append(
+					&declarations.named_identities,
+					Named_Identity{identity = identity_value, name = v.symbol_intern(symbol_name)},
+				)
 			}
 
 		case "make_relation", "make_functional_relation":
@@ -944,12 +943,15 @@ prescan_file :: proc(
 
 			created, create_err := k.kernel_create_relation(env.kernel, metadata)
 			if create_err != k.Kernel_Error.None {
-				return Run_Result{ok = false, message = fmt.aprintf(
-					"cannot create relation %s: %v",
-					relation_name,
-					create_err,
-					allocator = env.allocator,
-				)}
+				return Run_Result {
+					ok = false,
+					message = fmt.aprintf(
+						"cannot create relation %s: %v",
+						relation_name,
+						create_err,
+						allocator = env.allocator,
+					),
+				}
 			}
 			k.snapshot_release(created)
 			ctx.relations[relation_name] = declarations.next_relation
@@ -1001,11 +1003,14 @@ install_rules :: proc(
 		}
 		rule, rule_ok := convert_rule(rule_item, env.ctx)
 		if !rule_ok {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"%s: could not lower a rule",
-				path,
-				allocator = env.allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"%s: could not lower a rule",
+					path,
+					allocator = env.allocator,
+				),
+			}
 		}
 		installed, install_err := k.kernel_install_rule(
 			kernel,
@@ -1014,20 +1019,26 @@ install_rules :: proc(
 			rule_source,
 		)
 		if install_err != k.Kernel_Error.None {
-			return Run_Result{ok = false, message = fmt.aprintf(
-				"%s: rule install failed: %v",
-				path,
-				install_err,
-				allocator = env.allocator,
-			)}
+			return Run_Result {
+				ok = false,
+				message = fmt.aprintf(
+					"%s: rule install failed: %v",
+					path,
+					install_err,
+					allocator = env.allocator,
+				),
+			}
 		}
 		k.snapshot_release(installed)
-		append(&facts, Rule_Fact {
-			id     = v.Identity(declarations.next_rule),
-			head   = rule.head_relation,
-			source = rule_source,
-			active = true,
-		})
+		append(
+			&facts,
+			Rule_Fact {
+				id = v.Identity(declarations.next_rule),
+				head = rule.head_relation,
+				source = rule_source,
+				active = true,
+			},
+		)
 		declarations.next_rule += 1
 	}
 	fact_result := assert_rule_facts(env, facts[:])
@@ -1094,7 +1105,9 @@ builtin_destroy_identity :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bo
 	env := builtin_env(state)
 	snapshot := k.kernel_snapshot(env.kernel)
 	defer k.snapshot_release(snapshot)
-	source := k.Relation_Source{transaction = state.transaction}
+	source := k.Relation_Source {
+		transaction = state.transaction,
+	}
 	count := i64(0)
 	for metadata in snapshot.catalog {
 		if metadata.arity == 0 || read_only_system_relation(metadata.id) {
@@ -1106,7 +1119,8 @@ builtin_destroy_identity :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bo
 		rows = make([dynamic]v.Tuple, 0, 8, context.temp_allocator)
 		k.relation_source_scan_into(&source, metadata.id, bindings, &rows)
 		for row in rows {
-			if err := k.transaction_retract(state.transaction, metadata.id, row); err != k.Kernel_Error.None {
+			if err := k.transaction_retract(state.transaction, metadata.id, row);
+			   err != k.Kernel_Error.None {
 				vm.vm_set_error(state, "E_KERNEL", "destroy_identity could not retract a fact")
 				return v.Value(0), false
 			}
@@ -1125,11 +1139,8 @@ builtin_destroy_identity :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bo
 		&name_rows,
 	)
 	for row in name_rows {
-		if err := k.transaction_retract(
-			state.transaction,
-			k.SYSTEM_NAMED_IDENTITY_ID,
-			row,
-		); err != k.Kernel_Error.None {
+		if err := k.transaction_retract(state.transaction, k.SYSTEM_NAMED_IDENTITY_ID, row);
+		   err != k.Kernel_Error.None {
 			vm.vm_set_error(state, "E_KERNEL", "destroy_identity could not retract a name")
 			return v.Value(0), false
 		}
@@ -1216,11 +1227,11 @@ builtin_set_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	// access does the same normalization.
 	info, found := env.fields[lower_first(name, context.temp_allocator)]
 	if !found || len(info.key_positions) == 0 {
-		vm.vm_set_error(state, "E_FIELD", fmt.aprintf(
-			"unknown functional field: %s",
-			name,
-			allocator = context.temp_allocator,
-		))
+		vm.vm_set_error(
+			state,
+			"E_FIELD",
+			fmt.aprintf("unknown functional field: %s", name, allocator = context.temp_allocator),
+		)
 		return v.Value(0), false
 	}
 	// Field syntax is an ordinary relation write: enforce the same relation
@@ -1297,9 +1308,10 @@ builtin_get_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 		case "message":
 			if error_value.has_message {
 				return option_some_value(
-					state.allocator,
-					v.value_string(state.allocator, error_value.message),
-				), true
+						state.allocator,
+						v.value_string(state.allocator, error_value.message),
+					),
+					true
 			}
 			return option_none_value(state.allocator), true
 		case "value":
@@ -1311,11 +1323,11 @@ builtin_get_field :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
 	}
 	info, found := env.fields[lower_first(name, context.temp_allocator)]
 	if !found || len(info.key_positions) != 1 || info.key_positions[0] != 0 {
-		vm.vm_set_error(state, "E_FIELD", fmt.aprintf(
-			"unknown functional field: %s",
-			name,
-			allocator = context.temp_allocator,
-		))
+		vm.vm_set_error(
+			state,
+			"E_FIELD",
+			fmt.aprintf("unknown functional field: %s", name, allocator = context.temp_allocator),
+		)
 		return v.Value(0), false
 	}
 	// Field syntax is an ordinary relation read: enforce the same relation
@@ -1348,7 +1360,7 @@ symbol_text :: proc(expr: ^c.Expr) -> string {
 		return ""
 	}
 	if strings.has_prefix(symbol.name, "\"") && len(symbol.name) >= 2 {
-		return symbol.name[1 : len(symbol.name) - 1]
+		return symbol.name[1:len(symbol.name) - 1]
 	}
 	return symbol.name
 }

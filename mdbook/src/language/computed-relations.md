@@ -30,10 +30,17 @@ result with ordinary facts.
 
 ## Read-Only Results
 
-Computed rows are produced from the current reader by a registered implementation. System reflection
-reports the catalogue or stored facts visible to that reader; nearest-neighbour search reports a
-selection calculated from embedding facts. Neither requires storing the answer rows in the queried
-relation.
+Computed rows are produced from the current reader by a registered implementation. A reflection
+implementation can report catalogue or stored facts visible to that reader. Nearest-neighbour
+search reports a selection calculated from embedding facts. Neither operation must store its answer
+rows in the queried relation.
+
+A computed scan keeps the caller's read authority. Access to the computed relation does not grant
+access to its backing relations or buffers.
+
+The Odin runtime registers `NearestEmbedding` and the buffer projections `BufferStat`, `BufferLine`,
+and `BufferMarkers`. The source-provider and fact-neighbourhood projections remain separate porting
+work.
 
 You cannot assert into a computed relation:
 

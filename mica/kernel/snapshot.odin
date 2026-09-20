@@ -8,12 +8,12 @@
 // because the committed store outlives every snapshot.
 package kernel
 
+import v "../var"
 import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
 import "core:sync"
-import v "../var"
 
 // A derived relation's rows, computed from rules at snapshot creation.
 Derived_Relation :: struct {
@@ -195,11 +195,7 @@ snapshot_derived_rows :: proc(snapshot: ^Snapshot, relation: Relation_ID) -> []v
 
 // Reports whether a relation tuple is visible in this snapshot, including
 // derived facts.
-snapshot_contains :: proc(
-	snapshot: ^Snapshot,
-	relation: Relation_ID,
-	tuple: v.Tuple,
-) -> bool {
+snapshot_contains :: proc(snapshot: ^Snapshot, relation: Relation_ID, tuple: v.Tuple) -> bool {
 	if block, ok := snapshot_relation_block(snapshot, relation); ok {
 		if relation_block_contains(block, tuple) {
 			return true
@@ -321,7 +317,10 @@ snapshot_active_rules :: proc(snapshot: ^Snapshot, alloc: mem.Allocator) -> []Ru
 // Converts an evaluation result into sorted relation row sets allocated from
 // `alloc`. Tuples are deep-copied so the result does not reference evaluation
 // scratch storage.
-derived_relations_from :: proc(alloc: mem.Allocator, derived: ^Rule_Derived) -> []Derived_Relation {
+derived_relations_from :: proc(
+	alloc: mem.Allocator,
+	derived: ^Rule_Derived,
+) -> []Derived_Relation {
 	relations := make([]Derived_Relation, len(derived.relations), alloc)
 	for relation, i in derived.relations {
 		rows := make([]v.Tuple, len(derived.rows[i]), alloc)
@@ -339,7 +338,7 @@ derived_relations_from :: proc(alloc: mem.Allocator, derived: ^Rule_Derived) -> 
 // Computes all derived relations for a snapshot from its active rules and
 // stores them on the snapshot. Evaluation runs in a short-lived arena; the
 // surviving tuples are deep-copied into the snapshot arena.
-snapshot_compute_derived :: proc(snapshot: ^Snapshot) {
+snapshot_compute_derived :: proc(snapshot: ^Snapshot, kernel: ^Kernel = nil) {
 	if len(snapshot.rules) == 0 {
 		snapshot.derived = nil
 		return
@@ -355,7 +354,7 @@ snapshot_compute_derived :: proc(snapshot: ^Snapshot) {
 	}
 	alloc := virtual.arena_allocator(arena)
 
-	derived, err := rules_evaluate(alloc, snapshot.rules, snapshot)
+	derived, err := rules_evaluate(alloc, snapshot.rules, snapshot, kernel)
 	if err != .None {
 		snapshot.derived = nil
 		return
@@ -364,13 +363,7 @@ snapshot_compute_derived :: proc(snapshot: ^Snapshot) {
 }
 
 // Returns the buffer block for a relation, if any.
-snapshot_buffer :: proc(
-	snapshot: ^Snapshot,
-	relation: Relation_ID,
-) -> (
-	^Buffer_Block,
-	bool,
-) {
+snapshot_buffer :: proc(snapshot: ^Snapshot, relation: Relation_ID) -> (^Buffer_Block, bool) {
 	for block in snapshot.buffers {
 		if block.relation == relation {
 			return block, true

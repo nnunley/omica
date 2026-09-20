@@ -208,7 +208,9 @@ append_span :: proc(user: rawptr, text: string, offset: u64) -> bool {
 tree_text :: proc(root: ^Piece_Node, allocator := context.allocator) -> string {
 	builder: [dynamic]u8
 	builder = make([dynamic]u8, allocator)
-	state := Append_State{builder = &builder}
+	state := Append_State {
+		builder = &builder,
+	}
 	tree_visit_spans(root, 0, tree_scalars(root), append_span, &state)
 	return string(builder[:])
 }
@@ -246,12 +248,7 @@ tree_newline_scalar :: proc(root: ^Piece_Node, n: u64) -> i64 {
 // Scalar offset of the `n`-th newline within a piece, or -1.
 @(private)
 chunk_piece_newline :: proc(piece: Piece, n: u64) -> i64 {
-	return chunk_nth_newline_in_range(
-		piece.chunk,
-		piece.start,
-		piece.start + piece.length,
-		n,
-	)
+	return chunk_nth_newline_in_range(piece.chunk, piece.start, piece.start + piece.length, n)
 }
 
 // Scalar offset where `line` starts (0-based). Returns the scalar count when the
@@ -277,12 +274,7 @@ tree_line_of_scalar :: proc(root: ^Piece_Node, scalar: u64) -> u64 {
 }
 
 @(private)
-tree_count_newlines_before :: proc(
-	node: ^Piece_Node,
-	scalar: u64,
-	count: ^u64,
-	position: ^u64,
-) {
+tree_count_newlines_before :: proc(node: ^Piece_Node, scalar: u64, count: ^u64, position: ^u64) {
 	if node == nil || position^ >= scalar {
 		return
 	}
@@ -345,10 +337,7 @@ tree_split :: proc(store: ^Store, node: ^Piece_Node, at: u64) -> (^Piece_Node, ^
 			case remaining == 0:
 				append(&right, piece)
 			case:
-				append(
-					&left,
-					Piece{chunk = piece.chunk, start = piece.start, length = remaining},
-				)
+				append(&left, Piece{chunk = piece.chunk, start = piece.start, length = remaining})
 				append(
 					&right,
 					Piece {
@@ -506,11 +495,7 @@ Base_Entry :: struct {
 }
 
 @(private)
-collect_base_entries :: proc(
-	root: ^Piece_Node,
-	out: ^[dynamic]Base_Entry,
-	position: ^u64,
-) {
+collect_base_entries :: proc(root: ^Piece_Node, out: ^[dynamic]Base_Entry, position: ^u64) {
 	if root == nil {
 		return
 	}
@@ -562,6 +547,7 @@ tree_provenance_counted :: proc(
 	base, edited: ^Piece_Node,
 	steps: ^u64,
 	allocator := context.allocator,
+	max_steps: u64 = 0,
 ) -> (
 	Delta,
 	Delta_Error,
@@ -572,6 +558,25 @@ tree_provenance_counted :: proc(
 	base_position := u64(0)
 	collect_base_entries(base, &base_entries, &base_position)
 	base_scalars := base_position
+	// Odin's map storage requires cache-line alignment. Transaction frame
+	// arenas deliberately provide smaller alignment, so this transient lookup
+	// index uses the worker-local temporary allocator and is released here.
+	index_allocator := context.temp_allocator
+	base_by_chunk := make(map[u64][dynamic]Base_Entry, index_allocator)
+	for entry in base_entries {
+		bucket, found := base_by_chunk[entry.chunk_id]
+		if !found {
+			bucket = make([dynamic]Base_Entry, 0, index_allocator)
+		}
+		append(&bucket, entry)
+		base_by_chunk[entry.chunk_id] = bucket
+	}
+	defer {
+		for _, bucket in base_by_chunk {
+			delete(bucket)
+		}
+		delete(base_by_chunk)
+	}
 
 	reps: [dynamic]Replacement
 	reps = make([dynamic]Replacement, allocator)
@@ -604,6 +609,9 @@ tree_provenance_counted :: proc(
 	for piece in pieces {
 		if steps != nil {
 			steps^ += 1
+			if max_steps > 0 && steps^ > max_steps {
+				return Delta{}, .Budget_Exceeded
+			}
 		}
 		// A piece is retained base material only when the base actually
 		// contains that (chunk, interval). The scan is linear in the base's
@@ -611,15 +619,19 @@ tree_provenance_counted :: proc(
 		// deletions interleave; the kernel build replaces it with a
 		// chunk-keyed index.
 		retained_base: i64 = -1
-		for entry in base_entries {
-			if steps != nil {
-				steps^ += 1
-			}
-			if entry.chunk_id == piece.chunk.id &&
-			   piece.start >= entry.start &&
-			   piece.start + piece.length <= entry.start + entry.length {
-				retained_base = i64(entry.base_pos + (piece.start - entry.start))
-				break
+		if candidates, found := base_by_chunk[piece.chunk.id]; found {
+			for entry in candidates {
+				if steps != nil {
+					steps^ += 1
+					if max_steps > 0 && steps^ > max_steps {
+						return Delta{}, .Budget_Exceeded
+					}
+				}
+				if piece.start >= entry.start &&
+				   piece.start + piece.length <= entry.start + entry.length {
+					retained_base = i64(entry.base_pos + (piece.start - entry.start))
+					break
+				}
 			}
 		}
 
@@ -712,7 +724,9 @@ tree_slice :: proc(
 	}
 	builder: [dynamic]u8
 	builder = make([dynamic]u8, allocator)
-	state := Append_State{builder = &builder}
+	state := Append_State {
+		builder = &builder,
+	}
 	tree_visit_spans(root, start, end, append_span, &state)
 	return string(builder[:]), .None
 }

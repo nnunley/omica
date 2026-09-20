@@ -5,9 +5,9 @@
 // accounting, structural sharing across snapshots, and conservative conflict.
 package kernel
 
-import "core:testing"
 import buf "../buffer"
 import v "../var"
+import "core:testing"
 
 @(private)
 buffer_test_sym :: proc(name: string) -> v.Symbol {
@@ -17,6 +17,12 @@ buffer_test_sym :: proc(name: string) -> v.Symbol {
 @(private)
 buffer_test_identity :: proc(raw: u64) -> v.Value {
 	value, _ := v.value_identity_raw(raw)
+	return value
+}
+
+@(private)
+buffer_test_int :: proc(raw: i64) -> v.Value {
+	value, _ := v.value_int(raw)
 	return value
 }
 
@@ -35,7 +41,9 @@ create_buffer_relation :: proc(
 ) -> Relation_ID {
 	metadata := relation_metadata(Relation_ID(id), buffer_test_sym(name), 0)
 	metadata.storage = .Buffer
-	metadata.conflict = Conflict_Policy{kind = conflict}
+	metadata.conflict = Conflict_Policy {
+		kind = conflict,
+	}
 	snapshot, err := kernel_create_relation(kernel, metadata)
 	testing.expectf(t, err == .None, "create buffer %s: %v", name, err)
 	if snapshot != nil {
@@ -91,6 +99,187 @@ test_kernel_buffer_commits_and_reads :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, kernel_buffer_text(&kernel, notes, context.temp_allocator), "hello")
 	testing.expect_value(t, kernel_buffer_revision(&kernel, notes), u64(1))
+}
+
+// A group candidate contains a complete snapshot, including unchanged buffer
+// blocks. Group publication must adopt only the block each transaction wrote;
+// otherwise the later candidate restores the earlier candidate's buffer.
+@(test)
+test_kernel_group_publish_preserves_disjoint_buffer_writes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	left := create_buffer_relation(t, &kernel, 1, "left")
+	right := create_buffer_relation(t, &kernel, 2, "right")
+
+	left_tx := kernel_begin(&kernel)
+	right_tx := kernel_begin(&kernel)
+	transaction_buffer_edit(&left_tx, left, 0, 0, "L")
+	transaction_buffer_edit(&right_tx, right, 0, 0, "R")
+
+	left_candidate := transaction_build_candidate(&kernel, &left_tx, left_tx.base)
+	right_candidate := transaction_build_candidate(&kernel, &right_tx, right_tx.base)
+	snapshot_retain(left_tx.base)
+	snapshot_retain(right_tx.base)
+	left_entry := Commit_Entry {
+		transaction = &left_tx,
+		base        = left_tx.base,
+		candidate   = left_candidate,
+	}
+	right_entry := Commit_Entry {
+		transaction = &right_tx,
+		base        = right_tx.base,
+		candidate   = right_candidate,
+	}
+	kernel_publish_group(&kernel, []^Commit_Entry{&left_entry, &right_entry})
+
+	testing.expect(t, left_entry.published != nil)
+	testing.expect(t, right_entry.published != nil)
+	testing.expect_value(t, kernel_buffer_text(&kernel, left, context.temp_allocator), "L")
+	testing.expect_value(t, kernel_buffer_text(&kernel, right, context.temp_allocator), "R")
+
+	if left_entry.published != nil {
+		snapshot_release(left_entry.published)
+	}
+	if right_entry.published != nil {
+		snapshot_release(right_entry.published)
+	}
+	transaction_destroy(&left_tx)
+	transaction_destroy(&right_tx)
+}
+
+@(test)
+test_kernel_group_publish_carries_buffer_tombstones :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	left := create_buffer_relation(t, &kernel, 1, "left")
+	right := create_buffer_relation(t, &kernel, 2, "right")
+	kill_tx := kernel_begin(&kernel)
+	right_tx := kernel_begin(&kernel)
+	testing.expect_value(t, transaction_kill_relation(&kill_tx, left), Kernel_Error.None)
+	transaction_buffer_edit(&right_tx, right, 0, 0, "R")
+
+	kill_candidate := transaction_build_candidate(&kernel, &kill_tx, kill_tx.base)
+	right_candidate := transaction_build_candidate(&kernel, &right_tx, right_tx.base)
+	snapshot_retain(kill_tx.base)
+	snapshot_retain(right_tx.base)
+	kill_entry := Commit_Entry {
+		transaction = &kill_tx,
+		base        = kill_tx.base,
+		candidate   = kill_candidate,
+	}
+	right_entry := Commit_Entry {
+		transaction = &right_tx,
+		base        = right_tx.base,
+		candidate   = right_candidate,
+	}
+	kernel_publish_group(&kernel, []^Commit_Entry{&kill_entry, &right_entry})
+
+	current := kernel_snapshot(&kernel)
+	metadata, found := snapshot_relation_metadata(current, left)
+	testing.expect(t, found)
+	testing.expect(t, metadata.tombstoned)
+	testing.expect_value(t, snapshot_buffer_text(current, left, context.temp_allocator), "")
+	testing.expect_value(t, snapshot_buffer_text(current, right, context.temp_allocator), "R")
+	snapshot_release(current)
+
+	if kill_entry.published != nil {
+		snapshot_release(kill_entry.published)
+	}
+	if right_entry.published != nil {
+		snapshot_release(right_entry.published)
+	}
+	transaction_destroy(&kill_tx)
+	transaction_destroy(&right_tx)
+}
+
+@(test)
+test_kernel_group_publish_preserves_disjoint_relation_writes :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	left := create_tuple_relation(t, &kernel, 1, "Left", 1)
+	right := create_tuple_relation(t, &kernel, 2, "Right", 1)
+	left_tx := kernel_begin(&kernel)
+	right_tx := kernel_begin(&kernel)
+	transaction_assert(&left_tx, left, buffer_test_tuple(buffer_test_int(1)))
+	transaction_assert(&right_tx, right, buffer_test_tuple(buffer_test_int(2)))
+
+	left_candidate := transaction_build_candidate(&kernel, &left_tx, left_tx.base)
+	right_candidate := transaction_build_candidate(&kernel, &right_tx, right_tx.base)
+	snapshot_retain(left_tx.base)
+	snapshot_retain(right_tx.base)
+	left_entry := Commit_Entry {
+		transaction = &left_tx,
+		base        = left_tx.base,
+		candidate   = left_candidate,
+	}
+	right_entry := Commit_Entry {
+		transaction = &right_tx,
+		base        = right_tx.base,
+		candidate   = right_candidate,
+	}
+	kernel_publish_group(&kernel, []^Commit_Entry{&left_entry, &right_entry})
+
+	testing.expect(t, kernel_contains(&kernel, left, buffer_test_tuple(buffer_test_int(1))))
+	testing.expect(t, kernel_contains(&kernel, right, buffer_test_tuple(buffer_test_int(2))))
+	if left_entry.published != nil {
+		snapshot_release(left_entry.published)
+	}
+	if right_entry.published != nil {
+		snapshot_release(right_entry.published)
+	}
+	transaction_destroy(&left_tx)
+	transaction_destroy(&right_tx)
+}
+
+// Whole-buffer last-writer-wins publishes the loser's private view. When its
+// base moved, persistence must record a replacement against the actual winner,
+// rather than retaining offsets expressed against the old base.
+@(test)
+test_kernel_whole_rebase_records_delta_against_winner :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	notes := create_buffer_relation(t, &kernel, 1, "notes", .Whole)
+	seed := kernel_begin(&kernel)
+	transaction_buffer_edit(&seed, notes, 0, 0, "abc")
+	commit_buffer_tx(t, &seed)
+
+	loser := kernel_begin(&kernel)
+	transaction_buffer_edit(&loser, notes, 3, 0, "Y")
+	winner := kernel_begin(&kernel)
+	transaction_buffer_edit(&winner, notes, 0, 0, "X")
+	commit_buffer_tx(t, &winner)
+
+	published, err := transaction_commit(&loser)
+	testing.expect_value(t, err, Kernel_Error.None)
+	if published != nil {
+		snapshot_release(published)
+	}
+	testing.expect_value(t, kernel_buffer_text(&kernel, notes, context.temp_allocator), "abcY")
+	testing.expect_value(t, len(loser.buffer_writes), 1)
+	if len(loser.buffer_writes) == 1 {
+		delta := loser.buffer_writes[0].delta
+		testing.expect_value(t, len(delta.replacements), 1)
+		if len(delta.replacements) == 1 {
+			testing.expect_value(
+				t,
+				delta.replacements[0],
+				buf.Replacement{start = 0, end = 4, text = "abcY"},
+			)
+		}
+	}
+	transaction_destroy(&loser)
 }
 
 @(test)
@@ -162,7 +351,11 @@ test_kernel_buffer_isolation_across_snapshots :: proc(t: ^testing.T) {
 
 	// The retained reader still sees the version it acquired.
 	testing.expect_value(t, snapshot_buffer_text(reader, notes, context.temp_allocator), "hello")
-	testing.expect_value(t, kernel_buffer_text(&kernel, notes, context.temp_allocator), "hello world")
+	testing.expect_value(
+		t,
+		kernel_buffer_text(&kernel, notes, context.temp_allocator),
+		"hello world",
+	)
 	testing.expect_value(t, kernel_buffer_revision(&kernel, notes), u64(2))
 }
 
@@ -198,11 +391,7 @@ test_kernel_untouched_buffer_root_is_shared_across_snapshots :: proc(t: ^testing
 	defer snapshot_release(after)
 	after_block, after_ok := snapshot_buffer(after, notes)
 	testing.expect(t, after_ok)
-	testing.expectf(
-		t,
-		before_block.root == after_block.root,
-		"untouched buffer root was copied",
-	)
+	testing.expectf(t, before_block.root == after_block.root, "untouched buffer root was copied")
 	testing.expect_value(t, after_block.revision, before_block.revision)
 }
 
@@ -302,20 +491,26 @@ test_kernel_buffer_relation_metadata_is_validated :: proc(t: ^testing.T) {
 	// A buffer has no columns.
 	bad_arity := relation_metadata(Relation_ID(90), buffer_test_sym("bad_arity"), 2)
 	bad_arity.storage = .Buffer
-	bad_arity.conflict = Conflict_Policy{kind = .Reject}
+	bad_arity.conflict = Conflict_Policy {
+		kind = .Reject,
+	}
 	_, arity_error := kernel_create_relation(&kernel, bad_arity)
 	testing.expect_value(t, arity_error, Kernel_Error.Invalid_Metadata)
 
 	// A buffer cannot carry a tuple conflict policy.
 	bad_conflict := relation_metadata(Relation_ID(91), buffer_test_sym("bad_conflict"), 0)
 	bad_conflict.storage = .Buffer
-	bad_conflict.conflict = Conflict_Policy{kind = .Set}
+	bad_conflict.conflict = Conflict_Policy {
+		kind = .Set,
+	}
 	_, conflict_error := kernel_create_relation(&kernel, bad_conflict)
 	testing.expect_value(t, conflict_error, Kernel_Error.Invalid_Metadata)
 
 	// A tuple relation cannot carry a buffer conflict policy.
 	bad_tuple := relation_metadata(Relation_ID(92), buffer_test_sym("bad_tuple"), 1)
-	bad_tuple.conflict = Conflict_Policy{kind = .Reject}
+	bad_tuple.conflict = Conflict_Policy {
+		kind = .Reject,
+	}
 	_, tuple_error := kernel_create_relation(&kernel, bad_tuple)
 	testing.expect_value(t, tuple_error, Kernel_Error.Invalid_Metadata)
 }
@@ -343,7 +538,9 @@ test_kernel_buffer_edit_on_tuple_relation_is_unknown :: proc(t: ^testing.T) {
 staged_metadata :: proc(name: string, storage: Storage_Kind) -> Relation_Metadata {
 	metadata := relation_metadata(0, buffer_test_sym(name), 0)
 	metadata.storage = storage
-	metadata.conflict = Conflict_Policy{kind = .Reject}
+	metadata.conflict = Conflict_Policy {
+		kind = .Reject,
+	}
 	return metadata
 }
 
@@ -355,10 +552,7 @@ test_kernel_buffer_creation_with_content_is_atomic :: proc(t: ^testing.T) {
 	defer kernel_destroy(&kernel)
 
 	tx := kernel_begin(&kernel)
-	notes, create_error := transaction_create_relation(
-		&tx,
-		staged_metadata("notes", .Buffer),
-	)
+	notes, create_error := transaction_create_relation(&tx, staged_metadata("notes", .Buffer))
 	testing.expect_value(t, create_error, Kernel_Error.None)
 	testing.expect(t, notes != 0)
 
@@ -546,15 +740,15 @@ test_kernel_compaction_preserves_revision_and_bumps_epoch :: proc(t: ^testing.T)
 	testing.expect_value(t, kernel_buffer_epoch(&kernel, notes), u64(0))
 
 	compact := kernel_begin(&kernel)
-	testing.expect_value(
-		t,
-		transaction_buffer_compact(&compact, notes),
-		Kernel_Error.None,
-	)
+	testing.expect_value(t, transaction_buffer_compact(&compact, notes), Kernel_Error.None)
 	commit_buffer_tx(t, &compact)
 
 	// Content and revision are unchanged; only the chunk lineage moved.
-	testing.expect_value(t, kernel_buffer_text(&kernel, notes, context.temp_allocator), "hello world")
+	testing.expect_value(
+		t,
+		kernel_buffer_text(&kernel, notes, context.temp_allocator),
+		"hello world",
+	)
 	testing.expect_value(t, kernel_buffer_revision(&kernel, notes), u64(1))
 	testing.expect_value(t, kernel_buffer_epoch(&kernel, notes), u64(1))
 
@@ -593,7 +787,11 @@ test_kernel_reapplies_edits_across_a_compaction :: proc(t: ^testing.T) {
 	testing.expect_value(t, kernel_buffer_revision(&kernel, notes), u64(0))
 
 	// Its edit is re-applied under the new epoch.
-	testing.expect_value(t, transaction_buffer_edit(&stale, notes, 0, 0, "kept"), Kernel_Error.None)
+	testing.expect_value(
+		t,
+		transaction_buffer_edit(&stale, notes, 0, 0, "kept"),
+		Kernel_Error.None,
+	)
 	commit_buffer_tx(t, &stale)
 	testing.expect_value(t, kernel_buffer_text(&kernel, notes, context.temp_allocator), "kept")
 	testing.expect_value(t, kernel_buffer_revision(&kernel, notes), u64(1))
@@ -622,7 +820,11 @@ test_kernel_rebase_across_a_compaction_conflicts :: proc(t: ^testing.T) {
 	commit_buffer_tx(t, &compact)
 
 	// Both the revision and the epoch moved.
-	testing.expect_value(t, transaction_buffer_edit(&stale, notes, 0, 0, "mine"), Kernel_Error.None)
+	testing.expect_value(
+		t,
+		transaction_buffer_edit(&stale, notes, 0, 0, "mine"),
+		Kernel_Error.None,
+	)
 	commit_buffer_tx(t, &stale, .Conflict)
 	testing.expect_value(t, kernel_buffer_text(&kernel, notes, context.temp_allocator), "theirs")
 }
@@ -692,16 +894,17 @@ test_kernel_buffer_apply_batches_edits_in_order :: proc(t: ^testing.T) {
 
 	apply := kernel_begin(&kernel)
 	// Two edits in one batch, the second addressing the view the first made.
-	edits := []buf.Edit {
-		{at = 0, remove = 0, text = "abc"},
-		{at = 3, remove = 0, text = "def"},
-	}
+	edits := []buf.Edit{{at = 0, remove = 0, text = "abc"}, {at = 3, remove = 0, text = "def"}}
 	testing.expect_value(
 		t,
 		transaction_buffer_apply(&apply, notes, 0, edits),
 		Apply_Status.Applied,
 	)
-	testing.expect_value(t, transaction_buffer_text(&apply, notes, context.temp_allocator), "abcdef")
+	testing.expect_value(
+		t,
+		transaction_buffer_text(&apply, notes, context.temp_allocator),
+		"abcdef",
+	)
 	commit_buffer_tx(t, &apply)
 	testing.expect_value(t, kernel_buffer_text(&kernel, notes, context.temp_allocator), "abcdef")
 }
@@ -736,7 +939,11 @@ test_kernel_span_merges_disjoint_concurrent_edits :: proc(t: ^testing.T) {
 	)
 
 	commit_buffer_tx(t, &replace_head)
-	testing.expect_value(t, kernel_buffer_text(&kernel, shared, context.temp_allocator), "HELLO world")
+	testing.expect_value(
+		t,
+		kernel_buffer_text(&kernel, shared, context.temp_allocator),
+		"HELLO world",
+	)
 
 	// The second commit is rebased and merged rather than refused.
 	commit_buffer_tx(t, &append_tail)
@@ -767,7 +974,11 @@ test_kernel_span_refuses_overlapping_concurrent_edits :: proc(t: ^testing.T) {
 
 	commit_buffer_tx(t, &first)
 	commit_buffer_tx(t, &second, .Conflict)
-	testing.expect_value(t, kernel_buffer_text(&kernel, shared, context.temp_allocator), "HELLO world")
+	testing.expect_value(
+		t,
+		kernel_buffer_text(&kernel, shared, context.temp_allocator),
+		"HELLO world",
+	)
 }
 
 // Merging needs comparable provenance, so a compaction boundary refuses even
@@ -843,10 +1054,7 @@ test_kernel_kill_of_a_staged_creation_is_a_tombstone :: proc(t: ^testing.T) {
 	defer kernel_destroy(&kernel)
 
 	tx := kernel_begin(&kernel)
-	notes, create_error := transaction_create_relation(
-		&tx,
-		staged_metadata("ephemeral", .Buffer),
-	)
+	notes, create_error := transaction_create_relation(&tx, staged_metadata("ephemeral", .Buffer))
 	testing.expect_value(t, create_error, Kernel_Error.None)
 	transaction_buffer_edit(&tx, notes, 0, 0, "gone")
 	testing.expect_value(t, transaction_kill_relation(&tx, notes), Kernel_Error.None)
@@ -901,6 +1109,39 @@ test_kernel_buffer_apply_reports_completion :: proc(t: ^testing.T) {
 		result.delta.replacements[0],
 		buf.Replacement{start = 5, end = 5, text = "!"},
 	)
+}
+
+// Completion readers own a clone. Evicting the ring entry after lookup must
+// not invalidate the returned delta while the caller turns it into Mica values.
+@(test)
+test_kernel_buffer_completion_survives_ring_eviction :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	replacements := []buf.Replacement{{start = 1, end = 1, text = "kept"}}
+	kernel_record_buffer_result(
+		&kernel,
+		Buffer_Apply_Result {
+			token = 1,
+			relation = 9,
+			outcome = .Ok,
+			revision = 2,
+			delta = buf.Delta{replacements = replacements},
+		},
+	)
+	result, found := kernel_buffer_result(&kernel, 1, context.temp_allocator)
+	testing.expect(t, found)
+	for token := u64(2); token <= u64(BUFFER_RESULT_CAPACITY + 2); token += 1 {
+		kernel_record_buffer_result(
+			&kernel,
+			Buffer_Apply_Result{token = token, relation = 9, outcome = .Aborted},
+		)
+	}
+	_, still_stored := kernel_buffer_result(&kernel, 1, context.temp_allocator)
+	testing.expect(t, !still_stored)
+	testing.expect_value(t, result.delta.replacements[0].text, "kept")
 }
 
 @(test)
@@ -1199,7 +1440,11 @@ test_kernel_buffer_revert_never_adopts_a_historical_root :: proc(t: ^testing.T) 
 	after_block, after_found := snapshot_buffer(after, notes)
 	testing.expect(t, after_found)
 
-	testing.expect_value(t, snapshot_buffer_text(after, notes, context.temp_allocator), "original text")
+	testing.expect_value(
+		t,
+		snapshot_buffer_text(after, notes, context.temp_allocator),
+		"original text",
+	)
 	before_ids := buffer_test_chunk_ids(before_block.root)
 	after_ids := buffer_test_chunk_ids(after_block.root)
 	testing.expect(t, len(before_ids) > 0)
@@ -1231,11 +1476,7 @@ test_kernel_buffer_revert_checks_revision :: proc(t: ^testing.T) {
 	commit_buffer_tx(t, &second)
 
 	stale := kernel_begin(&kernel)
-	testing.expect_value(
-		t,
-		transaction_buffer_revert(&stale, notes, 1, 1),
-		Revert_Status.Stale,
-	)
+	testing.expect_value(t, transaction_buffer_revert(&stale, notes, 1, 1), Revert_Status.Stale)
 	// Nothing was staged: the view is untouched, and committing publishes no
 	// new version.
 	testing.expect_value(t, transaction_buffer_text(&stale, notes, context.temp_allocator), "two")
@@ -1279,11 +1520,7 @@ test_kernel_buffer_revert_refuses_unretained_revisions :: proc(t: ^testing.T) {
 
 	// Reverting to the version in hand is a no-op rather than a new version.
 	noop := kernel_begin(&kernel)
-	testing.expect_value(
-		t,
-		transaction_buffer_revert(&noop, notes, 2, 2),
-		Revert_Status.Reverted,
-	)
+	testing.expect_value(t, transaction_buffer_revert(&noop, notes, 2, 2), Revert_Status.Reverted)
 	commit_buffer_tx(t, &noop)
 	testing.expect_value(t, kernel_buffer_revision(&kernel, notes), u64(2))
 }
@@ -1310,11 +1547,7 @@ test_kernel_buffer_revert_requires_a_pristine_view :: proc(t: ^testing.T) {
 	// discarded, so the reversion is refused.
 	dirty := kernel_begin(&kernel)
 	transaction_buffer_edit(&dirty, notes, 0, 0, "prefix ")
-	testing.expect_value(
-		t,
-		transaction_buffer_revert(&dirty, notes, 1, 2),
-		Revert_Status.Dirty,
-	)
+	testing.expect_value(t, transaction_buffer_revert(&dirty, notes, 1, 2), Revert_Status.Dirty)
 	transaction_destroy(&dirty)
 
 	// After a reversion the view is locked, exactly like a revision-checked
@@ -1330,11 +1563,7 @@ test_kernel_buffer_revert_requires_a_pristine_view :: proc(t: ^testing.T) {
 		transaction_buffer_edit(&locked, notes, 0, 0, "bare"),
 		Kernel_Error.Already_Applied,
 	)
-	testing.expect_value(
-		t,
-		transaction_buffer_revert(&locked, notes, 1, 2),
-		Revert_Status.Dirty,
-	)
+	testing.expect_value(t, transaction_buffer_revert(&locked, notes, 1, 2), Revert_Status.Dirty)
 	commit_buffer_tx(t, &locked)
 	testing.expect_value(t, kernel_buffer_text(&kernel, notes, context.temp_allocator), "one")
 }
@@ -1365,11 +1594,7 @@ test_kernel_compaction_preserves_multi_chunk_text :: proc(t: ^testing.T) {
 	)
 
 	compact := kernel_begin(&kernel)
-	testing.expect_value(
-		t,
-		transaction_buffer_compact(&compact, notes),
-		Kernel_Error.None,
-	)
+	testing.expect_value(t, transaction_buffer_compact(&compact, notes), Kernel_Error.None)
 	// The rebuilt root is readable before the commit.
 	testing.expect_value(
 		t,
@@ -1502,15 +1727,15 @@ test_kernel_kill_buffer_drops_its_history :: proc(t: ^testing.T) {
 
 @(private)
 Buffer_Feed_Probe :: struct {
-	records:       int,
+	records:        int,
 	buffer_records: int,
-	version:       u64,
-	relation:      Relation_ID,
-	base_revision: u64,
-	new_revision:  u64,
-	epoch:         u64,
-	hunks:         int,
-	first:         buf.Replacement,
+	version:        u64,
+	relation:       Relation_ID,
+	base_revision:  u64,
+	new_revision:   u64,
+	epoch:          u64,
+	hunks:          int,
+	first:          buf.Replacement,
 }
 
 @(private)
@@ -1559,11 +1784,7 @@ test_kernel_change_feed_records_buffer_edits :: proc(t: ^testing.T) {
 	testing.expect_value(t, seed_probe.base_revision, u64(0))
 	testing.expect_value(t, seed_probe.new_revision, u64(1))
 	testing.expect_value(t, seed_probe.hunks, 1)
-	testing.expect_value(
-		t,
-		seed_probe.first,
-		buf.Replacement{start = 0, end = 0, text = "hello"},
-	)
+	testing.expect_value(t, seed_probe.first, buf.Replacement{start = 0, end = 0, text = "hello"})
 
 	edit := kernel_begin(&kernel)
 	transaction_buffer_edit(&edit, notes, 5, 0, " world")
@@ -1577,11 +1798,7 @@ test_kernel_change_feed_records_buffer_edits :: proc(t: ^testing.T) {
 	testing.expect_value(t, edit_probe.base_revision, u64(1))
 	testing.expect_value(t, edit_probe.new_revision, u64(2))
 	testing.expect_value(t, edit_probe.hunks, 1)
-	testing.expect_value(
-		t,
-		edit_probe.first,
-		buf.Replacement{start = 5, end = 5, text = " world"},
-	)
+	testing.expect_value(t, edit_probe.first, buf.Replacement{start = 5, end = 5, text = " world"})
 
 	compact := kernel_begin(&kernel)
 	transaction_buffer_compact(&compact, notes)
@@ -1636,11 +1853,7 @@ test_kernel_compaction_refuses_a_moved_view :: proc(t: ^testing.T) {
 	// Compacted first: the view is sealed, so a later edit is refused rather
 	// than published at the preserved revision.
 	compacted := kernel_begin(&kernel)
-	testing.expect_value(
-		t,
-		transaction_buffer_compact(&compacted, notes),
-		Kernel_Error.None,
-	)
+	testing.expect_value(t, transaction_buffer_compact(&compacted, notes), Kernel_Error.None)
 	testing.expect_value(
 		t,
 		transaction_buffer_edit(&compacted, notes, 4, 0, "!"),
@@ -1725,11 +1938,12 @@ test_kernel_persist_bytes_counts_buffer_writes :: proc(t: ^testing.T) {
 
 	// A batch apply is charged for every edit it staged.
 	apply := kernel_begin(&kernel)
-	edits := []buf.Edit {
-		{at = 4, remove = 0, text = " one"},
-		{at = 8, remove = 0, text = " two"},
-	}
-	testing.expect_value(t, transaction_buffer_apply(&apply, notes, 1, edits), Apply_Status.Applied)
+	edits := []buf.Edit{{at = 4, remove = 0, text = " one"}, {at = 8, remove = 0, text = " two"}}
+	testing.expect_value(
+		t,
+		transaction_buffer_apply(&apply, notes, 1, edits),
+		Apply_Status.Applied,
+	)
 	bytes = kernel_persist_bytes(&apply)
 	testing.expectf(
 		t,
@@ -1744,7 +1958,9 @@ test_kernel_persist_bytes_counts_buffer_writes :: proc(t: ^testing.T) {
 	staged := kernel_begin(&kernel)
 	metadata := relation_metadata(Relation_ID(2), buffer_test_sym("drafted"), 0)
 	metadata.storage = .Buffer
-	metadata.conflict = Conflict_Policy{kind = .Reject}
+	metadata.conflict = Conflict_Policy {
+		kind = .Reject,
+	}
 	drafted, create_error := transaction_create_relation(&staged, metadata)
 	testing.expect_value(t, create_error, Kernel_Error.None)
 	transaction_buffer_edit(&staged, drafted, 0, 0, "draft content")
@@ -1761,7 +1977,9 @@ test_kernel_persist_bytes_counts_buffer_writes :: proc(t: ^testing.T) {
 	volatile := kernel_begin(&kernel)
 	metadata_v := relation_metadata(Relation_ID(3), buffer_test_sym("scratch"), 0)
 	metadata_v.storage = .Buffer
-	metadata_v.conflict = Conflict_Policy{kind = .Reject}
+	metadata_v.conflict = Conflict_Policy {
+		kind = .Reject,
+	}
 	metadata_v.durability = .Volatile
 	scratch, create_error_v := transaction_create_relation(&volatile, metadata_v)
 	testing.expect_value(t, create_error_v, Kernel_Error.None)

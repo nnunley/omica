@@ -5,12 +5,12 @@
 // go through transactions obtained from `kernel_begin`.
 package kernel
 
+import buf "../buffer"
+import v "../var"
 import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:sync"
-import v "../var"
-import buf "../buffer"
 
 // Published world state.
 //
@@ -21,34 +21,34 @@ import buf "../buffer"
 // matching Rust mica's commit mutex. Loads are lock-free, so a long commit
 // never blocks transaction begins or scans.
 Kernel :: struct {
-	current:      ^Snapshot,
-	catalog_lock: sync.Mutex,
+	current:              ^Snapshot,
+	catalog_lock:         sync.Mutex,
 
 	// One striped lock per relation id. Commits hold the stripes for the
 	// relations they write, so candidates for the same relation are prepared
 	// in order while writes to different relations proceed in parallel.
-	relation_locks: [RELATION_LOCK_STRIPES]sync.Mutex,
+	relation_locks:       [RELATION_LOCK_STRIPES]sync.Mutex,
 
 	// Group publication. Prepared candidates queue here; the first task
 	// thread to enqueue drains the batch and publishes every candidate in one
 	// snapshot. This stops independent tasks from invalidating each other's
 	// candidates, which otherwise causes retry amplification under load.
-	commit_queue_lock: sync.Mutex,
-	commit_queue_cond: sync.Cond,
-	pending_commits:   [dynamic]^Commit_Entry,
-	committer_active:  bool,
+	commit_queue_lock:    sync.Mutex,
+	commit_queue_cond:    sync.Cond,
+	pending_commits:      [dynamic]^Commit_Entry,
+	committer_active:     bool,
 
 	// Reader-count reclamation (RCU-style). A reader increments `readers`
 	// around load-and-retain; a publisher swaps `current`, moves the previous
 	// snapshot to `retired`, and frees retired snapshots only while no reader
 	// is active. This closes the load-then-retain race without a lock on the
 	// read path.
-	readers:     [READER_SLOTS]Reader_Slot,
-	retire_lock: sync.Mutex,
-	retired:     [dynamic]^Snapshot,
+	readers:              [READER_SLOTS]Reader_Slot,
+	retire_lock:          sync.Mutex,
+	retired:              [dynamic]^Snapshot,
 	// Number of snapshots awaiting reclamation. Zero lets reader exits skip
 	// the retire lock entirely.
-	retire_pending: i32,
+	retire_pending:       i32,
 
 	// While true, commits apply extensional writes but skip derived-relation
 	// maintenance. Bulk ingest suspends the fixpoint and resumes once at the
@@ -58,37 +58,40 @@ Kernel :: struct {
 
 	// Relation metadata and rule definitions live here for the life of the
 	// kernel; blocks and snapshots reference their slices.
-	world:           ^virtual.Arena,
-	world_allocator: mem.Allocator,
+	world:                ^virtual.Arena,
+	world_allocator:      mem.Allocator,
 
 	// Arenas for transaction staging, snapshot arrays, derived rows, and
 	// block payloads. Arenas are reset on release and reused, so the hot path
 	// performs no arena creation at all.
-	arena_pool: ^Arena_Pool,
+	arena_pool:           ^Arena_Pool,
 
 	// Bearer capabilities minted for this world. Ephemeral; not persisted.
-	capabilities: Capability_Store,
+	capabilities:         Capability_Store,
 
 	// Chunk and piece-node pools shared by every buffer in this world.
-	buffer_store: buf.Store,
+	buffer_store:         buf.Store,
 
 	// Bounded per-buffer reversion history: the retained versions a
 	// `buffer_revert` can splice back in.
-	buffer_history: Buffer_History,
+	buffer_history:       Buffer_History,
 
 	// Recent client-tagged buffer completions, read back after publication.
-	buffer_results: Buffer_Result_Ring,
+	buffer_results:       Buffer_Result_Ring,
+
+	// Read-only relation implementations supplied by the runtime.
+	computed:             Computed_Registry,
 
 	// Highest id reserved by a transaction for a staged catalogue creation.
 	// Reservations are never reused, so an aborted transaction merely leaves a
 	// gap, which is preferable to two concurrent creators colliding.
-	staged_id_high: u32,
+	staged_id_high:       u32,
 
 	// Bounded window of committed fact changes for subscriptions.
-	changes: Change_Feed,
+	changes:              Change_Feed,
 
 	// Optional durable store hooks. Zero value means in-memory only.
-	store: Store_Hooks,
+	store:                Store_Hooks,
 }
 
 // A pool of reset-able virtual arenas shared by transactions, snapshots, and
@@ -107,9 +110,9 @@ RELATION_LOCK_STRIPES :: 64
 
 @(private)
 Reader_Slot :: struct {
-	count:  i32,
+	count:   i32,
 	// Hazard pointer for borrowed (non-retained) snapshot reads.
-	hazard: ^Snapshot,
+	hazard:  ^Snapshot,
 	// Set while a thread holds this slot as its exclusive hazard pin. The
 	// count field needs no exclusivity (concurrent increments compose), but
 	// a hazard pin must never be shared: two borrowers on one slot would
@@ -207,7 +210,7 @@ Arena_Pool_Shard :: struct {
 }
 
 Arena_Pool :: struct {
-	shards: [ARENA_POOL_SHARDS]Arena_Pool_Shard,
+	shards:      [ARENA_POOL_SHARDS]Arena_Pool_Shard,
 	// Arenas currently checked out. Diagnostics only.
 	live_arenas: i32,
 }
@@ -326,6 +329,7 @@ kernel_init :: proc(kernel: ^Kernel) {
 	buf.store_init(&kernel.buffer_store, runtime.default_allocator())
 	buffer_history_init(&kernel.buffer_history, runtime.default_allocator())
 	buffer_result_ring_init(&kernel.buffer_results, runtime.default_allocator())
+	computed_registry_init(&kernel.computed, runtime.default_allocator())
 	kernel.current = snapshot_create(kernel, 0, nil)
 }
 
@@ -344,6 +348,7 @@ kernel_destroy :: proc(kernel: ^Kernel) {
 	capability_store_destroy(&kernel.capabilities)
 	changes_destroy(&kernel.changes)
 	buffer_result_ring_destroy(&kernel.buffer_results)
+	computed_registry_destroy(&kernel.computed)
 	// Retained history blocks keep piece trees alive, so release them before
 	// the pools that own those chunks and nodes.
 	buffer_history_destroy(&kernel.buffer_history)
@@ -560,12 +565,12 @@ Commit_Entry :: struct {
 	transaction: ^Transaction,
 	// Durable budget reservation from admission; consumed by the store on
 	// successful publication.
-	ticket: Persist_Ticket,
+	ticket:      Persist_Ticket,
 	// The snapshot the candidate was prepared against, retained by the owner.
-	base:      ^Snapshot,
-	candidate: ^Snapshot,
-	published: ^Snapshot,
-	done:      bool,
+	base:        ^Snapshot,
+	candidate:   ^Snapshot,
+	published:   ^Snapshot,
+	done:        bool,
 }
 
 // Adds a prepared candidate to the commit queue. Returns true when the caller
@@ -659,12 +664,7 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 				return
 			}
 			winner := kernel_snapshot(kernel)
-			if transaction_rebase_in_place(
-				kernel,
-				entry.transaction,
-				entry.candidate,
-				winner,
-			) {
+			if transaction_rebase_in_place(kernel, entry.transaction, entry.candidate, winner) {
 				snapshot_release(entry.base)
 				entry.base = winner
 				continue
@@ -674,11 +674,7 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 			snapshot_release(entry.candidate)
 			snapshot_release(entry.base)
 			entry.base = winner
-			entry.candidate = transaction_build_candidate(
-				kernel,
-				entry.transaction,
-				entry.base,
-			)
+			entry.candidate = transaction_build_candidate(kernel, entry.transaction, entry.base)
 			if entry.transaction.catalog_conflict || entry.transaction.buffer_conflict {
 				// A staged entry now collides, or a buffer change could not be
 				// reconciled; give up and let the owner re-read and retry.
@@ -706,7 +702,11 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 		for entry in batch {
 			collides := false
 			for change in entry.transaction.catalog_changes {
-				if _, exists := snapshot_relation_metadata_named(merged, change.metadata.name); exists {
+				if change.kind != .Create {
+					continue
+				}
+				if _, exists := snapshot_relation_metadata_named(merged, change.metadata.name);
+				   exists {
 					collides = true
 					break
 				}
@@ -722,21 +722,53 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 		}
 
 		for entry in publishable {
-			for block in entry.candidate.blocks {
-				relation_block_retain(block)
-				snapshot_set_block(merged, block)
+			// A candidate is a full snapshot. Adopting all of it would let a
+			// later candidate restore the old blocks for relations or buffers
+			// changed by an earlier candidate in this same group. Merge only
+			// the entries this transaction owns under its write stripes.
+			for writes in entry.transaction.writes {
+				if block, found := snapshot_relation_block(entry.candidate, writes.relation);
+				   found {
+					relation_block_retain(block)
+					snapshot_set_block(merged, block)
+				}
 			}
-			for block in entry.candidate.buffers {
-				buffer_block_retain(block)
-				snapshot_set_buffer(merged, block)
+			for writes in entry.transaction.buffer_writes {
+				if block, found := snapshot_buffer(entry.candidate, writes.relation); found {
+					buffer_block_retain(block)
+					snapshot_set_buffer(merged, block)
+				}
 			}
-			// Catalogue entries staged by a batched transaction ride along.
-			for metadata in entry.candidate.catalog {
-				if _, exists := snapshot_relation_metadata(merged, metadata.id); !exists {
-					snapshot_add_relation(
-						merged,
-						metadata_clone(merged.allocator, metadata),
-					)
+			// Killing a buffer changes its block without creating a buffer
+			// write set, so carry that candidate block explicitly.
+			for change in entry.transaction.catalog_changes {
+				if change.kind != .Kill || change.metadata.storage != .Buffer {
+					continue
+				}
+				if block, found := snapshot_buffer(entry.candidate, change.metadata.id); found {
+					buffer_block_retain(block)
+					snapshot_set_buffer(merged, block)
+				}
+			}
+			// Apply only this transaction's catalogue changes. Like blocks, a
+			// candidate's full catalogue also contains stale copies of every
+			// entry it did not change.
+			for change in entry.transaction.catalog_changes {
+				switch change.kind {
+				case .Create:
+					if metadata, found := snapshot_relation_metadata(
+						entry.candidate,
+						change.metadata.id,
+					); found {
+						snapshot_add_relation(merged, metadata_clone(merged.allocator, metadata))
+					}
+				case .Kill:
+					for &metadata in merged.catalog {
+						if metadata.id == change.metadata.id {
+							metadata.tombstoned = true
+							break
+						}
+					}
 				}
 			}
 		}
@@ -758,16 +790,8 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 				snapshot_release(entry.base)
 				entry.base = nil
 			}
-			changes_record_writes(
-				&kernel.changes,
-				merged.version,
-				merged_writes[:],
-			)
-			changes_record_buffers(
-				&kernel.changes,
-				merged.version,
-				merged_buffers[:],
-			)
+			changes_record_writes(&kernel.changes, merged.version, merged_writes[:])
+			changes_record_buffers(&kernel.changes, merged.version, merged_buffers[:])
 			// One record per published version: relation writes, buffer
 			// writes, and catalogue changes from every batched transaction are
 			// aggregated into a single durable record, so a torn tail can never
@@ -880,11 +904,13 @@ kernel_create_relation :: proc(
 		if published {
 			kernel_retire(kernel, previous)
 			snapshot_release(current)
-			changes_record_catalog(&kernel.changes, next.version, []Catalog_Change{{
-				kind     = .Relation_Created,
-				relation = metadata.id,
-				name     = metadata.name,
-			}})
+			changes_record_catalog(
+				&kernel.changes,
+				next.version,
+				[]Catalog_Change {
+					{kind = .Relation_Created, relation = metadata.id, name = metadata.name},
+				},
+			)
 			kernel_store_persist(kernel, 0, next.version, next, nil, nil)
 			return next, .None
 		}
@@ -933,7 +959,7 @@ kernel_compute_derived :: proc(kernel: ^Kernel, snapshot: ^Snapshot) {
 	if kernel_derivation_suspended(kernel) {
 		return
 	}
-	snapshot_compute_derived(snapshot)
+	snapshot_compute_derived(snapshot, kernel)
 }
 
 // Enables or suspends derived-relation maintenance. While suspended, commits
@@ -1020,11 +1046,13 @@ kernel_install_rule :: proc(
 		if published {
 			kernel_retire(kernel, previous)
 			snapshot_release(current)
-			changes_record_catalog(&kernel.changes, next.version, []Catalog_Change{{
-				kind     = .Rule_Installed,
-				relation = rule.head_relation,
-				rule     = id,
-			}})
+			changes_record_catalog(
+				&kernel.changes,
+				next.version,
+				[]Catalog_Change {
+					{kind = .Rule_Installed, relation = rule.head_relation, rule = id},
+				},
+			)
 			kernel_store_persist(kernel, 0, next.version, next, nil, nil)
 			return next, .None
 		}
@@ -1080,11 +1108,11 @@ kernel_set_rule_active :: proc(
 			if !active {
 				kind = .Rule_Disabled
 			}
-			changes_record_catalog(&kernel.changes, next.version, []Catalog_Change{{
-				kind     = kind,
-				relation = head_relation,
-				rule     = rule_id,
-			}})
+			changes_record_catalog(
+				&kernel.changes,
+				next.version,
+				[]Catalog_Change{{kind = kind, relation = head_relation, rule = rule_id}},
+			)
 			kernel_store_persist(kernel, 0, next.version, next, nil, nil)
 			return next, .None
 		}
@@ -1095,25 +1123,13 @@ kernel_set_rule_active :: proc(
 
 // Deactivates a rule and publishes a new snapshot. The returned snapshot is
 // caller-owned.
-kernel_disable_rule :: proc(
-	kernel: ^Kernel,
-	rule_id: v.Identity,
-) -> (
-	^Snapshot,
-	Kernel_Error,
-) {
+kernel_disable_rule :: proc(kernel: ^Kernel, rule_id: v.Identity) -> (^Snapshot, Kernel_Error) {
 	return kernel_set_rule_active(kernel, rule_id, false)
 }
 
 // Activates a rule and publishes a new snapshot. The returned snapshot is
 // caller-owned.
-kernel_enable_rule :: proc(
-	kernel: ^Kernel,
-	rule_id: v.Identity,
-) -> (
-	^Snapshot,
-	Kernel_Error,
-) {
+kernel_enable_rule :: proc(kernel: ^Kernel, rule_id: v.Identity) -> (^Snapshot, Kernel_Error) {
 	return kernel_set_rule_active(kernel, rule_id, true)
 }
 
@@ -1129,7 +1145,11 @@ kernel_visit :: proc(
 	current := kernel_snapshot(kernel)
 	defer snapshot_release(current)
 
-	source := Relation_Source{snapshot = current, use_stored_derived = true}
+	source := Relation_Source {
+		kernel             = kernel,
+		snapshot           = current,
+		use_stored_derived = true,
+	}
 	return relation_source_visit(&source, relation, bindings, visit, user)
 }
 
@@ -1145,7 +1165,7 @@ kernel_scan_into :: proc(
 	defer snapshot_release(current)
 
 	relation_source_scan_into(
-		&Relation_Source{snapshot = current, use_stored_derived = true},
+		&Relation_Source{kernel = kernel, snapshot = current, use_stored_derived = true},
 		relation,
 		bindings,
 		out,

@@ -748,6 +748,7 @@ subscription_scan_rows :: proc(
 	snapshot := k.kernel_snapshot(env.kernel)
 	defer k.snapshot_release(snapshot)
 	source := k.Relation_Source {
+		kernel             = env.kernel,
 		snapshot           = snapshot,
 		use_stored_derived = subject == .Relation,
 	}

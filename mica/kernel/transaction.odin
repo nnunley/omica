@@ -8,13 +8,13 @@
 // the relation conflict policy.
 package kernel
 
+import buf "../buffer"
+import v "../var"
 import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
 import "core:sync"
-import buf "../buffer"
-import v "../var"
 
 // The kind of a staged write.
 Write_Kind :: enum {
@@ -34,8 +34,8 @@ NO_ENTRY :: max(u32)
 
 // Staged writes for one relation.
 Relation_Writes :: struct {
-	relation: Relation_ID,
-	entries:  [dynamic]Pending_Write,
+	relation:       Relation_ID,
+	entries:        [dynamic]Pending_Write,
 	// Hash index over `entries` for duplicate lookup: `buckets` maps a tuple
 	// hash to an entry index and `next_in_bucket` chains entries that share a
 	// hash. Staging a write then costs O(1) expected instead of scanning every
@@ -49,33 +49,34 @@ Relation_Writes :: struct {
 	// the functional-key visibility check O(1) expected per assert. The
 	// positions are a view into the base snapshot's cloned catalog metadata,
 	// valid for the transaction's lifetime.
-	functional:    bool,
-	key_positions: []u16,
-	key_buckets:   map[u64]u32,
-	next_key:      [dynamic]u32,
+	functional:     bool,
+	key_positions:  []u16,
+	key_buckets:    map[u64]u32,
+	next_key:       [dynamic]u32,
 }
 
 // A snapshot-isolated transaction over a base snapshot.
 Transaction :: struct {
-	kernel:        ^Kernel,
-	base:          ^Snapshot,
-	arena:         ^Frame_Arena,
-	allocator:     mem.Allocator,
-	writes:        [dynamic]Relation_Writes,
-	buffer_writes: [dynamic]Buffer_Writes,
+	kernel:              ^Kernel,
+	base:                ^Snapshot,
+	arena:               ^Frame_Arena,
+	allocator:           mem.Allocator,
+	writes:              [dynamic]Relation_Writes,
+	buffer_writes:       [dynamic]Buffer_Writes,
 	// Catalogue entries this transaction stages for creation. They become
 	// visible only at publication, together with the facts and buffer content
 	// written against them.
-	catalog_changes: [dynamic]Staged_Catalog_Change,
+	catalog_changes:     [dynamic]Staged_Catalog_Change,
 	// Set when a staged entry cannot be published, for example because a
 	// concurrent transaction claimed the same name.
-	catalog_conflict: bool,
+	catalog_conflict:    bool,
 	// Set when a buffer change could not be reconciled: overlapping edits, a
 	// compaction boundary, or the rebase budget exhausted.
-	buffer_conflict: bool,
-	derived:          []Derived_Relation,
-	derived_valid:    bool,
-	read_only:        bool,
+	buffer_conflict:     bool,
+	buffer_rebase_usage: buf.Budget_Usage,
+	derived:             []Derived_Relation,
+	derived_valid:       bool,
+	read_only:           bool,
 }
 
 // What a staged catalogue change does.
@@ -202,10 +203,7 @@ transaction_relation_metadata_named :: proc(
 }
 
 // Returns true when the transaction staged `relation` for creation.
-transaction_has_staged_relation :: proc(
-	transaction: ^Transaction,
-	relation: Relation_ID,
-) -> bool {
+transaction_has_staged_relation :: proc(transaction: ^Transaction, relation: Relation_ID) -> bool {
 	for change in transaction.catalog_changes {
 		if change.metadata.id == relation {
 			return true
@@ -255,10 +253,7 @@ transaction_create_relation :: proc(
 
 	staged := metadata_clone(transaction.allocator, metadata)
 	staged.id = id
-	append(
-		&transaction.catalog_changes,
-		Staged_Catalog_Change{kind = .Create, metadata = staged},
-	)
+	append(&transaction.catalog_changes, Staged_Catalog_Change{kind = .Create, metadata = staged})
 	return id, .None
 }
 
@@ -288,10 +283,7 @@ transaction_kill_relation :: proc(
 
 // Releases the references a staged buffer write holds.
 @(private)
-transaction_release_buffer_writes :: proc(
-	transaction: ^Transaction,
-	writes: ^Buffer_Writes,
-) {
+transaction_release_buffer_writes :: proc(transaction: ^Transaction, writes: ^Buffer_Writes) {
 	if writes.private_root != nil {
 		buf.tree_release(&transaction.kernel.buffer_store, writes.private_root)
 		writes.private_root = nil
@@ -319,9 +311,11 @@ transaction_relation_writes :: proc(
 	if !create {
 		return nil, false
 	}
-	writes := Relation_Writes{relation = relation}
-	if metadata, ok := transaction_relation_metadata(transaction, relation); ok &&
-	   metadata.conflict.kind == .Functional {
+	writes := Relation_Writes {
+		relation = relation,
+	}
+	if metadata, ok := transaction_relation_metadata(transaction, relation);
+	   ok && metadata.conflict.kind == .Functional {
 		writes.functional = true
 		writes.key_positions = metadata.conflict.key_positions
 	}
@@ -412,7 +406,11 @@ transaction_find_staged_assert_by_key :: proc(
 	for entry != NO_ENTRY {
 		index := int(entry)
 		if writes.entries[index].kind == .Assert &&
-		   tuple_matches_key_values(writes.entries[index].tuple, writes.key_positions, key_values) {
+		   tuple_matches_key_values(
+			   writes.entries[index].tuple,
+			   writes.key_positions,
+			   key_values,
+		   ) {
 			return index
 		}
 		entry = writes.next_key[index]
@@ -454,11 +452,7 @@ transaction_record_write :: proc(
 }
 
 @(private)
-tuple_key_values :: proc(
-	tuple: v.Tuple,
-	positions: []u16,
-	alloc: mem.Allocator,
-) -> []v.Value {
+tuple_key_values :: proc(tuple: v.Tuple, positions: []u16, alloc: mem.Allocator) -> []v.Value {
 	values := make([]v.Value, len(positions), alloc)
 	for position, i in positions {
 		values[i] = v.tuple_values(tuple)[int(position)]
@@ -496,6 +490,9 @@ transaction_assert :: proc(
 	if transaction.read_only {
 		return .Read_Only
 	}
+	if kernel_relation_is_computed(transaction.kernel, relation) {
+		return .Read_Only
+	}
 	metadata, ok := transaction_relation_metadata(transaction, relation)
 	if !ok {
 		return .Unknown_Relation
@@ -511,7 +508,11 @@ transaction_assert :: proc(
 
 	owned := v.tuple_deep_copy(transaction.allocator, tuple)
 	if metadata.conflict.kind == .Functional {
-		key_values := tuple_key_values(owned, metadata.conflict.key_positions, context.temp_allocator)
+		key_values := tuple_key_values(
+			owned,
+			metadata.conflict.key_positions,
+			context.temp_allocator,
+		)
 		existing, found := transaction_tuple_for_key(
 			transaction,
 			relation,
@@ -536,6 +537,9 @@ transaction_retract :: proc(
 	tuple: v.Tuple,
 ) -> Kernel_Error {
 	if transaction.read_only {
+		return .Read_Only
+	}
+	if kernel_relation_is_computed(transaction.kernel, relation) {
 		return .Read_Only
 	}
 	metadata, ok := transaction_relation_metadata(transaction, relation)
@@ -569,9 +573,9 @@ transaction_visit_extensional :: proc(
 	if block, ok := snapshot_relation_block(transaction.base, relation); ok {
 		ctx := Transaction_Base_Scan {
 			transaction = transaction,
-			relation = relation,
-			visit = visit,
-			user = user,
+			relation    = relation,
+			visit       = visit,
+			user        = user,
 		}
 		relation_block_visit(block, bindings, transaction_base_visit, &ctx)
 		if ctx.stopped {
@@ -663,18 +667,22 @@ transaction_tuple_for_key :: proc(
 	// Functional relations keep a staged key index, so the visibility check
 	// does not walk every prior staged entry. A staged assert shadows the
 	// base tuple; a base tuple hidden by a staged retract is not visible.
-	if writes, has_writes := transaction_relation_writes(transaction, relation, false); has_writes &&
-	   writes.functional &&
-	   same_positions(writes.key_positions, positions) {
+	if writes, has_writes := transaction_relation_writes(transaction, relation, false);
+	   has_writes && writes.functional && same_positions(writes.key_positions, positions) {
 		if index := transaction_find_staged_assert_by_key(writes, key_values); index >= 0 {
 			return writes.entries[index].tuple, true
 		}
-		base_tuple, base_ok := snapshot_tuple_for_key(transaction.base, relation, positions, key_values)
+		base_tuple, base_ok := snapshot_tuple_for_key(
+			transaction.base,
+			relation,
+			positions,
+			key_values,
+		)
 		if !base_ok {
 			return nil, false
 		}
-		if kind, found := transaction_effective_write(transaction, relation, base_tuple); found &&
-		   kind == .Retract {
+		if kind, found := transaction_effective_write(transaction, relation, base_tuple);
+		   found && kind == .Retract {
 			return nil, false
 		}
 		return base_tuple, true
@@ -722,7 +730,9 @@ transaction_evaluate_derived :: proc(transaction: ^Transaction) -> Kernel_Error 
 	// published. Reference them instead of re-running the fixpoint: read-only
 	// transactions are the common case (every task begins one), and recomputing
 	// made each read of a derived relation cost a full closure evaluation.
-	if len(transaction.writes) == 0 {
+	if len(transaction.writes) == 0 &&
+	   len(transaction.buffer_writes) == 0 &&
+	   len(transaction.catalog_changes) == 0 {
 		transaction.derived = transaction.base.derived
 		transaction.derived_valid = true
 		return .None
@@ -743,7 +753,8 @@ transaction_evaluate_derived :: proc(transaction: ^Transaction) -> Kernel_Error 
 		transaction = transaction,
 		derived     = &result,
 	}
-	if err := rules_evaluate_source(alloc, transaction.base.rules, &source, &result); err != .None {
+	if err := rules_evaluate_source(alloc, transaction.base.rules, &source, &result);
+	   err != .None {
 		return err
 	}
 
@@ -779,7 +790,11 @@ transaction_validate_conflicts :: proc(
 				if entry.kind != .Assert {
 					continue
 				}
-				base_has := snapshot_contains_extensional(transaction.base, writes.relation, entry.tuple)
+				base_has := snapshot_contains_extensional(
+					transaction.base,
+					writes.relation,
+					entry.tuple,
+				)
 				current_has := snapshot_contains_extensional(current, writes.relation, entry.tuple)
 				if base_has && !current_has {
 					return .Conflict
@@ -789,7 +804,11 @@ transaction_validate_conflicts :: proc(
 			keys: [dynamic][]v.Value
 			defer delete(keys)
 			for entry in writes.entries {
-				key := make([]v.Value, len(metadata.conflict.key_positions), context.temp_allocator)
+				key := make(
+					[]v.Value,
+					len(metadata.conflict.key_positions),
+					context.temp_allocator,
+				)
 				for position, i in metadata.conflict.key_positions {
 					key[i] = v.tuple_values(entry.tuple)[int(position)]
 				}
@@ -1013,10 +1032,8 @@ transaction_build_candidate :: proc(
 	for change in transaction.catalog_changes {
 		switch change.kind {
 		case .Create:
-			if _, exists := snapshot_relation_metadata_named(
-				current,
-				change.metadata.name,
-			); exists {
+			if _, exists := snapshot_relation_metadata_named(current, change.metadata.name);
+			   exists {
 				transaction.catalog_conflict = true
 				return fork
 			}
@@ -1033,13 +1050,7 @@ transaction_build_candidate :: proc(
 				}
 				metadata.tombstoned = true
 				if metadata.storage == .Buffer {
-					block := buffer_block_create(
-						&kernel.buffer_store,
-						metadata.id,
-						nil,
-						0,
-						0,
-					)
+					block := buffer_block_create(&kernel.buffer_store, metadata.id, nil, 0, 0)
 					snapshot_set_buffer(fork, block)
 				}
 				break
@@ -1175,7 +1186,6 @@ transaction_prepare_writes :: proc(transaction: ^Transaction) {
 	}
 }
 
-@(private)
 transaction_writes_relation :: proc(transaction: ^Transaction, relation: Relation_ID) -> bool {
 	for writes in transaction.writes {
 		if writes.relation == relation {

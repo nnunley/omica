@@ -20,10 +20,10 @@
 // in, so the result is an ordinary, conflict-checkable delta.
 package kernel
 
+import buf "../buffer"
 import "core:mem"
 import "core:strings"
 import "core:sync"
-import buf "../buffer"
 
 // A buffer's committed text at one version.
 Buffer_Block :: struct {
@@ -55,7 +55,7 @@ buffer_block_create :: proc(
 
 buffer_block_retain :: proc(block: ^Buffer_Block) -> ^Buffer_Block {
 	if block != nil {
-		block.refs += 1
+		sync.atomic_add_explicit(&block.refs, 1, .Relaxed)
 	}
 	return block
 }
@@ -64,8 +64,7 @@ buffer_block_release :: proc(block: ^Buffer_Block) {
 	if block == nil {
 		return
 	}
-	block.refs -= 1
-	if block.refs > 0 {
+	if sync.atomic_sub_explicit(&block.refs, 1, .Acq_Rel) != 1 {
 		return
 	}
 	store := block.store
@@ -135,7 +134,10 @@ buffer_history_destroy :: proc(history: ^Buffer_History) {
 }
 
 @(private)
-buffer_history_find :: proc(history: ^Buffer_History, relation: Relation_ID) -> ^Buffer_History_Ring {
+buffer_history_find :: proc(
+	history: ^Buffer_History,
+	relation: Relation_ID,
+) -> ^Buffer_History_Ring {
 	for &ring in history.rings {
 		if ring.relation == relation {
 			return &ring
@@ -204,7 +206,7 @@ buffer_history_record :: proc(history: ^Buffer_History, block: ^Buffer_Block) {
 			Buffer_History_Ring {
 				relation = block.relation,
 				blocks = make([dynamic]^Buffer_Block, 0, history.depth, history.allocator),
-				touched  = history.clock,
+				touched = history.clock,
 			},
 		)
 		ring = &history.rings[len(history.rings) - 1]
@@ -272,25 +274,26 @@ Buffer_Client_Failure :: enum {
 }
 
 // Staged writes for one buffer.
-Buffer_Writes :: struct {	relation: Relation_ID,
+Buffer_Writes :: struct {
+	relation:           Relation_ID,
 	// Staged edits, view-relative and in application order.
-	edits: [dynamic]buf.Edit,
+	edits:              [dynamic]buf.Edit,
 	// The tree after staging applied those edits. Owned by the write set.
-	private_root: ^buf.Piece_Node,
+	private_root:       ^buf.Piece_Node,
 	// The base block, retained so provenance can be computed at commit even
 	// after a rebase moved the transaction's base.
-	base_block: ^Buffer_Block,
+	base_block:         ^Buffer_Block,
 	// True once the write set has been anchored, so a staged buffer (which has
 	// no base block) is not re-anchored on every edit.
-	initialized: bool,
+	initialized:        bool,
 	// True when the buffer is created by this transaction, in which case
 	// there is no base block and its content publishes at revision 1.
-	staged: bool,
+	staged:             bool,
 	// Set when this write carries a client token, so a completion result can
 	// be reported after publication.
-	has_client:      bool,
-	client_token:    u64,
-	client_revision: u64,
+	has_client:         bool,
+	client_token:       u64,
+	client_revision:    u64,
 	// The change relative to the client's baseline, composed before publication
 	// when the published version superseded something newer. `writes.delta` is
 	// relative to the version actually superseded, which after a rebase is not
@@ -305,34 +308,34 @@ Buffer_Writes :: struct {	relation: Relation_ID,
 	// moves, and compaction only describes committed content, so once sealed no
 	// further staging is allowed: a second apply or reversion, a compaction
 	// alongside an edit, and a bare mutation after either, are all rejected.
-	sealed: bool,
+	sealed:             bool,
 	// True when the staged root was rebuilt into fresh chunks that share no
 	// lineage with the base, so the published root begins a new structure
 	// epoch. Set by reversion, which replaces the whole content in one splice.
-	fresh_lineage:    bool,
+	fresh_lineage:      bool,
 	// Upper bound on the text bytes this write will make durable: the inserted
 	// material of every staged edit, accumulated as it is staged. Admission
 	// runs before the base-relative delta exists, so it sizes from this rather
 	// than from the private root, which would charge a whole document for one
 	// keystroke. Intermediate inserts later deleted make it an over-estimate,
 	// which is the safe direction for a budget.
-	inserted_bytes:   u64,
+	inserted_bytes:     u64,
 
 	// Filled at commit. `delta` is the normalized base-relative change, which
 	// is both what persistence records and what a client reconciles against.
 	// The revisions bracket the change.
-	committed:     bool,
-	base_revision: u64,
-	new_revision:  u64,
-	epoch:         u64,
-	delta:         buf.Delta,
+	committed:          bool,
+	base_revision:      u64,
+	new_revision:       u64,
+	epoch:              u64,
+	delta:              buf.Delta,
 
 	// Absolute publication values, used where the default "current + 1"
 	// revision does not apply: compaction preserves the revision and bumps the
 	// epoch, and replay restores the exact values the log recorded.
-	has_target:      bool,
-	target_revision: u64,
-	target_epoch:    u64,
+	has_target:         bool,
+	target_revision:    u64,
+	target_epoch:       u64,
 }
 
 @(private)
@@ -356,7 +359,6 @@ transaction_buffer_writes :: proc(
 	return &transaction.buffer_writes[len(transaction.buffer_writes) - 1], true
 }
 
-@(private)
 transaction_writes_buffer :: proc(transaction: ^Transaction, relation: Relation_ID) -> bool {
 	_, found := transaction_buffer_writes(transaction, relation, false)
 	return found
@@ -410,7 +412,11 @@ transaction_buffer_edit :: proc(
 
 	append(
 		&writes.edits,
-		buf.Edit{at = int(at), remove = int(remove), text = strings.clone(text, transaction.allocator)},
+		buf.Edit {
+			at = int(at),
+			remove = int(remove),
+			text = strings.clone(text, transaction.allocator),
+		},
 	)
 	writes.inserted_bytes += u64(len(text))
 	return .None
@@ -486,8 +492,8 @@ transaction_buffer_root :: proc(
 ) -> ^buf.Piece_Node {
 	// An uninitialized write set means nothing has been staged for this buffer
 	// yet, so the base root is still the truth.
-	if writes, found := transaction_buffer_writes(transaction, relation, false); found &&
-	   writes.initialized {
+	if writes, found := transaction_buffer_writes(transaction, relation, false);
+	   found && writes.initialized {
 		return writes.private_root
 	}
 	block, ok := snapshot_buffer(transaction.base, relation)
@@ -509,8 +515,8 @@ transaction_buffer_text :: proc(
 // The revision the transaction read. This is what a client's
 // `expected_revision` is checked against.
 transaction_buffer_revision :: proc(transaction: ^Transaction, relation: Relation_ID) -> u64 {
-	if writes, found := transaction_buffer_writes(transaction, relation, false); found &&
-	   writes.base_block != nil {
+	if writes, found := transaction_buffer_writes(transaction, relation, false);
+	   found && writes.base_block != nil {
 		return writes.base_block.revision
 	}
 	block, ok := snapshot_buffer(transaction.base, relation)
@@ -518,6 +524,29 @@ transaction_buffer_revision :: proc(transaction: ^Transaction, relation: Relatio
 		return 0
 	}
 	return block.revision
+}
+
+// Revision the transaction's current buffer view will have if it publishes.
+// Computed projections use this to join staged text with marker coordinates
+// rebased in the same transaction.
+transaction_buffer_projected_revision :: proc(
+	transaction: ^Transaction,
+	relation: Relation_ID,
+) -> u64 {
+	writes, found := transaction_buffer_writes(transaction, relation, false)
+	if !found || !writes.initialized {
+		return transaction_buffer_revision(transaction, relation)
+	}
+	if writes.staged {
+		return 1
+	}
+	if writes.has_target {
+		return writes.target_revision
+	}
+	if writes.base_block != nil {
+		return writes.base_block.revision + 1
+	}
+	return 0
 }
 
 // Conservative conflict validation: a buffer whose committed revision moved
@@ -551,8 +580,8 @@ transaction_buffer_validate :: proc(
 				return .Conflict
 			}
 		case .Span:
-			// Disjoint changes merge in materialization; only a compaction
-			// boundary or an overlap is refused there.
+		// Disjoint changes merge in materialization; only a compaction
+		// boundary or an overlap is refused there.
 		case .Set, .Functional, .Event_Append:
 			continue
 		}
@@ -591,23 +620,24 @@ transaction_buffer_compose_client_delta :: proc(
 		return true
 	}
 
-	steps := u64(0)
+	steps := transaction.buffer_rebase_usage.comparison_steps
 	composed, compose_error := buf.tree_provenance_counted(
 		&transaction.kernel.buffer_store,
 		writes.base_block.root,
 		root,
 		&steps,
 		transaction.allocator,
+		buf.DEFAULT_REBASE_BUDGET.comparison_steps,
 	)
 	if compose_error != .None {
 		return false
 	}
-	usage := buf.Budget_Usage {
-		comparison_steps = steps,
-		text_bytes       = buffer_delta_bytes(composed),
-		hunks            = u64(len(composed.replacements)),
-	}
-	if buf.budget_exceeded(buf.DEFAULT_REBASE_BUDGET, usage) {
+	transaction.buffer_rebase_usage.comparison_steps = steps
+	transaction.buffer_rebase_usage.text_bytes += buffer_delta_bytes(composed)
+	transaction.buffer_rebase_usage.hunks += u64(len(composed.replacements))
+	transaction.buffer_rebase_usage.alloc_bytes +=
+		buffer_delta_bytes(composed) + u64(len(composed.replacements) * size_of(buf.Replacement))
+	if buf.budget_exceeded(buf.DEFAULT_REBASE_BUDGET, transaction.buffer_rebase_usage) {
 		return false
 	}
 	writes.client_delta = composed
@@ -696,7 +726,7 @@ transaction_buffer_materialize :: proc(
 		case .Span:
 		// Disjoint changes merge below.
 		case .Whole:
-			// Last-writer-wins: our view replaces the current content.
+		// Last-writer-wins: our view replaces the current content.
 		}
 
 		if (writes.has_target || writes.fresh_lineage) && revision_moved {
@@ -709,13 +739,13 @@ transaction_buffer_materialize :: proc(
 
 		// This transaction's own change, in base coordinates. A compaction
 		// already set an empty delta and its target values.
-		steps := u64(0)
+		normalize_steps := u64(0)
 		if !writes.has_target {
 			normalized, normalize_error := buf.tree_provenance_counted(
 				store,
 				writes.base_block.root,
 				writes.private_root,
-				&steps,
+				&normalize_steps,
 				transaction.allocator,
 			)
 			if normalize_error != .None {
@@ -736,8 +766,11 @@ transaction_buffer_materialize :: proc(
 			publish_epoch = writes.target_epoch
 		}
 
-		merge := !writes.has_target && !writes.fresh_lineage &&
-			metadata.conflict.kind == .Span && revision_moved
+		merge :=
+			!writes.has_target &&
+			!writes.fresh_lineage &&
+			metadata.conflict.kind == .Span &&
+			revision_moved
 		root: ^buf.Piece_Node
 
 		if merge {
@@ -747,24 +780,28 @@ transaction_buffer_materialize :: proc(
 				transaction.buffer_conflict = true
 				continue
 			}
+			steps := transaction.buffer_rebase_usage.comparison_steps
 			winner_delta, winner_error := buf.tree_provenance_counted(
 				store,
 				writes.base_block.root,
 				current_block.root,
 				&steps,
 				transaction.allocator,
+				buf.DEFAULT_REBASE_BUDGET.comparison_steps,
 			)
 			if winner_error != .None {
 				writes.client_failure = .Resync
 				transaction.buffer_conflict = true
 				continue
 			}
-			usage := buf.Budget_Usage {
-				comparison_steps = steps,
-				text_bytes = buffer_delta_bytes(winner_delta) + buffer_delta_bytes(writes.delta),
-				hunks = u64(len(winner_delta.replacements) + len(writes.delta.replacements)),
-			}
-			if buf.budget_exceeded(buf.DEFAULT_REBASE_BUDGET, usage) {
+			transaction.buffer_rebase_usage.comparison_steps = steps
+			text_bytes := buffer_delta_bytes(winner_delta) + buffer_delta_bytes(writes.delta)
+			hunks := len(winner_delta.replacements) + len(writes.delta.replacements)
+			transaction.buffer_rebase_usage.text_bytes += text_bytes
+			transaction.buffer_rebase_usage.hunks += u64(hunks)
+			transaction.buffer_rebase_usage.alloc_bytes +=
+				text_bytes + u64(hunks * size_of(buf.Replacement))
+			if buf.budget_exceeded(buf.DEFAULT_REBASE_BUDGET, transaction.buffer_rebase_usage) {
 				// Reconciling is the work being bounded; failing closed is the
 				// safe answer, and a client can resynchronize and retry.
 				writes.client_failure = .Resync
@@ -785,6 +822,28 @@ transaction_buffer_materialize :: proc(
 			}
 			root = applied
 			writes.delta = transformed
+		} else if metadata.conflict.kind == .Whole && revision_moved {
+			// Whole-buffer last-writer-wins replaces the actual predecessor.
+			// Its recorded delta must therefore be relative to `current_block`,
+			// even when both roots still share an epoch.
+			text := buf.tree_text(writes.private_root, transaction.allocator)
+			replacements := make([]buf.Replacement, 1, transaction.allocator)
+			replacements[0] = buf.Replacement {
+				start = 0,
+				end   = int(buf.tree_scalars(current_block.root)),
+				text  = text,
+			}
+			whole := buf.Delta {
+				replacements = replacements,
+			}
+			applied, apply_error := buf.tree_apply_delta(store, current_block.root, whole)
+			if apply_error != .None {
+				writes.client_failure = .Resync
+				transaction.buffer_conflict = true
+				continue
+			}
+			root = applied
+			writes.delta = whole
 		} else if current_block.epoch == writes.base_block.epoch {
 			// Same chunk lineage: the private root is publishable as built.
 			root = buf.tree_retain(writes.private_root)
@@ -799,7 +858,9 @@ transaction_buffer_materialize :: proc(
 				end   = int(buf.tree_scalars(current_block.root)),
 				text  = text,
 			}
-			whole := buf.Delta{replacements = replacements}
+			whole := buf.Delta {
+				replacements = replacements,
+			}
 			applied, apply_error := buf.tree_apply_delta(store, current_block.root, whole)
 			if apply_error != .None {
 				writes.client_failure = .Resync
@@ -826,11 +887,11 @@ transaction_buffer_materialize :: proc(
 		// `:resync`.
 		if writes.has_client &&
 		   !transaction_buffer_compose_client_delta(
-				transaction,
-				&writes,
-				current_block.revision,
-				root,
-			) {
+				   transaction,
+				   &writes,
+				   current_block.revision,
+				   root,
+			   ) {
 			writes.client_failure = .Resync
 			transaction.buffer_conflict = true
 			buf.tree_release(store, root)
@@ -842,13 +903,7 @@ transaction_buffer_materialize :: proc(
 		writes.new_revision = publish_revision
 		writes.epoch = publish_epoch
 
-		block := buffer_block_create(
-			store,
-			writes.relation,
-			root,
-			publish_revision,
-			publish_epoch,
-		)
+		block := buffer_block_create(store, writes.relation, root, publish_revision, publish_epoch)
 		snapshot_set_buffer(fork, block)
 	}
 }
@@ -1003,9 +1058,9 @@ Buffer_Apply_Result :: struct {
 // when the outcome is known -- at publication, or at teardown for a transaction
 // that never published -- and read back by the client on a later turn.
 Buffer_Result_Ring :: struct {
-	lock:     sync.Mutex,
-	entries:  [dynamic]Buffer_Apply_Result,
-	capacity: int,
+	lock:      sync.Mutex,
+	entries:   [dynamic]Buffer_Apply_Result,
+	capacity:  int,
 	allocator: mem.Allocator,
 }
 
@@ -1057,7 +1112,9 @@ kernel_record_buffer_result :: proc(kernel: ^Kernel, result: Buffer_Apply_Result
 				text  = text,
 			}
 		}
-		cloned.delta = buf.Delta{replacements = replacements}
+		cloned.delta = buf.Delta {
+			replacements = replacements,
+		}
 	}
 
 	for len(ring.entries) >= ring.capacity {
@@ -1074,6 +1131,7 @@ kernel_record_buffer_result :: proc(kernel: ^Kernel, result: Buffer_Apply_Result
 kernel_buffer_result :: proc(
 	kernel: ^Kernel,
 	token: u64,
+	allocator := context.temp_allocator,
 ) -> (
 	Buffer_Apply_Result,
 	bool,
@@ -1083,7 +1141,25 @@ kernel_buffer_result :: proc(
 	defer sync.mutex_unlock(&ring.lock)
 	for &entry in ring.entries {
 		if entry.token == token {
-			return entry, true
+			cloned := entry
+			if len(entry.delta.replacements) > 0 {
+				replacements := make([]buf.Replacement, len(entry.delta.replacements), allocator)
+				for replacement, index in entry.delta.replacements {
+					text := replacement.text
+					if text != "" {
+						text = strings.clone(text, allocator)
+					}
+					replacements[index] = buf.Replacement {
+						start = replacement.start,
+						end   = replacement.end,
+						text  = text,
+					}
+				}
+				cloned.delta = buf.Delta {
+					replacements = replacements,
+				}
+			}
+			return cloned, true
 		}
 	}
 	return {}, false
@@ -1252,11 +1328,7 @@ transaction_buffer_revert :: proc(
 	if !has_base {
 		return .Unknown_Revision
 	}
-	historical := buffer_history_lookup(
-		&transaction.kernel.buffer_history,
-		relation,
-		revision,
-	)
+	historical := buffer_history_lookup(&transaction.kernel.buffer_history, relation, revision)
 	if historical == nil {
 		return .Unknown_Revision
 	}
@@ -1268,11 +1340,7 @@ transaction_buffer_revert :: proc(
 	writes.base_block = buffer_block_retain(base)
 	// Fresh chunks, so provenance normalizes the whole view to one replacement
 	// and the published root shares no lineage with the base.
-	writes.private_root = buf.tree_from_text(
-		&transaction.kernel.buffer_store,
-		text,
-		.Original,
-	)
+	writes.private_root = buf.tree_from_text(&transaction.kernel.buffer_store, text, .Original)
 	// A reversion's durable payload is the whole restored text: the recorded
 	// delta is one full-buffer replacement.
 	writes.inserted_bytes += u64(len(text))

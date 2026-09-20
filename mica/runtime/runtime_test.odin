@@ -1,22 +1,22 @@
 package mica_runtime
 
-import "core:fmt"
-import "core:strings"
-import "core:os"
-import "core:mem"
-import "core:mem/virtual"
-import "core:path/filepath"
-import "core:testing"
-import "core:time"
 import c "../compiler"
 import k "../kernel"
 import s "../store"
-import vm "../vm"
 import v "../var"
+import vm "../vm"
+import "core:fmt"
+import "core:mem"
+import "core:mem/virtual"
+import "core:os"
+import "core:path/filepath"
+import "core:strings"
+import "core:testing"
+import "core:time"
 
 @(private)
 corpus_candidate :: proc(name: string) -> string {
-	candidates := []string{
+	candidates := []string {
 		"apps/shared/capabilities.mica",
 		"../apps/shared/capabilities.mica",
 		"../../apps/shared/capabilities.mica",
@@ -39,7 +39,14 @@ expect_relation_rows :: proc(t: ^testing.T, kernel: ^k.Kernel, name: string, exp
 	bindings := make([]v.Binding, metadata.arity, context.temp_allocator)
 	rows: [dynamic]v.Tuple
 	k.kernel_scan_into(kernel, metadata.id, bindings, &rows)
-	testing.expectf(t, len(rows) == expected, "%s has %d rows, expected %d", name, len(rows), expected)
+	testing.expectf(
+		t,
+		len(rows) == expected,
+		"%s has %d rows, expected %d",
+		name,
+		len(rows),
+		expected,
+	)
 	delete(rows)
 }
 
@@ -65,15 +72,17 @@ test_run_capabilities_filein :: proc(t: ^testing.T) {
 }
 
 @(private)
-compile_and_run :: proc(
-	t: ^testing.T,
-	source: string,
-	ctx: ^c.Compile_Context,
-) -> vm.VM {
+compile_and_run :: proc(t: ^testing.T, source: string, ctx: ^c.Compile_Context) -> vm.VM {
 	ast, parse_errors := c.parse_program(source, context.temp_allocator)
 	testing.expectf(t, len(parse_errors) == 0, "parse errors for %q: %v", source, parse_errors)
 	compiled := c.compile_program(ast, ctx, context.temp_allocator)
-	testing.expectf(t, len(compiled.errors) == 0, "compile errors for %q: %v", source, compiled.errors)
+	testing.expectf(
+		t,
+		len(compiled.errors) == 0,
+		"compile errors for %q: %v",
+		source,
+		compiled.errors,
+	)
 
 	state: vm.VM
 	vm.vm_init(&state, compiled.program, context.temp_allocator)
@@ -169,12 +178,7 @@ end`,
 }
 
 @(private)
-expect_int_builtin :: proc(
-	t: ^testing.T,
-	ctx: ^c.Compile_Context,
-	source: string,
-	expected: i64,
-) {
+expect_int_builtin :: proc(t: ^testing.T, ctx: ^c.Compile_Context, source: string, expected: i64) {
 	state := compile_and_run(t, source, ctx)
 	defer vm.vm_destroy(&state)
 	value, ok := v.value_as_int(state.result)
@@ -226,7 +230,13 @@ expect_builtin_error :: proc(
 	ast, parse_errors := c.parse_program(source, context.temp_allocator)
 	testing.expectf(t, len(parse_errors) == 0, "parse errors for %q: %v", source, parse_errors)
 	compiled := c.compile_program(ast, ctx, context.temp_allocator)
-	testing.expectf(t, len(compiled.errors) == 0, "compile errors for %q: %v", source, compiled.errors)
+	testing.expectf(
+		t,
+		len(compiled.errors) == 0,
+		"compile errors for %q: %v",
+		source,
+		compiled.errors,
+	)
 
 	state: vm.VM
 	vm.vm_init(&state, compiled.program, context.temp_allocator)
@@ -237,7 +247,14 @@ expect_builtin_error :: proc(
 	testing.expectf(t, error_ok, "%s: no error value", source)
 	if error_ok {
 		code, _ := v.symbol_name(error.code)
-		testing.expectf(t, code == expected_code, "%s raised %s, expected %s", source, code, expected_code)
+		testing.expectf(
+			t,
+			code == expected_code,
+			"%s raised %s, expected %s",
+			source,
+			code,
+			expected_code,
+		)
 	}
 }
 
@@ -315,12 +332,7 @@ test_scalar_builtins :: proc(t: ^testing.T) {
 	expect_bool_builtin(t, &ctx, `string_equal_fold("HeLLo", "hello")`, true)
 	expect_string_builtin(t, &ctx, `lower("HeLLo")`, "hello")
 	expect_int_builtin(t, &ctx, `edit_distance("kitten", "sitting")`, 3)
-	expect_string_builtin(
-		t,
-		&ctx,
-		`url_decode_component(url_encode_component("a b&c"))`,
-		"a b&c",
-	)
+	expect_string_builtin(t, &ctx, `url_decode_component(url_encode_component("a b&c"))`, "a b&c")
 	expect_int_builtin(t, &ctx, `len(sort([3, 1, 2]))`, 3)
 
 	expect_builtin_error(t, &ctx, `string_len(1)`, "E_TYPE")
@@ -337,7 +349,7 @@ test_scalar_builtins :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_builtin_splice_and_set_index :: proc(t: ^testing.T) {	ctx := c.Compile_Context {
+test_builtin_splice_and_set_index :: proc(t: ^testing.T) {ctx := c.Compile_Context {
 		builtins   = make(map[string]bool),
 		relations  = make(map[string]u32),
 		identities = make(map[string]v.Value),
@@ -486,11 +498,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(
-		&kernel,
-		[]string{library_path, caller_path},
-		context.temp_allocator,
-	)
+	result := run_files(&kernel, []string{library_path, caller_path}, context.temp_allocator)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Shared", 1)
 }
@@ -510,11 +518,7 @@ suspend()
 		testing.expect(t, false, "cannot resolve a temporary directory")
 		return
 	}
-	path := fmt.aprintf(
-		"%s/mica_spawn_test.mica",
-		directory,
-		allocator = context.temp_allocator,
-	)
+	path := fmt.aprintf("%s/mica_spawn_test.mica", directory, allocator = context.temp_allocator)
 	if write_err := os.write_entire_file(path, source); write_err != nil {
 		testing.expect(t, false, "cannot write the spawn test file")
 		return
@@ -541,11 +545,7 @@ test_run_raise_reports_error :: proc(t: ^testing.T) {
 		testing.expect(t, false, "cannot resolve a temporary directory")
 		return
 	}
-	path := fmt.aprintf(
-		"%s/mica_raise_test.mica",
-		directory,
-		allocator = context.temp_allocator,
-	)
+	path := fmt.aprintf("%s/mica_raise_test.mica", directory, allocator = context.temp_allocator)
 	if write_err := os.write_entire_file(path, source); write_err != nil {
 		testing.expect(t, false, "cannot write the raise test file")
 		return
@@ -583,11 +583,7 @@ invoke(:take, {:actor -> #alice})
 		testing.expect(t, false, "cannot resolve a temporary directory")
 		return
 	}
-	path := fmt.aprintf(
-		"%s/mica_invoke_test.mica",
-		directory,
-		allocator = context.temp_allocator,
-	)
+	path := fmt.aprintf("%s/mica_invoke_test.mica", directory, allocator = context.temp_allocator)
 	if write_err := os.write_entire_file(path, source); write_err != nil {
 		testing.expect(t, false, "cannot write the invoke test file")
 		return
@@ -627,11 +623,7 @@ assert Failed(classify("banana"))
 		testing.expect(t, false, "cannot resolve a temporary directory")
 		return
 	}
-	path := fmt.aprintf(
-		"%s/mica_match_test.mica",
-		directory,
-		allocator = context.temp_allocator,
-	)
+	path := fmt.aprintf("%s/mica_match_test.mica", directory, allocator = context.temp_allocator)
 	if write_err := os.write_entire_file(path, source); write_err != nil {
 		testing.expect(t, false, "cannot write the match test file")
 		return
@@ -722,10 +714,7 @@ test_run_mud_app_world :: proc(t: ^testing.T) {
 	}
 	paths := make([]string, len(names), context.temp_allocator)
 	for name, index in names {
-		joined, join_err := filepath.join(
-			[]string{apps, name},
-			context.temp_allocator,
-		)
+		joined, join_err := filepath.join([]string{apps, name}, context.temp_allocator)
 		if join_err != nil {
 			testing.expect(t, false, "cannot join a corpus path")
 			return
@@ -754,11 +743,7 @@ Parent(child, parent) :-
 		testing.expect(t, false, "cannot resolve a temporary directory")
 		return
 	}
-	path := fmt.aprintf(
-		"%s/mica_catalog_test.mica",
-		directory,
-		allocator = context.temp_allocator,
-	)
+	path := fmt.aprintf("%s/mica_catalog_test.mica", directory, allocator = context.temp_allocator)
 	if write_err := os.write_entire_file(path, source); write_err != nil {
 		testing.expect(t, false, "cannot write the catalog test file")
 		return
@@ -780,12 +765,7 @@ Parent(child, parent) :-
 
 	names: [dynamic]v.Tuple
 	defer delete(names)
-	k.kernel_scan_into(
-		&kernel,
-		k.SYSTEM_RELATION_NAME_ID,
-		[]v.Binding{{}, {}},
-		&names,
-	)
+	k.kernel_scan_into(&kernel, k.SYSTEM_RELATION_NAME_ID, []v.Binding{{}, {}}, &names)
 	found_name := false
 	for row in names {
 		values := v.tuple_values(row)
@@ -797,12 +777,7 @@ Parent(child, parent) :-
 
 	arity_rows: [dynamic]v.Tuple
 	defer delete(arity_rows)
-	k.kernel_scan_into(
-		&kernel,
-		k.SYSTEM_ARITY_ID,
-		[]v.Binding{{}, {}},
-		&arity_rows,
-	)
+	k.kernel_scan_into(&kernel, k.SYSTEM_ARITY_ID, []v.Binding{{}, {}}, &arity_rows)
 	found_arity := false
 	for row in arity_rows {
 		values := v.tuple_values(row)
@@ -824,12 +799,7 @@ Parent(child, parent) :-
 
 	source_rows: [dynamic]v.Tuple
 	defer delete(source_rows)
-	k.kernel_scan_into(
-		&kernel,
-		k.SYSTEM_RULE_SOURCE_ID,
-		[]v.Binding{{}, {}},
-		&source_rows,
-	)
+	k.kernel_scan_into(&kernel, k.SYSTEM_RULE_SOURCE_ID, []v.Binding{{}, {}}, &source_rows)
 	testing.expect(t, len(source_rows) >= 1)
 }
 
@@ -1184,12 +1154,7 @@ write_temp_source :: proc(t: ^testing.T, name: string, source: string) -> (strin
 		testing.expect(t, false, "cannot resolve a temporary directory")
 		return "", false
 	}
-	path := fmt.aprintf(
-		"%s/%s",
-		directory,
-		name,
-		allocator = context.temp_allocator,
-	)
+	path := fmt.aprintf("%s/%s", directory, name, allocator = context.temp_allocator)
 	if write_err := os.write_entire_file(path, source); write_err != nil {
 		testing.expect(t, false, "cannot write the test file")
 		return "", false
@@ -2490,6 +2455,115 @@ assert Seen(1)
 	expect_relation_rows(t, &kernel, "Seen", 1)
 }
 
+// A completion token is not a capability. The reader must also have read
+// authority for the buffer whose apply produced the result.
+@(test)
+test_run_buffer_completion_requires_read_authority :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+make_relation(:CanInvoke, 2)
+make_relation(:Denied, 1)
+make_buffer(:secret_notes, :durable)
+require buffer_apply(:secret_notes, 0, [{:at -> 0, :remove -> 0, :text -> "secret"}], 9876) == :staged
+grant #alice
+  write:
+    :Denied
+  invoke:
+    :buffer_apply_result
+end
+commit()
+verb probe_completion()
+  try
+    buffer_apply_result(9876)
+  catch E_PERMISSION
+    assert Denied(1)
+  end
+end
+spawn :probe_completion()
+suspend()
+`
+	path, path_ok := write_temp_source(t, "mica_buffer_completion_authority_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{actor = "alice"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Denied", 1)
+}
+
+// Access to a computed projection does not grant access to its backing
+// buffer. The projection must apply the caller's authority to both layers.
+@(test)
+test_run_buffer_computed_relation_requires_buffer_authority :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_identity(:alice)
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+make_relation(:BufferLine, 7)
+make_relation(:NearestEmbedding, 6)
+make_relation(:VectorIndexContains, 2)
+make_functional_relation(:EmbeddingOf, 2, [0])
+make_functional_relation(:EmbeddingVector, 2, [0])
+make_relation(:Denied, 1)
+make_buffer(:secret_notes, :durable)
+buffer_insert(:secret_notes, 0, "secret")
+assert VectorIndexContains(:secret_index, :secret_vector)
+assert EmbeddingOf(:secret_vector, :secret_subject)
+assert EmbeddingVector(:secret_vector, [1.0, 0.0])
+grant #alice
+  read:
+    :BufferLine
+    :NearestEmbedding
+  write:
+    :Denied
+end
+commit()
+verb probe_projection()
+  try
+    BufferLine(:secret_notes, 0, 1, ?line, _, _, ?text)
+  catch E_PERMISSION
+    assert Denied(:buffer)
+  end
+  try
+    NearestEmbedding(:secret_index, [1.0, 0.0], 1, ?subject, _, _)
+  catch E_PERMISSION
+    assert Denied(:retrieval)
+  end
+end
+spawn :probe_projection()
+suspend()
+`
+	path, path_ok := write_temp_source(t, "mica_buffer_computed_authority_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	result := run_files(
+		&kernel,
+		[]string{path},
+		context.temp_allocator,
+		Run_Options{actor = "alice"},
+	)
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Denied", 2)
+}
+
 @(test)
 test_run_json_roundtrip :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
@@ -3318,10 +3392,7 @@ end
 	deadline := time.tick_now()
 	for time.tick_since(deadline) < 2 * time.Second {
 		snapshot := k.kernel_snapshot(&kernel)
-		metadata, found := k.snapshot_relation_metadata_named(
-			snapshot,
-			v.symbol_intern("Slept"),
-		)
+		metadata, found := k.snapshot_relation_metadata_named(snapshot, v.symbol_intern("Slept"))
 		k.snapshot_release(snapshot)
 		if found {
 			one, _ := v.value_int(1)
@@ -3567,9 +3638,16 @@ test_run_store_boot :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_identity(:alice)
 make_relation(:Marker, 2)
+make_relation(:BufferStat, 4)
+make_buffer(:notes, :durable)
+buffer_insert(:notes, 0, "persistent text")
 
 verb mark(who)
   assert Marker(who, :marked)
+end
+verb buffer_size()
+  let exactly {:length -> length} = BufferStat(:notes, ?length, _, _)
+  return length
 end
 assert Marker(#alice, :seed)
 `
@@ -3609,10 +3687,11 @@ assert Marker(#alice, :seed)
 			entry := world_wait(world, world.entry)
 			testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
 			who := v.value_symbol(v.symbol_intern("alice"))
-			outcome := world_call(world, "mark", []k.Role_Pair{{
-				role  = v.value_symbol(v.symbol_intern("who")),
-				value = who,
-			}})
+			outcome := world_call(
+				world,
+				"mark",
+				[]k.Role_Pair{{role = v.value_symbol(v.symbol_intern("who")), value = who}},
+			)
 			testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)
 			testing.expect(t, world_checkpoint(world))
 			world_destroy(world)
@@ -3642,12 +3721,23 @@ assert Marker(#alice, :seed)
 	// Code and identity names are restored; the verb runs against them.
 	alice, has_alice := world.ctx.identities["alice"]
 	testing.expect(t, has_alice)
-	outcome := world_call(world, "mark", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("who")),
-		value = alice,
-	}})
+	outcome := world_call(
+		world,
+		"mark",
+		[]k.Role_Pair{{role = v.value_symbol(v.symbol_intern("who")), value = alice}},
+	)
 	testing.expectf(t, outcome.kind == .Complete, "call failed: %s", outcome.message)
 	expect_relation_rows(t, &kernel, "Marker", 3)
+	stat := world_call(world, "buffer_size", nil)
+	testing.expectf(
+		t,
+		stat.kind == .Complete,
+		"computed relation after boot failed: %s",
+		stat.message,
+	)
+	length, length_ok := v.value_as_int(stat.value)
+	testing.expect(t, length_ok)
+	testing.expect_value(t, length, i64(15))
 }
 
 @(test)
@@ -3703,12 +3793,7 @@ assert Marker(#alice, :seed)
 	// Exactly one ProgramBytes row, keyed by content identity.
 	rows: [dynamic]v.Tuple
 	defer delete(rows)
-	k.kernel_scan_into(
-		&kernel,
-		k.SYSTEM_PROGRAM_BYTES_ID,
-		[]v.Binding{{}, {}},
-		&rows,
-	)
+	k.kernel_scan_into(&kernel, k.SYSTEM_PROGRAM_BYTES_ID, []v.Binding{{}, {}}, &rows)
 	testing.expect_value(t, len(rows), 1)
 	if len(rows) != 1 {
 		return
@@ -3837,21 +3922,17 @@ assert Marker(#alice, :seed)
 
 	alice, has_alice := world.ctx.identities["alice"]
 	testing.expect(t, has_alice)
-	outcome := world_call(world, "mark", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("who")),
-		value = alice,
-	}})
+	outcome := world_call(
+		world,
+		"mark",
+		[]k.Role_Pair{{role = v.value_symbol(v.symbol_intern("who")), value = alice}},
+	)
 	testing.expectf(t, outcome.kind == .Complete, "call failed: %s", outcome.message)
 
 	// Boot resolves; it never backfills a second row.
 	rows: [dynamic]v.Tuple
 	defer delete(rows)
-	k.kernel_scan_into(
-		&kernel,
-		k.SYSTEM_PROGRAM_BYTES_ID,
-		[]v.Binding{{}, {}},
-		&rows,
-	)
+	k.kernel_scan_into(&kernel, k.SYSTEM_PROGRAM_BYTES_ID, []v.Binding{{}, {}}, &rows)
 	testing.expect_value(t, len(rows), 1)
 }
 
@@ -3908,10 +3989,7 @@ assert Log(#alice, :seed)
 	testing.expect(t, boot_equivalence_load(t, path, recompile_store, true))
 
 	artifact_values, artifact_rows, artifact_ok := boot_equivalence_boot(t, artifact_store)
-	recompile_values, recompile_rows, recompile_ok := boot_equivalence_boot(
-		t,
-		recompile_store,
-	)
+	recompile_values, recompile_rows, recompile_ok := boot_equivalence_boot(t, recompile_store)
 	testing.expect(t, artifact_ok && recompile_ok)
 	if !artifact_ok || !recompile_ok {
 		return
@@ -3949,10 +4027,11 @@ boot_equivalence_exercise :: proc(
 	if first.kind != .Complete {
 		return {}, 0, false
 	}
-	second := world_call(world, "ping", []k.Role_Pair {
-		{role = who_role, value = alice},
-		{role = marker_role, value = loud},
-	})
+	second := world_call(
+		world,
+		"ping",
+		[]k.Role_Pair{{role = who_role, value = alice}, {role = marker_role, value = loud}},
+	)
 	if second.kind != .Complete {
 		return {}, 0, false
 	}
@@ -3963,10 +4042,7 @@ boot_equivalence_exercise :: proc(
 
 	rows: [dynamic]v.Tuple
 	defer delete(rows)
-	metadata, found := k.snapshot_relation_metadata_named(
-		kernel.current,
-		v.symbol_intern("Log"),
-	)
+	metadata, found := k.snapshot_relation_metadata_named(kernel.current, v.symbol_intern("Log"))
 	if !found {
 		return {}, 0, false
 	}
@@ -3997,16 +4073,10 @@ boot_equivalence_load :: proc(t: ^testing.T, path, store_path: string, strip: bo
 	ok := entry.kind == .Complete
 	if ok && strip {
 		artifact_rows: [dynamic]v.Tuple
-		k.kernel_scan_into(
-			&kernel,
-			k.SYSTEM_PROGRAM_BYTES_ID,
-			[]v.Binding{{}, {}},
-			&artifact_rows,
-		)
+		k.kernel_scan_into(&kernel, k.SYSTEM_PROGRAM_BYTES_ID, []v.Binding{{}, {}}, &artifact_rows)
 		tx := k.kernel_begin(&kernel)
 		for row in artifact_rows {
-			if k.transaction_retract(&tx, k.SYSTEM_PROGRAM_BYTES_ID, row) !=
-			   k.Kernel_Error.None {
+			if k.transaction_retract(&tx, k.SYSTEM_PROGRAM_BYTES_ID, row) != k.Kernel_Error.None {
 				ok = false
 			}
 		}
@@ -4023,14 +4093,7 @@ boot_equivalence_load :: proc(t: ^testing.T, path, store_path: string, strip: bo
 
 // Boots store_path sourceless and exercises it.
 @(private)
-boot_equivalence_boot :: proc(
-	t: ^testing.T,
-	store_path: string,
-) -> (
-	[3]v.Value,
-	int,
-	bool,
-) {
+boot_equivalence_boot :: proc(t: ^testing.T, store_path: string) -> ([3]v.Value, int, bool) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -4136,12 +4199,7 @@ end
 	bad_names := []string{"build_no_entry", "build_bad_op", "build_bad_entry"}
 	for name in bad_names {
 		failed := world_call(world, name, nil)
-		testing.expectf(
-			t,
-			failed.kind != .Complete,
-			"%s unexpectedly succeeded",
-			name,
-		)
+		testing.expectf(t, failed.kind != .Complete, "%s unexpectedly succeeded", name)
 	}
 }
 
@@ -4196,7 +4254,7 @@ end
 	entry := world_wait(world, world.entry)
 	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
 
-	names := []string{
+	names := []string {
 		"comp_map",
 		"comp_filter",
 		"comp_sort",
@@ -4420,7 +4478,8 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 		"[:x, :y] {[1, 2], [3, 4]}",
 		"let [first, ?second = \"dflt\", @rest] = [\"a\"]\n[first, second, rest]",
 		"let [first, ?second = \"dflt\", @rest] = [\"a\", \"b\", \"c\"]\n[first, second, rest]",
-		"let [a, @more] = [1, 2, 3]\n[a, more]",	}
+		"let [a, @more] = [1, 2, 3]\n[a, more]",
+	}
 	for source in cases {
 		if !mica_emitter_matches_odin(t, world, source, alloc) {
 			testing.expectf(t, false, "emitter mismatch for %q", source)
@@ -4463,10 +4522,16 @@ mica_emitter_matches_odin :: proc(
 	}
 
 	// Mica path: emit to bytes through the world, decode, run.
-	outcome := world_call(world, "emit_source", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("source")),
-		value = v.value_string(context.temp_allocator, source),
-	}})
+	outcome := world_call(
+		world,
+		"emit_source",
+		[]k.Role_Pair {
+			{
+				role = v.value_symbol(v.symbol_intern("source")),
+				value = v.value_string(context.temp_allocator, source),
+			},
+		},
+	)
 	if outcome.kind != .Complete {
 		testing.expectf(t, false, "emit_source failed for %q: %s", source, outcome.message)
 		return false
@@ -4540,7 +4605,7 @@ test_mica_emitter_relation_write :: proc(t: ^testing.T) {
 
 	world, start := world_start(
 		&kernel,
-		[]string{
+		[]string {
 			"apps/compiler/lex.mica",
 			"apps/compiler/parse.mica",
 			"apps/compiler/emit.mica",
@@ -4556,10 +4621,16 @@ test_mica_emitter_relation_write :: proc(t: ^testing.T) {
 	entry := world_wait(world, world.entry)
 	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
 
-	outcome := world_call(world, "emit_source", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("source")),
-		value = v.value_string(context.temp_allocator, "assert Point(7)"),
-	}})
+	outcome := world_call(
+		world,
+		"emit_source",
+		[]k.Role_Pair {
+			{
+				role = v.value_symbol(v.symbol_intern("source")),
+				value = v.value_string(context.temp_allocator, "assert Point(7)"),
+			},
+		},
+	)
 	testing.expectf(t, outcome.kind == .Complete, "emit_source failed: %s", outcome.message)
 	if outcome.kind != .Complete {
 		return
@@ -4589,7 +4660,10 @@ test_mica_emitter_relation_write :: proc(t: ^testing.T) {
 	// The Mica world's context must be reachable to the running program so
 	// the name-resolving builtin can find :Point.
 	tx := k.kernel_begin(&kernel)
-	relation_source := k.Relation_Source{transaction = &tx, use_stored_derived = true}
+	relation_source := k.Relation_Source {
+		transaction        = &tx,
+		use_stored_derived = true,
+	}
 	state: vm.VM
 	vm.vm_init(&state, program, alloc)
 	defer vm.vm_destroy(&state)
@@ -4645,7 +4719,7 @@ assert Point(2, 20)
 
 	world, start := world_start(
 		&kernel,
-		[]string{
+		[]string {
 			"apps/compiler/lex.mica",
 			"apps/compiler/parse.mica",
 			"apps/compiler/emit.mica",
@@ -4661,10 +4735,16 @@ assert Point(2, 20)
 	entry := world_wait(world, world.entry)
 	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
 
-	outcome := world_call(world, "emit_source", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("source")),
-		value = v.value_string(context.temp_allocator, "Point(?x, ?y)"),
-	}})
+	outcome := world_call(
+		world,
+		"emit_source",
+		[]k.Role_Pair {
+			{
+				role = v.value_symbol(v.symbol_intern("source")),
+				value = v.value_string(context.temp_allocator, "Point(?x, ?y)"),
+			},
+		},
+	)
 	testing.expectf(t, outcome.kind == .Complete, "emit_source failed: %s", outcome.message)
 	if outcome.kind != .Complete {
 		return
@@ -4692,7 +4772,10 @@ assert Point(2, 20)
 	testing.expect_value(t, vm.program_validate(program), vm.Program_Error.None)
 
 	tx := k.kernel_begin(&kernel)
-	relation_source := k.Relation_Source{transaction = &tx, use_stored_derived = true}
+	relation_source := k.Relation_Source {
+		transaction        = &tx,
+		use_stored_derived = true,
+	}
 	state: vm.VM
 	vm.vm_init(&state, program, alloc)
 	defer vm.vm_destroy(&state)
@@ -4739,7 +4822,7 @@ test_mica_emitter_rejects_const_assignment :: proc(t: ^testing.T) {
 	entry := world_wait(world, world.entry)
 	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
 
-	sources := []string{
+	sources := []string {
 		// const reassignment must be rejected.
 		"verb go()\n const x = 10\n x = 20\n return x\nend",
 		// A mutable binding must still be accepted.
@@ -4747,10 +4830,16 @@ test_mica_emitter_rejects_const_assignment :: proc(t: ^testing.T) {
 	}
 	expect_ok := []bool{false, true}
 	for source, index in sources {
-		outcome := world_call(world, "emit_source", []k.Role_Pair{{
-			role  = v.value_symbol(v.symbol_intern("source")),
-			value = v.value_string(context.temp_allocator, source),
-		}})
+		outcome := world_call(
+			world,
+			"emit_source",
+			[]k.Role_Pair {
+				{
+					role = v.value_symbol(v.symbol_intern("source")),
+					value = v.value_string(context.temp_allocator, source),
+				},
+			},
+		)
 		if outcome.kind != .Complete {
 			testing.expectf(t, false, "emit_source aborted for %q", source)
 			continue
@@ -4800,7 +4889,7 @@ test_mica_emitter_compiles_compiler :: proc(t: ^testing.T) {
 	entry := world_wait(world, world.entry)
 	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
 
-	sources := []string{
+	sources := []string {
 		"apps/compiler/lex.mica",
 		"apps/compiler/parse.mica",
 		"apps/compiler/emit.mica",
@@ -4811,10 +4900,16 @@ test_mica_emitter_compiles_compiler :: proc(t: ^testing.T) {
 			testing.expectf(t, false, "cannot read %s", path)
 			continue
 		}
-		outcome := world_call(world, "emit_source", []k.Role_Pair{{
-			role  = v.value_symbol(v.symbol_intern("source")),
-			value = v.value_string(context.temp_allocator, string(source)),
-		}})
+		outcome := world_call(
+			world,
+			"emit_source",
+			[]k.Role_Pair {
+				{
+					role = v.value_symbol(v.symbol_intern("source")),
+					value = v.value_string(context.temp_allocator, string(source)),
+				},
+			},
+		)
 		if outcome.kind != .Complete {
 			testing.expectf(t, false, "%s: emit_source failed: %s", path, outcome.message)
 			continue
@@ -4827,7 +4922,8 @@ test_mica_emitter_compiles_compiler :: proc(t: ^testing.T) {
 		ok, _ := v.value_as_bool(map_get(fields, "ok"))
 		if !ok {
 			message := "?"
-			if list, list_ok := v.value_as_list(map_get(fields, "errors")); list_ok && len(list) > 0 {
+			if list, list_ok := v.value_as_list(map_get(fields, "errors"));
+			   list_ok && len(list) > 0 {
 				if s, s_ok := v.value_as_string(list[0]); s_ok {
 					message = s
 				}
@@ -4871,9 +4967,9 @@ test_mica_emitter_app_conformance :: proc(t: ^testing.T) {
 	alloc := virtual.arena_allocator(&arena)
 
 	cases := [?]struct {
-		name: string,
+		name:  string,
 		paths: []string,
-		call: string,
+		call:  string,
 	} {
 		{
 			name = "equipment-service",
@@ -4889,8 +4985,8 @@ test_mica_emitter_app_conformance :: proc(t: ^testing.T) {
 			// Exercises match, structural literals, verb overloading with
 			// parameter restrictions, runtime identity resolution, and dynamic
 			// invoke in one scenario suite.
-			name = "mud scenarios",
-			paths = []string{
+			name  = "mud scenarios",
+			paths = []string {
 				"apps/shared/string.mica",
 				"apps/shared/events.mica",
 				"apps/mud/core.mica",
@@ -4898,7 +4994,7 @@ test_mica_emitter_app_conformance :: proc(t: ^testing.T) {
 				"apps/mud/event-substitutions.mica",
 				"apps/mud/tests/event-scenarios.mica",
 			},
-			call = "test/command_parser_records_structured_utility_events",
+			call  = "test/command_parser_records_structured_utility_events",
 		},
 	}
 
@@ -4968,7 +5064,14 @@ app_identity :: proc(name: string) -> v.Value {
 // artifact. Concatenation matches how the app-conformance tool compiles a
 // multi-file app: one program from all its sources.
 @(private)
-app_conformance_emit :: proc(t: ^testing.T, paths: []string, alloc: mem.Allocator) -> ([]u8, bool) {
+app_conformance_emit :: proc(
+	t: ^testing.T,
+	paths: []string,
+	alloc: mem.Allocator,
+) -> (
+	[]u8,
+	bool,
+) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -4996,10 +5099,16 @@ app_conformance_emit :: proc(t: ^testing.T, paths: []string, alloc: mem.Allocato
 		strings.write_string(&builder, "\n")
 		strings.write_string(&builder, string(source))
 	}
-	outcome := world_call(world, "emit_source", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("source")),
-		value = v.value_string(context.temp_allocator, strings.to_string(builder)),
-	}})
+	outcome := world_call(
+		world,
+		"emit_source",
+		[]k.Role_Pair {
+			{
+				role = v.value_symbol(v.symbol_intern("source")),
+				value = v.value_string(context.temp_allocator, strings.to_string(builder)),
+			},
+		},
+	)
 	if outcome.kind != .Complete {
 		return nil, false
 	}
@@ -5030,16 +5139,14 @@ app_conformance_run :: proc(
 	call: string,
 	roles: []k.Role_Pair,
 	alloc: mem.Allocator,
-) -> (v.Value, bool) {
+) -> (
+	v.Value,
+	bool,
+) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(
-		&kernel,
-		paths,
-		context.temp_allocator,
-		HARNESS_CONFIG,
-	)
+	world, start := world_start(&kernel, paths, context.temp_allocator, HARNESS_CONFIG)
 	if !start.ok {
 		return v.Value(0), false
 	}
@@ -5066,7 +5173,10 @@ app_conformance_run :: proc(
 		if symbol, is_symbol := v.value_as_symbol(role.value); is_symbol {
 			if name_text, has_name := v.symbol_name(symbol); has_name {
 				if identity, found := world.ctx.identities[name_text]; found {
-					resolved[index] = k.Role_Pair{role = role.role, value = identity}
+					resolved[index] = k.Role_Pair {
+						role  = role.role,
+						value = identity,
+					}
 				}
 			}
 		}
@@ -5113,7 +5223,7 @@ test_mica_emitter_execution_conformance :: proc(t: ^testing.T) {
 	entry := world_wait(world, world.entry)
 	testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
 
-	files := []string{
+	files := []string {
 		"benchmarks/mica/relation_join_scan.mica",
 		"benchmarks/mica/language_for_pattern.mica",
 		"benchmarks/mica/relation_commit.mica",
@@ -5124,10 +5234,16 @@ test_mica_emitter_execution_conformance :: proc(t: ^testing.T) {
 			testing.expectf(t, false, "cannot read %s", path)
 			continue
 		}
-		outcome := world_call(world, "emit_source", []k.Role_Pair{{
-			role  = v.value_symbol(v.symbol_intern("source")),
-			value = v.value_string(context.temp_allocator, string(source)),
-		}})
+		outcome := world_call(
+			world,
+			"emit_source",
+			[]k.Role_Pair {
+				{
+					role = v.value_symbol(v.symbol_intern("source")),
+					value = v.value_string(context.temp_allocator, string(source)),
+				},
+			},
+		)
 		if outcome.kind != .Complete {
 			testing.expectf(t, false, "%s: emit_source failed: %s", path, outcome.message)
 			continue
@@ -5217,10 +5333,7 @@ end
 			&kernel,
 			[]string{path},
 			context.temp_allocator,
-			World_Config {
-				instruction_budget = HARNESS_INSTRUCTION_BUDGET,
-				time_limit         = limit,
-			},
+			World_Config{instruction_budget = HARNESS_INSTRUCTION_BUDGET, time_limit = limit},
 		)
 		testing.expectf(t, start.ok, "world start failed: %s", start.message)
 		if !start.ok {
@@ -5258,18 +5371,16 @@ conformance_run :: proc(
 	path: string,
 	artifact: []u8,
 	alloc: mem.Allocator,
-) -> (v.Value, bool) {
+) -> (
+	v.Value,
+	bool,
+) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 	// Budget the file under test so a mis-emitted loop fails here instead of
 	// hanging the suite. The compiler world in the caller is left unlimited.
-	world, start := world_start(
-		&kernel,
-		[]string{path},
-		context.temp_allocator,
-		HARNESS_CONFIG,
-	)
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator, HARNESS_CONFIG)
 	if !start.ok {
 		return v.Value(0), false
 	}
@@ -5377,7 +5488,10 @@ read_compiler_sources :: proc(
 	t: ^testing.T,
 	paths: []string,
 	alloc: mem.Allocator,
-) -> (string, bool) {
+) -> (
+	string,
+	bool,
+) {
 	builder: strings.Builder
 	strings.builder_init(&builder, alloc)
 	defer strings.builder_destroy(&builder)
@@ -5401,7 +5515,10 @@ compiler_emit :: proc(
 	source: string,
 	replace: []u8,
 	alloc: mem.Allocator,
-) -> ([]u8, bool) {
+) -> (
+	[]u8,
+	bool,
+) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -5430,10 +5547,16 @@ compiler_emit :: proc(
 		vm.program_destroy(world.program, world.allocator)
 		world.program = program
 	}
-	outcome := world_call(world, "emit_source", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("source")),
-		value = v.value_string(context.temp_allocator, source),
-	}})
+	outcome := world_call(
+		world,
+		"emit_source",
+		[]k.Role_Pair {
+			{
+				role = v.value_symbol(v.symbol_intern("source")),
+				value = v.value_string(context.temp_allocator, source),
+			},
+		},
+	)
 	if outcome.kind != .Complete {
 		return nil, false
 	}
@@ -5462,7 +5585,10 @@ run_target :: proc(
 	target: string,
 	artifact: []u8,
 	alloc: mem.Allocator,
-) -> (v.Value, bool) {
+) -> (
+	v.Value,
+	bool,
+) {
 	path, path_ok := write_temp_source(t, "mica_bootstrap_target.mica", target)
 	if !path_ok {
 		return v.Value(0), false
@@ -5471,12 +5597,7 @@ run_target :: proc(
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(
-		&kernel,
-		[]string{path},
-		context.temp_allocator,
-		HARNESS_CONFIG,
-	)
+	world, start := world_start(&kernel, []string{path}, context.temp_allocator, HARNESS_CONFIG)
 	if !start.ok {
 		testing.expectf(t, false, "target load failed: %s", start.message)
 		return v.Value(0), false
@@ -5724,10 +5845,7 @@ end
 	testing.expect_value(t, suspended.kind, Task_Outcome_Kind.Pending)
 	testing.expect_value(t, suspended.suspend, Task_Suspend.Host_Request)
 
-	testing.expect(
-		t,
-		world_resume(world, id, v.value_string(context.temp_allocator, "look")),
-	)
+	testing.expect(t, world_resume(world, id, v.value_string(context.temp_allocator, "look")))
 
 	finished := Task_Outcome{}
 	deadline = time.tick_now()
@@ -5775,11 +5893,7 @@ test_json_decode_string_no_leak :: proc(t: ^testing.T) {
 test_read_only_store_boot_has_no_pending_writes :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	path := ""
-	for candidate in ([]string {
-		"apps/examples/equipment-service.mica",
-		"../apps/examples/equipment-service.mica",
-		"../../apps/examples/equipment-service.mica",
-	}) {
+	for candidate in ([]string{"apps/examples/equipment-service.mica", "../apps/examples/equipment-service.mica", "../../apps/examples/equipment-service.mica"}) {
 		if os.is_file(candidate) {
 			path = candidate
 			break
@@ -5845,11 +5959,7 @@ test_read_only_store_boot_has_no_pending_writes :: proc(t: ^testing.T) {
 			)
 			// Rule reconstruction advanced the version without writing the
 			// log; a checkpoint must still complete rather than wait forever.
-			testing.expectf(
-				t,
-				world_checkpoint(world),
-				"checkpoint after boot failed",
-			)
+			testing.expectf(t, world_checkpoint(world), "checkpoint after boot failed")
 			world_destroy(world)
 		}
 		k.kernel_destroy(&kernel)
@@ -5901,13 +6011,8 @@ test_local_shadows_builtin :: proc(t: ^testing.T) {
 	defer delete(ctx.identities)
 	install_builtin_names(&ctx)
 
-	expect_int_builtin(
-		t,
-		&ctx,
-		`let len = fn(x) => 99
-return len([1, 2])`,
-		99,
-	)
+	expect_int_builtin(t, &ctx, `let len = fn(x) => 99
+return len([1, 2])`, 99)
 }
 
 // `continue` in a for loop must advance the index, not repeat the element.
@@ -6389,10 +6494,11 @@ mica_lexer_matches_odin :: proc(
 	defer c.lex_destroy(&odin_result, context.temp_allocator)
 
 	source_value := v.value_string(context.temp_allocator, source)
-	outcome := world_call(world, "lex", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("source")),
-		value = source_value,
-	}})
+	outcome := world_call(
+		world,
+		"lex",
+		[]k.Role_Pair{{role = v.value_symbol(v.symbol_intern("source")), value = source_value}},
+	)
 	if outcome.kind != .Complete {
 		testing.expectf(t, false, "%s: Mica lex failed: %s", label, outcome.message)
 		return false
@@ -6568,7 +6674,11 @@ mica_lexer_matches_odin :: proc(
 
 @(private)
 corpus_relative :: proc(relative: string) -> string {
-	candidates := []string{relative, fmt.aprintf("../%s", relative, allocator = context.temp_allocator), fmt.aprintf("../../%s", relative, allocator = context.temp_allocator)}
+	candidates := []string {
+		relative,
+		fmt.aprintf("../%s", relative, allocator = context.temp_allocator),
+		fmt.aprintf("../../%s", relative, allocator = context.temp_allocator),
+	}
 	for candidate in candidates {
 		if os.is_file(candidate) {
 			return candidate
@@ -6579,7 +6689,11 @@ corpus_relative :: proc(relative: string) -> string {
 
 @(private)
 corpus_relative_dir :: proc(relative: string) -> string {
-	candidates := []string{relative, fmt.aprintf("../%s", relative, allocator = context.temp_allocator), fmt.aprintf("../../%s", relative, allocator = context.temp_allocator)}
+	candidates := []string {
+		relative,
+		fmt.aprintf("../%s", relative, allocator = context.temp_allocator),
+		fmt.aprintf("../../%s", relative, allocator = context.temp_allocator),
+	}
 	for candidate in candidates {
 		if os.is_dir(candidate) {
 			return candidate
@@ -6625,11 +6739,7 @@ test_mica_parser_matches_odin :: proc(t: ^testing.T) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(
-		&kernel,
-		[]string{lexer_path, parser_path},
-		context.temp_allocator,
-	)
+	world, start := world_start(&kernel, []string{lexer_path, parser_path}, context.temp_allocator)
 	testing.expectf(t, start.ok, "parser load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -6716,10 +6826,16 @@ mica_parser_matches_odin :: proc(
 	odin_ast, odin_errors := c.parse_program(source, context.temp_allocator)
 	odin_rendered := c.ast_sexpr(odin_ast, context.temp_allocator)
 
-	outcome := world_call(world, "parse", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("source")),
-		value = v.value_string(context.temp_allocator, source),
-	}})
+	outcome := world_call(
+		world,
+		"parse",
+		[]k.Role_Pair {
+			{
+				role = v.value_symbol(v.symbol_intern("source")),
+				value = v.value_string(context.temp_allocator, source),
+			},
+		},
+	)
 	if outcome.kind != .Complete {
 		testing.expectf(t, false, "%s: Mica parse failed: %s", label, outcome.message)
 		return false
@@ -6746,7 +6862,14 @@ mica_parser_matches_odin :: proc(
 		return false
 	}
 	if mica_rendered != odin_rendered {
-		testing.expectf(t, false, "%s:\n  mica: %s\n  odin: %s", label, mica_rendered, odin_rendered)
+		testing.expectf(
+			t,
+			false,
+			"%s:\n  mica: %s\n  odin: %s",
+			label,
+			mica_rendered,
+			odin_rendered,
+		)
 		return false
 	}
 	return true
@@ -6756,7 +6879,7 @@ mica_parser_matches_odin :: proc(
 // in.
 @(private)
 buffer_scenario_path :: proc() -> string {
-	candidates := []string{
+	candidates := []string {
 		"apps/buffers/tests/buffer-scenarios.mica",
 		"../apps/buffers/tests/buffer-scenarios.mica",
 		"../../apps/buffers/tests/buffer-scenarios.mica",
@@ -6924,6 +7047,9 @@ test_marker_builtins_mica_scenarios :: proc(t: ^testing.T) {
 		// Order matters: seed publishes revision 1, the token apply publishes
 		// revision 2, and the rebase reads that change back.
 		"test/marker_seed",
+		"test/buffer_computed_stat_and_lines",
+		"test/buffer_computed_lines_are_bounded",
+		"test/marker_create_at_committed_revision",
 		"test/marker_apply_with_token",
 		"test/marker_rebases_from_the_recorded_delta",
 		"test/annotation_follows_its_markers",
@@ -6942,6 +7068,50 @@ test_marker_builtins_mica_scenarios :: proc(t: ^testing.T) {
 			verb,
 			outcome.kind,
 			detail,
+		)
+	}
+}
+
+@(test)
+test_retrieval_computed_relation_scenarios :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	library := scenario_source_path("apps/shared/retrieval.mica")
+	scenarios := scenario_source_path("apps/retrieval/tests/computed-scenarios.mica")
+	if library == "" || scenarios == "" {
+		testing.expect(t, false, "retrieval scenario sources not found")
+		return
+	}
+
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(&kernel, []string{library, scenarios}, alloc)
+	if !start.ok {
+		testing.expectf(t, false, "retrieval scenarios failed to load: %s", start.message)
+		return
+	}
+	defer world_destroy(world)
+	if started := world_wait(world, world.entry); started.kind != .Complete {
+		testing.expectf(t, false, "retrieval scenario load failed: %s", started.message)
+		return
+	}
+	verbs := []string{"test/retrieval_seed", "test/retrieval_exact_computed_relation"}
+	for verb in verbs {
+		outcome := world_call(world, verb, nil)
+		testing.expectf(
+			t,
+			outcome.kind == .Complete,
+			"%s: kind=%v message=%s",
+			verb,
+			outcome.kind,
+			outcome.message,
 		)
 	}
 }

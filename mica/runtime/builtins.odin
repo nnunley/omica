@@ -263,6 +263,7 @@ builtin_assume_actor :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 		}
 		snapshot := k.kernel_snapshot(env.kernel)
 		source := k.Relation_Source {
+			kernel   = env.kernel,
 			snapshot = snapshot,
 		}
 		k.authority_destroy(state.authority)

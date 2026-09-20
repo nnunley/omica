@@ -19,9 +19,10 @@
 // do that would make a middle edit O(document).
 package buffer
 
-import "core:mem"
-import "core:unicode/utf8"
 import v "../var"
+import "core:mem"
+import "core:sync"
+import "core:unicode/utf8"
 
 // Targets for compaction and batching. Never a minimum allocation.
 CHUNK_TARGET_BYTES :: 64 * 1024
@@ -54,29 +55,30 @@ chunk_size_classes := [CHUNK_CLASS_COUNT]int {
 }
 
 Text_Chunk :: struct {
-	refs:  i64,
-	id:    u64,
-	kind:  Chunk_Kind,
+	refs:            i64,
+	id:              u64,
+	kind:            Chunk_Kind,
 	// The used prefix of `storage`.
-	bytes: []u8,
+	bytes:           []u8,
 	// The full class-sized buffer, returned to the pool on release.
-	storage: []u8,
-	class:   int,
-	scalars: u64,
+	storage:         []u8,
+	class:           int,
+	scalars:         u64,
 	// Number of newlines; the document line count is `newlines + 1`.
-	newlines: u64,
+	newlines:        u64,
 	// Scalar offset of every newline, ascending.
 	newline_offsets: []u32,
 	ascii:           bool,
 	// Sampled scalar-to-byte offsets; nil for ASCII or short non-ASCII runs.
-	index:      ^v.String_Index,
-	generation: u64,
-	pool:       ^Chunk_Pool,
-	owner:      mem.Allocator,
+	index:           ^v.String_Index,
+	generation:      u64,
+	pool:            ^Chunk_Pool,
+	owner:           mem.Allocator,
 }
 
 // Owns chunk storage and hands out class-sized buffers.
 Chunk_Pool :: struct {
+	lock:            sync.Mutex,
 	allocator:       mem.Allocator,
 	free:            [CHUNK_CLASS_COUNT][dynamic][]u8,
 	next_id:         u64,
@@ -113,6 +115,8 @@ chunk_class_for :: proc(size: int) -> int {
 
 @(private)
 chunk_pool_take :: proc(pool: ^Chunk_Pool, size: int) -> ([]u8, int) {
+	sync.mutex_lock(&pool.lock)
+	defer sync.mutex_unlock(&pool.lock)
 	class := chunk_class_for(size)
 	if class >= 0 && len(pool.free[class]) > 0 {
 		buffer := pop(&pool.free[class])
@@ -130,6 +134,8 @@ chunk_pool_take :: proc(pool: ^Chunk_Pool, size: int) -> ([]u8, int) {
 
 @(private)
 chunk_pool_give :: proc(pool: ^Chunk_Pool, buffer: []u8, class: int) {
+	sync.mutex_lock(&pool.lock)
+	defer sync.mutex_unlock(&pool.lock)
 	if class < 0 {
 		delete(buffer, pool.allocator)
 		return
@@ -175,16 +181,14 @@ chunk_create :: proc(
 
 	chunk := new(Text_Chunk, allocator)
 	chunk.refs = 1
-	chunk.id = pool.next_id + 1
-	pool.next_id += 1
+	chunk.id = sync.atomic_add_explicit(&pool.next_id, 1, .Relaxed) + 1
 	chunk.kind = kind
 	chunk.bytes = bytes
 	chunk.storage = storage
 	chunk.class = class
 	chunk.pool = pool
 	chunk.owner = allocator
-	chunk.generation = pool.next_generation + 1
-	pool.next_generation += 1
+	chunk.generation = sync.atomic_add_explicit(&pool.next_generation, 1, .Relaxed) + 1
 
 	newlines: [dynamic]u32
 	newlines = make([dynamic]u32, allocator)
@@ -207,7 +211,7 @@ chunk_create :: proc(
 
 chunk_retain :: proc(chunk: ^Text_Chunk) -> ^Text_Chunk {
 	if chunk != nil {
-		chunk.refs += 1
+		sync.atomic_add_explicit(&chunk.refs, 1, .Relaxed)
 	}
 	return chunk
 }
@@ -217,8 +221,7 @@ chunk_release :: proc(chunk: ^Text_Chunk) {
 	if chunk == nil {
 		return
 	}
-	chunk.refs -= 1
-	if chunk.refs > 0 {
+	if sync.atomic_sub_explicit(&chunk.refs, 1, .Acq_Rel) != 1 {
 		return
 	}
 	if chunk.index != nil {
@@ -263,11 +266,7 @@ chunk_byte_offset :: proc(chunk: ^Text_Chunk, index: u64) -> int {
 }
 
 // Copies the scalar range `[start, end)` of a chunk into `builder`.
-chunk_write_range :: proc(
-	chunk: ^Text_Chunk,
-	start, end: u64,
-	builder: ^[dynamic]u8,
-) {
+chunk_write_range :: proc(chunk: ^Text_Chunk, start, end: u64, builder: ^[dynamic]u8) {
 	byte_start := chunk_byte_offset(chunk, start)
 	byte_end := chunk_byte_offset(chunk, end)
 	append(builder, ..chunk.bytes[byte_start:byte_end])

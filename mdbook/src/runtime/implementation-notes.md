@@ -25,8 +25,9 @@ implementation; they are collected here.
   `openai_chat_completion`, `openai_chat_completion_with_options`) is
   implemented in `mica/external` on top of libcurl. See
   [The LLM Host Bridge](../runtime/llm-bridge.md). The agent shell can call a
-  model; the Rust source-provider computed relations its tools use are still
-  not ported.
+  model. The computed-relation registry, buffer projections, and exact
+  `NearestEmbedding` search are implemented. The Rust source-provider and
+  fact-neighbourhood projections are not ported.
 - `emit` is not implemented in this port: it is a no-op and committed effects
   are not recorded. Delivery remains future work.
 - `world_eval` compiles source against a live world for command-line use, which
