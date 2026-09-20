@@ -9,6 +9,7 @@ import "core:net"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -440,8 +441,46 @@ Stub_Response :: struct {
 	listener: net.TCP_Socket,
 	start:    time.Tick,
 	response: string,
-	// The bytes curl sent, for request assertions.
+	// The bytes curl sent, for request assertions. Guarded by `mutex`: the
+	// serving thread appends while the test thread reads after the transfer,
+	// and the network is not a synchronization edge ThreadSanitizer can see.
+	mutex:    sync.Mutex,
 	received: [dynamic]u8,
+}
+
+@(private)
+stub_received_append :: proc(server: ^Stub_Response, data: []byte) {
+	sync.mutex_lock(&server.mutex)
+	append(&server.received, ..data)
+	sync.mutex_unlock(&server.mutex)
+}
+
+@(private)
+stub_received_length :: proc(server: ^Stub_Response) -> int {
+	sync.mutex_lock(&server.mutex)
+	defer sync.mutex_unlock(&server.mutex)
+	return len(server.received)
+}
+
+@(private)
+stub_received_find_header_end :: proc(server: ^Stub_Response) -> int {
+	sync.mutex_lock(&server.mutex)
+	defer sync.mutex_unlock(&server.mutex)
+	return strings.index(string(server.received[:]), "\r\n\r\n")
+}
+
+@(private)
+stub_received_headers :: proc(server: ^Stub_Response) -> string {
+	sync.mutex_lock(&server.mutex)
+	defer sync.mutex_unlock(&server.mutex)
+	return string(server.received[:])
+}
+
+@(private)
+stub_received_text :: proc(server: ^Stub_Response) -> string {
+	sync.mutex_lock(&server.mutex)
+	defer sync.mutex_unlock(&server.mutex)
+	return strings.clone(string(server.received[:]), context.temp_allocator)
 }
 
 @(private)
@@ -462,14 +501,15 @@ stub_server_proc :: proc(data: rawptr) {
 	for time.tick_since(server.start) < 5 * time.Second {
 		read, recv_err := net.recv_tcp(client, chunk[:])
 		if read > 0 {
-			append(&server.received, ..chunk[:read])
+			stub_received_append(server, chunk[:read])
 			if header_end < 0 {
-				if index := strings.index(string(server.received[:]), "\r\n\r\n"); index >= 0 {
+				if index := stub_received_find_header_end(server); index >= 0 {
 					header_end = index + 4
-					expected = header_end + stub_content_length(string(server.received[:header_end]))
+					headers := stub_received_headers(server)
+					expected = header_end + stub_content_length(headers[:header_end])
 				}
 			}
-			if header_end >= 0 && len(server.received) >= expected {
+			if header_end >= 0 && stub_received_length(server) >= expected {
 				break
 			}
 			continue
@@ -647,11 +687,12 @@ test_live_chat_completion :: proc(t: ^testing.T) {
 		message, _ := lookup(choices[0], "message")
 		testing.expect_value(t, test_lookup_text(t, message, "content"), "pong")
 	}
+	received := stub_received_text(server.state)
 	testing.expectf(
 		t,
-		strings.contains(string(server.state.received[:]), "\"model\":\"test-model\""),
+		strings.contains(received, "\"model\":\"test-model\""),
 		"request body: %s",
-		string(server.state.received[:]),
+		received,
 	)
 }
 
@@ -802,10 +843,11 @@ test_live_chat_stream :: proc(t: ^testing.T) {
 	testing.expect_value(t, kinds[0], "started")
 	testing.expect_value(t, kinds[1], "text_delta")
 	testing.expect_value(t, kinds[2], "completed")
+	received := stub_received_text(server.state)
 	testing.expectf(
 		t,
-		strings.contains(string(server.state.received[:]), "\"stream\":true"),
+		strings.contains(received, "\"stream\":true"),
 		"request body: %s",
-		string(server.state.received[:]),
+		received,
 	)
 }

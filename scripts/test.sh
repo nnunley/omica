@@ -22,7 +22,9 @@
 # Environment:
 #   ODIN_BIN       Odin compiler (default: `odin` on PATH, else ../odin-setup/odin)
 #   STRICT_LEAKS   set to 1 to fail on any tracking-allocator leak
-#   TEST_TIMEOUT   per-command timeout in seconds (default 120)
+#   TEST_TIMEOUT   per-command timeout in seconds (default 300; the runtime
+#                  suite compiles and runs near the old 120s budget on the
+#                  4-core CI runners)
 #   TSAN_TIMEOUT   per-package ThreadSanitizer timeout in seconds (default 1200)
 #   PORTABLE_TIMEOUT  set to 1 to force the portable timeout fallback
 set -euo pipefail
@@ -43,7 +45,7 @@ packages=(mica/var mica/kernel mica/vm mica/compiler mica/runtime mica/external 
 bin_dir="${repo_root}/.cache/test-bin"
 log_dir="${repo_root}/.cache/test-logs"
 strict_leaks="${STRICT_LEAKS:-0}"
-test_timeout="${TEST_TIMEOUT:-120}"
+test_timeout="${TEST_TIMEOUT:-300}"
 tsan_timeout="${TSAN_TIMEOUT:-1200}"
 fail=0
 cleanup_pids=()
