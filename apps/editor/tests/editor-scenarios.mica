@@ -579,8 +579,10 @@ verb test/editor_max_runs_a_registered_command()
   test/editor_input(:editor/test/endpoint, :editor/test/max, 1, {:kind -> :text, :text -> "end-of-line"})
   let accepted = test/editor_input(:editor/test/endpoint, :editor/test/max, 1, {:kind -> :key, :key -> "<return>"})
   test/assert_equal(accepted[:status], :ok, "return accepts")
+  test/assert_equal(accepted[:snapshot_required], true, "acceptance removes the picker window")
   test/assert_equal(accepted[:point], 3, "the command ran")
   test/assert_equal(editor/minibuffer_active(:editor/test/max), false, "the prompt is closed")
+  test/assert_equal(len(editor/window_leaves(:editor/test/max, 1)), 1, "the picker window is gone")
 
   return true
 end
@@ -597,7 +599,94 @@ verb test/editor_max_rejects_unknown_names()
 
   let cancelled = test/editor_input(:editor/test/endpoint, :editor/test/max, 1, {:kind -> :key, :key -> "C-g"})
   test/assert_equal(cancelled[:message], "Quit", "C-g cancels")
+  test/assert_equal(cancelled[:snapshot_required], true, "C-g removes the picker window")
   test/assert_equal(editor/minibuffer_active(:editor/test/max), false, "the prompt is closed")
+  test/assert_equal(len(editor/window_leaves(:editor/test/max, 1)), 1, "the picker window is gone")
+
+  return true
+end
+
+verb test/editor_picker_navigation_and_buffer_switch()
+  editor/session_create(:editor/test/picker, :editor/test/actor, :default)
+  let source = editor/buffer_create(:editor/test/actor, :scratch, "*picker-source*", "source")
+  let target = editor/buffer_create(:editor/test/actor, :scratch, "*picker-target-unique*", "target")
+  editor/window_show(:editor/test/picker, 1, source)
+
+  test/editor_input(:editor/test/endpoint, :editor/test/picker, 1, {:kind -> :key, :key -> "C-x"})
+  let opened = test/editor_input(
+    :editor/test/endpoint,
+    :editor/test/picker,
+    1,
+    {:kind -> :key, :key -> "b"}
+  )
+  test/assert_equal(opened[:snapshot_required], true, "the picker changes the frame")
+  test/assert_true(editor/picker_active(:editor/test/picker), "the picker is active")
+  test/assert_equal(editor/selected_window(:editor/test/picker), 1, "the origin stays selected")
+  test/assert_equal(
+    editor/buffer_kind(editor/picker_buffer(:editor/test/picker)),
+    :completion,
+    "the picker uses a completion buffer"
+  )
+  test/assert_equal(
+    editor/buffer_read_only(editor/picker_buffer(:editor/test/picker)),
+    true,
+    "the completion buffer is read-only"
+  )
+
+  let first = editor/picker_selected_candidate(:editor/test/picker)
+  test/assert_true(first != none, "the picker has a selected candidate")
+  test/editor_input(:editor/test/endpoint, :editor/test/picker, 1, {:kind -> :key, :key -> "C-n"})
+  let second = editor/picker_selected_candidate(:editor/test/picker)
+  test/assert_true(second != none, "C-n keeps a candidate selected")
+  test/assert_true(second[:key] != first[:key], "C-n selects the next candidate")
+
+  let picker_window = editor/picker_window(:editor/test/picker)
+  let picker_buffer = editor/picker_buffer(:editor/test/picker)
+  test/editor_input(
+    :editor/test/endpoint,
+    :editor/test/picker,
+    1,
+    {:kind -> :viewport, :window -> picker_window, :height -> 2, :width -> 80}
+  )
+  test/editor_input(:editor/test/endpoint, :editor/test/picker, 1, {:kind -> :key, :key -> "C-n"})
+  test/assert_equal(
+    editor/window_first_line(:editor/test/picker, picker_window),
+    1,
+    "the picker scrolls at its measured height"
+  )
+  let clicked = test/editor_input(
+    :editor/test/endpoint,
+    :editor/test/picker,
+    1,
+    {
+      :kind -> :pointer,
+      :window -> picker_window,
+      :scalar_offset -> buffer_line_column_offset(picker_buffer, 0, 0),
+      :extend -> false
+    }
+  )
+  test/assert_equal(clicked[:snapshot_required], true, "a picker click updates its view")
+  test/assert_equal(editor/picker_selected_index(:editor/test/picker), 0, "the click selects its row")
+  test/assert_equal(editor/selected_window(:editor/test/picker), 1, "a picker click keeps the origin selected")
+
+  test/editor_input(:editor/test/endpoint, :editor/test/picker, 1, {:kind -> :key, :key -> "C-u"})
+  test/editor_input(
+    :editor/test/endpoint,
+    :editor/test/picker,
+    1,
+    {:kind -> :text, :text -> "*picker-target-unique*"}
+  )
+  test/assert_equal(editor/picker_candidate_count(:editor/test/picker), 1, "the query filters candidates")
+  let accepted = test/editor_input(
+    :editor/test/endpoint,
+    :editor/test/picker,
+    1,
+    {:kind -> :key, :key -> "<return>"}
+  )
+  test/assert_equal(accepted[:status], :ok, "return accepts the buffer")
+  test/assert_equal(editor/window_buffer(:editor/test/picker, 1), target, "the origin shows the buffer")
+  test/assert_equal(editor/picker_active(:editor/test/picker), false, "acceptance closes the picker")
+  test/assert_equal(len(editor/window_leaves(:editor/test/picker, 1)), 1, "acceptance removes its window")
 
   return true
 end

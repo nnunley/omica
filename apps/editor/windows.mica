@@ -347,6 +347,11 @@ verb editor/window_set_size(session, window, height, width)
   return true
 end
 
+verb editor/window_width(session, window)
+  let exactly {:width -> width} = editor/WindowWidthColumns(session, window, ?width)
+  return width
+end
+
 // Changes one split ratio after a browser divider drag. The ratio uses the
 // same 1 through 999 range as frame snapshots.
 verb editor/split_set_ratio(session, frame, split, ratio)

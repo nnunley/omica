@@ -50,6 +50,9 @@ end
 // Retracts every volatile session fact. User buffers are not retired.
 verb editor/session_cleanup(session)
   let frame = editor/session_frame(session)
+  if editor/picker_active(session)
+    editor/picker_clear(session, frame)
+  end
   for row in editor/WindowBuffer(session, ?window, ?buffer)
     editor/window_remove(session, row[:window])
   end
@@ -450,6 +453,46 @@ verb editor/input_resize_split(session, frame, window, input)
   )
 end
 
+verb editor/input_viewport(session, frame, window, input)
+  let target = index_or(input, :window, window)
+  if not editor/window_complete(session, target)
+    return editor/result(
+      :rejected,
+      session,
+      frame,
+      window,
+      {:error -> :bad_window, :message -> "viewport window is not live"}
+    )
+  end
+  let height = index_or(input, :height, index_or(input, :line_count, editor/window_height(session, target)))
+  let width = index_or(input, :width, editor/window_width(session, target))
+  if height < 1
+    height = 1
+  end
+  if height > 1000
+    height = 1000
+  end
+  if width < 1
+    width = 1
+  end
+  if width > 1000
+    width = 1000
+  end
+  editor/window_set_size(session, target, height, width)
+  let snapshot_required = false
+  if editor/picker_window_active(session, target)
+    editor/picker_render(session)
+    snapshot_required = true
+  end
+  return editor/result(
+    :ok,
+    session,
+    frame,
+    window,
+    {:barrier -> false, :snapshot_required -> snapshot_required}
+  )
+end
+
 // The host calls this once per admitted item. It never sends a command
 // selector; Mica resolves the item against the active keymaps.
 verb editor_input(endpoint, session, frame, item, client_token)
@@ -464,6 +507,12 @@ verb editor_input(endpoint, session, frame, item, client_token)
   let input = item
   input[:client_token] = client_token
   let kind = index_or(input, :kind, :key)
+  if kind == :pointer
+    let target_window = index_or(input, :window, window)
+    if editor/picker_window_active(session, target_window)
+      return editor/picker_pointer(session, frame, window, input)
+    end
+  end
   // A pointer or window-selection item names its window because one frame can
   // display many buffers. Select that window before interpreting the item.
   if kind == :pointer || kind == :select_window
@@ -516,6 +565,9 @@ verb editor_input(endpoint, session, frame, item, client_token)
   end
   if kind == :pointer
     return editor/input_pointer(session, frame, window, buffer, input)
+  end
+  if kind == :viewport
+    return editor/input_viewport(session, frame, window, input)
   end
   if kind == :resize_split
     return editor/input_resize_split(session, frame, window, input)

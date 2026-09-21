@@ -44,6 +44,7 @@ fileins=(
   apps/editor/undo.mica
   apps/editor/commands.mica
   apps/editor/session.mica
+  apps/editor/picker.mica
   apps/editor/minibuffer.mica
   apps/editor/ui.mica
   apps/editor/defaults.mica

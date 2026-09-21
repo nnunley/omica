@@ -58,6 +58,7 @@ main :: proc() {
 		"apps/editor/undo.mica",
 		"apps/editor/commands.mica",
 		"apps/editor/session.mica",
+		"apps/editor/picker.mica",
 		"apps/editor/minibuffer.mica",
 		"apps/editor/ui.mica",
 		"apps/editor/defaults.mica",
@@ -329,6 +330,11 @@ main :: proc() {
 			name = "editor: M-x runs a registered command",
 			files = editor_files,
 			call = "test/editor_max_runs_a_registered_command",
+		},
+		{
+			name = "editor: picker navigation and buffer switching",
+			files = editor_files,
+			call = "test/editor_picker_navigation_and_buffer_switch",
 		},
 		{
 			name = "editor: minibuffer editing and escape",

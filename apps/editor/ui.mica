@@ -92,7 +92,8 @@ verb editor/window_snapshot(session, window, lines, max_scalars)
     :point_line -> placed[:line],
     :point_column -> placed[:column],
     :mark -> mark,
-    :mark_active -> editor/mark_active(session, buffer)
+    :mark_active -> editor/mark_active(session, buffer),
+    :picker -> editor/picker_window_active(session, window)
   }
 end
 

@@ -212,6 +212,7 @@ The implementation uses these files:
 | `apps/editor/commands.mica` | Command protocol and common editing commands. |
 | `apps/editor/undo.mica` | Undo journal and inverse edit handling. |
 | `apps/editor/minibuffer.mica` | Prompts, command completion, and histories. |
+| `apps/editor/picker.mica` | Bounded candidate buffers, selection, and acceptance. |
 | `apps/editor/files.mica` | Visit, save, external-change, and recovery policy. |
 | `apps/editor/modes.mica` | Major modes, minor modes, hooks, and local values. |
 | `apps/editor/ui.mica` | Frame chrome and `sync_view_*` verbs. |
@@ -1210,6 +1211,30 @@ KiB of text. It removes the oldest complete entries first.
 `M-x` queries command names and returns command identities. The browser never turns minibuffer text
 directly into a selector.
 
+### 29.1 Pickers
+
+A picker shows a bounded candidate list in a volatile, read-only completion buffer. The minibuffer
+contains the query. The origin window remains selected while the completion window is visible.
+
+Each candidate has a stable key, an acceptance value, a label, and an optional annotation. The
+stable key preserves selection after a query changes the candidate list.
+
+Mica owns the candidate provider, filter, selected candidate, continuation, and transient key
+behavior. The browser paints the completion buffer and sends pointer offsets.
+
+`C-n` and Down select the next candidate. `C-p` and Up select the previous candidate. `C-v` and
+`M-v` move by the completion-window height. Return accepts the selected candidate. `C-g` and Escape
+cancel the picker.
+
+The browser reports the visible row count after layout changes. Mica uses this count to keep the
+selected candidate inside the completion window.
+
+A pointer offset maps to a line in the completion buffer. Mica maps that line to a candidate. A
+picker click does not select the completion window.
+
+The picker removes its window and completion buffer after acceptance or cancellation. `M-x` and
+`C-x b` use the same picker implementation.
+
 ## 30. Modes, hooks, and local values
 
 A major mode and a minor mode are identities with Mica-owned behavior.
@@ -1720,6 +1745,7 @@ The implementation is acceptable if all statements in this section are true:
 - `C-x 2`, `C-x 3`, `C-x 0`, `C-x 1`, and `C-x o` update the Mica split tree.
 - `C-x b` and `C-x k` use display names without catalogue-name reuse.
 - `M-x` resolves only registered command identities.
+- `M-x` and `C-x b` use bounded Mica-owned pickers.
 - Live unit replacement is atomic and invalidates affected browser plans.
 - Undo uses command groups and does not call `buffer_revert`.
 - File save detects an external file change before replacement.

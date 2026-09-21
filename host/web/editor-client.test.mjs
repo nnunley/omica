@@ -231,6 +231,7 @@ async function installEditor(snapshot, transport, options = {}) {
     navigator: { platform: "Linux" },
     fetch: transport.fetch,
     root: doc.root,
+    measureViewports: false,
     ...options,
   });
   await tick();
@@ -669,6 +670,76 @@ test("clicking inactive window chrome selects that window", async () => {
   const settledSecondPanel = settledSplit.children[2];
   assert.equal(settledFirstPanel.querySelector(".editor-caret"), null);
   assert.ok(settledSecondPanel.querySelector(".editor-caret"));
+});
+
+test("clicking a picker row leaves the origin window selected", async () => {
+  const snapshot = twoWindowSnapshot();
+  snapshot.windows[1] = {
+    ...snapshot.windows[1],
+    buffer: "editor/buffer/completions",
+    buffer_name: "*Completions*",
+    picker: true,
+    rows: [
+      { line: 0, start: 0, stop: 7, text: "> first", complete: true },
+      { line: 1, start: 8, stop: 16, text: "  second", complete: true },
+    ],
+    point: 2,
+    point_line: 0,
+    point_column: 2,
+  };
+  const transport = makeTransport(snapshot);
+  const { editor, doc } = await installEditor(snapshot, transport);
+  const split = editor.elements.frameRoot.children[0];
+  const firstPanel = split.children[0];
+  const pickerPanel = split.children[2];
+  const secondLine = pickerPanel.children[0].children[1];
+  assert.equal(secondLine._row.line, 1);
+  assert.equal(secondLine.closest(".editor-window"), pickerPanel);
+  doc.caretRangeFromPoint = () => ({
+    startContainer: secondLine,
+    startOffset: 0,
+  });
+
+  secondLine.dispatch("mousedown", {
+    clientX: 10,
+    clientY: 30,
+    shiftKey: false,
+    preventDefault() {},
+  });
+  assert.equal(firstPanel.className, "editor-window selected");
+  assert.equal(pickerPanel.className, "editor-window");
+  await tick();
+
+  assert.deepEqual(transport.requests.at(-1), {
+    kind: "pointer",
+    scalar_offset: 16,
+    extend: false,
+    window: 3,
+  });
+});
+
+test("the browser reports each rendered window height", async () => {
+  const snapshot = twoWindowSnapshot();
+  const transport = makeTransport(snapshot);
+  const window = makeWindow();
+  let measure = null;
+  window.requestAnimationFrame = (callback) => { measure = callback; };
+  const { editor } = await installEditor(snapshot, transport, {
+    window,
+    measureViewports: true,
+  });
+  const split = editor.elements.frameRoot.children[0];
+  split.children[0].children[0].clientHeight = 180;
+  split.children[2].children[0].clientHeight = 252;
+  assert.ok(measure, "a measurement is scheduled after frame rendering");
+  measure();
+  await tick();
+  await tick();
+
+  assert.deepEqual(transport.requests.slice(0, 2), [
+    { kind: "viewport", window: 1, line_count: 10, height: 10, width: 80 },
+    { kind: "viewport", window: 3, line_count: 14, height: 14, width: 80 },
+  ]);
 });
 
 test("an edit updates every visible window on the same buffer", async () => {

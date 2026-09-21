@@ -377,6 +377,7 @@ export function createEditor(options = {}) {
   const nav = options.navigator ?? globalThis.navigator ?? {};
   const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
   const EventSourceImpl = options.EventSource ?? globalThis.EventSource;
+  const measureViewports = options.measureViewports !== false;
   const root = options.root ?? doc.getElementById("mica-editor");
   if (!root) return null;
   const debug = options.debug === true && typeof console !== "undefined" && !!console.debug;
@@ -408,6 +409,7 @@ export function createEditor(options = {}) {
     selectedWindow: null,
     windowStates: new Map(),
     windowElements: new Map(),
+    reportedViewportSizes: new Map(),
     keymapPlan: [],
     snapshot: null,
     pointLine: 0,
@@ -423,6 +425,7 @@ export function createEditor(options = {}) {
   let eventSource = null;
   let flushScheduled = false;
   let draggingSplit = null;
+  let viewportMeasurementScheduled = false;
   const postingBatches = new Map();
 
   function buildChrome() {
@@ -685,7 +688,13 @@ export function createEditor(options = {}) {
         return { predictor: "delete_forward_scalar", barrier: false };
       }
     }
-    if (item.kind === "pointer") return { predictor: "set_point", barrier: false };
+    if (item.kind === "viewport") return { predictor: "none", barrier: false };
+    if (item.kind === "pointer") {
+      if (item.window !== undefined && String(item.window) !== String(state.selectedWindow)) {
+        return { predictor: "none", barrier: true };
+      }
+      return { predictor: "set_point", barrier: false };
+    }
     if (item.kind === "key") {
       const sequence = state.pending ? `${state.pending} ${item.key}` : item.key;
       const plan = state.keymapPlan.find((row) => String(row.sequence || "") === sequence);
@@ -1095,6 +1104,56 @@ export function createEditor(options = {}) {
       viewport = selectedViewport;
       modeline = selectedModeline;
     }
+    scheduleViewportMeasurements();
+  }
+
+  function viewportSize(view) {
+    const style = win && typeof win.getComputedStyle === "function"
+      ? win.getComputedStyle(view)
+      : null;
+    const paddingY = style
+      ? (Number.parseFloat(style.paddingTop) || 0) + (Number.parseFloat(style.paddingBottom) || 0)
+      : 0;
+    const paddingX = style
+      ? (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0)
+      : 0;
+    const line = view.querySelector(".editor-line");
+    const rowHeight = Math.max(1, Number(line && line.offsetHeight) || 18);
+    const height = Math.max(1, Math.floor((Number(view.clientHeight) - paddingY) / rowHeight));
+    const fontSize = style ? Number.parseFloat(style.fontSize) || 14 : 14;
+    const charWidth = Math.max(1, fontSize * 0.6);
+    const measuredWidth = Number(view.clientWidth);
+    const width = Number.isFinite(measuredWidth) && measuredWidth > 0
+      ? Math.max(1, Math.floor((measuredWidth - paddingX) / charWidth))
+      : 80;
+    return { height, width };
+  }
+
+  function reportViewportSizes() {
+    viewportMeasurementScheduled = false;
+    for (const [key, elements] of state.windowElements) {
+      const size = viewportSize(elements.viewport);
+      const signature = `${size.height}:${size.width}`;
+      if (state.reportedViewportSizes.get(key) === signature) continue;
+      state.reportedViewportSizes.set(key, signature);
+      send({
+        kind: "viewport",
+        window: Number(key),
+        line_count: size.height,
+        height: size.height,
+        width: size.width,
+      });
+    }
+  }
+
+  function scheduleViewportMeasurements() {
+    if (!measureViewports || viewportMeasurementScheduled) return;
+    viewportMeasurementScheduled = true;
+    if (win && typeof win.requestAnimationFrame === "function") {
+      win.requestAnimationFrame(reportViewportSizes);
+    } else {
+      Promise.resolve().then(reportViewportSizes);
+    }
   }
 
   function dragRatio(event) {
@@ -1255,9 +1314,12 @@ export function createEditor(options = {}) {
       if (!panel) return;
       const targetWindow = Number(panel.dataset.window);
       const hasTargetWindow = Number.isSafeInteger(targetWindow);
+      const targetState = state.windowStates.get(String(targetWindow));
+      const targetIsPicker = targetState && targetState.picker === true;
       const line = event.target.closest(".editor-line");
       if (!line || !line._row) {
-        if (hasTargetWindow && String(targetWindow) !== String(state.selectedWindow)) {
+        if (!targetIsPicker && hasTargetWindow &&
+            String(targetWindow) !== String(state.selectedWindow)) {
           selectWindowLocally(targetWindow);
           send({ kind: "select_window", window: targetWindow });
         }
@@ -1277,7 +1339,8 @@ export function createEditor(options = {}) {
         }
       }
       if (utf16 === null) {
-        if (hasTargetWindow && String(targetWindow) !== String(state.selectedWindow)) {
+        if (!targetIsPicker && hasTargetWindow &&
+            String(targetWindow) !== String(state.selectedWindow)) {
           selectWindowLocally(targetWindow);
           send({ kind: "select_window", window: targetWindow });
         }
@@ -1293,7 +1356,7 @@ export function createEditor(options = {}) {
       } else if (hasTargetWindow) {
         pointer.window = targetWindow;
       }
-      if (pointer.window !== undefined) selectWindowLocally(pointer.window);
+      if (!targetIsPicker && pointer.window !== undefined) selectWindowLocally(pointer.window);
       send(pointer);
     });
 
@@ -1308,6 +1371,7 @@ export function createEditor(options = {}) {
     }
     if (win && win.addEventListener) {
       win.addEventListener("focus", () => inputTarget.focus());
+      win.addEventListener("resize", scheduleViewportMeasurements);
       win.addEventListener("mousemove", updateDividerDrag);
       win.addEventListener("mouseup", finishDividerDrag);
     }

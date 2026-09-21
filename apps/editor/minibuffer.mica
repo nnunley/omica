@@ -77,6 +77,9 @@ end
 
 // Retracts the prompt and retires its buffer. Tolerant of missing facts.
 verb editor/minibuffer_clear(session)
+  if editor/picker_active(session)
+    editor/picker_clear(session, editor/session_frame(session))
+  end
   let request = 1
   let requests = editor/ActiveMinibuffer(session, ?r)
   if requests
@@ -125,6 +128,23 @@ verb editor/minibuffer_accept(session, frame, window, input)
   let value = editor/trim(buffer_text(buffer))
   let request = editor/minibuffer_request_or_none(session)
 
+  let had_picker = editor/picker_active(session)
+  let accept_window = window
+  if had_picker
+    accept_window = editor/picker_origin_window(session)
+    let candidate = editor/picker_selected_candidate(session)
+    if candidate == none
+      return editor/result(
+        :ok,
+        session,
+        frame,
+        window,
+        {:message -> "No match (C-g or Esc cancels)", :barrier -> true}
+      )
+    end
+    value = candidate[:value]
+  end
+
   let kind = :command
   if request != none
     let kinds = editor/MinibufferCompletionKind(session, request, ?k)
@@ -158,16 +178,20 @@ verb editor/minibuffer_accept(session, frame, window, input)
   if continuation == none
     return editor/result(:ok, session, frame, window, {:message -> "No match", :barrier -> true})
   end
-  return invoke(
+  let accepted = invoke(
     continuation,
     {
       :session -> session,
       :frame -> frame,
-      :window -> window,
+      :window -> accept_window,
       :input -> input,
       :value -> value
     }
   )
+  if had_picker
+    accepted[:snapshot_required] = true
+  end
+  return accepted
 end
 
 // The M-x continuation: dispatch a registered command by name.
@@ -177,6 +201,25 @@ verb editor/minibuffer_accept_command(session, frame, window, input, value)
     return editor/result(:ok, session, frame, window, {:message -> "No match", :barrier -> true})
   end
   return editor/input_command(session, frame, window, editor/window_buffer(session, window), command, input)
+end
+
+// The buffer-picker continuation changes only its origin window. Candidate
+// values are internal buffer identities, not browser-supplied display names.
+verb editor/minibuffer_accept_buffer(session, frame, window, input, value)
+  if not editor/Buffer(value)
+    return editor/result(:ok, session, frame, window, {:message -> "No match", :barrier -> true})
+  end
+  if editor/window_buffer(session, window) != value
+    editor/window_show(session, window, value)
+    editor/frame_bump(session, frame)
+  end
+  return editor/result(
+    :ok,
+    session,
+    frame,
+    window,
+    {:barrier -> true, :snapshot_required -> true}
+  )
 end
 
 // Removes the last scalar of the prompt. There is no prompt cursor yet, so
@@ -191,7 +234,18 @@ verb editor/minibuffer_backspace(session, frame, window)
   if length > 0
     buffer_delete(buffer, length - 1, 1)
   end
-  return editor/result(:ok, session, frame, window, {:barrier -> false})
+  let snapshot_required = false
+  if editor/picker_active(session)
+    editor/picker_refresh(session)
+    snapshot_required = true
+  end
+  return editor/result(
+    :ok,
+    session,
+    frame,
+    window,
+    {:barrier -> false, :snapshot_required -> snapshot_required}
+  )
 end
 
 verb editor/minibuffer_clear_input(session, frame, window)
@@ -202,12 +256,30 @@ verb editor/minibuffer_clear_input(session, frame, window)
       buffer_delete(buffer, 0, length)
     end
   end
-  return editor/result(:ok, session, frame, window, {:barrier -> false})
+  let snapshot_required = false
+  if editor/picker_active(session)
+    editor/picker_refresh(session)
+    snapshot_required = true
+  end
+  return editor/result(
+    :ok,
+    session,
+    frame,
+    window,
+    {:barrier -> false, :snapshot_required -> snapshot_required}
+  )
 end
 
 verb editor/minibuffer_cancel(session, frame, window)
+  let had_picker = editor/picker_active(session)
   editor/minibuffer_clear(session)
-  return editor/result(:ok, session, frame, window, {:message -> "Quit", :barrier -> true})
+  return editor/result(
+    :ok,
+    session,
+    frame,
+    window,
+    {:message -> "Quit", :barrier -> true, :snapshot_required -> had_picker}
+  )
 end
 
 // Routes one input item while a prompt is active. C-g and Escape cancel,
@@ -229,6 +301,30 @@ verb editor/minibuffer_input(session, frame, window, input)
     if key == "C-u"
       return editor/minibuffer_clear_input(session, frame, window)
     end
+    if editor/picker_active(session)
+      if key == "C-n" || key == "<down>"
+        return editor/picker_move(session, frame, window, 1)
+      end
+      if key == "C-p" || key == "<up>"
+        return editor/picker_move(session, frame, window, -1)
+      end
+      if key == "C-v" || key == "<pagedown>"
+        return editor/picker_move(
+          session,
+          frame,
+          window,
+          editor/window_height(session, editor/picker_window(session))
+        )
+      end
+      if key == "M-v" || key == "<pageup>"
+        return editor/picker_move(
+          session,
+          frame,
+          window,
+          0 - editor/window_height(session, editor/picker_window(session))
+        )
+      end
+    end
     return editor/result(:ok, session, frame, window, {:barrier -> false})
   end
 
@@ -246,5 +342,16 @@ verb editor/minibuffer_input(session, frame, window, input)
   if text != ""
     buffer_insert(buffer, buffer_len(buffer), text)
   end
-  return editor/result(:ok, session, frame, window, {:barrier -> false})
+  let snapshot_required = false
+  if editor/picker_active(session)
+    editor/picker_refresh(session)
+    snapshot_required = true
+  end
+  return editor/result(
+    :ok,
+    session,
+    frame,
+    window,
+    {:barrier -> false, :snapshot_required -> snapshot_required}
+  )
 end

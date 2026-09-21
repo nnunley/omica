@@ -82,6 +82,8 @@ verb editor/define_default_commands()
     false
   )
   editor/command_define("other-window", :editor/other_window_command, :none, true, false)
+  // Buffers
+  editor/command_define("switch-to-buffer", :editor/switch_to_buffer_command, :none, true, false)
   // Minibuffer
   editor/command_define(
     "execute-extended-command",
@@ -159,6 +161,8 @@ verb editor/install_default_keymaps()
   editor/keymap_bind_named(:editor/global, "C-x 2", "split-window-below")
   editor/keymap_bind_named(:editor/global, "C-x 3", "split-window-right")
   editor/keymap_bind_named(:editor/global, "C-x o", "other-window")
+
+  editor/keymap_bind_named(:editor/global, "C-x b", "switch-to-buffer")
 
   editor/keymap_bind_named(:editor/global, "M-x", "execute-extended-command")
   return true

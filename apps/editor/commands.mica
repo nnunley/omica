@@ -683,8 +683,30 @@ verb editor/execute_extended_command(session, frame, window, buffer, point, mark
   if editor/minibuffer_active(session)
     return {:status -> :ok, :message -> "minibuffer is already active"}
   end
-  editor/minibuffer_begin(session, "M-x ", :command, :editor/minibuffer_accept_command)
-  return {:status -> :ok}
+  editor/picker_begin(
+    session,
+    frame,
+    window,
+    "M-x ",
+    :command,
+    :editor/minibuffer_accept_command
+  )
+  return {:status -> :ok, :snapshot_required -> true}
+end
+
+verb editor/switch_to_buffer_command(session, frame, window, buffer, point, mark, prefix_argument, input)
+  if editor/minibuffer_active(session)
+    return {:status -> :ok, :message -> "minibuffer is already active"}
+  end
+  editor/picker_begin(
+    session,
+    frame,
+    window,
+    "Switch to buffer: ",
+    :buffer,
+    :editor/minibuffer_accept_buffer
+  )
+  return {:status -> :ok, :snapshot_required -> true}
 end
 
 // --- Quit -------------------------------------------------------------------

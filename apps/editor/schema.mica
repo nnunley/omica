@@ -109,6 +109,18 @@ make_functional_relation(:editor/ActiveMinibuffer, 2, [0], :volatile)
 make_functional_relation(:editor/HistoryEntry, 4, [0, 1, 2], :volatile)
 make_functional_relation(:editor/HistoryHead, 3, [0, 1], :volatile)
 
+// --- Pickers ----------------------------------------------------------------
+
+make_functional_relation(:editor/PickerProvider, 2, [0])
+make_relation(:editor/Picker, 2, :volatile)
+make_functional_relation(:editor/PickerOriginWindow, 3, [0, 1], :volatile)
+make_functional_relation(:editor/PickerWindow, 3, [0, 1], :volatile)
+make_functional_relation(:editor/PickerBuffer, 3, [0, 1], :volatile)
+make_functional_relation(:editor/PickerCandidate, 4, [0, 1, 2], :volatile)
+make_functional_relation(:editor/PickerSelectedIndex, 3, [0, 1], :volatile)
+make_functional_relation(:editor/PickerSelectedKey, 3, [0, 1], :volatile)
+make_functional_relation(:editor/PickerGeneration, 3, [0, 1], :volatile)
+
 // --- Modes and local values -------------------------------------------------
 
 make_relation(:editor/MajorMode, 1)
