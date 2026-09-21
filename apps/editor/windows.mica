@@ -347,6 +347,30 @@ verb editor/window_set_size(session, window, height, width)
   return true
 end
 
+// Changes one split ratio after a browser divider drag. The ratio uses the
+// same 1 through 999 range as frame snapshots.
+verb editor/split_set_ratio(session, frame, split, ratio)
+  let kinds = editor/NodeKind(session, split, ?kind)
+  if not kinds
+    raise E_STATE, "not a live frame node"
+  end
+  let exactly {:kind -> kind} = kinds
+  if kind != :split
+    raise E_INVARG, "the frame node is not a split"
+  end
+  let clamped = ratio
+  if clamped < 1
+    clamped = 1
+  end
+  if clamped > 999
+    clamped = 999
+  end
+  retract editor/SplitRatio(session, split, _)
+  assert editor/SplitRatio(session, split, clamped)
+  editor/frame_bump(session, frame)
+  return clamped
+end
+
 verb editor/selected_window(session)
   let exactly {:window -> window} = editor/SelectedWindow(session, ?window)
   return window

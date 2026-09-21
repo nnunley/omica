@@ -395,6 +395,11 @@ window.
 `other-window` walks leaves in stable depth-first order. A positive argument moves forward. A
 negative argument moves backward.
 
+A frame snapshot includes the node id of each split. The browser uses this id during a divider
+drag. The browser changes the visible ratio during the drag. On release, it sends one
+`resize_split` item with the split id and ratio. Mica stores the ratio and increases the frame
+generation.
+
 ## 11. Point, mark, and viewport positions
 
 Each point and viewport start uses the existing marker relations. A session marker id is the
@@ -791,6 +796,7 @@ An item kind is one of:
 | `input` | `input_type`, optional `text` |
 | `paste` | `text` |
 | `pointer` | `scalar_offset`, `extend` |
+| `resize_split` | `split`, `ratio` |
 | `viewport` | `first_line`, `line_count`, `width`, `height` |
 | `focus` | `focused` |
 
@@ -1706,6 +1712,9 @@ The implementation is acceptable if all statements in this section are true:
 - An authoritative result can correct provisional text without data loss.
 - Point, mark, and selection survive edits through scalar coordinates.
 - Two windows can show one buffer with independent points.
+- An edit updates every visible window that shows its buffer.
+- Only the selected window shows the cursor.
+- A divider drag updates its Mica split ratio.
 - `C-x 2`, `C-x 3`, `C-x 0`, `C-x 1`, and `C-x o` update the Mica split tree.
 - `C-x b` and `C-x k` use display names without catalogue-name reuse.
 - `M-x` resolves only registered command identities.

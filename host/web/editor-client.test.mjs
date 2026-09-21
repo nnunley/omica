@@ -44,8 +44,11 @@ function makeElement(tag) {
     },
     dispatch(type, event) {
       if (!event.target) event.target = this;
+      if (!event.stopPropagation) {
+        event.stopPropagation = () => { event.cancelBubble = true; };
+      }
       for (const handler of listeners.get(type) || []) handler(event);
-      if (this.parentElement) this.parentElement.dispatch(type, event);
+      if (this.parentElement && !event.cancelBubble) this.parentElement.dispatch(type, event);
     },
     appendChild(child) {
       this._raw = undefined;
@@ -64,6 +67,9 @@ function makeElement(tag) {
     },
     setAttribute() {},
     focus() {},
+    getBoundingClientRect() {
+      return this._rect || { left: 0, top: 0, width: 1000, height: 800 };
+    },
     querySelector(selector) {
       const wanted = selector.replace(/^\./, "");
       const visit = (node) => {
@@ -108,6 +114,20 @@ function makeElement(tag) {
   return element;
 }
 
+function makeWindow() {
+  const listeners = new Map();
+  return {
+    addEventListener(type, handler) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(handler);
+    },
+    dispatch(type, event = {}) {
+      if (!event.preventDefault) event.preventDefault = () => {};
+      for (const handler of listeners.get(type) || []) handler(event);
+    },
+  };
+}
+
 function makeDocument(session) {
   const root = makeElement("div");
   root.dataset.session = session;
@@ -138,6 +158,37 @@ function baseSnapshot(overrides = {}) {
     minibuffer_active: false,
     minibuffer_prompt: "",
     minibuffer_text: "",
+    ...overrides,
+  };
+}
+
+function twoWindowSnapshot(overrides = {}) {
+  const first = {
+    ...baseSnapshot(),
+    window: 1,
+    buffer: "editor/buffer/shared",
+    rows: [{ line: 0, start: 0, stop: 2, text: "ab", complete: true }],
+    point: 1,
+    point_column: 1,
+  };
+  const second = {
+    ...first,
+    window: 3,
+    point: 2,
+    point_column: 2,
+  };
+  return {
+    ...first,
+    selected_window: 1,
+    windows: [first, second],
+    frame_tree: {
+      kind: "split",
+      node: 2,
+      axis: "vertical",
+      ratio: 500,
+      first: { kind: "window", window: 1 },
+      second: { kind: "window", window: 3 },
+    },
     ...overrides,
   };
 }
@@ -571,9 +622,99 @@ test("the frame tree renders every visible window", async () => {
   const { editor } = await installEditor(snapshot, transport);
   const split = editor.elements.frameRoot.children[0];
   assert.equal(split.className, "editor-split vertical");
-  assert.equal(split.children.length, 2);
+  assert.equal(split.children.length, 3);
+  assert.equal(split.children[1].className, "editor-divider vertical");
   assert.ok(editor.elements.frameRoot.textContent.includes("one"));
   assert.ok(editor.elements.frameRoot.textContent.includes("two"));
+});
+
+test("only the selected editor window paints a cursor", async () => {
+  const snapshot = twoWindowSnapshot({ selected_window: 3, window: 3, point: 2, point_column: 2 });
+  const transport = makeTransport(snapshot);
+  const { editor } = await installEditor(snapshot, transport);
+  const split = editor.elements.frameRoot.children[0];
+  const firstPanel = split.children[0];
+  const secondPanel = split.children[2];
+  assert.equal(firstPanel.querySelector(".editor-caret"), null);
+  assert.ok(secondPanel.querySelector(".editor-caret"));
+  assert.equal(firstPanel.className, "editor-window");
+  assert.equal(secondPanel.className, "editor-window selected");
+});
+
+test("an edit updates every visible window on the same buffer", async () => {
+  const snapshot = twoWindowSnapshot();
+  let resolveInput;
+  const transport = {
+    fetch: async (url, options = {}) => {
+      if (!options.method) return { ok: true, json: async () => snapshot };
+      return new Promise((resolve) => {
+        resolveInput = () => resolve({
+          ok: true,
+          json: async () => ({
+            through_sequence: 1,
+            result: {
+              status: "ok",
+              buffer: "editor/buffer/shared",
+              revision: 2,
+              edits: [{ at: 1, remove: 0, text: "X" }],
+              window: 1,
+              selected_window: 1,
+              point: 2,
+              point_line: 0,
+              point_column: 2,
+              mark: 2,
+              mark_active: false,
+              first_line: 0,
+              pending: "",
+              windows: [
+                { ...snapshot.windows[0], revision: 2, point: 2, point_column: 2 },
+                { ...snapshot.windows[1], revision: 2, point: 3, point_column: 3 },
+              ],
+            },
+          }),
+        });
+      });
+    },
+  };
+  const { editor } = await installEditor(snapshot, transport);
+  const input = editor.elements.inputTarget;
+  input.dispatch("beforeinput", { inputType: "insertText", data: "X", preventDefault() {} });
+  await tick();
+  let split = editor.elements.frameRoot.children[0];
+  assert.equal(split.children[0].children[0].textContent, "aXb");
+  assert.equal(split.children[2].children[0].textContent, "aXb");
+  assert.equal(split.children[2].querySelector(".editor-caret"), null);
+
+  resolveInput();
+  await tick();
+  split = editor.elements.frameRoot.children[0];
+  assert.equal(split.children[0].children[0].textContent, "aXb");
+  assert.equal(split.children[2].children[0].textContent, "aXb");
+  assert.equal(editor.state.windowStates.get("3").point, 3);
+});
+
+test("dragging a divider publishes one authoritative split ratio", async () => {
+  const snapshot = twoWindowSnapshot();
+  const transport = makeTransport(snapshot);
+  const window = makeWindow();
+  const { editor } = await installEditor(snapshot, transport, { window });
+  const split = editor.elements.frameRoot.children[0];
+  const divider = split.children[1];
+  divider.dispatch("mousedown", {
+    clientX: 500,
+    clientY: 0,
+    preventDefault() {},
+  });
+  window.dispatch("mousemove", { clientX: 750, clientY: 0 });
+  assert.equal(split.children[0].style.flexGrow, "750");
+  assert.equal(split.children[2].style.flexGrow, "250");
+  window.dispatch("mouseup", { clientX: 750, clientY: 0 });
+  await tick();
+  assert.deepEqual(transport.requests.at(-1), {
+    kind: "resize_split",
+    split: 2,
+    ratio: 750,
+  });
 });
 
 test("typing paints provisionally before the result arrives", async () => {

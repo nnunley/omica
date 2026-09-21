@@ -424,6 +424,20 @@ verb test/editor_windows_split_and_points()
   test/assert_equal(editor/selected_window(:editor/test/windows), fresh, "the new window is selected")
   test/assert_true(editor/frame_valid(:editor/test/windows, 1), "the frame stays valid")
 
+  let root = editor/frame_root(:editor/test/windows, 1)
+  let generation = editor/frame_generation(:editor/test/windows, 1)
+  let resized = test/editor_input(
+    :editor/test/endpoint,
+    :editor/test/windows,
+    1,
+    {:kind -> :resize_split, :split -> root, :ratio -> 700}
+  )
+  test/assert_equal(resized[:status], :ok, "a divider drag resizes the split")
+  test/assert_equal(resized[:snapshot_required], true, "a resize returns the frame")
+  let exactly {:ratio -> stored_ratio} = editor/SplitRatio(:editor/test/windows, root, ?ratio)
+  test/assert_equal(stored_ratio, 700, "the ratio is stored")
+  test/assert_equal(editor/frame_generation(:editor/test/windows, 1), generation + 1, "resize bumps the frame")
+
   // Point in the new window, then back in the first.
   let eol = test/editor_input(:editor/test/endpoint, :editor/test/windows, 1, {:kind -> :key, :key -> "C-e"})
   test/assert_equal(eol[:point], 11, "end of the buffer in the new window")
@@ -472,6 +486,8 @@ verb test/editor_windows_edit_rebases_both()
   test/assert_equal(buffer_text(buffer), "hel!lo world", "the edit landed")
   test/assert_equal(editor/window_point(:editor/test/windows, leaves[0]), 4, "the edited window advances")
   test/assert_equal(editor/window_point(:editor/test/windows, leaves[1]), 12, "the other window's point sticks after")
+  test/assert_equal(len(typed[:windows]), 2, "the edit reports both visible windows")
+  test/assert_equal(typed[:windows][1][:point], 12, "the other point is authoritative")
 
   return true
 end

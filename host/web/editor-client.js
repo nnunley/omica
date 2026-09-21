@@ -259,6 +259,7 @@ export function replayPredictions(rows, pointLine, pointColumn, entries, initial
   let markActive = mark !== null;
   let goalColumn = null;
   let complete = point !== null;
+  const edits = [];
 
   const applyEdit = (at, remove, text, nextPoint) => {
     const applied = applyEditsToRows(copy, [{ at, remove, text }]);
@@ -267,6 +268,7 @@ export function replayPredictions(rows, pointLine, pointColumn, entries, initial
       return;
     }
     copy = applied.rows;
+    edits.push({ at, remove, text });
     const inserted = scalarLength(text);
     if (mark !== null) {
       if (mark > at + remove) mark += inserted - remove;
@@ -363,6 +365,7 @@ export function replayPredictions(rows, pointLine, pointColumn, entries, initial
     mark,
     markActive,
     complete,
+    edits,
   };
 }
 
@@ -402,6 +405,9 @@ export function createEditor(options = {}) {
     baseRows: [],
     basePoint: { line: 0, column: 0 },
     baseMark: null,
+    selectedWindow: null,
+    windowStates: new Map(),
+    windowElements: new Map(),
     keymapPlan: [],
     snapshot: null,
     pointLine: 0,
@@ -416,6 +422,7 @@ export function createEditor(options = {}) {
   let frameRoot;
   let eventSource = null;
   let flushScheduled = false;
+  let draggingSplit = null;
   const postingBatches = new Map();
 
   function buildChrome() {
@@ -432,6 +439,7 @@ export function createEditor(options = {}) {
     modeline.className = "editor-modeline";
     panel.append(viewport, modeline);
     frameRoot.appendChild(panel);
+    state.windowElements.set("1", { panel, viewport, modeline });
 
     echo = doc.createElement("div");
     echo.className = "editor-echo";
@@ -750,38 +758,95 @@ export function createEditor(options = {}) {
 
   function applyAuthoritativeResult(result) {
     if (!result || result.status === "resync") return false;
-    let rows = state.baseRows;
-    if (Array.isArray(result.edits) && result.edits.length > 0) {
-      const applied = applyEditsToRows(rows, result.edits);
-      if (!applied.ok) return false;
-      rows = applied.rows;
-    }
-    const line = Number(result.point_line);
-    const column = Number(result.point_column);
-    if (!Number.isFinite(line) || !Number.isFinite(column) ||
-        offsetForPosition(rows, line, column) === null) {
-      return false;
-    }
-    if (result.first_line !== undefined && rows.length > 0 &&
-        Number(result.first_line) !== Number(rows[0].line)) {
-      return false;
+    const edits = Array.isArray(result.edits) ? result.edits : [];
+    const affectedBuffer = String(result.buffer ?? "");
+    if (edits.length > 0) {
+      for (const [key, windowState] of state.windowStates) {
+        if (String(windowState.buffer ?? "") !== affectedBuffer) continue;
+        const applied = applyEditsToRows(windowState.rows || [], edits);
+        if (!applied.ok) return false;
+        state.windowStates.set(key, { ...windowState, rows: applied.rows });
+      }
     }
 
-    state.baseRows = rows;
-    state.basePoint = { line, column };
-    state.baseMark = result.mark_active ? Number(result.mark) : null;
+    if (Array.isArray(result.windows)) {
+      for (const summary of result.windows) {
+        const key = String(summary.window);
+        const previous = state.windowStates.get(key);
+        if (!previous) return false;
+        const rows = previous.rows || [];
+        if (summary.first_line !== undefined && rows.length > 0 &&
+            Number(summary.first_line) !== Number(rows[0].line)) {
+          return false;
+        }
+        state.windowStates.set(key, { ...previous, ...summary, rows });
+      }
+    }
+
+    const selectedKey = String(result.selected_window ?? result.window ?? state.selectedWindow);
+    const selected = state.windowStates.get(selectedKey);
+    if (!selected) return false;
+    const selectedRows = selected.rows || [];
+    const line = Number(result.point_line ?? selected.point_line);
+    const column = Number(result.point_column ?? selected.point_column);
+    if (!Number.isFinite(line) || !Number.isFinite(column) ||
+        offsetForPosition(selectedRows, line, column) === null) {
+      return false;
+    }
+    state.windowStates.set(selectedKey, {
+      ...selected,
+      ...result,
+      rows: selectedRows,
+      point_line: line,
+      point_column: column,
+    });
+    state.selectedWindow = selectedKey;
     state.authoritativePending = result.pending || "";
     if (Array.isArray(result.keymap_plan)) state.keymapPlan = result.keymap_plan;
     state.snapshot = {
       ...(state.snapshot || {}),
       ...result,
-      rows,
+      selected_window: result.selected_window ?? result.window,
+      windows: Array.from(state.windowStates.values()),
+      rows: selectedRows,
       point_line: line,
       point_column: column,
       keymap_plan: state.keymapPlan,
     };
+    syncSelectedWindow();
     updatePredictedPending();
     return true;
+  }
+
+  function rebaseOffset(offset, edits) {
+    let rebased = Number(offset);
+    for (const edit of edits) {
+      const at = Number(edit.at);
+      const remove = Number(edit.remove || 0);
+      const inserted = scalarLength(String(edit.text || ""));
+      if (rebased > at + remove) rebased += inserted - remove;
+      else if (rebased >= at) rebased = at + inserted;
+    }
+    return rebased;
+  }
+
+  function syncSelectedWindow() {
+    const selected = state.windowStates.get(String(state.selectedWindow));
+    if (!selected) return;
+    state.baseRows = selected.rows || [];
+    state.basePoint = {
+      line: Number(selected.point_line || 0),
+      column: Number(selected.point_column || 0),
+    };
+    state.baseMark = selected.mark_active ? Number(selected.mark) : null;
+    for (const [key, elements] of state.windowElements) {
+      const active = key === String(state.selectedWindow);
+      elements.panel.className = active ? "editor-window selected" : "editor-window";
+      if (active) {
+        viewport = elements.viewport;
+        modeline = elements.modeline;
+      }
+    }
   }
 
   function paintProvisional() {
@@ -792,34 +857,96 @@ export function createEditor(options = {}) {
     let rows = state.baseRows;
     let line = state.basePoint.line;
     let column = state.basePoint.column;
+    let predictedEdits = [];
     if (!inMinibuffer) {
       const replayed = replayPredictions(rows, line, column, pendingEntries(), state.baseMark);
       rows = replayed.rows;
       line = replayed.line;
       column = replayed.column;
+      predictedEdits = replayed.edits;
     }
     state.pointLine = line;
     state.pointColumn = column;
-    paint(rows, line, column);
+    const selectedKey = String(state.selectedWindow);
+    const selected = state.windowStates.get(selectedKey) || state.snapshot || {};
+    for (const [key, elements] of state.windowElements) {
+      const windowState = state.windowStates.get(key);
+      if (!windowState) continue;
+      if (key === selectedKey) {
+        paintRows(elements.viewport, elements.modeline, selected, rows, line, column, true);
+        continue;
+      }
+      let otherRows = windowState.rows || [];
+      let otherLine = Number(windowState.point_line || 0);
+      let otherColumn = Number(windowState.point_column || 0);
+      if (!inMinibuffer && predictedEdits.length > 0 &&
+          String(windowState.buffer) === String(selected.buffer)) {
+        let complete = true;
+        for (const edit of predictedEdits) {
+          const applied = applyEditsToRows(otherRows, [edit]);
+          if (!applied.ok) {
+            complete = false;
+            break;
+          }
+          otherRows = applied.rows;
+        }
+        if (complete) {
+          const placed = positionForOffset(
+            otherRows,
+            rebaseOffset(windowState.point, predictedEdits),
+          );
+          if (placed) {
+            otherLine = placed.line;
+            otherColumn = placed.column;
+          }
+        }
+      }
+      paintRows(
+        elements.viewport,
+        elements.modeline,
+        windowState,
+        otherRows,
+        otherLine,
+        otherColumn,
+        false,
+      );
+    }
+    renderEcho();
+    placeInputTarget();
   }
 
   function render(snapshot) {
     state.session = snapshot.session || state.session;
     state.authoritativePending = snapshot.pending || "";
-    state.baseRows = snapshot.rows || [];
-    state.basePoint = {
-      line: snapshot.point_line || 0,
-      column: snapshot.point_column || 0,
-    };
-    state.baseMark = snapshot.mark_active ? Number(snapshot.mark) : null;
+    state.windowStates = new Map();
+    const windows = Array.isArray(snapshot.windows) && snapshot.windows.length > 0
+      ? snapshot.windows
+      : [snapshot];
+    for (const entry of windows) {
+      state.windowStates.set(String(entry.window ?? snapshot.window ?? 1), {
+        ...entry,
+        rows: entry.rows || [],
+      });
+    }
+    state.selectedWindow = String(snapshot.selected_window ?? snapshot.window ?? 1);
     if (Array.isArray(snapshot.keymap_plan)) state.keymapPlan = snapshot.keymap_plan;
     state.snapshot = snapshot;
+    syncSelectedWindow();
     updatePredictedPending();
     renderFrame(snapshot);
+    syncSelectedWindow();
     paintProvisional();
   }
 
-  function paintRows(targetViewport, targetModeline, windowSnapshot, rows, pointLine, pointColumn) {
+  function paintRows(
+    targetViewport,
+    targetModeline,
+    windowSnapshot,
+    rows,
+    pointLine,
+    pointColumn,
+    showCaret = true,
+  ) {
     const previous = targetViewport._editorRows || new Map();
     const next = new Map();
     const ordered = [];
@@ -830,10 +957,11 @@ export function createEditor(options = {}) {
       line._row = row;
       line._window = windowSnapshot.window;
       const text = row.text || "";
-      const renderKey = `${text}\u0000${row.line === pointLine ? pointColumn : -1}`;
+      const caretColumn = showCaret && row.line === pointLine ? pointColumn : -1;
+      const renderKey = `${text}\u0000${caretColumn}`;
       if (line._editorRenderKey !== renderKey) {
         line.replaceChildren();
-        if (row.line === pointLine) {
+        if (caretColumn >= 0) {
           const utf16 = utf16OffsetForScalar(text, pointColumn);
           line.appendChild(doc.createTextNode(text.slice(0, utf16)));
           const caret = doc.createElement("span");
@@ -852,11 +980,16 @@ export function createEditor(options = {}) {
       const line = previous.get("__empty") || doc.createElement("div");
       line.className = "editor-line";
       line._window = windowSnapshot.window;
-      if (line._editorRenderKey !== "empty") {
-        const caret = doc.createElement("span");
-        caret.className = "editor-caret";
-        line.replaceChildren(caret);
-        line._editorRenderKey = "empty";
+      const emptyKey = showCaret ? "empty-caret" : "empty";
+      if (line._editorRenderKey !== emptyKey) {
+        if (showCaret) {
+          const caret = doc.createElement("span");
+          caret.className = "editor-caret";
+          line.replaceChildren(caret);
+        } else {
+          line.replaceChildren();
+        }
+        line._editorRenderKey = emptyKey;
       }
       next.set("__empty", line);
       ordered.push(line);
@@ -878,7 +1011,7 @@ export function createEditor(options = {}) {
 
   function renderFrame(snapshot) {
     if (!snapshot.frame_tree || !Array.isArray(snapshot.windows)) return;
-    const windows = new Map(snapshot.windows.map((entry) => [String(entry.window), entry]));
+    state.windowElements = new Map();
     let selectedViewport = null;
     let selectedModeline = null;
 
@@ -891,12 +1024,35 @@ export function createEditor(options = {}) {
         const ratio = Math.max(1, Math.min(999, Number(node.ratio) || 500));
         first.style.flexGrow = String(ratio);
         second.style.flexGrow = String(1000 - ratio);
-        split.append(first, second);
+        const divider = doc.createElement("div");
+        divider.className = `editor-divider ${node.axis || "horizontal"}`;
+        divider.dataset.split = String(node.node);
+        divider.setAttribute("role", "separator");
+        divider.setAttribute(
+          "aria-orientation",
+          node.axis === "vertical" ? "vertical" : "horizontal",
+        );
+        divider.addEventListener("mousedown", (event) => {
+          event.preventDefault();
+          if (event.stopPropagation) event.stopPropagation();
+          const rect = split.getBoundingClientRect();
+          draggingSplit = {
+            split: Number(node.node),
+            axis: node.axis || "horizontal",
+            rect,
+            first,
+            second,
+            ratio,
+          };
+          inputTarget.focus();
+        });
+        split.append(first, divider, second);
         return split;
       }
-      const data = windows.get(String(node && node.window)) || snapshot;
+      const key = String(node && node.window);
+      const data = state.windowStates.get(key) || snapshot;
       const panel = doc.createElement("div");
-      const selected = String(data.window) === String(snapshot.selected_window || snapshot.window);
+      const selected = key === String(state.selectedWindow);
       panel.className = selected ? "editor-window selected" : "editor-window";
       panel.dataset.window = String(data.window);
       const view = doc.createElement("pre");
@@ -906,7 +1062,16 @@ export function createEditor(options = {}) {
       const mode = doc.createElement("div");
       mode.className = "editor-modeline";
       panel.append(view, mode);
-      paintRows(view, mode, data, data.rows || [], data.point_line || 0, data.point_column || 0);
+      paintRows(
+        view,
+        mode,
+        data,
+        data.rows || [],
+        data.point_line || 0,
+        data.point_column || 0,
+        selected,
+      );
+      state.windowElements.set(key, { panel, viewport: view, modeline: mode });
       if (selected) {
         selectedViewport = view;
         selectedModeline = mode;
@@ -921,12 +1086,35 @@ export function createEditor(options = {}) {
     }
   }
 
-  function paint(rows, pointLine, pointColumn) {
-    const snapshot = state.snapshot || {};
-    paintRows(viewport, modeline, snapshot, rows, pointLine, pointColumn);
+  function dragRatio(event) {
+    if (!draggingSplit) return null;
+    const vertical = draggingSplit.axis === "vertical";
+    const start = vertical ? draggingSplit.rect.left : draggingSplit.rect.top;
+    const size = vertical ? draggingSplit.rect.width : draggingSplit.rect.height;
+    const coordinate = vertical ? event.clientX : event.clientY;
+    if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(coordinate)) return null;
+    return Math.max(1, Math.min(999, Math.round(((coordinate - start) / size) * 1000)));
+  }
 
-    renderEcho();
-    placeInputTarget();
+  function updateDividerDrag(event) {
+    const ratio = dragRatio(event);
+    if (ratio === null) return;
+    event.preventDefault();
+    draggingSplit.ratio = ratio;
+    draggingSplit.first.style.flexGrow = String(ratio);
+    draggingSplit.second.style.flexGrow = String(1000 - ratio);
+  }
+
+  function finishDividerDrag(event) {
+    if (!draggingSplit) return;
+    updateDividerDrag(event);
+    const item = {
+      kind: "resize_split",
+      split: draggingSplit.split,
+      ratio: draggingSplit.ratio,
+    };
+    draggingSplit = null;
+    send(item);
   }
 
   function renderEcho() {
@@ -1088,6 +1276,8 @@ export function createEditor(options = {}) {
     }
     if (win && win.addEventListener) {
       win.addEventListener("focus", () => inputTarget.focus());
+      win.addEventListener("mousemove", updateDividerDrag);
+      win.addEventListener("mouseup", finishDividerDrag);
     }
   }
 

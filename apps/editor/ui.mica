@@ -107,6 +107,7 @@ verb editor/frame_snapshot_node(session, node)
   let exactly {:second -> second} = editor/SplitSecond(session, node, ?second)
   return {
     :kind -> :split,
+    :node -> node,
     :axis -> axis,
     :ratio -> ratio,
     :first -> editor/frame_snapshot_node(session, first),

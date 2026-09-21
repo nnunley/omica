@@ -146,6 +146,35 @@ verb editor/window_for_buffer(session, buffer)
   return selected
 end
 
+// Compact state for one visible window. Text rows stay in the browser's
+// replica; an edit delta updates every window that shows the changed buffer.
+verb editor/window_result_state(session, window)
+  let buffer = editor/window_buffer(session, window)
+  let point = editor/window_point(session, window)
+  let placed = buffer_position_line_column(buffer, point)
+  return {
+    :window -> window,
+    :buffer -> buffer,
+    :revision -> buffer_revision(buffer),
+    :point -> point,
+    :point_line -> placed[:line],
+    :point_column -> placed[:column],
+    :first_line -> editor/window_first_line(session, window),
+    :buffer_name -> editor/buffer_display_name(buffer),
+    :modified -> editor/buffer_modified(buffer),
+    :mark -> editor/mark_position(session, buffer),
+    :mark_active -> editor/mark_active(session, buffer)
+  }
+end
+
+verb editor/frame_window_result_states(session, frame)
+  let states = []
+  for window in editor/window_leaves(session, frame)
+    states = [@states, editor/window_result_state(session, window)]
+  end
+  return states
+end
+
 verb editor/result(status, session, frame, window, extra)
   // Panel state follows the current selection: a command may have moved it.
   let current = editor/selected_window(session)
@@ -165,6 +194,7 @@ verb editor/result(status, session, frame, window, extra)
     :session -> session,
     :frame -> frame,
     :window -> current,
+    :selected_window -> current,
     :buffer -> buffer,
     :revision -> buffer_revision(buffer),
     :point -> point,
@@ -192,6 +222,9 @@ verb editor/result(status, session, frame, window, extra)
   }
   for pair in map_pairs(extra)
     base[pair[0]] = pair[1]
+  end
+  if base[:edits] != []
+    base[:windows] = editor/frame_window_result_states(session, frame)
   end
   // JSON cannot encode an absent option; the browser reads null instead.
   if base[:message] == none
@@ -404,6 +437,19 @@ verb editor/input_pointer(session, frame, window, buffer, input)
   return editor/result(:ok, session, frame, window, {:barrier -> true})
 end
 
+verb editor/input_resize_split(session, frame, window, input)
+  let split = index_or(input, :split, 0)
+  let ratio = index_or(input, :ratio, 500)
+  editor/split_set_ratio(session, frame, split, ratio)
+  return editor/result(
+    :ok,
+    session,
+    frame,
+    window,
+    {:barrier -> true, :snapshot_required -> true}
+  )
+end
+
 // The host calls this once per admitted item. It never sends a command
 // selector; Mica resolves the item against the active keymaps.
 verb editor_input(endpoint, session, frame, item, client_token)
@@ -428,13 +474,13 @@ verb editor_input(endpoint, session, frame, item, client_token)
       buffer = editor/window_buffer(session, window)
     end
   end
-  if editor/minibuffer_active(session) && kind != :viewport && kind != :focus
+  if editor/minibuffer_active(session) && kind != :viewport && kind != :focus && kind != :resize_split
     return editor/minibuffer_input(session, frame, window, input)
   end
   // A text or paste item is never a chord. If a stale prefix is still pending
   // (an older client, a disconnected one), drop it rather than letting it
   // swallow every later key.
-  if kind != :key && kind != :pointer && kind != :viewport && kind != :focus
+  if kind != :key && kind != :pointer && kind != :viewport && kind != :focus && kind != :resize_split
     if editor/pending_keys(session) != ""
       editor/set_pending_keys(session, "")
     end
@@ -467,6 +513,9 @@ verb editor_input(endpoint, session, frame, item, client_token)
   end
   if kind == :pointer
     return editor/input_pointer(session, frame, window, buffer, input)
+  end
+  if kind == :resize_split
+    return editor/input_resize_split(session, frame, window, input)
   end
   return editor/result(
     :rejected,
