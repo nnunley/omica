@@ -375,7 +375,7 @@ transaction_buffer_edit :: proc(
 	kernel := transaction.kernel
 
 	metadata, known := transaction_relation_metadata(transaction, relation)
-	if !known || metadata.storage != .Buffer {
+	if !known || metadata.storage != .Buffer || metadata.tombstoned {
 		return .Unknown_Relation
 	}
 
@@ -394,7 +394,10 @@ transaction_buffer_edit :: proc(
 			// block; its content starts empty.
 			writes.staged = true
 		case:
-			return .Unknown_Relation
+			// A published buffer with no block is an empty buffer: content is
+			// materialized only once a buffer is first written. Treat it as
+			// empty, exactly as `transaction_buffer_apply` does.
+			writes.staged = true
 		}
 	}
 
@@ -435,7 +438,7 @@ transaction_buffer_compact :: proc(
 ) -> Kernel_Error {
 	kernel := transaction.kernel
 	metadata, known := transaction_relation_metadata(transaction, relation)
-	if !known || metadata.storage != .Buffer {
+	if !known || metadata.storage != .Buffer || metadata.tombstoned {
 		return .Unknown_Relation
 	}
 
@@ -1208,7 +1211,7 @@ transaction_buffer_apply :: proc(
 	client_token: u64 = 0,
 ) -> Apply_Status {
 	metadata, known := transaction_relation_metadata(transaction, relation)
-	if !known || metadata.storage != .Buffer {
+	if !known || metadata.storage != .Buffer || metadata.tombstoned {
 		return .Unknown_Relation
 	}
 
@@ -1293,7 +1296,7 @@ transaction_buffer_revert :: proc(
 	expected_revision: u64,
 ) -> Revert_Status {
 	metadata, known := transaction_relation_metadata(transaction, relation)
-	if !known || metadata.storage != .Buffer {
+	if !known || metadata.storage != .Buffer || metadata.tombstoned {
 		return .Unknown_Relation
 	}
 

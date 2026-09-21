@@ -462,3 +462,130 @@ verb test/buffer_lines_projects_spans()
 
   return true
 end
+
+// --- Navigation -------------------------------------------------------------
+//
+// Cursor movement and viewport rendering need line and column arithmetic
+// without materializing whole lines.
+
+verb test/buffer_line_spans_address_lines()
+  make_buffer(:addressed, :durable)
+  buffer_insert(:addressed, 0, "alpha\nbeta\ngamma")
+
+  let first = buffer_line_span(:addressed, 0)
+  test/assert_equal(first[:start], 0, "first line start")
+  test/assert_equal(first[:stop], 5, "first line stop excludes the newline")
+
+  let middle = buffer_line_span(:addressed, 1)
+  test/assert_equal(middle[:start], 6, "middle line start")
+  test/assert_equal(middle[:stop], 10, "middle line stop")
+
+  let last = buffer_line_span(:addressed, 2)
+  test/assert_equal(last[:start], 11, "last line start")
+  test/assert_equal(last[:stop], 16, "last line stop at the buffer end")
+
+  test/assert_equal(buffer_line_span(:addressed, 3), none, "past the end is none")
+
+  // A trailing newline creates a final empty line.
+  make_buffer(:trailing, :durable)
+  buffer_insert(:trailing, 0, "one\n")
+  test/assert_equal(buffer_line_count(:trailing), 2, "trailing newline line count")
+  let empty = buffer_line_span(:trailing, 1)
+  test/assert_equal(empty[:start], 4, "empty last line start")
+  test/assert_equal(empty[:stop], 4, "empty last line stop")
+
+  return true
+end
+
+verb test/buffer_positions_convert_to_lines_and_columns()
+  make_buffer(:placed, :durable)
+  buffer_insert(:placed, 0, "alpha\nbeta\ngamma")
+
+  let start = buffer_position_line_column(:placed, 0)
+  test/assert_equal(start[:line], 0, "buffer start line")
+  test/assert_equal(start[:column], 0, "buffer start column")
+
+  // Offset 5 is the newline itself: still the end of line 0.
+  let newline = buffer_position_line_column(:placed, 5)
+  test/assert_equal(newline[:line], 0, "the newline stays on its line")
+  test/assert_equal(newline[:column], 5, "newline column")
+
+  let second = buffer_position_line_column(:placed, 6)
+  test/assert_equal(second[:line], 1, "second line")
+  test/assert_equal(second[:column], 0, "second line start")
+
+  let finish = buffer_position_line_column(:placed, 16)
+  test/assert_equal(finish[:line], 2, "buffer end line")
+  test/assert_equal(finish[:column], 5, "buffer end column")
+
+  // Past the end clamps.
+  let clamped = buffer_position_line_column(:placed, 99)
+  test/assert_equal(clamped[:line], 2, "clamped line")
+  test/assert_equal(clamped[:column], 5, "clamped column")
+
+  return true
+end
+
+verb test/buffer_line_columns_convert_to_offsets()
+  make_buffer(:locatable, :durable)
+  buffer_insert(:locatable, 0, "alpha\nbeta\ngamma")
+
+  test/assert_equal(buffer_line_column_offset(:locatable, 0, 2), 2, "inside the first line")
+  test/assert_equal(buffer_line_column_offset(:locatable, 1, 0), 6, "start of the second line")
+
+  // The column clamps to the logical line, not to the buffer.
+  test/assert_equal(buffer_line_column_offset(:locatable, 1, 99), 10, "clamped to the line end")
+  test/assert_equal(buffer_line_column_offset(:locatable, 2, 99), 16, "clamped at the buffer end")
+  test/assert_equal(buffer_line_column_offset(:locatable, 9, 0), 16, "a line past the end clamps")
+
+  return true
+end
+
+verb test/buffer_viewport_is_bounded()
+  make_buffer(:windowed, :durable)
+  buffer_insert(:windowed, 0, "alpha\nbeta\ngamma")
+
+  let whole = buffer_viewport(:windowed, 0, 3, 100)
+  test/assert_equal(len(whole), 3, "three rows")
+  test/assert_equal(whole[0][:line], 0, "first row line")
+  test/assert_equal(whole[0][:text], "alpha", "first row text")
+  test/assert_equal(whole[0][:start], 0, "first row start")
+  test/assert_equal(whole[0][:stop], 5, "first row stop")
+  test/assert_equal(whole[0][:complete], true, "first row complete")
+  test/assert_equal(whole[2][:text], "gamma", "last row text")
+
+  // The line count bounds the read.
+  let portion = buffer_viewport(:windowed, 1, 2, 100)
+  test/assert_equal(len(portion), 2, "two rows")
+  test/assert_equal(portion[0][:line], 1, "requested first line")
+
+  // The scalar budget truncates the row it reaches and marks it.
+  let cut = buffer_viewport(:windowed, 0, 1, 3)
+  test/assert_equal(len(cut), 1, "one truncated row")
+  test/assert_equal(cut[0][:text], "alp", "truncated fragment")
+  test/assert_equal(cut[0][:stop], 3, "truncated stop")
+  test/assert_equal(cut[0][:complete], false, "truncation is marked")
+
+  // A row that fits the budget is complete.
+  let fits = buffer_viewport(:windowed, 0, 1, 5)
+  test/assert_equal(fits[0][:text], "alpha", "complete fragment")
+  test/assert_equal(fits[0][:complete], true, "a complete row is marked")
+
+  // A longer read spans lines until the budget runs out; the row the budget
+  // cut is the second line, cut two scalars in.
+  let spanned = buffer_viewport(:windowed, 0, 10, 7)
+  test/assert_equal(len(spanned), 2, "budget stops the read")
+  test/assert_equal(buffer_viewport(:windowed, 1, 1, 2)[0][:text], "be", "cut fragment")
+  test/assert_equal(buffer_viewport(:windowed, 1, 1, 2)[0][:stop], 8, "cut at the budget")
+
+  // An exhausted budget still reports where the text stops.
+  let empty = buffer_viewport(:windowed, 0, 10, 0)
+  test/assert_equal(len(empty), 1, "one marker row")
+  test/assert_equal(empty[0][:text], "", "marker row has no text")
+  test/assert_equal(empty[0][:complete], false, "marker row is incomplete")
+
+  // Past the end is an empty relation.
+  test/assert_equal(len(buffer_viewport(:windowed, 9, 4, 100)), 0, "past the end is empty")
+
+  return true
+end

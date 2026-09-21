@@ -57,6 +57,12 @@ runtime_builtins := [?]Builtin_Spec {
 	{"buffer_slice", 3, builtin_buffer_slice},
 	{"buffer_find", 4, builtin_buffer_find},
 	{"buffer_lines", 3, builtin_buffer_lines},
+	// Navigation: bounded line and column arithmetic for cursor movement and
+	// viewport rendering, without materializing line text.
+	{"buffer_line_span", 2, builtin_buffer_line_span},
+	{"buffer_position_line_column", 2, builtin_buffer_position_line_column},
+	{"buffer_line_column_offset", 3, builtin_buffer_line_column_offset},
+	{"buffer_viewport", 4, builtin_buffer_viewport},
 	{"__set_field", 3, builtin_set_field},
 	{"__get_field", 2, builtin_get_field},
 	// `emit` is a no-op in this port: effects are not recorded (see

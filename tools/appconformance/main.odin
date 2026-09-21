@@ -21,7 +21,11 @@ import r "../../mica/runtime"
 import v "../../mica/var"
 import vm "../../mica/vm"
 
-COMPILER :: []string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"}
+COMPILER :: []string {
+	"apps/compiler/lex.mica",
+	"apps/compiler/parse.mica",
+	"apps/compiler/emit.mica",
+}
 
 // One conformance case: load `files`, run `setup` if non-empty, then call
 // `call` with `roles`. Each role's value names an identity in the world, so
@@ -45,20 +49,34 @@ Role_Name :: struct {
 }
 
 main :: proc() {
+	editor_files := []string {
+		"apps/shared/buffers.mica",
+		"apps/editor/schema.mica",
+		"apps/editor/windows.mica",
+		"apps/editor/buffers.mica",
+		"apps/editor/keymaps.mica",
+		"apps/editor/undo.mica",
+		"apps/editor/commands.mica",
+		"apps/editor/session.mica",
+		"apps/editor/minibuffer.mica",
+		"apps/editor/ui.mica",
+		"apps/editor/defaults.mica",
+		"apps/editor/tests/editor-scenarios.mica",
+	}
 	cases := []Case {
 		{
-			name  = "equipment-service: record calibration",
+			name = "equipment-service: record calibration",
 			files = []string{"apps/examples/equipment-service.mica"},
-			call  = "record_calibration",
+			call = "record_calibration",
 			roles = []Role_Name {
 				{role = "actor", identity = "technician"},
 				{role = "instrument", identity = "sensor_17"},
 			},
 		},
 		{
-			name  = "equipment-service: transfer",
+			name = "equipment-service: transfer",
 			files = []string{"apps/examples/equipment-service.mica"},
-			call  = "transfer",
+			call = "transfer",
 			roles = []Role_Name {
 				{role = "actor", identity = "alice"},
 				{role = "instrument", identity = "sensor_17"},
@@ -66,18 +84,18 @@ main :: proc() {
 			},
 		},
 		{
-			name  = "dependency-planner: mark unavailable",
+			name = "dependency-planner: mark unavailable",
 			files = []string{"apps/examples/dependency-planner.mica"},
-			call  = "mark_unavailable",
+			call = "mark_unavailable",
 			roles = []Role_Name {
 				{role = "actor", identity = "olivia"},
 				{role = "component", identity = "database"},
 			},
 		},
 		{
-			name  = "approval-workflow: approve",
+			name = "approval-workflow: approve",
 			files = []string{"apps/examples/approval-workflow.mica"},
-			call  = "approve",
+			call = "approve",
 			roles = []Role_Name {
 				{role = "actor", identity = "sam"},
 				{role = "request", identity = "office_supplies_request"},
@@ -85,8 +103,8 @@ main :: proc() {
 			},
 		},
 		{
-			name  = "mud core: loads and answers",
-			files = []string{
+			name = "mud core: loads and answers",
+			files = []string {
 				"apps/shared/string.mica",
 				"apps/shared/list.mica",
 				"apps/shared/events.mica",
@@ -97,8 +115,8 @@ main :: proc() {
 			call = "",
 		},
 		{
-			name  = "mud scenarios: substitutions only",
-			files = []string{
+			name = "mud scenarios: substitutions only",
+			files = []string {
 				"apps/shared/string.mica",
 				"apps/shared/list.mica",
 				"apps/shared/events.mica",
@@ -109,8 +127,8 @@ main :: proc() {
 			call = "test/event_substitutions_render_per_viewer",
 		},
 		{
-			name  = "mud scenarios: command parser and substitutions",
-			files = []string{
+			name = "mud scenarios: command parser and substitutions",
+			files = []string {
 				"apps/shared/string.mica",
 				"apps/shared/list.mica",
 				"apps/shared/events.mica",
@@ -122,49 +140,49 @@ main :: proc() {
 			call = "test/command_parser_records_structured_utility_events",
 		},
 		{
-			name  = "buffers: insert, read, measure",
+			name = "buffers: insert, read, measure",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffer_insert_read_and_measure",
+			call = "test/buffer_insert_read_and_measure",
 		},
 		{
-			name  = "buffers: view-relative offsets",
+			name = "buffers: view-relative offsets",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffer_offsets_are_view_relative",
+			call = "test/buffer_offsets_are_view_relative",
 		},
 		{
-			name  = "buffers: line accounting",
+			name = "buffers: line accounting",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffer_line_accounting",
+			call = "test/buffer_line_accounting",
 		},
 		{
-			name  = "buffers: scalars not bytes",
+			name = "buffers: scalars not bytes",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffer_scalars_not_bytes",
+			call = "test/buffer_scalars_not_bytes",
 		},
 		{
-			name  = "buffers: independent buffers",
+			name = "buffers: independent buffers",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffers_are_independent",
+			call = "test/buffers_are_independent",
 		},
 		{
-			name  = "buffers: compaction is accepted",
+			name = "buffers: compaction is accepted",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffer_compaction_is_accepted",
+			call = "test/buffer_compaction_is_accepted",
 		},
 		{
-			name  = "buffers: apply checks revision and order",
+			name = "buffers: apply checks revision and order",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffer_apply_checks_revision_and_order",
+			call = "test/buffer_apply_checks_revision_and_order",
 		},
 		{
-			name  = "buffers: conflict policy is selectable",
+			name = "buffers: conflict policy is selectable",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffer_conflict_policy_is_selectable",
+			call = "test/buffer_conflict_policy_is_selectable",
 		},
 		{
-			name  = "buffers: kill retires the name",
+			name = "buffers: kill retires the name",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/kill_buffer_retires_the_name",
+			call = "test/kill_buffer_retires_the_name",
 		},
 		{
 			// The completion is read on a later turn, so only the staging half
@@ -179,7 +197,7 @@ main :: proc() {
 			// a summary read on a later turn.
 			name  = "buffers: reversion splices an earlier revision",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			calls = []string{
+			calls = []string {
 				"test/buffer_revert_seed",
 				"test/buffer_revert_second_version",
 				"test/buffer_revert_third_version",
@@ -193,31 +211,172 @@ main :: proc() {
 			// transaction with a change.
 			name  = "buffers: compaction seals the view",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			calls = []string{
+			calls = []string {
 				"test/buffer_compaction_seed",
 				"test/buffer_compaction_refuses_a_moved_view",
 				"test/buffer_compaction_seals_the_view",
 			},
 		},
 		{
-			name  = "buffers: find locates and windows",
+			name = "buffers: find locates and windows",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffer_find_locates_and_windows",
+			call = "test/buffer_find_locates_and_windows",
 		},
 		{
-			name  = "buffers: the line projection",
+			name = "buffers: the line projection",
 			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
-			call  = "test/buffer_lines_projects_spans",
+			call = "test/buffer_lines_projects_spans",
+		},
+		{
+			name = "buffers: line spans address lines",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call = "test/buffer_line_spans_address_lines",
+		},
+		{
+			name = "buffers: positions convert to lines and columns",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call = "test/buffer_positions_convert_to_lines_and_columns",
+		},
+		{
+			name = "buffers: line columns convert to offsets",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call = "test/buffer_line_columns_convert_to_offsets",
+		},
+		{
+			name = "buffers: the viewport is bounded",
+			files = []string{"apps/buffers/tests/buffer-scenarios.mica"},
+			call = "test/buffer_viewport_is_bounded",
+		},
+		{
+			// The editor core is a Mica application. These cases compare the
+			// Odin compiler and the Mica emitter on its session, command
+			// loop, window tree, undo, and M-x paths.
+			name  = "editor: sessions and buffers",
+			files = editor_files,
+			call  = "test/editor_session_seeds_a_frame",
+		},
+		{
+			name = "editor: typing and key resolution",
+			files = editor_files,
+			call = "test/editor_typing_inserts_at_point",
+		},
+		{
+			name = "editor: consecutive Returns preserve the viewport",
+			files = editor_files,
+			calls = []string {
+				"test/editor_consecutive_returns_seed",
+				"test/editor_consecutive_returns_first",
+				"test/editor_consecutive_returns_second",
+			},
+		},
+		{
+			name = "editor: prefix and undefined keys",
+			files = editor_files,
+			calls = []string {
+				"test/editor_prefix_and_undefined_keys",
+				"test/editor_text_clears_a_stale_prefix",
+			},
+		},
+		{
+			name = "editor: movement and numeric arguments",
+			files = editor_files,
+			calls = []string {
+				"test/editor_movement_keeps_a_goal_column",
+				"test/editor_numeric_arguments",
+			},
+		},
+		{
+			name = "editor: undo and redo across commits",
+			files = editor_files,
+			calls = []string {
+				"test/editor_undo_seed",
+				"test/editor_undo_types_b",
+				"test/editor_undo_types_c",
+				"test/editor_undo_reverts_one_group",
+				"test/editor_undo_reports_nothing_left",
+				"test/editor_redo_reapplies_the_group",
+				"test/editor_redo_tail_undo",
+				"test/editor_redo_tail_type",
+				"test/editor_redo_tail_is_gone",
+			},
+		},
+		{
+			name = "editor: session and keymap invariants",
+			files = editor_files,
+			calls = []string {
+				"test/editor_session_seeds_a_frame",
+				"test/editor_session_create_is_idempotent",
+				"test/editor_session_rejects_a_different_actor",
+				"test/editor_word_and_keymap_invariants",
+			},
+		},
+		{
+			name = "editor: window split and independent points",
+			files = editor_files,
+			calls = []string {
+				"test/editor_windows_seed",
+				"test/editor_windows_split_and_points",
+				"test/editor_windows_edit_rebases_both",
+				"test/editor_window_tree_commands",
+			},
+		},
+		{
+			name = "editor: marks and regions",
+			files = editor_files,
+			calls = []string{"test/editor_marks_seed", "test/editor_marks_and_region"},
+		},
+		{
+			name = "editor: M-x runs a registered command",
+			files = editor_files,
+			call = "test/editor_max_runs_a_registered_command",
+		},
+		{
+			name = "editor: minibuffer editing and escape",
+			files = editor_files,
+			calls = []string {
+				"test/editor_minibuffer_editing",
+				"test/editor_minibuffer_survives_a_broken_prompt",
+			},
+		},
+		{
+			name = "editor: staged results finalize",
+			files = editor_files,
+			calls = []string {
+				"test/editor_staged_result_has_a_token",
+				"test/editor_result_finalizes",
+			},
+		},
+		{
+			name = "editor: the snapshot payload",
+			files = editor_files,
+			calls = []string {
+				"test/editor_snapshot_seed",
+				"test/editor_snapshot_reports_the_viewport",
+			},
+		},
+		{
+			name = "editor: the JSON input bridge",
+			files = editor_files,
+			calls = []string {
+				"test/editor_json_bridge_seed",
+				"test/editor_json_bridge_runs_items",
+				"test/editor_json_bridge_rejects_bad_json",
+			},
+		},
+		{
+			name = "editor: pointer items move point",
+			files = editor_files,
+			calls = []string{"test/editor_snapshot_seed", "test/editor_pointer_items_move_point"},
 		},
 		{
 			// The marker and annotation library spans commits: seed, a
 			// token-tagged apply, then a rebase by the committed delta.
 			name  = "buffers: markers rebase through a committed delta",
-			files = []string{
+			files = []string {
 				"apps/shared/buffers.mica",
 				"apps/buffers/tests/marker-scenarios.mica",
 			},
-			calls = []string{
+			calls = []string {
 				"test/marker_rebase_insertion_types",
 				"test/marker_rebase_shifts_and_collapses",
 				"test/marker_seed",
@@ -229,8 +388,8 @@ main :: proc() {
 			},
 		},
 		{
-			name  = "mud scenarios: social commands",
-			files = []string{
+			name = "mud scenarios: social commands",
+			files = []string {
 				"apps/shared/string.mica",
 				"apps/shared/list.mica",
 				"apps/shared/events.mica",
@@ -255,7 +414,11 @@ main :: proc() {
 			fmt.printf("FAIL %s: mica program did not run\n", entry.name)
 			fail += 1
 		case v.value_eq(baseline, emitted):
-			fmt.printf("ok   %s (%s)\n", entry.name, v.value_to_string(baseline, context.temp_allocator))
+			fmt.printf(
+				"ok   %s (%s)\n",
+				entry.name,
+				v.value_to_string(baseline, context.temp_allocator),
+			)
 			pass += 1
 		case:
 			fmt.printf(
@@ -296,10 +459,16 @@ compile_case :: proc(entry: Case) -> []u8 {
 		}
 		source = fmt.aprintf("%s\n%s", source, string(data))
 	}
-	outcome := r.world_call(world, "emit_source", []k.Role_Pair{{
-		role  = v.value_symbol(v.symbol_intern("source")),
-		value = v.value_string(context.allocator, source),
-	}})
+	outcome := r.world_call(
+		world,
+		"emit_source",
+		[]k.Role_Pair {
+			{
+				role = v.value_symbol(v.symbol_intern("source")),
+				value = v.value_string(context.allocator, source),
+			},
+		},
+	)
 	if outcome.kind != .Complete {
 		return nil
 	}
@@ -335,12 +504,7 @@ run_case :: proc(entry: Case, artifact: []u8) -> (v.Value, bool) {
 	defer k.kernel_destroy(&kernel)
 	// A mis-emitted loop is unbounded; the budget turns that into a failed
 	// case rather than a hung run.
-	world, start := r.world_start(
-		&kernel,
-		entry.files,
-		context.allocator,
-		r.HARNESS_CONFIG,
-	)
+	world, start := r.world_start(&kernel, entry.files, context.allocator, r.HARNESS_CONFIG)
 	if !start.ok {
 		return v.Value(0), false
 	}
@@ -403,7 +567,13 @@ run_case :: proc(entry: Case, artifact: []u8) -> (v.Value, bool) {
 			if error_value, is_error := v.value_as_error(outcome.error); is_error {
 				detail = error_value.message
 			}
-			fmt.eprintf("  [%s] call failed: kind=%v message=%s error=%s\n", entry.name, outcome.kind, outcome.message, detail)
+			fmt.eprintf(
+				"  [%s] call failed: kind=%v message=%s error=%s\n",
+				entry.name,
+				outcome.kind,
+				outcome.message,
+				detail,
+			)
 		}
 		return outcome.value, outcome.kind == .Complete
 	}
@@ -429,7 +599,13 @@ run_case :: proc(entry: Case, artifact: []u8) -> (v.Value, bool) {
 		if error_value, is_error := v.value_as_error(outcome.value); is_error {
 			detail = error_value.message
 		}
-		fmt.eprintf("  [%s] call failed: kind=%v message=%s detail=%s\n", entry.name, outcome.kind, outcome.message, detail)
+		fmt.eprintf(
+			"  [%s] call failed: kind=%v message=%s detail=%s\n",
+			entry.name,
+			outcome.kind,
+			outcome.message,
+			detail,
+		)
 		return v.Value(0), false
 	}
 	return outcome.value, true

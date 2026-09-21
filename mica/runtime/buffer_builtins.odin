@@ -11,6 +11,7 @@
 package mica_runtime
 
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 
 import buf "../buffer"
@@ -504,6 +505,244 @@ builtin_buffer_lines :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) 
 	result, relation_error := v.value_relation(state.allocator, heading, rows[:])
 	if relation_error != .None {
 		vm.vm_set_error(state, "E_INVARG", "buffer_lines could not build a relation")
+		return v.Value(0), false
+	}
+	return result, true
+}
+
+// --- Navigation -------------------------------------------------------------
+//
+// Cursor movement and viewport rendering need line and column arithmetic
+// without materializing line text. These four builtins are that surface: line
+// bounds, position conversion in both directions, and a bounded viewport read.
+
+// Computes the scalar bounds of one logical line. `stop` excludes the trailing
+// newline, so a buffer ending in a newline has a final empty line.
+@(private)
+buffer_line_bounds :: proc(root: ^buf.Piece_Node, line: u64) -> (start, stop: u64, found: bool) {
+	total_lines := buf.tree_line_count(root)
+	if line >= total_lines {
+		return 0, 0, false
+	}
+	start = buf.tree_line_start(root, line)
+	stop = buf.tree_scalars(root)
+	if line + 1 < total_lines {
+		stop = buf.tree_line_start(root, line + 1) - 1
+	}
+	return start, stop, true
+}
+
+// Returns the scalar span of one logical line without materializing its text,
+// or `none` for a line past the end.
+@(private)
+builtin_buffer_line_span :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 2 {
+		vm.vm_set_error(state, "E_INVARG", "buffer_line_span expects a buffer and a line")
+		return v.Value(0), false
+	}
+	root, ok := buffer_view(state, args[0])
+	if !ok {
+		return v.Value(0), false
+	}
+	line, line_ok := v.value_as_int(args[1])
+	if !line_ok || line < 0 {
+		vm.vm_set_error(
+			state,
+			"E_TYPE",
+			"buffer_line_span line must be a non-negative integer",
+		)
+		return v.Value(0), false
+	}
+	start, stop, found := buffer_line_bounds(root, u64(line))
+	if !found {
+		return option_none_value(state.allocator), true
+	}
+	entries := []v.Map_Entry {
+		{key = buffer_status("start"), value = buffer_int(i64(start))},
+		{key = buffer_status("stop"), value = buffer_int(i64(stop))},
+	}
+	return v.value_map(state.allocator, entries), true
+}
+
+// Converts a scalar offset to a logical line and a scalar column. An offset
+// past the end clamps to the buffer end.
+@(private)
+builtin_buffer_position_line_column :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 2 {
+		vm.vm_set_error(
+			state,
+			"E_INVARG",
+			"buffer_position_line_column expects a buffer and an offset",
+		)
+		return v.Value(0), false
+	}
+	root, ok := buffer_view(state, args[0])
+	if !ok {
+		return v.Value(0), false
+	}
+	offset, offset_ok := v.value_as_int(args[1])
+	if !offset_ok || offset < 0 {
+		vm.vm_set_error(
+			state,
+			"E_TYPE",
+			"buffer_position_line_column offset must be a non-negative integer",
+		)
+		return v.Value(0), false
+	}
+	position := min(u64(offset), buf.tree_scalars(root))
+	line := buf.tree_line_of_scalar(root, position)
+	start := buf.tree_line_start(root, line)
+	entries := []v.Map_Entry {
+		{key = buffer_status("line"), value = buffer_int(i64(line))},
+		{key = buffer_status("column"), value = buffer_int(i64(position - start))},
+	}
+	return v.value_map(state.allocator, entries), true
+}
+
+// Converts a logical line and a scalar column to a scalar offset, clamping the
+// column to the line. A line past the end clamps to the buffer end.
+@(private)
+builtin_buffer_line_column_offset :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 3 {
+		vm.vm_set_error(
+			state,
+			"E_INVARG",
+			"buffer_line_column_offset expects a buffer, a line, and a column",
+		)
+		return v.Value(0), false
+	}
+	root, ok := buffer_view(state, args[0])
+	if !ok {
+		return v.Value(0), false
+	}
+	line, line_ok := v.value_as_int(args[1])
+	column, column_ok := v.value_as_int(args[2])
+	if !line_ok || !column_ok || line < 0 || column < 0 {
+		vm.vm_set_error(
+			state,
+			"E_TYPE",
+			"buffer_line_column_offset line and column must be non-negative integers",
+		)
+		return v.Value(0), false
+	}
+	total := buf.tree_scalars(root)
+	if u64(line) >= buf.tree_line_count(root) {
+		return buffer_int(i64(total)), true
+	}
+	start, stop, _ := buffer_line_bounds(root, u64(line))
+	offset := min(start + u64(column), stop)
+	return buffer_int(i64(offset)), true
+}
+
+// Builds one `buffer_viewport` row.
+@(private)
+buffer_viewport_row :: proc(
+	allocator: mem.Allocator,
+	name: v.Symbol,
+	line, start, stop: u64,
+	text: string,
+	complete: bool,
+) -> v.Tuple {
+	row := make([]v.Value, 6, allocator)
+	row[0] = v.value_symbol(name)
+	row[1] = buffer_int(i64(line))
+	row[2] = buffer_int(i64(start))
+	row[3] = buffer_int(i64(stop))
+	row[4] = v.value_string(allocator, text)
+	row[5] = v.value_bool(complete)
+	return v.tuple_new(allocator, row)
+}
+
+// Projects a bounded viewport: at most `lines` rows and at most `max_scalars`
+// scalars of text, in the shape `[:buffer, :line, :start, :stop, :text,
+// :complete]`. A row the scalar budget cut has `:complete -> false` and ends
+// the read. No text outside the budget is materialized.
+@(private)
+builtin_buffer_viewport :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
+	if len(args) != 4 {
+		vm.vm_set_error(
+			state,
+			"E_INVARG",
+			"buffer_viewport expects a buffer, a first line, a line count, and a scalar budget",
+		)
+		return v.Value(0), false
+	}
+	root, ok := buffer_view(state, args[0])
+	if !ok {
+		return v.Value(0), false
+	}
+	name, _ := v.value_as_symbol(args[0])
+	first, first_ok := v.value_as_int(args[1])
+	lines, lines_ok := v.value_as_int(args[2])
+	budget, budget_ok := v.value_as_int(args[3])
+	if !first_ok || !lines_ok || !budget_ok || first < 0 || lines < 0 || budget < 0 {
+		vm.vm_set_error(
+			state,
+			"E_TYPE",
+			"buffer_viewport line and budget arguments must be non-negative integers",
+		)
+		return v.Value(0), false
+	}
+
+	total_lines := buf.tree_line_count(root)
+	rows: [dynamic]v.Tuple
+	rows = make([dynamic]v.Tuple, 0, state.allocator)
+	used := u64(0)
+	limit := u64(budget)
+	line := u64(first)
+	for line < total_lines && len(rows) < int(lines) {
+		start, stop, _ := buffer_line_bounds(root, line)
+		length := stop - start
+		remaining := limit - used
+		if length > remaining {
+			fragment, slice_error := buf.tree_slice(
+				root,
+				start,
+				start + remaining,
+				state.allocator,
+			)
+			if slice_error != .None {
+				vm.vm_set_error(state, "E_RANGE", "buffer_viewport could not read a line")
+				return v.Value(0), false
+			}
+			append(
+				&rows,
+				buffer_viewport_row(
+					state.allocator,
+					name,
+					line,
+					start,
+					start + remaining,
+					fragment,
+					false,
+				),
+			)
+			break
+		}
+		text, slice_error := buf.tree_slice(root, start, stop, state.allocator)
+		if slice_error != .None {
+			vm.vm_set_error(state, "E_RANGE", "buffer_viewport could not read a line")
+			return v.Value(0), false
+		}
+		append(
+			&rows,
+			buffer_viewport_row(state.allocator, name, line, start, stop, text, true),
+		)
+		used += length
+		line += 1
+	}
+
+	heading := []v.Symbol {
+		v.symbol_intern("buffer"),
+		v.symbol_intern("line"),
+		v.symbol_intern("start"),
+		v.symbol_intern("stop"),
+		v.symbol_intern("text"),
+		v.symbol_intern("complete"),
+	}
+	result, relation_error := v.value_relation(state.allocator, heading, rows[:])
+	if relation_error != .None {
+		vm.vm_set_error(state, "E_INVARG", "buffer_viewport could not build a relation")
 		return v.Value(0), false
 	}
 	return result, true

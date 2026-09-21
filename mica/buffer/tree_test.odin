@@ -41,7 +41,12 @@ check_tree_invariants :: proc(t: ^testing.T, node: ^Piece_Node, label: string) {
 	check_tree_invariants(t, right, label)
 
 	testing.expectf(t, node.scalars == left.scalars + right.scalars, "%s: internal scalars", label)
-	testing.expectf(t, node.newlines == left.newlines + right.newlines, "%s: internal newlines", label)
+	testing.expectf(
+		t,
+		node.newlines == left.newlines + right.newlines,
+		"%s: internal newlines",
+		label,
+	)
 
 	expected_height := 1 + max(node_height(left), node_height(right))
 	testing.expectf(
@@ -117,9 +122,37 @@ test_tree_offset_and_line_lookup :: proc(t: ^testing.T) {
 	testing.expect_value(t, tree_line_of_scalar(root, 7), u64(2))
 }
 
+@(test)
+test_tree_line_lookup_across_joined_edits :: proc(t: ^testing.T) {
+	alloc, arena := test_allocator(t)
+	defer test_allocator_destroy(arena)
+
+	store: Store
+	store_init(&store, alloc)
+	defer store_destroy(&store)
+
+	root := tree_from_text(&store, "", .Original)
+	next := tree_edit(&store, root, 0, 0, "a", .Added)
+	tree_release(&store, root)
+	root = next
+	next = tree_edit(&store, root, 1, 0, "b", .Added)
+	tree_release(&store, root)
+	root = next
+	next = tree_edit(&store, root, 2, 0, "\n", .Added)
+	tree_release(&store, root)
+	root = next
+	defer tree_release(&store, root)
+
+	// Each edit is a separate tree. The newline is in a right subtree, so its
+	// scalar offset must include all text in the subtrees before it.
+	testing.expect_value(t, tree_text(root, alloc), "ab\n")
+	testing.expect_value(t, tree_line_start(root, 1), u64(3))
+	testing.expect_value(t, tree_line_of_scalar(root, 3), u64(1))
+}
+
 @(private)
 Span_Collector :: struct {
-	pieces: [dynamic]string,
+	pieces:  [dynamic]string,
 	offsets: [dynamic]u64,
 }
 
@@ -190,12 +223,7 @@ test_tree_split_and_join_round_trip :: proc(t: ^testing.T) {
 		)
 		joined := tree_join(&store, left, right)
 		check_tree_invariants(t, joined, "rejoined")
-		testing.expectf(
-			t,
-			tree_text(joined, alloc) == want,
-			"split/join at %d changed text",
-			at,
-		)
+		testing.expectf(t, tree_text(joined, alloc) == want, "split/join at %d changed text", at)
 		node_release(&store.nodes, left)
 		node_release(&store.nodes, right)
 		tree_release(&store, joined)
@@ -302,19 +330,13 @@ test_tree_provenance_matches_reference_model :: proc(t: ^testing.T) {
 				} else {
 					limit := remaining < 3 ? remaining : 3
 					count := 1 + int(next_random(&state) % limit)
-					text := insertion_sources[int(next_random(&state) % u64(len(insertion_sources)))]
+					text :=
+						insertion_sources[int(next_random(&state) % u64(len(insertion_sources)))]
 					edit = replace(int(at), count, text)
 				}
 			}
 
-			next_tree := tree_edit(
-				&store,
-				tree,
-				u64(edit.at),
-				u64(edit.remove),
-				edit.text,
-				.Added,
-			)
+			next_tree := tree_edit(&store, tree, u64(edit.at), u64(edit.remove), edit.text, .Added)
 			tree_release(&store, tree)
 			tree = next_tree
 
@@ -386,7 +408,11 @@ test_tree_provenance_reports_deletion_and_replacement :: proc(t: ^testing.T) {
 	deleted_delta, deleted_err := tree_provenance(&store, base, deleted, alloc)
 	testing.expect_value(t, deleted_err, Delta_Error.None)
 	testing.expect_value(t, len(deleted_delta.replacements), 1)
-	testing.expect_value(t, deleted_delta.replacements[0], Replacement{start = 1, end = 2, text = ""})
+	testing.expect_value(
+		t,
+		deleted_delta.replacements[0],
+		Replacement{start = 1, end = 2, text = ""},
+	)
 }
 
 // Complexity guard. A point edit must copy structure proportional to the tree's
@@ -486,10 +512,7 @@ test_tree_find_crosses_chunk_boundaries :: proc(t: ^testing.T) {
 
 	// Two chunks that meet in the middle of "needle": a byte-level scan of each
 	// chunk buffer cannot see the match, so the search must bridge them.
-	pieces := []Piece {
-		piece_of(&store, "haystac", alloc),
-		piece_of(&store, "kneedle", alloc),
-	}
+	pieces := []Piece{piece_of(&store, "haystac", alloc), piece_of(&store, "kneedle", alloc)}
 	root := tree_from_pieces(&store, pieces)
 	// The tree retains each chunk; drop the creator references.
 	for piece in pieces {

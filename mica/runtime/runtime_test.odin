@@ -6964,6 +6964,132 @@ test_buffer_builtins_mica_scenarios :: proc(t: ^testing.T) {
 		"test/buffer_compaction_seals_the_view",
 		"test/buffer_find_locates_and_windows",
 		"test/buffer_lines_projects_spans",
+		"test/buffer_line_spans_address_lines",
+		"test/buffer_positions_convert_to_lines_and_columns",
+		"test/buffer_line_columns_convert_to_offsets",
+		"test/buffer_viewport_is_bounded",
+	}
+	for verb in verbs {
+		outcome := world_call(world, verb, nil)
+		detail := outcome.message
+		if error_value, is_error := v.value_as_error(outcome.error); is_error {
+			detail = error_value.message
+		}
+		testing.expectf(
+			t,
+			outcome.kind == .Complete,
+			"%s: kind=%v message=%s",
+			verb,
+			outcome.kind,
+			detail,
+		)
+	}
+}
+
+// The editor core is a Mica application, so its acceptance tests are written
+// in Mica and driven here. Session state is volatile but in-memory, so the
+// verbs run in order against one world: later scenarios build on committed
+// history from earlier ones.
+@(test)
+test_editor_mica_scenarios :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	relative := []string {
+		"apps/shared/buffers.mica",
+		"apps/editor/schema.mica",
+		"apps/editor/windows.mica",
+		"apps/editor/buffers.mica",
+		"apps/editor/keymaps.mica",
+		"apps/editor/undo.mica",
+		"apps/editor/commands.mica",
+		"apps/editor/session.mica",
+		"apps/editor/minibuffer.mica",
+		"apps/editor/ui.mica",
+		"apps/editor/defaults.mica",
+		"apps/editor/tests/editor-scenarios.mica",
+	}
+	files := make([]string, len(relative), context.temp_allocator)
+	for path, index in relative {
+		files[index] = scenario_source_path(path)
+		if files[index] == "" {
+			testing.expectf(t, false, "editor filein not found: %s", path)
+			return
+		}
+	}
+
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expect(t, false, "cannot initialize test arena")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	world, start := world_start(&kernel, files, alloc)
+	if !start.ok {
+		testing.expectf(t, false, "editor scenarios failed to load: %s", start.message)
+		return
+	}
+	defer world_destroy(world)
+	started := world_wait(world, world.entry)
+	if started.kind != .Complete {
+		testing.expectf(
+			t,
+			false,
+			"editor scenario load task did not complete: %s",
+			started.message,
+		)
+		return
+	}
+
+	// Order matters: sessions, undo history, and buffer revisions accumulate.
+	verbs := []string {
+		"test/editor_session_seeds_a_frame",
+		"test/editor_session_create_is_idempotent",
+		"test/editor_session_rejects_a_different_actor",
+		"test/editor_word_and_keymap_invariants",
+		"test/editor_display_names_are_disambiguated",
+		"test/editor_retirement_keeps_internal_names_distinct",
+		"test/editor_typing_inserts_at_point",
+		"test/editor_consecutive_returns_seed",
+		"test/editor_consecutive_returns_first",
+		"test/editor_consecutive_returns_second",
+		"test/editor_prefix_and_undefined_keys",
+		"test/editor_text_clears_a_stale_prefix",
+		"test/editor_movement_keeps_a_goal_column",
+		"test/editor_numeric_arguments",
+		"test/editor_undo_seed",
+		"test/editor_undo_types_b",
+		"test/editor_undo_types_c",
+		"test/editor_undo_reverts_one_group",
+		"test/editor_undo_reports_nothing_left",
+		"test/editor_redo_reapplies_the_group",
+		"test/editor_redo_tail_undo",
+		"test/editor_redo_tail_type",
+		"test/editor_redo_tail_is_gone",
+		"test/editor_read_only_rejects_edits",
+		"test/editor_windows_seed",
+		"test/editor_windows_split_and_points",
+		"test/editor_windows_edit_rebases_both",
+		"test/editor_window_tree_commands",
+		"test/editor_marks_seed",
+		"test/editor_marks_and_region",
+		"test/editor_max_runs_a_registered_command",
+		"test/editor_max_rejects_unknown_names",
+		"test/editor_minibuffer_editing",
+		"test/editor_minibuffer_survives_a_broken_prompt",
+		"test/editor_staged_result_has_a_token",
+		"test/editor_result_finalizes",
+		"test/editor_snapshot_seed",
+		"test/editor_snapshot_reports_the_viewport",
+		"test/editor_json_bridge_seed",
+		"test/editor_json_bridge_runs_items",
+		"test/editor_json_bridge_rejects_bad_json",
+		"test/editor_pointer_items_move_point",
+		"test/editor_session_cleanup_removes_state",
 	}
 	for verb in verbs {
 		outcome := world_call(world, verb, nil)

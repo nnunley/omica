@@ -30,6 +30,7 @@ DEFAULT_WORKERS :: 4
 main :: proc() {
 	bind := DEFAULT_BIND
 	sync_client := ""
+	editor_client := ""
 	actor := ""
 	store_path := ""
 	durability_text := "group"
@@ -53,6 +54,13 @@ main :: proc() {
 			}
 			index += 1
 			sync_client = args[index]
+		case "--editor-client":
+			if index + 1 >= len(args) {
+				usage()
+				os.exit(1)
+			}
+			index += 1
+			editor_client = args[index]
 		case "--filein":
 			if index + 1 >= len(args) {
 				usage()
@@ -98,7 +106,7 @@ main :: proc() {
 	host: Webhost
 	web.auth_init(&host.auth, context.allocator)
 	defer web.auth_destroy(&host.auth)
-	if ok, message := web.routes_init(&host.routes, sync_client); !ok {
+	if ok, message := web.routes_init(&host.routes, sync_client, editor_client); !ok {
 		fmt.eprintf("webhost: %s\n", message)
 		os.exit(1)
 	}
@@ -147,6 +155,7 @@ main :: proc() {
 			}
 		}
 		web.documents_init(&host.documents, world)
+		web.editor_init(&host.editor, world)
 		web.sync_host_init(&host.sync, world)
 		webhost_configure_auth(world, true, false)
 		webhost_seed_person(world, "alice", "Alice")
@@ -190,6 +199,7 @@ main :: proc() {
 	// pump before the deferred world_destroy tears down the runtime it reads.
 	if world != nil {
 		web.sync_host_destroy(&host.sync)
+		web.editor_destroy(&host.editor)
 	}
 }
 
@@ -296,7 +306,7 @@ parse_durability :: proc(text: string) -> s.Durability {
 usage :: proc() {
 	fmt.eprintln(
 		"usage: webhost [--bind address:port] [--filein path]... " +
-		"[--sync-client path.js] [--actor name] [--store dir] " +
-		"[--durability none|group|strict]",
+		"[--sync-client path.js] [--editor-client path.js] [--actor name] " +
+		"[--store dir] [--durability none|group|strict]",
 	)
 }

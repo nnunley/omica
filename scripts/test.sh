@@ -221,8 +221,12 @@ run_unit() {
   if command -v node >/dev/null 2>&1 && [[ -f "${repo_root}/host/web/sync-client.test.mjs" ]]; then
     log="${log_dir}/unit-sync-client.log"
     rc=0
-    capture "${log}" "${test_timeout}" node --test host/web/sync-client.test.mjs || rc=$?
-    inspect "unit:sync-client.js" "${log}" "${rc}"
+    client_tests=("${repo_root}/host/web/sync-client.test.mjs")
+    if [[ -f "${repo_root}/host/web/editor-client.test.mjs" ]]; then
+      client_tests+=("${repo_root}/host/web/editor-client.test.mjs")
+    fi
+    capture "${log}" "${test_timeout}" node --test "${client_tests[@]}" || rc=$?
+    inspect "unit:client-js" "${log}" "${rc}"
   fi
 }
 

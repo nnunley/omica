@@ -1047,6 +1047,32 @@ test_kernel_kill_buffer_tombstones_and_releases :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_kernel_tombstoned_buffer_rejects_edits :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	notes := create_buffer_relation(t, &kernel, 1, "dead_notes")
+	kill := kernel_begin(&kernel)
+	testing.expect_value(t, transaction_kill_relation(&kill, notes), Kernel_Error.None)
+	commit_buffer_tx(t, &kill)
+
+	edit := kernel_begin(&kernel)
+	defer transaction_destroy(&edit)
+	testing.expect_value(
+		t,
+		transaction_buffer_edit(&edit, notes, 0, 0, "no"),
+		Kernel_Error.Unknown_Relation,
+	)
+	testing.expect_value(
+		t,
+		transaction_buffer_apply(&edit, notes, 0, []buf.Edit{{at = 0, text = "no"}}),
+		Apply_Status.Unknown_Relation,
+	)
+}
+
+@(test)
 test_kernel_kill_of_a_staged_creation_is_a_tombstone :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	kernel: Kernel
@@ -1986,4 +2012,43 @@ test_kernel_persist_bytes_counts_buffer_writes :: proc(t: ^testing.T) {
 	transaction_buffer_edit(&volatile, scratch, 0, 0, "scratch text")
 	testing.expect_value(t, kernel_persist_bytes(&volatile), i64(0))
 	transaction_destroy(&volatile)
+}
+
+// A buffer created but never written has no published content block. A later
+// transaction must treat it as empty and publish its first content, exactly as
+// `transaction_buffer_apply` already does. Without this, an empty buffer could
+// be applied to but not inserted into.
+@(test)
+test_kernel_empty_buffer_stays_editable :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	empty := create_buffer_relation(t, &kernel, 41, "empty")
+
+	edit := kernel_begin(&kernel)
+	defer transaction_destroy(&edit)
+	testing.expect_value(t, transaction_buffer_revision(&edit, empty), u64(0))
+	testing.expect_value(
+		t,
+		transaction_buffer_edit(&edit, empty, 0, 0, "first"),
+		Kernel_Error.None,
+	)
+	testing.expect_value(t, transaction_buffer_revision(&edit, empty), u64(0))
+	committed, commit_error := transaction_commit(&edit)
+	testing.expect_value(t, commit_error, Kernel_Error.None)
+	if committed != nil {
+		defer snapshot_release(committed)
+	}
+
+	read := kernel_begin(&kernel)
+	defer transaction_destroy(&read)
+	testing.expect_value(t, transaction_buffer_revision(&read, empty), u64(1))
+	root := transaction_buffer_root(&read, empty)
+	testing.expect(t, root != nil)
+	if root != nil {
+		testing.expect_value(t, buf.tree_text(root, context.temp_allocator), "first")
+	}
 }

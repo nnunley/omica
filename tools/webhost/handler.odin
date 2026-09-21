@@ -8,6 +8,7 @@ import web "../../host/web"
 Webhost :: struct {
 	routes:    web.Routes,
 	documents: web.Documents,
+	editor:    web.Editor,
 	sync:      web.Sync_Host,
 	auth:      web.Auth,
 }
@@ -15,7 +16,7 @@ Webhost :: struct {
 webhost_handle :: proc(user: rawptr, request: ^web.Http_Request, response: ^web.Http_Response) {
 	host := (^Webhost)(user)
 	path := web.http_request_path(request.target)
-	if path == "/healthz" || path == "/sync-client.js" {
+	if path == "/healthz" || path == "/sync-client.js" || path == "/editor-client.js" {
 		web.routes_handle(&host.routes, request, response)
 		return
 	}
@@ -25,6 +26,9 @@ webhost_handle :: proc(user: rawptr, request: ^web.Http_Request, response: ^web.
 	actor := web.auth_actor_for_request(&host.auth, request)
 	if path == web.SYNC_INPUT_PATH {
 		web.sync_handle_request(&host.sync, actor, request, response)
+		return
+	}
+	if web.editor_handle_request(&host.editor, actor, request, response) {
 		return
 	}
 	web.documents_handle_actor(&host.documents, actor, request, response)

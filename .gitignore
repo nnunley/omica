@@ -41,6 +41,7 @@ desktop.ini
 
 # Local web host build cache
 .cache/
+/node_modules/
 
 # mdBook build output
 mdbook/book/

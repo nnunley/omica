@@ -242,7 +242,11 @@ tree_newline_scalar :: proc(root: ^Piece_Node, n: u64) -> i64 {
 	if n < left.newlines {
 		return tree_newline_scalar(left, n)
 	}
-	return tree_newline_scalar(root.children[1], n - left.newlines)
+	offset := tree_newline_scalar(root.children[1], n - left.newlines)
+	if offset < 0 {
+		return -1
+	}
+	return i64(left.scalars) + offset
 }
 
 // Scalar offset of the `n`-th newline within a piece, or -1.

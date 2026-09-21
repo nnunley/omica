@@ -7,8 +7,9 @@ import "core:os"
 import "core:strings"
 
 Routes :: struct {
-	sync_client: []u8,
-	allocator:   mem.Allocator,
+	sync_client:   []u8,
+	editor_client: []u8,
+	allocator:     mem.Allocator,
 }
 
 // Static header lists. Handlers must not return slice literals that outlive
@@ -19,30 +20,40 @@ allow_get_headers := []Http_Header{{"Allow", "GET"}}
 @(private)
 no_store_headers := []Http_Header{{"Cache-Control", "no-store"}}
 
-// Loads the sync client script from disk. An empty path leaves it unserved.
+// Loads the client scripts from disk. An empty path leaves one unserved.
 routes_init :: proc(
 	routes: ^Routes,
 	sync_client_path: string,
+	editor_client_path := "",
 	allocator := context.allocator,
 ) -> (
 	ok: bool,
 	message: string,
 ) {
 	routes.allocator = allocator
-	if sync_client_path == "" {
-		return true, ""
+	if sync_client_path != "" {
+		data, read_err := os.read_entire_file(sync_client_path, allocator)
+		if read_err != nil {
+			return false, "cannot read the sync client script"
+		}
+		routes.sync_client = data
 	}
-	data, read_err := os.read_entire_file(sync_client_path, allocator)
-	if read_err != nil {
-		return false, "cannot read the sync client script"
+	if editor_client_path != "" {
+		data, read_err := os.read_entire_file(editor_client_path, allocator)
+		if read_err != nil {
+			return false, "cannot read the editor client script"
+		}
+		routes.editor_client = data
 	}
-	routes.sync_client = data
 	return true, ""
 }
 
 routes_destroy :: proc(routes: ^Routes) {
 	if routes.sync_client != nil {
 		delete(routes.sync_client, routes.allocator)
+	}
+	if routes.editor_client != nil {
+		delete(routes.editor_client, routes.allocator)
 	}
 }
 
@@ -68,6 +79,15 @@ routes_handle :: proc(user: rawptr, request: ^Http_Request, response: ^Http_Resp
 		response.content_type = "text/javascript; charset=utf-8"
 		response.headers = no_store_headers
 		response.body = routes.sync_client
+	case path == "/editor-client.js":
+		if len(routes.editor_client) == 0 {
+			http_response_text(response, 404, "text/plain", "not found\n")
+			return
+		}
+		response.status = 200
+		response.content_type = "text/javascript; charset=utf-8"
+		response.headers = no_store_headers
+		response.body = routes.editor_client
 	case path == "/":
 		http_response_text(
 			response,
