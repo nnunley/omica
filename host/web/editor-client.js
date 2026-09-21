@@ -849,6 +849,17 @@ export function createEditor(options = {}) {
     }
   }
 
+  function selectWindowLocally(window) {
+    const key = String(window);
+    if (key === String(state.selectedWindow) || !state.windowStates.has(key)) return;
+    // Earlier items still belong to the old selected window. Let Mica apply
+    // them before the browser changes its provisional window.
+    if (pendingEntries().length > 0) return;
+    state.selectedWindow = key;
+    state.snapshot = { ...(state.snapshot || {}), selected_window: window };
+    syncSelectedWindow();
+  }
+
   function paintProvisional() {
     const inMinibuffer = !!(state.snapshot && state.snapshot.minibuffer_active);
     // Text typed at a prompt belongs to the prompt, not the buffer behind it.
@@ -1240,8 +1251,18 @@ export function createEditor(options = {}) {
       event.preventDefault();
       inputTarget.focus();
       if (!event.target || typeof event.target.closest !== "function") return;
+      const panel = event.target.closest(".editor-window");
+      if (!panel) return;
+      const targetWindow = Number(panel.dataset.window);
+      const hasTargetWindow = Number.isSafeInteger(targetWindow);
       const line = event.target.closest(".editor-line");
-      if (!line || !line._row) return;
+      if (!line || !line._row) {
+        if (hasTargetWindow && String(targetWindow) !== String(state.selectedWindow)) {
+          selectWindowLocally(targetWindow);
+          send({ kind: "select_window", window: targetWindow });
+        }
+        return;
+      }
       const row = line._row;
       let utf16 = null;
       if (doc.caretRangeFromPoint) {
@@ -1255,13 +1276,24 @@ export function createEditor(options = {}) {
           utf16 = utf16OffsetInLine(line, position.offsetNode, position.offset);
         }
       }
-      if (utf16 === null) return;
+      if (utf16 === null) {
+        if (hasTargetWindow && String(targetWindow) !== String(state.selectedWindow)) {
+          selectWindowLocally(targetWindow);
+          send({ kind: "select_window", window: targetWindow });
+        }
+        return;
+      }
       const pointer = {
         kind: "pointer",
         scalar_offset: (row.start || 0) + scalarPrefixLength(row.text || "", utf16),
         extend: event.shiftKey,
       };
-      if (line._window !== undefined && line._window !== null) pointer.window = line._window;
+      if (line._window !== undefined && line._window !== null) {
+        pointer.window = line._window;
+      } else if (hasTargetWindow) {
+        pointer.window = targetWindow;
+      }
+      if (pointer.window !== undefined) selectWindowLocally(pointer.window);
       send(pointer);
     });
 

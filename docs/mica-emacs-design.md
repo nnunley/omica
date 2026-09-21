@@ -796,6 +796,7 @@ An item kind is one of:
 | `input` | `input_type`, optional `text` |
 | `paste` | `text` |
 | `pointer` | `scalar_offset`, `extend` |
+| `select_window` | `window` |
 | `resize_split` | `split`, `ratio` |
 | `viewport` | `first_line`, `line_count`, `width`, `height` |
 | `focus` | `focused` |
@@ -1714,6 +1715,7 @@ The implementation is acceptable if all statements in this section are true:
 - Two windows can show one buffer with independent points.
 - An edit updates every visible window that shows its buffer.
 - Only the selected window shows the cursor.
+- A click in an inactive window selects that window. A click outside its text does not move point.
 - A divider drag updates its Mica split ratio.
 - `C-x 2`, `C-x 3`, `C-x 0`, `C-x 1`, and `C-x o` update the Mica split tree.
 - `C-x b` and `C-x k` use display names without catalogue-name reuse.

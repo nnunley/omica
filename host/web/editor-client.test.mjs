@@ -641,6 +641,36 @@ test("only the selected editor window paints a cursor", async () => {
   assert.equal(secondPanel.className, "editor-window selected");
 });
 
+test("clicking inactive window chrome selects that window", async () => {
+  const snapshot = twoWindowSnapshot();
+  const selected = twoWindowSnapshot({
+    selected_window: 3,
+    window: 3,
+    point: 2,
+    point_column: 2,
+  });
+  const transport = makeTransport(snapshot, [selected]);
+  const { editor } = await installEditor(snapshot, transport);
+  const split = editor.elements.frameRoot.children[0];
+  const firstPanel = split.children[0];
+  const secondPanel = split.children[2];
+
+  secondPanel.children[1].dispatch("mousedown", { preventDefault() {} });
+  assert.equal(firstPanel.className, "editor-window");
+  assert.equal(secondPanel.className, "editor-window selected");
+  await tick();
+
+  assert.deepEqual(transport.requests.at(-1), {
+    kind: "select_window",
+    window: 3,
+  });
+  const settledSplit = editor.elements.frameRoot.children[0];
+  const settledFirstPanel = settledSplit.children[0];
+  const settledSecondPanel = settledSplit.children[2];
+  assert.equal(settledFirstPanel.querySelector(".editor-caret"), null);
+  assert.ok(settledSecondPanel.querySelector(".editor-caret"));
+});
+
 test("an edit updates every visible window on the same buffer", async () => {
   const snapshot = twoWindowSnapshot();
   let resolveInput;

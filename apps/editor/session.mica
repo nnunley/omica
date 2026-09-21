@@ -464,15 +464,18 @@ verb editor_input(endpoint, session, frame, item, client_token)
   let input = item
   input[:client_token] = client_token
   let kind = index_or(input, :kind, :key)
-  // A pointer item names its window because one frame can display many
-  // buffers. Select that window before interpreting its scalar offset.
-  if kind == :pointer
+  // A pointer or window-selection item names its window because one frame can
+  // display many buffers. Select that window before interpreting the item.
+  if kind == :pointer || kind == :select_window
     let target_window = index_or(input, :window, window)
     if target_window != window
       editor/window_select(session, frame, target_window)
       window = target_window
       buffer = editor/window_buffer(session, window)
     end
+  end
+  if kind == :select_window
+    return editor/result(:ok, session, frame, window, {:barrier -> true})
   end
   if editor/minibuffer_active(session) && kind != :viewport && kind != :focus && kind != :resize_split
     return editor/minibuffer_input(session, frame, window, input)

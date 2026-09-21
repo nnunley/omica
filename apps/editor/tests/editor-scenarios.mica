@@ -451,6 +451,15 @@ verb test/editor_windows_split_and_points()
   test/assert_equal(moved[:point], 3, "point in the first window")
   test/assert_equal(editor/window_point(:editor/test/windows, fresh), 11, "the new window keeps its point")
 
+  let focused = test/editor_input(
+    :editor/test/endpoint,
+    :editor/test/windows,
+    1,
+    {:kind -> :select_window, :window -> fresh}
+  )
+  test/assert_equal(focused[:window], fresh, "a window click selects its window")
+  test/assert_equal(focused[:point], 11, "a window click does not move point")
+
   let clicked = test/editor_input(
     :editor/test/endpoint,
     :editor/test/windows,
