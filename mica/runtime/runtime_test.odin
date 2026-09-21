@@ -7087,6 +7087,7 @@ test_editor_mica_scenarios :: proc(t: ^testing.T) {
 		"test/editor_snapshot_reports_the_viewport",
 		"test/editor_json_bridge_seed",
 		"test/editor_json_bridge_runs_items",
+		"test/editor_json_bridge_commits_tagged_items_in_one_call",
 		"test/editor_json_bridge_rejects_bad_json",
 		"test/editor_pointer_items_move_point",
 		"test/editor_session_cleanup_removes_state",

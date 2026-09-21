@@ -11,13 +11,13 @@
 
 verb editor/define_default_commands()
   // Character movement
-  editor/command_define("forward-char", :editor/forward_char, :move_forward_scalar, true, true)
-  editor/command_define("backward-char", :editor/backward_char, :move_backward_scalar, true, true)
+  editor/command_define("forward-char", :editor/forward_char, :move_forward_scalar, false, true)
+  editor/command_define("backward-char", :editor/backward_char, :move_backward_scalar, false, true)
   // Line movement
-  editor/command_define("next-line", :editor/next_line, :move_logical_line_down, true, true)
-  editor/command_define("previous-line", :editor/previous_line, :move_logical_line_up, true, true)
-  editor/command_define("beginning-of-line", :editor/beginning_of_line, :move_line_start, true, true)
-  editor/command_define("end-of-line", :editor/end_of_line, :move_line_end, true, true)
+  editor/command_define("next-line", :editor/next_line, :move_logical_line_down, false, true)
+  editor/command_define("previous-line", :editor/previous_line, :move_logical_line_up, false, true)
+  editor/command_define("beginning-of-line", :editor/beginning_of_line, :move_line_start, false, true)
+  editor/command_define("end-of-line", :editor/end_of_line, :move_line_end, false, true)
   // Word and buffer movement
   editor/command_define("forward-word", :editor/forward_word, :none, true, true)
   editor/command_define("backward-word", :editor/backward_word, :none, true, true)
@@ -54,12 +54,12 @@ verb editor/define_default_commands()
     true
   )
   // Mark
-  editor/command_define("set-mark-command", :editor/set_mark_command, :set_point, false, false)
+  editor/command_define("set-mark-command", :editor/set_mark_command, :set_mark, false, false)
   editor/command_define(
     "exchange-point-and-mark",
     :editor/exchange_point_and_mark,
-    :set_point,
-    true,
+    :exchange_point_mark,
+    false,
     false
   )
   // Undo

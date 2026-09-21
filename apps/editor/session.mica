@@ -150,6 +150,16 @@ verb editor/result(status, session, frame, window, extra)
   // Panel state follows the current selection: a command may have moved it.
   let current = editor/selected_window(session)
   let buffer = editor/window_buffer(session, current)
+  let point = editor/window_point(session, current)
+  let placed = buffer_position_line_column(buffer, point)
+  let mark = editor/mark_position(session, buffer)
+  let mark_line = json_null()
+  let mark_column = json_null()
+  if editor/mark_active(session, buffer)
+    let marked = buffer_position_line_column(buffer, mark)
+    mark_line = marked[:line]
+    mark_column = marked[:column]
+  end
   let base = {
     :status -> status,
     :session -> session,
@@ -157,17 +167,28 @@ verb editor/result(status, session, frame, window, extra)
     :window -> current,
     :buffer -> buffer,
     :revision -> buffer_revision(buffer),
-    :point -> editor/window_point(session, current),
-    :mark -> editor/mark_position(session, buffer),
+    :point -> point,
+    :point_line -> placed[:line],
+    :point_column -> placed[:column],
+    :mark -> mark,
+    :mark_line -> mark_line,
+    :mark_column -> mark_column,
     :mark_active -> editor/mark_active(session, buffer),
     :first_line -> editor/window_first_line(session, current),
+    :buffer_name -> editor/buffer_display_name(buffer),
+    :modified -> editor/buffer_modified(buffer),
+    :frame_generation -> editor/frame_generation(session, frame),
     :pending -> editor/pending_keys(session),
     :prefix_argument -> editor/prefix_value(session),
     :keymap_generation -> editor/keymap_generation(session),
     :message -> none,
     :edits -> [],
     :browser_operations -> [],
-    :barrier -> false
+    :barrier -> false,
+    :snapshot_required -> false,
+    :minibuffer_active -> editor/minibuffer_active(session),
+    :minibuffer_prompt -> editor/minibuffer_prompt_or_empty(session),
+    :minibuffer_text -> editor/minibuffer_text(session)
   }
   for pair in map_pairs(extra)
     base[pair[0]] = pair[1]
@@ -187,7 +208,8 @@ verb editor/outcome_extras(command, outcome)
     :message -> index_or(outcome, :message, none),
     :browser_operations -> index_or(outcome, :browser_operations, []),
     :barrier -> editor/command_barrier(command),
-    :edits -> index_or(outcome, :edits, [])
+    :edits -> index_or(outcome, :edits, []),
+    :snapshot_required -> index_or(outcome, :snapshot_required, false)
   }
   let revision = index_or(outcome, :revision, none)
   if revision != none
@@ -276,12 +298,28 @@ end
 
 // Decodes one browser input item and runs it. The host passes the raw item
 // JSON and never builds a Mica item itself, so keymap policy stays in Mica.
-verb editor_input_json(endpoint, session, actor, frame, text, client_token)
+verb editor_input_json(endpoint, session, actor, frame, text, client_token, known_keymap_generation)
   // The first request may arrive before the page's snapshot, so create the
   // session here too.
   editor/session_create(session, actor, :default)
   let item = editor/json_item(json_decode(text))
-  return editor_input(endpoint, session, frame, item, client_token)
+  let result = editor_input(endpoint, session, frame, item, client_token)
+  // A tagged edit must publish before its authoritative delta is known.
+  // Continue in this task after the commit instead of making the host submit
+  // a second Mica task for every editing command.
+  if index_or(result, :needs_finalize, false)
+    commit()
+    result = editor_input_result(endpoint, session, client_token)
+  end
+
+  // Keymap plans are large and change rarely. Return a plan only when the
+  // browser's generation is not the generation used for this command.
+  if index_or(result, :keymap_generation, 0) != known_keymap_generation
+    let window = editor/selected_window(session, frame)
+    let buffer = editor/window_buffer(session, window)
+    result[:keymap_plan] = editor/keymap_plan(session, buffer)
+  end
+  return result
 end
 
 // JSON strings arrive as strings; the item enum fields are symbols in Mica.

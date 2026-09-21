@@ -9,6 +9,8 @@ import {
   scalarPrefixLength,
   utf16OffsetForScalar,
   replayInsertions,
+  applyEditsToRows,
+  replayPredictions,
   createEditor,
 } from "./editor-client.js";
 
@@ -170,7 +172,7 @@ function keyEvent(overrides = {}) {
   };
 }
 
-async function installEditor(snapshot, transport) {
+async function installEditor(snapshot, transport, options = {}) {
   const doc = makeDocument("41");
   const editor = createEditor({
     document: doc,
@@ -178,9 +180,29 @@ async function installEditor(snapshot, transport) {
     navigator: { platform: "Linux" },
     fetch: transport.fetch,
     root: doc.root,
+    ...options,
   });
   await tick();
   return { editor, doc };
+}
+
+class FakeEventSource {
+  static instances = [];
+
+  constructor(url) {
+    this.url = url;
+    this.listeners = new Map();
+    FakeEventSource.instances.push(this);
+  }
+
+  addEventListener(type, handler) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(handler);
+  }
+
+  emit(type, data = "") {
+    for (const handler of this.listeners.get(type) || []) handler({ data });
+  }
 }
 
 // --- Pure normalization -----------------------------------------------------
@@ -241,6 +263,44 @@ test("replay uses scalar columns around astral characters", () => {
   assert.equal(replayed.column, 3);
 });
 
+test("authoritative edits update a scalar-indexed viewport", () => {
+  const rows = [
+    { line: 0, start: 0, stop: 2, text: "ab", complete: true },
+    { line: 1, start: 3, stop: 5, text: "cd", complete: true },
+  ];
+  const joined = applyEditsToRows(rows, [{ at: 2, remove: 1, text: "" }]);
+  assert.equal(joined.ok, true);
+  assert.deepEqual(joined.rows.map((row) => row.text), ["abcd"]);
+  assert.equal(joined.rows[0].stop, 4);
+
+  const unicode = applyEditsToRows(joined.rows, [{ at: 1, remove: 1, text: "😀\n" }]);
+  assert.equal(unicode.ok, true);
+  assert.deepEqual(unicode.rows.map((row) => row.text), ["a😀", "cd"]);
+  assert.equal(unicode.rows[0].stop, 2, "the emoji is one scalar");
+  assert.equal(unicode.rows[1].start, 3);
+});
+
+test("predictors replay mixed edits, movement, and mark commands", () => {
+  const rows = [
+    { line: 0, start: 0, stop: 2, text: "ab", complete: true },
+    { line: 1, start: 3, stop: 5, text: "cd", complete: true },
+  ];
+  const replayed = replayPredictions(rows, 0, 2, [
+    { predictor: "insert_text", item: { kind: "key", key: "<return>" }, barrier: false },
+    { predictor: "insert_text", item: { kind: "text", text: "X" }, barrier: false },
+    { predictor: "move_logical_line_down", item: { kind: "key", key: "C-n" }, barrier: false },
+    { predictor: "move_forward_scalar", item: { kind: "key", key: "C-f" }, barrier: false },
+    { predictor: "delete_backward_scalar", item: { kind: "key", key: "<backspace>" }, barrier: false },
+    { predictor: "set_mark", item: { kind: "key", key: "C-<space>" }, barrier: false },
+  ]);
+  assert.equal(replayed.complete, true);
+  assert.deepEqual(replayed.rows.map((row) => row.text), ["ab", "X", "c"]);
+  assert.equal(replayed.line, 2);
+  assert.equal(replayed.column, 1);
+  assert.equal(replayed.markActive, true);
+  assert.equal(replayed.mark, 6);
+});
+
 // --- Input paths ------------------------------------------------------------
 
 test("plain letters are sent as text items, not key chords", async () => {
@@ -299,6 +359,118 @@ test("control chords and named keys are sent as key items", async () => {
   input.dispatch("keydown", keyEvent({ key: "Backspace" }));
   await tick();
   assert.deepEqual(transport.requests.at(-1), { kind: "key", key: "<backspace>" });
+});
+
+test("100 ms RTT does not serialize rapid typing, movement, deletion, and newline", async () => {
+  FakeEventSource.instances = [];
+  const snapshot = baseSnapshot({
+    keymap_generation: 7,
+    keymap_plan: [
+      { sequence: "C-b", predictor: "move_backward_scalar", barrier: false },
+      { sequence: "<return>", predictor: "insert_text", barrier: false },
+    ],
+  });
+  const batches = [];
+  let accepted = 0;
+  const transport = {
+    fetch: async (url, options = {}) => {
+      if (!options.method) return { ok: true, json: async () => snapshot };
+      batches.push(JSON.parse(options.body));
+      return new Promise((resolve) => setTimeout(() => {
+        accepted += 1;
+        resolve({ ok: true, json: async () => ({ accepted: true }) });
+      }, 100));
+    },
+  };
+  const { editor } = await installEditor(snapshot, transport, { EventSource: FakeEventSource });
+  const input = editor.elements.inputTarget;
+  FakeEventSource.instances[0].emit("open");
+
+  input.dispatch("beforeinput", { inputType: "insertText", data: "a", preventDefault() {} });
+  input.dispatch("beforeinput", { inputType: "insertText", data: "b", preventDefault() {} });
+  await tick();
+  assert.equal(batches.length, 1);
+  assert.equal(accepted, 0, "the first 100 ms admission is still in flight");
+
+  input.dispatch("keydown", keyEvent({ key: "b", ctrlKey: true }));
+  input.dispatch("beforeinput", { inputType: "deleteContentForward", data: null, preventDefault() {} });
+  input.dispatch("beforeinput", { inputType: "insertLineBreak", data: null, preventDefault() {} });
+  await tick();
+
+  assert.equal(batches.length, 2, "a second batch starts before the first response");
+  assert.equal(accepted, 0);
+  assert.equal(editor.state.pointLine, 1);
+  assert.equal(editor.state.pointColumn, 0);
+  assert.equal(editor.elements.viewport.children.length, 2);
+  assert.equal(editor.elements.viewport.children[0].textContent, "a");
+  assert.deepEqual(
+    batches.flatMap((batch) => batch.items.map((item) => item.sequence)),
+    ["1", "2", "3", "4", "5"],
+  );
+});
+
+test("SSE results advance the replica in sequence order", async () => {
+  FakeEventSource.instances = [];
+  const snapshot = baseSnapshot({ keymap_generation: 4, keymap_plan: [] });
+  const transport = {
+    fetch: async (url, options = {}) => {
+      if (!options.method) return { ok: true, json: async () => snapshot };
+      return { ok: true, json: async () => ({ accepted: true }) };
+    },
+  };
+  const { editor } = await installEditor(snapshot, transport, { EventSource: FakeEventSource });
+  const input = editor.elements.inputTarget;
+  const source = FakeEventSource.instances[0];
+  source.emit("open");
+  input.dispatch("beforeinput", { inputType: "insertText", data: "a", preventDefault() {} });
+  input.dispatch("beforeinput", { inputType: "insertText", data: "b", preventDefault() {} });
+  await tick();
+
+  const result = (sequence, at, text, point) => JSON.stringify({
+    through_sequence: sequence,
+    result: {
+      status: "ok",
+      edits: [{ at, remove: 0, text }],
+      point,
+      point_line: 0,
+      point_column: point,
+      mark: point,
+      mark_active: false,
+      first_line: 0,
+      pending: "",
+      buffer_name: "*scratch*",
+      modified: true,
+    },
+  });
+  source.emit("editor", result(2, 1, "b", 2));
+  assert.equal(editor.state.baseRows[0].text, "", "sequence two waits for sequence one");
+  source.emit("editor", result(1, 0, "a", 1));
+  assert.equal(editor.state.baseRows[0].text, "ab");
+  assert.equal(editor.state.throughSequence, 2);
+  assert.equal(editor.state.outstanding.length, 0);
+});
+
+test("scroll commands update the viewport before the server result", async () => {
+  const snapshot = baseSnapshot({
+    keymap_plan: [
+      { sequence: "C-v", predictor: "scroll_lines", barrier: true },
+      { sequence: "M-v", predictor: "scroll_lines", barrier: true },
+    ],
+  });
+  let resolveInput;
+  const transport = {
+    fetch: async (url, options = {}) => {
+      if (!options.method) return { ok: true, json: async () => snapshot };
+      return new Promise((resolve) => {
+        resolveInput = () => resolve({ ok: true, json: async () => ({ result: { status: "resync" }, snapshot }) });
+      });
+    },
+  };
+  const { editor } = await installEditor(snapshot, transport);
+  editor.elements.inputTarget.dispatch("keydown", keyEvent({ key: "v", ctrlKey: true }));
+  assert.equal(editor.elements.viewport.scrollTop, 400);
+  resolveInput();
+  await tick();
 });
 
 test("a printable key completes a pending prefix as a chord", async () => {
@@ -437,6 +609,54 @@ test("typing paints provisionally before the result arrives", async () => {
   await tick();
   assert.equal(editor.elements.viewport.textContent, "a", "the authoritative render agrees");
   assert.equal(requests.length, 1, "the item is sent exactly once");
+});
+
+test("a compact result advances the authoritative replica without rebuilding its line", async () => {
+  let resolveInput;
+  const transport = {
+    fetch: async (url, options = {}) => {
+      if (!options.method) return { ok: true, json: async () => baseSnapshot() };
+      return new Promise((resolve) => {
+        resolveInput = () => resolve({
+          ok: true,
+          json: async () => ({
+            through_sequence: 1,
+            result: {
+              status: "ok",
+              revision: 2,
+              edits: [{ at: 0, remove: 0, text: "a" }],
+              point: 1,
+              point_line: 0,
+              point_column: 1,
+              mark: 1,
+              mark_active: false,
+              first_line: 0,
+              pending: "",
+              buffer_name: "*scratch*",
+              modified: true,
+              minibuffer_active: false,
+              minibuffer_prompt: "",
+              minibuffer_text: "",
+            },
+          }),
+        });
+      });
+    },
+  };
+  const { editor } = await installEditor(baseSnapshot(), transport);
+  editor.elements.inputTarget.dispatch("beforeinput", {
+    inputType: "insertText",
+    data: "a",
+    preventDefault() {},
+  });
+  await tick();
+  const provisionalLine = editor.elements.viewport.querySelector(".editor-line");
+  resolveInput();
+  await tick();
+  const authoritativeLine = editor.elements.viewport.querySelector(".editor-line");
+  assert.equal(editor.state.baseRows[0].text, "a");
+  assert.equal(editor.state.basePoint.column, 1);
+  assert.equal(authoritativeLine, provisionalLine, "the existing line node is retained");
 });
 
 test("typing at a prompt echoes provisionally without touching the buffer", async () => {

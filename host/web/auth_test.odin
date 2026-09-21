@@ -294,5 +294,7 @@ session_payload :: proc(t: ^testing.T, session: ^Sync_Session) -> string {
 	if len(session.messages) == 0 {
 		return ""
 	}
-	return string(session.messages[len(session.messages) - 1].payload)
+	message := session.messages[len(session.messages) - 1]
+	testing.expect_value(t, message.kind, Sync_Output_Kind.Sync)
+	return string(message.envelope.payload)
 }

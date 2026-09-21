@@ -159,6 +159,213 @@ export function replayInsertions(rows, line, column, texts) {
   return { rows: copy, line, column };
 }
 
+function scalarSlice(text, start, stop = undefined) {
+  return Array.from(text).slice(start, stop).join("");
+}
+
+function rowSegment(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  let text = "";
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (index > 0) {
+      const previous = rows[index - 1];
+      if (row.line !== previous.line + 1 || row.start !== previous.stop + 1) return null;
+      text += "\n";
+    }
+    text += String(row.text || "");
+  }
+  return {
+    start: Number(rows[0].start || 0),
+    firstLine: Number(rows[0].line || 0),
+    text,
+    lastComplete: rows[rows.length - 1].complete !== false,
+  };
+}
+
+function rowsFromSegment(segment, text) {
+  const parts = String(text).split("\n");
+  let start = segment.start;
+  return parts.map((part, index) => {
+    const length = scalarLength(part);
+    const row = {
+      line: segment.firstLine + index,
+      start,
+      stop: start + length,
+      text: part,
+      complete: index === parts.length - 1 ? segment.lastComplete : true,
+    };
+    start += length + 1;
+    return row;
+  });
+}
+
+// Applies authoritative scalar edits to a bounded viewport replica. The
+// caller requests a new snapshot when an edit reaches outside the replica.
+export function applyEditsToRows(rows, edits) {
+  const segment = rowSegment(rows);
+  if (!segment) return { rows, ok: false };
+  let scalars = Array.from(segment.text);
+  const ordered = [...(edits || [])].sort((a, b) => Number(b.at) - Number(a.at));
+  for (const edit of ordered) {
+    const at = Number(edit.at);
+    const remove = Number(edit.remove || 0);
+    const local = at - segment.start;
+    if (local < 0 || remove < 0 || local + remove > scalars.length) {
+      return { rows, ok: false };
+    }
+    scalars.splice(local, remove, ...Array.from(String(edit.text || "")));
+  }
+  return { rows: rowsFromSegment(segment, scalars.join("")), ok: true };
+}
+
+function offsetForPosition(rows, line, column) {
+  const row = rows.find((entry) => Number(entry.line) === Number(line));
+  if (!row) return null;
+  return Number(row.start) + Math.max(0, Math.min(Number(column), scalarLength(row.text || "")));
+}
+
+function positionForOffset(rows, offset) {
+  const target = Number(offset);
+  for (const row of rows) {
+    if (target >= Number(row.start) && target <= Number(row.stop)) {
+      return { line: Number(row.line), column: target - Number(row.start) };
+    }
+  }
+  return null;
+}
+
+function predictionText(entry) {
+  const item = entry.item || {};
+  if (item.kind === "text" || item.kind === "paste") return String(item.text || "");
+  if (item.kind === "input" &&
+      (item.input_type === "insertText" || item.input_type === "insertCompositionText")) {
+    return String(item.text || "");
+  }
+  if ((item.kind === "input" && item.input_type === "insertLineBreak") ||
+      (item.kind === "key" && ["<return>", "C-j", "C-m"].includes(item.key))) {
+    return "\n";
+  }
+  return "";
+}
+
+// Replays the fixed browser-side predictor vocabulary over an authoritative
+// viewport. Mica selects predictor names through its keymap plan; JavaScript
+// only implements these mechanical text and position operations.
+export function replayPredictions(rows, pointLine, pointColumn, entries, initialMark = null) {
+  let copy = rows.map((row) => ({ ...row }));
+  let point = offsetForPosition(copy, pointLine, pointColumn);
+  let mark = initialMark;
+  let markActive = mark !== null;
+  let goalColumn = null;
+  let complete = point !== null;
+
+  const applyEdit = (at, remove, text, nextPoint) => {
+    const applied = applyEditsToRows(copy, [{ at, remove, text }]);
+    if (!applied.ok) {
+      complete = false;
+      return;
+    }
+    copy = applied.rows;
+    const inserted = scalarLength(text);
+    if (mark !== null) {
+      if (mark > at + remove) mark += inserted - remove;
+      else if (mark >= at) mark = at + inserted;
+    }
+    point = nextPoint;
+  };
+
+  for (const entry of entries || []) {
+    if (!complete) break;
+    const predictor = entry.predictor || "none";
+    switch (predictor) {
+      case "insert_text": {
+        const text = predictionText(entry);
+        applyEdit(point, 0, text, point + scalarLength(text));
+        goalColumn = null;
+        break;
+      }
+      case "delete_backward_scalar":
+        if (point > Number(copy[0].start)) applyEdit(point - 1, 1, "", point - 1);
+        goalColumn = null;
+        break;
+      case "delete_forward_scalar": {
+        const last = copy[copy.length - 1];
+        if (point < Number(last.stop)) applyEdit(point, 1, "", point);
+        goalColumn = null;
+        break;
+      }
+      case "move_forward_scalar": {
+        const last = copy[copy.length - 1];
+        point = Math.min(point + 1, Number(last.stop));
+        goalColumn = null;
+        break;
+      }
+      case "move_backward_scalar":
+        point = Math.max(point - 1, Number(copy[0].start));
+        goalColumn = null;
+        break;
+      case "move_line_start": {
+        const position = positionForOffset(copy, point);
+        point = offsetForPosition(copy, position.line, 0);
+        goalColumn = null;
+        break;
+      }
+      case "move_line_end": {
+        const position = positionForOffset(copy, point);
+        const row = copy.find((candidate) => candidate.line === position.line);
+        point = Number(row.stop);
+        goalColumn = null;
+        break;
+      }
+      case "move_logical_line_down":
+      case "move_logical_line_up": {
+        const position = positionForOffset(copy, point);
+        if (goalColumn === null) goalColumn = position.column;
+        const direction = predictor === "move_logical_line_down" ? 1 : -1;
+        const moved = offsetForPosition(copy, position.line + direction, goalColumn);
+        if (moved !== null) point = moved;
+        break;
+      }
+      case "set_mark":
+        mark = point;
+        markActive = true;
+        break;
+      case "exchange_point_mark":
+        if (mark !== null) {
+          const oldPoint = point;
+          point = mark;
+          mark = oldPoint;
+          markActive = true;
+        }
+        break;
+      case "set_point": {
+        const target = Number(entry.item && entry.item.scalar_offset);
+        if (positionForOffset(copy, target)) point = target;
+        break;
+      }
+      case "none":
+      case "scroll_lines":
+        break;
+      default:
+        complete = false;
+        break;
+    }
+    if (entry.barrier) break;
+  }
+
+  const placed = positionForOffset(copy, point);
+  if (!placed) complete = false;
+  return {
+    rows: copy,
+    line: placed ? placed.line : pointLine,
+    column: placed ? placed.column : pointColumn,
+    mark,
+    markActive,
+    complete,
+  };
+}
+
 // Installs the editor into `root`. Everything the client touches is injected,
 // so a DOM stub can drive the real event paths in tests.
 export function createEditor(options = {}) {
@@ -166,6 +373,7 @@ export function createEditor(options = {}) {
   const win = options.window ?? globalThis.window;
   const nav = options.navigator ?? globalThis.navigator ?? {};
   const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
+  const EventSourceImpl = options.EventSource ?? globalThis.EventSource;
   const root = options.root ?? doc.getElementById("mica-editor");
   if (!root) return null;
   const debug = options.debug === true && typeof console !== "undefined" && !!console.debug;
@@ -183,12 +391,18 @@ export function createEditor(options = {}) {
     inFlight: false,
     inFlightItem: null,
     queue: [],
+    outstanding: [],
+    resultBuffer: new Map(),
+    throughSequence: 0,
+    asyncMode: typeof EventSourceImpl === "function",
     composing: false,
     composingText: "",
     message: "",
     error: false,
     baseRows: [],
     basePoint: { line: 0, column: 0 },
+    baseMark: null,
+    keymapPlan: [],
     snapshot: null,
     pointLine: 0,
     pointColumn: 0,
@@ -200,6 +414,9 @@ export function createEditor(options = {}) {
   let echo;
   let inputTarget;
   let frameRoot;
+  let eventSource = null;
+  let flushScheduled = false;
+  const postingBatches = new Map();
 
   function buildChrome() {
     frameRoot = doc.createElement("div");
@@ -239,12 +456,125 @@ export function createEditor(options = {}) {
   }
 
   function send(item) {
-    state.queue.push({ sequence: state.nextSequence, item });
+    state.queue.push({ sequence: state.nextSequence, item, ...predictionFor(item) });
     state.nextSequence += 1;
     updatePredictedPending();
     if (debug) console.debug("mica editor item", item);
     paintProvisional();
-    pump();
+    applyScrollPrediction(state.queue[state.queue.length - 1]);
+    if (state.asyncMode) scheduleFlush();
+    else pump();
+  }
+
+  function scheduleFlush() {
+    if (flushScheduled) return;
+    flushScheduled = true;
+    Promise.resolve().then(() => {
+      flushScheduled = false;
+      while (state.queue.length > 0) {
+        const entries = state.queue.splice(0, 256);
+        state.outstanding.push(...entries);
+        postBatch(entries);
+      }
+      updatePredictedPending();
+    });
+  }
+
+  function batchBody(entries) {
+    const generation = String((state.snapshot && state.snapshot.keymap_generation) || 0);
+    return {
+      type: "editor_input",
+      session: state.session,
+      items: entries.map((entry) => ({
+        ...entry.item,
+        sequence: String(entry.sequence),
+        depends_on: String(entry.sequence - 1),
+        frame: "1",
+        keymap_generation: generation,
+      })),
+    };
+  }
+
+  async function postBatch(entries) {
+    entries = entries.filter((entry) => entry.sequence > state.throughSequence);
+    if (entries.length === 0) return;
+    const key = entries[0].sequence;
+    if (postingBatches.has(key)) return;
+    postingBatches.set(key, entries);
+    try {
+      const response = await request("/editor/input", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(batchBody(entries)),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      postingBatches.delete(key);
+    } catch (error) {
+      postingBatches.delete(key);
+      state.message = `connection interrupted: ${error}`;
+      state.error = true;
+      renderEcho();
+      setTimeout(() => postBatch(entries), 50);
+    }
+  }
+
+  function replayOutstanding() {
+    const unsent = state.outstanding.filter(
+      (entry) => !postingBatches.has(entry.sequence),
+    );
+    for (let index = 0; index < unsent.length; index += 256) {
+      postBatch(unsent.slice(index, index + 256));
+    }
+  }
+
+  function receiveAsyncResult(data) {
+    const sequence = Number(data && data.through_sequence);
+    if (!Number.isSafeInteger(sequence) || sequence <= state.throughSequence) return;
+    state.resultBuffer.set(sequence, data);
+    while (state.resultBuffer.has(state.throughSequence + 1)) {
+      const next = state.throughSequence + 1;
+      const current = state.resultBuffer.get(next);
+      state.resultBuffer.delete(next);
+      const pendingIndex = state.outstanding.findIndex((entry) => entry.sequence === next);
+      if (pendingIndex >= 0) state.outstanding.splice(pendingIndex, 1);
+      state.throughSequence = next;
+      applyResult(current.result);
+      if (current.snapshot) {
+        render(current.snapshot);
+      } else if (applyAuthoritativeResult(current.result)) {
+        paintProvisional();
+      } else {
+        resync();
+      }
+    }
+  }
+
+  function connectEvents() {
+    if (!state.asyncMode || eventSource) return;
+    eventSource = new EventSourceImpl(
+      `/sync/events?session=${encodeURIComponent(state.session)}`,
+    );
+    let opened = false;
+    eventSource.addEventListener("open", () => {
+      if (opened) replayOutstanding();
+      opened = true;
+      state.error = false;
+      renderEcho();
+    });
+    eventSource.addEventListener("editor", (event) => {
+      try {
+        receiveAsyncResult(JSON.parse(event.data));
+      } catch (error) {
+        state.message = `invalid editor result: ${error}`;
+        state.error = true;
+        renderEcho();
+      }
+    });
+    eventSource.addEventListener("error", () => {
+      state.message = "editor result stream interrupted; reconnecting";
+      state.error = true;
+      renderEcho();
+    });
   }
 
   async function pump() {
@@ -266,8 +596,13 @@ export function createEditor(options = {}) {
       if (debug) console.debug("mica editor result", data.result && data.result.status, data.snapshot);
       state.inFlightItem = null;
       applyResult(data.result);
-      if (data.snapshot) render(data.snapshot);
-      else paintProvisional();
+      if (data.snapshot) {
+        render(data.snapshot);
+      } else if (applyAuthoritativeResult(data.result)) {
+        paintProvisional();
+      } else {
+        await resync();
+      }
     } catch (error) {
       state.message = `connection lost: ${error}`;
       state.error = true;
@@ -319,15 +654,69 @@ export function createEditor(options = {}) {
   function predictedPendingAfter(pending, item) {
     if (!item || item.kind !== "key") return "";
     const sequence = pending ? `${pending} ${item.key}` : item.key;
-    const plan = (state.snapshot && state.snapshot.keymap_plan) || [];
+    const plan = state.keymapPlan;
     const prefix = `${sequence} `;
     if (plan.some((row) => String(row.sequence || "").startsWith(prefix))) return sequence;
     return "";
   }
 
+  function predictionFor(item) {
+    if (!item) return { predictor: "none", barrier: true };
+    if (item.kind === "text" || item.kind === "paste") {
+      return { predictor: "insert_text", barrier: false };
+    }
+    if (item.kind === "input") {
+      if (item.input_type === "insertText" || item.input_type === "insertCompositionText" ||
+          item.input_type === "insertLineBreak") {
+        return { predictor: "insert_text", barrier: false };
+      }
+      if (item.input_type === "deleteContentBackward") {
+        return { predictor: "delete_backward_scalar", barrier: false };
+      }
+      if (item.input_type === "deleteContentForward") {
+        return { predictor: "delete_forward_scalar", barrier: false };
+      }
+    }
+    if (item.kind === "pointer") return { predictor: "set_point", barrier: false };
+    if (item.kind === "key") {
+      const sequence = state.pending ? `${state.pending} ${item.key}` : item.key;
+      const plan = state.keymapPlan.find((row) => String(row.sequence || "") === sequence);
+      if (plan) {
+        return {
+          predictor: String(plan.predictor || "none"),
+          barrier: plan.barrier === true,
+        };
+      }
+      const prefix = `${sequence} `;
+      if (state.keymapPlan.some((row) => String(row.sequence || "").startsWith(prefix))) {
+        return { predictor: "none", barrier: false };
+      }
+    }
+    return { predictor: "none", barrier: true };
+  }
+
+  function applyScrollPrediction(entry) {
+    if (!entry || entry.predictor !== "scroll_lines" || !viewport) return;
+    const key = entry.item && entry.item.key;
+    if (key === "C-v") {
+      viewport.scrollTop += viewport.clientHeight;
+    } else if (key === "M-v") {
+      viewport.scrollTop = Math.max(0, viewport.scrollTop - viewport.clientHeight);
+    } else if (key === "C-l") {
+      const caret = viewport.querySelector(".editor-caret");
+      if (caret && caret.parentElement) {
+        viewport.scrollTop = Math.max(
+          0,
+          caret.parentElement.offsetTop - Math.floor(viewport.clientHeight / 2),
+        );
+      }
+    }
+  }
+
   function updatePredictedPending() {
     let pending = state.authoritativePending;
     if (state.inFlightItem) pending = predictedPendingAfter(pending, state.inFlightItem.item);
+    for (const queued of state.outstanding) pending = predictedPendingAfter(pending, queued.item);
     for (const queued of state.queue) pending = predictedPendingAfter(pending, queued.item);
     state.pending = pending;
   }
@@ -340,6 +729,10 @@ export function createEditor(options = {}) {
       if (state.inFlightItem.item.kind !== "text") return null;
       items.push(state.inFlightItem.item);
     }
+    for (const queued of state.outstanding) {
+      if (queued.item.kind !== "text") return null;
+      items.push(queued.item);
+    }
     for (const queued of state.queue) {
       if (queued.item.kind !== "text") return null;
       items.push(queued.item);
@@ -347,16 +740,60 @@ export function createEditor(options = {}) {
     return items.map((item) => String(item.text || ""));
   }
 
+  function pendingEntries() {
+    const entries = [];
+    if (state.inFlightItem !== null) entries.push(state.inFlightItem);
+    entries.push(...state.outstanding);
+    entries.push(...state.queue);
+    return entries;
+  }
+
+  function applyAuthoritativeResult(result) {
+    if (!result || result.status === "resync") return false;
+    let rows = state.baseRows;
+    if (Array.isArray(result.edits) && result.edits.length > 0) {
+      const applied = applyEditsToRows(rows, result.edits);
+      if (!applied.ok) return false;
+      rows = applied.rows;
+    }
+    const line = Number(result.point_line);
+    const column = Number(result.point_column);
+    if (!Number.isFinite(line) || !Number.isFinite(column) ||
+        offsetForPosition(rows, line, column) === null) {
+      return false;
+    }
+    if (result.first_line !== undefined && rows.length > 0 &&
+        Number(result.first_line) !== Number(rows[0].line)) {
+      return false;
+    }
+
+    state.baseRows = rows;
+    state.basePoint = { line, column };
+    state.baseMark = result.mark_active ? Number(result.mark) : null;
+    state.authoritativePending = result.pending || "";
+    if (Array.isArray(result.keymap_plan)) state.keymapPlan = result.keymap_plan;
+    state.snapshot = {
+      ...(state.snapshot || {}),
+      ...result,
+      rows,
+      point_line: line,
+      point_column: column,
+      keymap_plan: state.keymapPlan,
+    };
+    updatePredictedPending();
+    return true;
+  }
+
   function paintProvisional() {
-    const texts = pendingText() ?? [];
     const inMinibuffer = !!(state.snapshot && state.snapshot.minibuffer_active);
     // Text typed at a prompt belongs to the prompt, not the buffer behind it.
+    const texts = pendingText() ?? [];
     state.provisionalText = inMinibuffer ? texts.join("") : "";
     let rows = state.baseRows;
     let line = state.basePoint.line;
     let column = state.basePoint.column;
-    if (!inMinibuffer && texts.length > 0) {
-      const replayed = replayInsertions(rows, line, column, texts);
+    if (!inMinibuffer) {
+      const replayed = replayPredictions(rows, line, column, pendingEntries(), state.baseMark);
       rows = replayed.rows;
       line = replayed.line;
       column = replayed.column;
@@ -374,6 +811,8 @@ export function createEditor(options = {}) {
       line: snapshot.point_line || 0,
       column: snapshot.point_column || 0,
     };
+    state.baseMark = snapshot.mark_active ? Number(snapshot.mark) : null;
+    if (Array.isArray(snapshot.keymap_plan)) state.keymapPlan = snapshot.keymap_plan;
     state.snapshot = snapshot;
     updatePredictedPending();
     renderFrame(snapshot);
@@ -381,39 +820,60 @@ export function createEditor(options = {}) {
   }
 
   function paintRows(targetViewport, targetModeline, windowSnapshot, rows, pointLine, pointColumn) {
-    targetViewport.replaceChildren();
+    const previous = targetViewport._editorRows || new Map();
+    const next = new Map();
+    const ordered = [];
     for (const row of rows) {
-      const line = doc.createElement("div");
+      const key = String(row.line);
+      const line = previous.get(key) || doc.createElement("div");
       line.className = "editor-line";
       line._row = row;
       line._window = windowSnapshot.window;
       const text = row.text || "";
-      if (row.line === pointLine) {
-        const utf16 = utf16OffsetForScalar(text, pointColumn);
-        line.appendChild(doc.createTextNode(text.slice(0, utf16)));
-        const caret = doc.createElement("span");
-        caret.className = "editor-caret";
-        line.appendChild(caret);
-        line.appendChild(doc.createTextNode(text.slice(utf16)));
-      } else {
-        line.textContent = text;
+      const renderKey = `${text}\u0000${row.line === pointLine ? pointColumn : -1}`;
+      if (line._editorRenderKey !== renderKey) {
+        line.replaceChildren();
+        if (row.line === pointLine) {
+          const utf16 = utf16OffsetForScalar(text, pointColumn);
+          line.appendChild(doc.createTextNode(text.slice(0, utf16)));
+          const caret = doc.createElement("span");
+          caret.className = "editor-caret";
+          line.appendChild(caret);
+          line.appendChild(doc.createTextNode(text.slice(utf16)));
+        } else {
+          line.textContent = text;
+        }
+        line._editorRenderKey = renderKey;
       }
-      targetViewport.appendChild(line);
+      next.set(key, line);
+      ordered.push(line);
     }
     if (rows.length === 0) {
-      const line = doc.createElement("div");
+      const line = previous.get("__empty") || doc.createElement("div");
       line.className = "editor-line";
       line._window = windowSnapshot.window;
-      const caret = doc.createElement("span");
-      caret.className = "editor-caret";
-      line.appendChild(caret);
-      targetViewport.appendChild(line);
+      if (line._editorRenderKey !== "empty") {
+        const caret = doc.createElement("span");
+        caret.className = "editor-caret";
+        line.replaceChildren(caret);
+        line._editorRenderKey = "empty";
+      }
+      next.set("__empty", line);
+      ordered.push(line);
     }
+    const children = Array.from(targetViewport.children || []);
+    const orderChanged = children.length !== ordered.length ||
+      ordered.some((line, index) => children[index] !== line);
+    if (orderChanged) {
+      targetViewport.replaceChildren(...ordered);
+    }
+    targetViewport._editorRows = next;
     const name = windowSnapshot.buffer_name || "*scratch*";
     const modified = windowSnapshot.modified ? " **" : "";
     const mark = windowSnapshot.mark_active ? "  mark" : "";
-    targetModeline.textContent =
+    const modelineText =
       `-UUU:----F1  ${name}${modified}  L${pointLine + 1} C${pointColumn}  (Fundamental)${mark}`;
+    if (targetModeline.textContent !== modelineText) targetModeline.textContent = modelineText;
   }
 
   function renderFrame(snapshot) {
@@ -634,6 +1094,7 @@ export function createEditor(options = {}) {
   async function boot() {
     buildChrome();
     attachInput();
+    connectEvents();
     try {
       const response = await request(snapshotUrl(), {});
       if (!response.ok) throw new Error(`HTTP ${response.status}`);

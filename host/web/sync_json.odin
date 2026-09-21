@@ -54,6 +54,14 @@ sync_write_event :: proc(builder: ^strings.Builder, envelope: ^Sync_Envelope) {
 	strings.write_string(builder, "\"}\n\n")
 }
 
+// Writes one editor result. The payload is already JSON produced by the
+// editor bridge, so it must not be quoted as a string.
+editor_write_event :: proc(builder: ^strings.Builder, payload: []u8) {
+	strings.write_string(builder, "event: editor\ndata: ")
+	strings.write_bytes(builder, payload)
+	strings.write_string(builder, "\n\n")
+}
+
 @(private)
 sync_write_json_string :: proc(builder: ^strings.Builder, text: string) {
 	for c in text {
@@ -80,6 +88,17 @@ sync_write_json_string :: proc(builder: ^strings.Builder, text: string) {
 
 // --- Sessions --------------------------------------------------------------
 
+Sync_Output_Kind :: enum {
+	Sync,
+	Editor,
+}
+
+Sync_Output :: struct {
+	kind:           Sync_Output_Kind,
+	envelope:       Sync_Envelope,
+	editor_payload: []u8,
+}
+
 Sync_Session :: struct {
 	lock:          sync.Mutex,
 	cond:          sync.Cond,
@@ -87,7 +106,7 @@ Sync_Session :: struct {
 	closed:        bool,
 	generation:    u64,
 	writer_active: bool,
-	messages:      [dynamic]Sync_Envelope,
+	messages:      [dynamic]Sync_Output,
 	allocator:     mem.Allocator,
 	// View state and the dependency-subscription mailbox.
 	views:         map[u64]^View_State,
@@ -172,7 +191,7 @@ sync_host_ensure_session :: proc(
 	session.session_id = session_id
 	session.actor = actor
 	session.allocator = host.allocator
-	session.messages = make([dynamic]Sync_Envelope, host.allocator)
+	session.messages = make([dynamic]Sync_Output, host.allocator)
 	session.views = make(map[u64]^View_State, host.allocator)
 	if host.world != nil {
 		receiver, sender, mailbox_ok := r.world_mailbox_create(host.world)
@@ -234,9 +253,10 @@ sync_session_post :: proc(session: ^Sync_Session, envelope: ^Sync_Envelope) -> b
 	if envelope.kind == .View_Snapshot {
 		write := 0
 		for message in session.messages {
-			if message.session_id == envelope.session_id &&
-			   message.view_id == envelope.view_id {
-				delete(message.payload, session.allocator)
+			if message.kind == .Sync &&
+			   message.envelope.session_id == envelope.session_id &&
+			   message.envelope.view_id == envelope.view_id {
+				delete(message.envelope.payload, session.allocator)
 				continue
 			}
 			session.messages[write] = message
@@ -246,15 +266,48 @@ sync_session_post :: proc(session: ^Sync_Session, envelope: ^Sync_Envelope) -> b
 	}
 	copied := envelope^
 	copied.payload = payload
-	append(&session.messages, copied)
-	for len(session.messages) > SYNC_OUTPUT_LIMIT {
-		delete(session.messages[0].payload, session.allocator)
-		copy(session.messages[:], session.messages[1:])
-		resize(&session.messages, len(session.messages) - 1)
+	if !sync_session_make_output_room(session) {
+		sync.mutex_unlock(&session.lock)
+		delete(payload, session.allocator)
+		return false
 	}
+	append(&session.messages, Sync_Output{kind = .Sync, envelope = copied})
 	sync.cond_broadcast(&session.cond)
 	sync.mutex_unlock(&session.lock)
 	return true
+}
+
+// Queues one ordered editor result on the session's SSE stream. Editor
+// results are not evicted: the editor retains them for reconnect replay.
+sync_session_post_editor :: proc(session: ^Sync_Session, payload: string) -> bool {
+	copy_payload := make([]u8, len(payload), session.allocator)
+	copy(copy_payload, string_bytes(payload))
+	sync.mutex_lock(&session.lock)
+	if session.closed || !sync_session_make_output_room(session) {
+		sync.mutex_unlock(&session.lock)
+		delete(copy_payload, session.allocator)
+		return false
+	}
+	append(&session.messages, Sync_Output{kind = .Editor, editor_payload = copy_payload})
+	sync.cond_broadcast(&session.cond)
+	sync.mutex_unlock(&session.lock)
+	return true
+}
+
+@(private)
+sync_session_make_output_room :: proc(session: ^Sync_Session) -> bool {
+	if len(session.messages) < SYNC_OUTPUT_LIMIT {
+		return true
+	}
+	for message, index in session.messages {
+		if message.kind != .Sync {
+			continue
+		}
+		delete(message.envelope.payload, session.allocator)
+		ordered_remove(&session.messages, index)
+		return true
+	}
+	return false
 }
 
 Sync_Take_Kind :: enum {
@@ -271,7 +324,7 @@ sync_session_take :: proc(
 	generation: u64,
 	timeout: time.Duration,
 ) -> (
-	batch: [dynamic]Sync_Envelope,
+	batch: [dynamic]Sync_Output,
 	kind: Sync_Take_Kind,
 ) {
 	start := time.tick_now()
@@ -285,7 +338,7 @@ sync_session_take :: proc(
 			return nil, .Closed
 		}
 		if len(session.messages) > 0 {
-			batch = make([dynamic]Sync_Envelope, session.allocator)
+			batch = make([dynamic]Sync_Output, session.allocator)
 			for message in session.messages {
 				append(&batch, message)
 			}
@@ -325,8 +378,8 @@ sync_session_wait_idle :: proc(session: ^Sync_Session) {
 
 @(private)
 sync_session_destroy :: proc(host: ^Sync_Host, session: ^Sync_Session) {
-	for message in session.messages {
-		delete(message.payload, session.allocator)
+	for &message in session.messages {
+		sync_output_destroy(&message, session.allocator)
 	}
 	delete(session.messages)
 	for _, view in session.views {
@@ -334,4 +387,13 @@ sync_session_destroy :: proc(host: ^Sync_Host, session: ^Sync_Session) {
 	}
 	delete(session.views)
 	free(session, session.allocator)
+}
+
+sync_output_destroy :: proc(message: ^Sync_Output, allocator: mem.Allocator) {
+	switch message.kind {
+	case .Sync:
+		delete(message.envelope.payload, allocator)
+	case .Editor:
+		delete(message.editor_payload, allocator)
+	}
 }

@@ -50,3 +50,38 @@ test_editor_session_is_bound_to_its_actor :: proc(t: ^testing.T) {
 	testing.expect(t, editor_ensure_session(&editor, 7, alice) == session)
 	testing.expect(t, editor_ensure_session(&editor, 7, bob) == nil)
 }
+
+@(test)
+test_editor_batch_is_admitted_atomically :: proc(t: ^testing.T) {
+	editor: Editor
+	editor_init(&editor, nil)
+	defer editor_destroy(&editor)
+	request := Http_Request {
+		method = "POST",
+		target = "/editor/input",
+		body   = string_bytes(
+			"{\"type\":\"editor_input\",\"session\":\"41\",\"items\":[" +
+			"{\"sequence\":\"1\",\"depends_on\":\"0\",\"frame\":\"1\",\"kind\":\"text\",\"text\":\"a\"}," +
+			"{\"sequence\":\"2\",\"depends_on\":\"1\",\"frame\":\"1\",\"kind\":\"text\",\"text\":\"b\"}]}",
+		),
+	}
+	response: Http_Response
+	actor := editor_int(11)
+	editor_handle_input_batch(&editor, actor, &request, &response)
+	testing.expect_value(t, response.status, 202)
+	session := editor_ensure_session(&editor, 41, actor)
+	testing.expect_value(t, len(session.inputs), 2)
+	testing.expect_value(t, session.next_admitted, u64(3))
+	testing.expect_value(t, session.inputs[0].sequence, u64(1))
+	testing.expect_value(t, session.inputs[1].sequence, u64(2))
+
+	bad_request := request
+	bad_request.body = string_bytes(
+		"{\"session\":\"41\",\"items\":[" +
+		"{\"sequence\":\"3\",\"depends_on\":\"1\",\"kind\":\"text\",\"text\":\"x\"}]}",
+	)
+	bad_response: Http_Response
+	editor_handle_input_batch(&editor, actor, &bad_request, &bad_response)
+	testing.expect_value(t, bad_response.status, 400)
+	testing.expect_value(t, len(session.inputs), 2)
+}

@@ -114,3 +114,41 @@ test_sync_sse_event_format :: proc(t: ^testing.T) {
 		"\"payload\":\"he\\\"llo\\n\"}\n\n"
 	testing.expect_value(t, strings.to_string(builder), expected)
 }
+
+@(test)
+test_editor_sse_event_keeps_json_payload :: proc(t: ^testing.T) {
+	builder: strings.Builder
+	strings.builder_init(&builder)
+	defer strings.builder_destroy(&builder)
+	editor_write_event(&builder, string_bytes("{\"through_sequence\":2}"))
+	testing.expect_value(
+		t,
+		strings.to_string(builder),
+		"event: editor\ndata: {\"through_sequence\":2}\n\n",
+	)
+}
+
+@(test)
+test_editor_output_evicts_sync_output_but_not_editor_results :: proc(t: ^testing.T) {
+	host: Sync_Host
+	sync_host_init(&host, nil)
+	defer sync_host_destroy(&host)
+	session := sync_host_ensure_session(&host, 7)
+	for sequence in 0 ..< SYNC_OUTPUT_LIMIT - 1 {
+		_ = sync_session_post_editor(session, "{\"through_sequence\":1}")
+	}
+	envelope := Sync_Envelope {
+		kind       = .View_Delta,
+		session_id = 7,
+		view_id    = 1,
+		payload    = string_bytes("delta"),
+	}
+	testing.expect(t, sync_session_post(session, &envelope))
+	testing.expect(t, sync_session_post_editor(session, "{\"through_sequence\":128}"))
+	testing.expect_value(t, len(session.messages), SYNC_OUTPUT_LIMIT)
+	for message in session.messages {
+		testing.expect_value(t, message.kind, Sync_Output_Kind.Editor)
+	}
+	testing.expect(t, !sync_session_post(session, &envelope))
+	testing.expect_value(t, len(session.messages), SYNC_OUTPUT_LIMIT)
+}

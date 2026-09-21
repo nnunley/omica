@@ -155,8 +155,8 @@ main :: proc() {
 			}
 		}
 		web.documents_init(&host.documents, world)
-		web.editor_init(&host.editor, world)
 		web.sync_host_init(&host.sync, world)
+		web.editor_init(&host.editor, world, &host.sync)
 		webhost_configure_auth(world, true, false)
 		webhost_seed_person(world, "alice", "Alice")
 		webhost_seed_person(world, "bob", "Bob")
@@ -198,8 +198,8 @@ main :: proc() {
 	// The acceptor and every connection thread are stopped. Retire the sync
 	// pump before the deferred world_destroy tears down the runtime it reads.
 	if world != nil {
-		web.sync_host_destroy(&host.sync)
 		web.editor_destroy(&host.editor)
+		web.sync_host_destroy(&host.sync)
 	}
 }
 

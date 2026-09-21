@@ -225,8 +225,9 @@ The implementation uses these files:
 | `host/web/editor_runtime.odin` | Evaluation and unit-replacement service. |
 | `host/web/editor-client.js` | Browser input, provisional replica, and viewport renderer. |
 | `host/web/editor-client.test.mjs` | Browser protocol and replica tests. |
+| `host/web/editor.odin` | Current input admission, result replay, and worker dispatch. |
 | `host/web/sync_json.odin` | Tagged session output and editor replay state. |
-| `host/web/sync.odin` | Editor input route and mixed SSE event writer. |
+| `host/web/sync.odin` | Mixed SSE event writer. |
 | `host/web/view.odin` | Buffer dependency registration and resynchronization. |
 | `host/web/routes.odin` | Static editor client route. |
 | `tools/webhost/` | Editor service configuration and lifecycle. |
@@ -897,18 +898,19 @@ lost result ledger, or unknown task outcome sets it to false.
 If its generation differs from the client generation, a result includes a new keymap plan. A
 barrier result also includes the current frame tree, frame generation, and selected window.
 
-The host calls the fixed Mica selector `editor_input`. It supplies the `endpoint`, `session`,
-`frame`, `item`, and `client_token` roles. It invokes the selector as the session actor.
+The host calls the fixed Mica selector `editor_input_json`. It supplies the endpoint, session,
+actor, frame, input text, client token, and known keymap generation.
 
-For a text change, the complete value contains the staged command result and its client token. The
-host then calls the fixed selector `editor_input_result` as the same actor. This selector reads
-`buffer_apply_result(client_token)` and creates the authoritative editor result.
+For a text change, `editor_input_json` commits the staged change. It then calls
+`editor_input_result` before the Mica execution ends. This selector reads
+`buffer_apply_result(client_token)` and creates the authoritative editor result. Thus, one input
+item needs one Mica execution.
 
 The finalizer maps buffer `ok` to the committed revision and authoritative `applied` delta. It maps
 buffer `resync` and `conflict` to editor `resync`. It maps buffer `aborted` to editor `rejected`.
 Each non-`ok` result contains the original buffer status as its error code.
 
-For a command without a text change, the complete `editor_input` value is already authoritative.
+For a command without a text change, the complete `editor_input_json` value is authoritative.
 The host converts an unexpected task abort to `rejected`. It retains every result before it queues
 the SSE event.
 

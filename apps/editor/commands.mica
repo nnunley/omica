@@ -534,7 +534,7 @@ verb editor/scroll_up_command(session, frame, window, buffer, point, mark, prefi
     step = editor/window_height(session, window)
   end
   editor/scroll_lines(session, window, buffer, step)
-  return {:status -> :ok}
+  return {:status -> :ok, :snapshot_required -> true}
 end
 
 verb editor/scroll_down_command(session, frame, window, buffer, point, mark, prefix_argument, input)
@@ -543,7 +543,7 @@ verb editor/scroll_down_command(session, frame, window, buffer, point, mark, pre
     step = editor/window_height(session, window)
   end
   editor/scroll_lines(session, window, buffer, 0 - step)
-  return {:status -> :ok}
+  return {:status -> :ok, :snapshot_required -> true}
 end
 
 verb editor/recenter_command(session, frame, window, buffer, point, mark, prefix_argument, input)
@@ -554,7 +554,7 @@ verb editor/recenter_command(session, frame, window, buffer, point, mark, prefix
     target_line = 0
   end
   editor/window_set_start(session, window, buffer_line_column_offset(buffer, target_line, 0))
-  return {:status -> :ok}
+  return {:status -> :ok, :snapshot_required -> true}
 end
 
 // --- Numeric arguments ------------------------------------------------------
@@ -636,18 +636,18 @@ end
 verb editor/split_window_below_command(session, frame, window, buffer, point, mark, prefix_argument, input)
   let fresh = editor/window_split(session, frame, window, :horizontal)
   editor/window_select(session, frame, fresh)
-  return {:status -> :ok}
+  return {:status -> :ok, :snapshot_required -> true}
 end
 
 verb editor/split_window_right_command(session, frame, window, buffer, point, mark, prefix_argument, input)
   let fresh = editor/window_split(session, frame, window, :vertical)
   editor/window_select(session, frame, fresh)
-  return {:status -> :ok}
+  return {:status -> :ok, :snapshot_required -> true}
 end
 
 verb editor/delete_window_command(session, frame, window, buffer, point, mark, prefix_argument, input)
   editor/window_delete(session, frame, window)
-  return {:status -> :ok}
+  return {:status -> :ok, :snapshot_required -> true}
 end
 
 // C-x 1: keep only the selected window.
@@ -667,14 +667,14 @@ verb editor/delete_other_windows_command(session, frame, window, buffer, point, 
       editor/window_delete(session, frame, victim)
     end
   end
-  return {:status -> :ok}
+  return {:status -> :ok, :snapshot_required -> true}
 end
 
 verb editor/other_window_command(session, frame, window, buffer, point, mark, prefix_argument, input)
   let step = editor/movement_step(prefix_argument)
   let target = editor/window_other(session, frame, step)
   editor/window_select(session, frame, target)
-  return {:status -> :ok}
+  return {:status -> :ok, :snapshot_required -> true}
 end
 
 // --- Minibuffer entry point -------------------------------------------------

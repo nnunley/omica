@@ -717,12 +717,36 @@ verb test/editor_json_bridge_runs_items()
     :editor/test/actor,
     1,
     "{\"kind\":\"text\",\"text\":\"hey\"}",
+    0,
     0
   )
   test/assert_equal(result[:status], :ok, "decoded item runs")
   test/assert_equal(result[:needs_finalize], false, "an untagged item needs no finalizer")
   let notes = editor/window_buffer(:editor/test/jsbridge, 1)
   test/assert_equal(buffer_text(notes), "hey", "text landed")
+
+  return true
+end
+
+verb test/editor_json_bridge_commits_tagged_items_in_one_call()
+  let result = editor_input_json(
+    :editor/test/endpoint,
+    :editor/test/jsbridge,
+    :editor/test/actor,
+    1,
+    "{\"kind\":\"text\",\"text\":\"!\"}",
+    8888,
+    0
+  )
+  test/assert_equal(result[:status], :ok, "the tagged item commits")
+  test/assert_equal(result[:revision], 2, "the committed revision is returned")
+  test/assert_equal(result[:edits][0][:text], "!", "the committed delta is returned")
+  test/assert_equal(result[:point_line], 0, "the compact result has a point line")
+  test/assert_equal(result[:point_column], 4, "the compact result has a point column")
+  test/assert_true(
+    not editor/PendingApply(:editor/test/jsbridge, 8888, ?pending_buffer),
+    "the wrapper consumes the completion"
+  )
 
   return true
 end
@@ -735,6 +759,7 @@ verb test/editor_json_bridge_rejects_bad_json()
       :editor/test/actor,
       1,
       "not json",
+      0,
       0
     )
     false
@@ -756,6 +781,7 @@ verb test/editor_pointer_items_move_point()
     :editor/test/actor,
     1,
     "{\"kind\":\"pointer\",\"scalar_offset\":2,\"extend\":false}",
+    0,
     0
   )
   test/assert_equal(first[:point], 2, "pointer moves point")
@@ -766,6 +792,7 @@ verb test/editor_pointer_items_move_point()
     :editor/test/actor,
     1,
     "{\"kind\":\"pointer\",\"scalar_offset\":7,\"extend\":true}",
+    0,
     0
   )
   test/assert_equal(second[:point], 7, "shift-click moves point")
@@ -779,6 +806,7 @@ verb test/editor_pointer_items_move_point()
     :editor/test/actor,
     1,
     "{\"kind\":\"pointer\",\"scalar_offset\":999,\"extend\":false}",
+    0,
     0
   )
   test/assert_equal(clamped[:point], 10, "pointer clamps to the end")

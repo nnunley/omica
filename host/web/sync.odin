@@ -19,6 +19,7 @@ SYNC_INPUT_PATH :: "/sync/input"
 
 // Heartbeat comment interval for idle streams.
 SYNC_HEARTBEAT :: 15 * time.Second
+SYNC_POLL :: 50 * time.Millisecond
 
 @(private)
 string_bytes :: proc(text: string) -> []u8 {
@@ -44,6 +45,10 @@ sync_handle_request :: proc(
 		http_response_text(response, 503, "text/plain; charset=utf-8", "no world loaded")
 		return true
 	}
+	principal := actor
+	if v.value_is_empty_relation(principal) {
+		principal = r.world_principal(host.world)
+	}
 	if request.method != "POST" {
 		response.headers = allow_post_headers
 		http_response_text(response, 405, "text/plain; charset=utf-8", "method not allowed")
@@ -51,19 +56,19 @@ sync_handle_request :: proc(
 	}
 	envelope, decoded := sync_decode_envelope(request.body)
 	if !decoded {
-		return sync_handle_dom_event(host, actor, request.body, response)
+		return sync_handle_dom_event(host, principal, request.body, response)
 	}
 	// The SSE client wraps DOM events in a HaveView envelope whose payload is
 	// the event JSON. Decode that payload before the view-refresh path.
 	if event, is_event := dom_event_decode(envelope.payload, host.world.allocator); is_event {
-		return sync_dispatch_dom_event(host, actor, event, response)
+		return sync_dispatch_dom_event(host, principal, event, response)
 	}
 	switch envelope.kind {
 	case .Need_View:
 		// The stream client normally creates the session, but an input can
 		// arrive first. Ensure the session here (as Have_View does) so request
 		// ordering cannot turn a legal Need_View into a failed render.
-		if sync_host_ensure_session(host, envelope.session_id, actor) == nil {
+		if sync_host_ensure_session(host, envelope.session_id, principal) == nil {
 			http_response_text(
 				response,
 				403,
@@ -75,7 +80,7 @@ sync_handle_request :: proc(
 		if !sync_render_view(
 			host,
 			envelope.session_id,
-			actor,
+			principal,
 			envelope.view_id,
 			envelope.client_revision,
 			envelope.client_signature,
@@ -90,7 +95,7 @@ sync_handle_request :: proc(
 			return true
 		}
 	case .Have_View:
-		session := sync_host_ensure_session(host, envelope.session_id, actor)
+		session := sync_host_ensure_session(host, envelope.session_id, principal)
 		if session == nil {
 			http_response_text(
 				response,
@@ -110,7 +115,7 @@ sync_handle_request :: proc(
 			if !sync_render_view(
 				host,
 				envelope.session_id,
-				actor,
+				principal,
 				envelope.view_id,
 				envelope.client_revision,
 				envelope.client_signature,
@@ -265,13 +270,17 @@ sync_events_stream :: proc(
 		sync_write_error(socket, 503, "no world loaded")
 		return true
 	}
+	principal := actor
+	if v.value_is_empty_relation(principal) {
+		principal = r.world_principal(host.world)
+	}
 	session_id, has_session := sync_query_u64(request.target, "session")
 	if !has_session {
 		sync_write_error(socket, 400, "sync event stream requires ?session=<u64>")
 		return true
 	}
 
-	session := sync_host_ensure_session(host, session_id, actor)
+	session := sync_host_ensure_session(host, session_id, principal)
 	if session == nil {
 		sync_write_error(socket, 403, "session actor mismatch")
 		return true
@@ -301,9 +310,6 @@ sync_events_stream :: proc(
 		return true
 	}
 
-	// Short receive timeout lets the writer notice a closed peer between
-	// heartbeats without sending.
-	_ = net.set_option(socket, .Receive_Timeout, 250 * time.Millisecond)
 	last_heartbeat := time.tick_now()
 	probe: [1]u8
 	for {
@@ -315,12 +321,19 @@ sync_events_stream :: proc(
 				return true
 			}
 		}
-		batch, kind := sync_session_take(session, generation, 0)
+		// Wait on the queue condition. A zero-time poll followed by a socket
+		// receive can block result delivery until the peer sends data.
+		batch, kind := sync_session_take(session, generation, SYNC_POLL)
 		switch kind {
 		case .Messages:
 			for _, index in batch {
 				strings.builder_reset(&builder)
-				sync_write_event(&builder, &batch[index])
+				switch batch[index].kind {
+				case .Sync:
+					sync_write_event(&builder, &batch[index].envelope)
+				case .Editor:
+					editor_write_event(&builder, batch[index].editor_payload)
+				}
 				strings.builder_reset(&chunk_builder)
 				http_write_chunk(
 					&chunk_builder,
@@ -330,11 +343,11 @@ sync_events_stream :: proc(
 					socket,
 					transmute([]u8)strings.to_string(chunk_builder),
 				)
-				delete(batch[index].payload, session.allocator)
+				sync_output_destroy(&batch[index], session.allocator)
 				if !sent {
 					// Free the payloads we never got to send.
-					for pending in batch[index + 1:] {
-						delete(pending.payload, session.allocator)
+					for _, pending_index in batch[index + 1:] {
+						sync_output_destroy(&batch[index + 1 + pending_index], session.allocator)
 					}
 					delete(batch)
 					return true
@@ -348,12 +361,16 @@ sync_events_stream :: proc(
 		case .Timeout:
 		}
 
+		// Probe without blocking so a closed peer can retire its writer. Toggle
+		// back before a send; web_send_all expects a blocking socket.
+		_ = net.set_blocking(socket, false)
 		read, recv_err := net.recv_tcp(socket, probe[:])
+		_ = net.set_blocking(socket, true)
 		if read == 0 && recv_err == .None {
-			// The client closed the stream; send the terminating chunk.
 			sync_finish_stream(socket, &builder)
 			return true
 		}
+
 		if time.tick_since(last_heartbeat) >= SYNC_HEARTBEAT {
 			last_heartbeat = time.tick_now()
 			strings.builder_reset(&builder)
