@@ -119,6 +119,20 @@ index_world :: proc(world: ^r.World, options: Options) -> Index_Result {
 	   !has_index {
 		return Index_Result{message = "world does not declare the source relations"}
 	}
+	// The walker reports canonical absolute paths. Normalize the root to the
+	// same form before removing its prefix, including macOS temporary aliases.
+	canonical_root, root_error := filepath.abs(root, context.temp_allocator)
+	if root_error != nil {
+		return Index_Result {
+			message = fmt.aprintf(
+				"cannot resolve source root %s: %v",
+				root,
+				root_error,
+				allocator = context.temp_allocator,
+			),
+		}
+	}
+	root = canonical_root
 	repository_name := options.repository_name
 	if repository_name == "" {
 		repository_name = "default"

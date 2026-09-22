@@ -142,7 +142,9 @@ run_timeout() {
   # restore it for the command: the REPL and other stdin consumers must still
   # see their input.
   local have_stdin=0
-  if exec 9<&0 2>/dev/null; then
+  # Scope stderr suppression to the duplication attempt. Redirection on a
+  # bare `exec` otherwise persists and hides the command's test diagnostics.
+  if { exec 9<&0; } 2>/dev/null; then
     have_stdin=1
   fi
   if [[ "${have_stdin}" == "1" ]]; then
@@ -152,7 +154,7 @@ run_timeout() {
   fi
   local pid=$!
   if [[ "${have_stdin}" == "1" ]]; then
-    exec 9<&- 2>/dev/null || true
+    { exec 9<&-; } 2>/dev/null || true
   fi
   (
     sleep "${secs}"

@@ -4,6 +4,7 @@ package source
 
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
 import "core:testing"
 import "core:time"
 
@@ -40,6 +41,26 @@ relation_rows :: proc(world: ^r.World, name: string) -> (rows: [dynamic]v.Tuple,
 
 @(test)
 test_index_workspace_tree :: proc(t: ^testing.T) {
+	test_index_workspace_tree_with_root(t, "plain")
+}
+
+@(test)
+test_index_workspace_normalized_root :: proc(t: ^testing.T) {
+	test_index_workspace_tree_with_root(t, "normalized")
+}
+
+@(test)
+test_index_workspace_symlink_root :: proc(t: ^testing.T) {
+	test_index_workspace_tree_with_root(t, "symlink")
+}
+
+@(test)
+test_index_workspace_relative_root :: proc(t: ^testing.T) {
+	test_index_workspace_tree_with_root(t, "relative")
+}
+
+@(private)
+test_index_workspace_tree_with_root :: proc(t: ^testing.T, root_kind: string) {
 	defer free_all(context.temp_allocator)
 	directory, directory_err := os.temp_dir(context.temp_allocator)
 	if directory_err != nil {
@@ -53,7 +74,9 @@ test_index_workspace_tree :: proc(t: ^testing.T) {
 		allocator = context.temp_allocator,
 	)
 	defer os.remove_all(root)
-	if err := os.make_directory_all(fmt.aprintf("%s/src", root, allocator = context.temp_allocator)); err != nil {
+	if err := os.make_directory_all(
+		fmt.aprintf("%s/src", root, allocator = context.temp_allocator),
+	); err != nil {
 		testing.expectf(t, false, "cannot create test tree: %v", err)
 		return
 	}
@@ -101,7 +124,26 @@ test_index_workspace_tree :: proc(t: ^testing.T) {
 	defer r.world_destroy(world)
 	r.world_wait(world, world.entry)
 
-	result := index_world(world, Options{root = root})
+	indexed_root := root
+	switch root_kind {
+	case "normalized":
+		indexed_root = fmt.aprintf("%s//.", root, allocator = context.temp_allocator)
+	case "symlink":
+		indexed_root = fmt.aprintf("%s-link", root, allocator = context.temp_allocator)
+		err := os.symlink(root, indexed_root)
+		testing.expectf(t, err == nil, "cannot create root alias: %v", err)
+		if err != nil {return}
+	case "relative":
+		cwd, cwd_err := os.getwd(context.temp_allocator)
+		testing.expect(t, cwd_err == nil)
+		if cwd_err != nil {return}
+		relative, rel_err := filepath.rel(cwd, root, context.temp_allocator)
+		testing.expect(t, rel_err == .None)
+		if rel_err != .None {return}
+		indexed_root = relative
+	}
+	defer if root_kind == "symlink" {os.remove(indexed_root)}
+	result := index_world(world, Options{root = indexed_root})
 	testing.expectf(t, result.ok, "index failed: %s", result.message)
 	testing.expect_value(t, result.files, 2)
 	testing.expect_value(t, result.directories, 1)
@@ -155,7 +197,12 @@ test_index_skips_world_without_schema :: proc(t: ^testing.T) {
 		testing.expect(t, false, "cannot resolve a temporary directory")
 		return
 	}
-	path := fmt.aprintf("%s/omica-source-empty-%d.mica", directory, time.tick_now(), allocator = context.temp_allocator)
+	path := fmt.aprintf(
+		"%s/omica-source-empty-%d.mica",
+		directory,
+		time.tick_now(),
+		allocator = context.temp_allocator,
+	)
 	defer os.remove(path)
 	if err := os.write_entire_file(path, "make_relation(:Marker, 1)\n"); err != nil {
 		testing.expectf(t, false, "cannot write source: %v", err)
