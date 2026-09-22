@@ -13,7 +13,8 @@
 # C-d/Backspace/Delete, C-j/C-m/Enter, click to place point and shift-click to
 # extend the region, mark and region (C-<space>, C-x C-x), undo/redo (C-/, C-_,
 # C-x u, C-x C-/), numeric arguments (C-u, M--, M-0..M-9), C-g, window commands
-# (C-x 0/1/2/3/o), and M-x by name.
+# (C-x 0/1/2/3/o), M-x by name, C-x b, C-x C-f, and C-x C-s.
+# File commands access the server workspace rooted at this repository.
 #
 # The browser paints plain inserted text immediately, then reconciles it with
 # the authoritative Mica snapshot. The Mica editor files live under apps/editor/.
@@ -46,6 +47,7 @@ fileins=(
   apps/editor/session.mica
   apps/editor/picker.mica
   apps/editor/minibuffer.mica
+  apps/editor/files.mica
   apps/editor/ui.mica
   apps/editor/defaults.mica
   apps/editor/http.mica
@@ -66,7 +68,7 @@ args=()
 for file in "${fileins[@]}"; do
   args+=(--filein "${file}")
 done
-args+=(--bind "${bind}" --editor-client host/web/editor-client.js)
+args+=(--bind "${bind}" --editor-client host/web/editor-client.js --editor-root "${repo_root}")
 if [[ -n "${MICA_STORE:-}" ]]; then
   args+=(--store "${MICA_STORE}")
   args+=(--durability "${MICA_DURABILITY:-group}")

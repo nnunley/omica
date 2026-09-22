@@ -166,6 +166,23 @@ verb editor/minibuffer_accept(session, frame, window, input)
     )
   end
 
+  // A directory candidate continues the same file prompt. It does not visit
+  // a directory as if it were a file.
+  if had_picker && kind == :file
+    let candidate = editor/picker_selected_candidate(session)
+    if candidate != none && index_or(candidate, :annotation, "") == "directory"
+      buffer_replace(buffer, 0, buffer_len(buffer), candidate[:value])
+      editor/picker_refresh(session)
+      return editor/result(
+        :ok,
+        session,
+        frame,
+        accept_window,
+        {:barrier -> true, :snapshot_required -> true}
+      )
+    end
+  end
+
   let continuation = none
   if request != none
     let continuations = editor/MinibufferContinuation(session, request, ?c)

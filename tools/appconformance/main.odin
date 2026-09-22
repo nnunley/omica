@@ -60,6 +60,7 @@ main :: proc() {
 		"apps/editor/session.mica",
 		"apps/editor/picker.mica",
 		"apps/editor/minibuffer.mica",
+		"apps/editor/files.mica",
 		"apps/editor/ui.mica",
 		"apps/editor/defaults.mica",
 		"apps/editor/tests/editor-scenarios.mica",

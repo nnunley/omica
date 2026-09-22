@@ -64,6 +64,9 @@ World_Config :: struct {
 	// Host-side handler for `External_Request` boundaries. Nil answers every
 	// request with an `ExternalUnavailable` error value.
 	external_handler:   External_Handler,
+	// Opaque host configuration copied into each external request context.
+	// The runtime does not inspect or own this pointer.
+	external_data:      rawptr,
 	// External worker threads. Values below one become one.
 	external_workers:   int,
 }
@@ -105,6 +108,7 @@ World :: struct {
 	// External host bridge. Stream workers are tracked here so world shutdown
 	// can join them before the scheduler they deliver through is destroyed.
 	external_handler:  External_Handler,
+	external_data:     rawptr,
 	external_workers:  [dynamic]^thread.Thread,
 	external_streams:  [dynamic]^External_Stream,
 	external_lock:     sync.Mutex,

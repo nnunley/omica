@@ -36,6 +36,8 @@ main :: proc() {
 	durability_text := "group"
 	fileins: [dynamic]string
 	defer delete(fileins)
+	editor_roots: [dynamic]string
+	defer delete(editor_roots)
 
 	args := os.args[1:]
 	for index := 0; index < len(args); index += 1 {
@@ -68,6 +70,13 @@ main :: proc() {
 			}
 			index += 1
 			append(&fileins, args[index])
+		case "--editor-root":
+			if index + 1 >= len(args) {
+				usage()
+				os.exit(1)
+			}
+			index += 1
+			append(&editor_roots, args[index])
 		case "--actor":
 			if index + 1 >= len(args) {
 				usage()
@@ -112,6 +121,13 @@ main :: proc() {
 	}
 	defer web.routes_destroy(&host.routes)
 
+	editor_files: web.Editor_Files
+	if ok, message := web.editor_files_init(&editor_files, editor_roots[:], context.allocator); !ok {
+		fmt.eprintf("webhost: %s\n", message)
+		os.exit(1)
+	}
+	defer web.editor_files_destroy(&editor_files)
+
 	world: ^r.World
 	if len(fileins) > 0 || store_path != "" {
 		started_world, result := r.world_start(
@@ -123,7 +139,8 @@ main :: proc() {
 				workers          = DEFAULT_WORKERS,
 				store_path       = store_path,
 				durability       = parse_durability(durability_text),
-				external_handler = ext.handle_request,
+				external_handler = webhost_external_request,
+				external_data    = &editor_files,
 				external_workers = 2,
 			},
 		)
@@ -303,10 +320,26 @@ parse_durability :: proc(text: string) -> s.Durability {
 	return .Group
 }
 
+webhost_external_request :: proc(
+	ctx: r.External_Context,
+	service: v.Value,
+	payload: v.Value,
+) -> v.Value {
+	if web.editor_file_service(service) {
+		return web.editor_file_handle_request(
+			ctx,
+			(^web.Editor_Files)(ctx.host_data),
+			service,
+			payload,
+		)
+	}
+	return ext.handle_request(ctx, service, payload)
+}
+
 usage :: proc() {
 	fmt.eprintln(
 		"usage: webhost [--bind address:port] [--filein path]... " +
 		"[--sync-client path.js] [--editor-client path.js] [--actor name] " +
-		"[--store dir] [--durability none|group|strict]",
+		"[--editor-root dir]... [--store dir] [--durability none|group|strict]",
 	)
 }

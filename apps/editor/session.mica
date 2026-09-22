@@ -85,6 +85,7 @@ verb editor/session_cleanup(session)
   for row in editor/PendingApply(session, ?token, ?buffer)
     retract editor/PendingApply(session, row[:token], _)
   end
+  retract editor/PendingFileWriteConfirmation(session, _, _, _)
   retract editor/PendingKeys(session, _)
   retract editor/PrefixArgument(session, _)
   retract editor/LastCommand(session, _)

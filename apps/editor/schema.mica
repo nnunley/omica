@@ -140,6 +140,7 @@ make_functional_relation(:editor/BufferFileStamp, 2, [0])
 make_functional_relation(:editor/BufferFileEncoding, 2, [0])
 make_functional_relation(:editor/BufferLineEnding, 2, [0])
 make_functional_relation(:editor/CleanShutdown, 2, [0])
+make_functional_relation(:editor/PendingFileWriteConfirmation, 4, [0, 1], :volatile)
 
 // Editor-internal: remembers which buffer a staged client-tagged apply belongs
 // to, so the finalizer can name it after the commit.

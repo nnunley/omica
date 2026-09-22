@@ -150,6 +150,7 @@ verb editor/buffer_kill(session, buffer, force)
   end
 
   let name = editor/buffer_display_name(buffer)
+  let owner = editor/buffer_owner(buffer)
   let file_path = none
   let paths = editor/BufferFilePath(buffer, ?path)
   if paths
@@ -174,8 +175,9 @@ verb editor/buffer_kill(session, buffer, force)
   retract editor/BufferFileStamp(buffer, _)
   retract editor/BufferFileEncoding(buffer, _)
   retract editor/BufferLineEnding(buffer, _)
+  retract editor/PendingFileWriteConfirmation(_, buffer, _, _)
   if file_path != none
-    retract editor/LiveFileBuffer(file_path, _)
+    retract editor/LiveFileBuffer([owner, file_path], _)
   end
   kill_buffer(buffer)
   return true

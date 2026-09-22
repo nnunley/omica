@@ -1346,9 +1346,12 @@ style in `BufferLineEnding`. The writer restores that style during save.
 `editor_file_write_atomic` requires the expected stamp. The host writes a temporary file in the
 same directory, flushes it, and renames it over the destination. It then flushes the parent
 directory. For a new file, the expected stamp is `none`.
+If the directory cannot be opened, flushed, or closed, the host reports an error even though replacement already occurred.
+The buffer remains modified after that error.
 
-When the expected stamp does not match, the host returns `:changed`. Mica then asks the user before
-it overwrites or reloads the file.
+When the expected stamp does not match, the host returns `:changed`. Mica refuses the first save.
+The user repeats `C-x C-s` to replace the changed file.
+Confirmation records are separate from their stamps, so a missing file's `none` stamp can also be confirmed.
 
 File metadata uses these relations:
 
@@ -1360,11 +1363,12 @@ make_functional_relation(:editor/BufferFileEncoding, 2, [0])
 make_functional_relation(:editor/BufferLineEnding, 2, [0])
 ```
 
-`LiveFileBuffer(canonical_path, buffer)` permits one live buffer for each canonical path. File
-visitation checks this relation before it reads the file.
+`LiveFileBuffer([actor, canonical_path], buffer)` permits one live buffer for each actor and path.
+File visitation checks this relation before it reads the file.
 
 `BufferSavedRevision` records the revision from the last successful load or save. If the current
 revision differs from this revision, the buffer is modified.
+Save captures the revision with the text before the external request. Edits committed during the request remain modified after save completes.
 
 The host restricts paths to configured workspace roots. It resolves symbolic links before the
 authority decision. It repeats the containment check before replacement. It never accepts a

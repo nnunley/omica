@@ -31,6 +31,8 @@ External_Context :: struct {
 	// Owns every value the handler returns or delivers. Lives as long as the
 	// world.
 	allocator: mem.Allocator,
+	// Opaque configuration supplied by the host in `World_Config`.
+	host_data: rawptr,
 	// Posts a value through a mailbox sender handle from a host thread.
 	// Returns false when the mailbox is closed, revoked, or the world is
 	// stopping.
@@ -69,6 +71,7 @@ external_worker_proc :: proc(data: rawptr) {
 		ctx := External_Context {
 			task      = job.task_id,
 			allocator = world.allocator,
+			host_data = world.external_data,
 			deliver   = world_external_deliver,
 			user      = world,
 			spawn     = world_external_spawn,
@@ -156,6 +159,7 @@ world_external_stopping :: proc(user: rawptr) -> bool {
 @(private)
 world_start_external :: proc(world: ^World, config: World_Config) {
 	world.external_handler = config.external_handler
+	world.external_data = config.external_data
 	if world.external_handler == nil {
 		return
 	}
