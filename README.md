@@ -68,6 +68,15 @@ Start a REPL against a store or a fresh in-memory world:
 odin run tools/repl -- --store world-db
 ```
 
+Initialize the benchmark dependency before you run tests or benchmarks:
+
+```sh
+git submodule update --init --recursive
+```
+
+The `vendor/micromeasure` submodule pins the upstream repository. Benchmarks import its `micromeasure-odin` package.
+For a new checkout, `git clone --recurse-submodules` initializes this dependency during the clone.
+
 Run the test suites:
 
 ```sh
@@ -490,7 +499,7 @@ The [guide](mdbook/src/SUMMARY.md) walks through the examples, the language, and
     Use `baseline` to compare against `benchmarks/results/kernel.tsv`.
     Use `update-baseline` for an explicit full-suite baseline update.
     Quick and filtered runs preserve the saved baseline.
-- [`micromeasure`](micromeasure/README.md): standalone Odin benchmark harness, with Linux counters and process memory observations.
+- [`micromeasure`](vendor/micromeasure/micromeasure-odin/README.md): upstream Odin benchmark harness, pinned through the `vendor/micromeasure` submodule.
 - [`scripts/mud.sh`](scripts/mud.sh): builds and runs the web host with the MUD fileins.
 - [`scripts/agent.sh`](scripts/agent.sh): builds and runs the web host with the agent fileins;
   model access needs `OPENROUTER_API_KEY`.

@@ -22,6 +22,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Odin
         uses: laytan/setup-odin@v2
@@ -37,7 +39,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libmbedtls-dev
 
       - name: Standalone benchmark package
-        run: bash micromeasure/check-standalone.sh
+        run: bash vendor/micromeasure/micromeasure-odin/check-standalone.sh
 
       - name: Unit and integration tests
         run: scripts/test.sh all
@@ -56,6 +58,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Odin
         uses: laytan/setup-odin@v2

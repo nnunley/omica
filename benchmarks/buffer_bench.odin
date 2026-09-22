@@ -11,7 +11,7 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 
-import mm "../micromeasure"
+import mm "../vendor/micromeasure/micromeasure-odin"
 import b "../mica/buffer"
 
 BUFFER_BENCH_LINES :: 2000

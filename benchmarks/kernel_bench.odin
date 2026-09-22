@@ -5,7 +5,7 @@ import "core:mem"
 import "core:mem/virtual"
 
 import k "../mica/kernel"
-import mm "../micromeasure"
+import mm "../vendor/micromeasure/micromeasure-odin"
 import v "../mica/var"
 
 // Shared accumulation target for visitors.

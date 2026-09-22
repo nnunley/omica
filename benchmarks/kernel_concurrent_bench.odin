@@ -12,7 +12,7 @@ import "core:sync"
 import "core:thread"
 
 import k "../mica/kernel"
-import mm "../micromeasure"
+import mm "../vendor/micromeasure/micromeasure-odin"
 import v "../mica/var"
 
 DISJOINT_THREADS :: 8

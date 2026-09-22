@@ -11,7 +11,7 @@ package main
 import "core:mem"
 import "core:mem/virtual"
 
-import mm "../micromeasure"
+import mm "../vendor/micromeasure/micromeasure-odin"
 import v "../mica/var"
 import vm "../mica/vm"
 

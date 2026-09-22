@@ -11,6 +11,11 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ ! -f "${repo_root}/vendor/micromeasure/micromeasure-odin/micromeasure.odin" ]]; then
+  echo "missing micromeasure submodule; run git submodule update --init --recursive" >&2
+  exit 1
+fi
+
 results="${repo_root}/benchmarks/results"
 mkdir -p "${results}"
 
@@ -59,6 +64,7 @@ mkdir -p "$(dirname "${driver}")"
 "${odin_bin}" build "${repo_root}/benchmarks" -o:speed -out:"${driver}"
 "${driver}" -suite=kernel "${args[@]+"${args[@]}"}" \
   -save="${results}/kernel-latest.tsv" -json="${results}/kernel-latest.json" \
+  -runner-id="${MICROMEASURE_RUNNER_ID:-$(hostname)}" \
   -build-flags=-o:speed -machine="$(uname -sm)" \
   -revision="$(git -C "${repo_root}" describe --always --dirty)"
 

@@ -1,0 +1,3 @@
+[submodule "micromeasure"]
+	path = vendor/micromeasure
+	url = https://github.com/rdaum/micromeasure.git

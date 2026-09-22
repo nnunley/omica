@@ -11,7 +11,7 @@ import "core:mem"
 import k "../mica/kernel"
 import r "../mica/runtime"
 import vm "../mica/vm"
-import mm "../micromeasure"
+import mm "../vendor/micromeasure/micromeasure-odin"
 import v "../mica/var"
 
 TASK_BENCH_TASKS :: 64

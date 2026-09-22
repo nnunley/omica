@@ -16,7 +16,7 @@ import "core:mem"
 import "core:mem/virtual"
 
 import k "../mica/kernel"
-import mm "../micromeasure"
+import mm "../vendor/micromeasure/micromeasure-odin"
 import v "../mica/var"
 
 // Row-count ladder. 10^4 / 10^5 / 10^6 cover the gap named in

@@ -12,7 +12,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 
-import mm "../micromeasure"
+import mm "../vendor/micromeasure/micromeasure-odin"
 
 Args :: struct {
 	config:     mm.Config,
@@ -103,6 +103,8 @@ parse_args :: proc() -> Args {
 			args.suite = arg[len("-suite="):]
 		case strings.has_prefix(arg, "-save="):
 			args.save = arg[len("-save="):]
+		case strings.has_prefix(arg, "-runner-id="):
+			args.provenance.runner_id = arg[len("-runner-id="):]
 		case strings.has_prefix(arg, "-machine="):
 			args.provenance.machine = arg[len("-machine="):]
 		case strings.has_prefix(arg, "-revision="):
@@ -118,6 +120,11 @@ parse_args :: proc() -> Args {
 		case !strings.has_prefix(arg, "-"):
 			args.filter = arg
 		}
+	}
+	args.provenance.suite = args.suite
+	if args.json != "" && strings.trim_space(args.provenance.runner_id) == "" {
+		fmt.eprintln("JSON export requires -runner-id=<stable machine identity>")
+		os.exit(1)
 	}
 	return args
 }
