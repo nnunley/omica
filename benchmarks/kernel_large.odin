@@ -305,11 +305,11 @@ bench_large_closure_reaches :: proc(user: rawptr, chunk: int, _: int) {
 // --- Memory growth ----------------------------------------------------------
 //
 // A bench that bulk-loads `rows` tuples into a fresh relation and reports the
-// per-run RSS delta through the harness's memory probe. The timed region is
+// process high-water growth through the memory probe. The timed region is
 // the bulk load (sort + dedup + chunk + index build + publish); the memory
 // column is the VmHWM delta measured by the probe before warmup and after the
 // last sample. VmHWM is a lifetime high-water, so the delta is run-
-// order-dependent: run with a filter for a clean per-scale reading.
+// order-dependent. Filtering does not isolate registration allocations.
 Mem_State :: struct {
 	kernel:   k.Kernel,
 	relation: k.Relation_ID,
@@ -595,13 +595,10 @@ register_mem_growth :: proc(runner: ^mm.Runner) {
 	)
 	for rows in ROW_COUNTS {
 		state := mem_state_init(rows)
-		// The memory probe reads VmHWM (peak RSS) before warmup and after
-		// the last sample; the harness records the delta in the result's
-		// `memory` field. VmHWM is a lifetime high-water, so the delta is
-		// run-order-dependent: a later 1M-row bench lifts the peak above
-		// what an earlier 10k-row bench can reach, and the earlier bench's
-		// delta clamps to zero. For a clean per-scale reading, run with a
-		// filter (e.g. `filter=10k`) so only one scale's states are built.
+		// VmHWM is process-lifetime. This delta includes warmup and calibration.
+		// Zero means no new high-water mark, not zero allocation cost.
+		// All suite states are built before filtering, so a filter does not
+		// provide memory isolation. Use a dedicated process for that purpose.
 		mm.bench_with_memory(
 			group,
 			fmt.aprintf("grow_%s", row_name(rows)),

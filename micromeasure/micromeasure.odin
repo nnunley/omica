@@ -25,18 +25,20 @@ import "core:time"
 
 // Default measurement configuration.
 DEFAULT_CONFIG :: Config {
-	warmup        = 200 * time.Millisecond,
-	target_sample = 20 * time.Millisecond,
-	min_samples   = 10,
-	max_samples   = 40,
-	noise_cv      = 0.05,
+	warmup           = 200 * time.Millisecond,
+	target_sample    = 20 * time.Millisecond,
+	min_samples      = 10,
+	max_samples      = 40,
+	noise_cv         = 0.05,
+	collect_counters = true,
 }
 
 // QUICK_CONFIG is a shorter configuration for fast feedback.
 QUICK_CONFIG :: Config {
-	warmup        = 50 * time.Millisecond,
-	target_sample = 5 * time.Millisecond,
-	min_samples   = 5,
-	max_samples   = 15,
-	noise_cv      = 0.10,
+	warmup           = 50 * time.Millisecond,
+	target_sample    = 5 * time.Millisecond,
+	min_samples      = 5,
+	max_samples      = 15,
+	noise_cv         = 0.10,
+	collect_counters = true,
 }

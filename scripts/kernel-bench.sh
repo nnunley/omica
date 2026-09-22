@@ -1,23 +1,13 @@
 #!/usr/bin/env bash
-# Runs the kernel microbenchmark suite and writes a TSV baseline.
+# Runs the kernel suite and writes kernel-latest.tsv and kernel-latest.json.
 #
-#   scripts/kernel-bench.sh             # run the full suite, replace baseline
-#   scripts/kernel-bench.sh baseline    # also show delta vs the saved baseline
-#   scripts/kernel-bench.sh filter=10k  # only benches whose name contains 10k
-#   scripts/kernel-bench.sh quick       # shorter warmup/samples (fast feedback)
+#   scripts/kernel-bench.sh                 # full suite, keep saved baseline
+#   scripts/kernel-bench.sh baseline        # compare against kernel.tsv
+#   scripts/kernel-bench.sh filter=10k quick # spot check, keep saved baseline
+#   scripts/kernel-bench.sh update-baseline # full suite, replace kernel.tsv
 #
-# The baseline is written to benchmarks/results/kernel.tsv. `quick` and
-# `filter` runs still overwrite the file, so use them for spot checks, not
-# for updating the committed baseline. `baseline` mode compares against the
-# saved file and then overwrites it with the new numbers.
-#
-# Note on the memory column: the `kernel/mem/growth` benches probe VmHWM
-# (peak RSS), which is a lifetime high-water. In a full run, the 1M-row store
-# states built during registration lift the peak above what the 10k/100k
-# benches can reach, so their deltas clamp to zero and print `-`. For a clean
-# per-scale memory reading, run with a filter (e.g. `filter=10k`), which
-# still builds all states but the probe is captured after the warmup of the
-# filtered bench, so the delta is the bench's own growth.
+# Memory is process high-water growth across warmup, calibration, and samples.
+# Previous allocations can mask growth. A filter still builds all suite states.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,28 +24,47 @@ if [[ -z "${odin_bin}" || ! -x "${odin_bin}" ]]; then
 fi
 
 args=()
+update_baseline=0
+partial_run=0
 for arg in "$@"; do
   case "${arg}" in
     quick)
       args+=("-quick")
+      partial_run=1
       ;;
     filter=*)
       args+=("-filter=${arg#filter=}")
+      partial_run=1
+      ;;
+    update-baseline)
+      update_baseline=1
       ;;
     baseline)
       args+=("-baseline=${results}/kernel.tsv")
       ;;
     *)
-      echo "unknown argument: ${arg} (use quick, filter=<text>, baseline)" >&2
+      echo "unknown argument: ${arg} (use quick, filter=<text>, baseline, update-baseline)" >&2
       exit 2
       ;;
   esac
 done
 
+if [[ "${update_baseline}" == "1" && "${partial_run}" == "1" ]]; then
+  echo "update-baseline requires a full run without quick or filter" >&2
+  exit 2
+fi
+
 driver="${repo_root}/.cache/test-bin/kernelbench"
 mkdir -p "$(dirname "${driver}")"
 "${odin_bin}" build "${repo_root}/benchmarks" -o:speed -out:"${driver}"
 "${driver}" -suite=kernel "${args[@]+"${args[@]}"}" \
-  -save="${results}/kernel.tsv"
+  -save="${results}/kernel-latest.tsv" -json="${results}/kernel-latest.json" \
+  -build-flags=-o:speed -machine="$(uname -sm)" \
+  -revision="$(git -C "${repo_root}" describe --always --dirty)"
 
-echo "wrote ${results}/kernel.tsv"
+if [[ "${update_baseline}" == "1" ]]; then
+  cp "${results}/kernel-latest.tsv" "${results}/kernel.tsv"
+  cp "${results}/kernel-latest.json" "${results}/kernel.json"
+  echo "updated ${results}/kernel.tsv and kernel.json"
+fi
+echo "wrote ${results}/kernel-latest.tsv and kernel-latest.json"

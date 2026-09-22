@@ -3,117 +3,144 @@ package micromeasure
 
 import "core:fmt"
 import "core:math"
+import "core:mem"
 import "core:strings"
 import "core:time"
 
-// Maximum calibrated chunk size.
 MAX_CHUNK :: 1 << 30
 
-// A benchmark session.
+// A session owns registration strings and results. Benchmark user state is borrowed.
 Runner :: struct {
-	config:  Config,
-	groups:  [dynamic]^Group,
-	filter:  string,
-	results: [dynamic]Result,
+	config:    Config,
+	groups:    [dynamic]^Group,
+	filter:    string,
+	results:   [dynamic]Result,
+	allocator: mem.Allocator,
 }
 
-// Creates a runner with the given configuration.
-runner_init :: proc(runner: ^Runner, config := DEFAULT_CONFIG) {
-	runner.config = config
-	runner.groups = make([dynamic]^Group)
-	runner.results = make([dynamic]Result)
-}
-
-// Releases all runner storage.
-runner_destroy :: proc(runner: ^Runner) {
-	for result in runner.results {
-		delete(result.samples)
+runner_init :: proc(runner: ^Runner, config := DEFAULT_CONFIG, allocator := context.allocator) {
+	assert(config.warmup >= 0 && config.target_sample > 0, "invalid benchmark duration")
+	assert(
+		config.min_samples >= 2 && config.max_samples >= config.min_samples,
+		"invalid sample limits",
+	)
+	assert(
+		config.noise_cv >= 0 && !math.is_nan(config.noise_cv) && !math.is_inf(config.noise_cv),
+		"invalid noise threshold",
+	)
+	runner^ = Runner {
+		config    = config,
+		allocator = allocator,
 	}
+	runner.groups = make([dynamic]^Group, allocator)
+	runner.results = make([dynamic]Result, allocator)
+}
+
+// Clears measurements but preserves registration. runner_run calls this automatically.
+runner_clear_results :: proc(runner: ^Runner) {
+	for result in runner.results {
+		delete(result.name, runner.allocator)
+		delete(result.samples, runner.allocator)
+	}
+	clear(&runner.results)
+}
+
+runner_destroy :: proc(runner: ^Runner) {
+	runner_clear_results(runner)
 	delete(runner.results)
 	for group in runner.groups {
+		for bench in group.benches {
+			delete(bench.name, runner.allocator)
+		}
 		delete(group.benches)
-		free(group)
+		delete(group.name, runner.allocator)
+		delete(group.throughput.unit, runner.allocator)
+		free(group, runner.allocator)
 	}
 	delete(runner.groups)
+	runner^ = {}
 }
 
-// Adds a benchmark group with a shared throughput description.
 group :: proc(
 	runner: ^Runner,
 	name: string,
-	throughput := Throughput{units_per_op = 1, unit = "op"},
+	throughput := Throughput{1, "op"},
+	counter_scope := Counter_Scope.Calling_Thread,
 ) -> ^Group {
-	created := new(Group)
-	created.name = name
+	assert(
+		throughput.units_per_op > 0 &&
+		!math.is_inf(throughput.units_per_op) &&
+		!math.is_nan(throughput.units_per_op),
+		"invalid throughput",
+	)
+	created := new(Group, runner.allocator)
+	created.name = strings.clone(name, runner.allocator)
 	created.throughput = throughput
+	created.throughput.unit = strings.clone(throughput.unit, runner.allocator)
+	created.counter_scope = counter_scope
+	created.allocator = runner.allocator
+	created.benches = make([dynamic]Bench, runner.allocator)
 	append(&runner.groups, created)
 	return created
 }
 
-// Registers a benchmark in a group.
+// Registers a body and optional untimed per-invocation hooks. Copies the name.
+bench_register :: proc(group: ^Group, specification: Bench) {
+	assert(specification.run != nil && specification.max_chunk >= 0, "invalid benchmark")
+	entry := specification
+	entry.name = strings.clone(entry.name, group.allocator)
+	append(&group.benches, entry)
+}
+
 bench :: proc(group: ^Group, name: string, user: rawptr, run: Bench_Proc) {
-	append(&group.benches, Bench{name = name, run = run, user = user})
+	bench_register(group, Bench{name = name, user = user, run = run})
 }
 
-// Registers a benchmark with an upper bound on the calibrated chunk. Use this
-// for allocation-heavy bodies so that one sample does not reserve too much
-// memory.
-bench_capped :: proc(
-	group: ^Group,
-	name: string,
-	user: rawptr,
-	run: Bench_Proc,
-	max_chunk: int,
-) {
-	append(&group.benches, Bench {
-		name      = name,
-		run       = run,
-		user      = user,
-		max_chunk = max_chunk,
-	})
+bench_capped :: proc(group: ^Group, name: string, user: rawptr, run: Bench_Proc, max_chunk: int) {
+	bench_register(group, Bench{name = name, user = user, run = run, max_chunk = max_chunk})
 }
 
-// Registers a benchmark with a memory probe. The probe is called before the
-// first warmup sample and after the last measured sample; the difference (in
-// bytes) is recorded in the result's `memory` field. The probe may run
-// repeatedly during warmup and calibration, so it must be cheap. Use a
-// monotonic probe (e.g. `peak_rss_bytes`) for delta reporting; a non-
-// monotonic probe (e.g. `current_rss_bytes`) will record a noisy after-
-// baseline that includes later samples' growth.
+// Observes memory before warmup and after the last sample's cleanup.
+// The signed delta includes warmup, calibration, hooks, and harness activity.
 bench_with_memory :: proc(
 	group: ^Group,
 	name: string,
 	user: rawptr,
 	run: Bench_Proc,
 	max_chunk: int,
-	memory_probe: proc() -> int,
+	memory_probe: Memory_Probe,
 ) {
-	append(&group.benches, Bench {
-		name         = name,
-		run          = run,
-		user         = user,
-		max_chunk    = max_chunk,
-		memory_probe = memory_probe,
-	})
+	bench_register(
+		group,
+		Bench {
+			name = name,
+			user = user,
+			run = run,
+			max_chunk = max_chunk,
+			memory_probe = memory_probe,
+		},
+	)
 }
 
-// Runs every registered benchmark that matches the filter. Returns the number
-// of benchmarks that ran.
+// Replaces prior results. The filter is borrowed for this call only.
 runner_run :: proc(runner: ^Runner) -> int {
-	ran := 0
+	runner_clear_results(runner)
+	// Own the filter too: a callback can clear the caller's temporary storage.
+	filter := strings.clone(runner.filter, runner.allocator)
+	defer delete(filter, runner.allocator)
 	for group in runner.groups {
 		for bench in group.benches {
-			full_name := bench_full_name(group.name, bench.name, context.temp_allocator)
-			if runner.filter != "" && !strings.contains(full_name, runner.filter) {
+			full_name := bench_full_name(group.name, bench.name, runner.allocator)
+			if filter != "" && !strings.contains(full_name, filter) {
+				delete(full_name, runner.allocator)
 				continue
 			}
 			fmt.eprintf("benchmark: %s\n", full_name)
 			result := measure_bench(runner, group^, bench, full_name)
 			append(&runner.results, result)
-			ran += 1
 		}
 	}
-	return ran
+	return len(runner.results)
 }
 
 @(private)
@@ -127,32 +154,43 @@ bench_full_name :: proc(group, name: string, allocator := context.allocator) -> 
 }
 
 @(private)
-sample_ns :: proc(bench: Bench, chunk: int, chunk_num: int) -> i64 {
+sample_ns :: proc(bench: Bench, chunk: int, chunk_num: int, counters: ^Counter_Set = nil) -> i64 {
+	if bench.prepare != nil {
+		bench.prepare(bench.user, chunk, chunk_num)
+	}
+	if counters != nil {
+		counters_begin(counters)
+	}
 	start := time.tick_now()
 	bench.run(bench.user, chunk, chunk_num)
 	end := time.tick_now()
+	if counters != nil {
+		counters_end(counters)
+	}
+	if bench.cleanup != nil {
+		bench.cleanup(bench.user, chunk, chunk_num)
+	}
 	return time.duration_nanoseconds(time.tick_diff(start, end))
 }
 
 @(private)
+next_chunk :: proc(chunk: int, elapsed: i64, target: time.Duration, cap: int) -> int {
+	per_op := max(f64(elapsed) / f64(chunk), 0.05)
+	limit := min(MAX_CHUNK, cap) if cap > 0 else MAX_CHUNK
+	// Clamp before conversion to avoid integer overflow for long targets.
+	return int(clamp(f64(time.duration_nanoseconds(target)) / per_op, 1, f64(limit)))
+}
+
+@(private)
 calibrate_chunk :: proc(runner: ^Runner, bench: Bench) -> int {
-	target_ns := f64(time.duration_nanoseconds(runner.config.target_sample))
 	chunk := 1
 	for _ in 0 ..< 12 {
 		elapsed := sample_ns(bench, chunk, 0)
-		per_op := f64(elapsed) / f64(max(chunk, 1))
-		if per_op < 0.05 {
-			per_op = 0.05
-		}
-		desired := int(target_ns / per_op)
-		desired = clamp(desired, 1, MAX_CHUNK)
-		if bench.max_chunk > 0 && desired > bench.max_chunk {
-			desired = bench.max_chunk
+		desired := next_chunk(chunk, elapsed, runner.config.target_sample, bench.max_chunk)
+		if elapsed >= time.duration_nanoseconds(runner.config.target_sample) || desired == chunk {
+			return desired
 		}
 		chunk = desired
-		if elapsed >= i64(target_ns) {
-			break
-		}
 		if bench.max_chunk > 0 && chunk >= bench.max_chunk {
 			break
 		}
@@ -161,111 +199,84 @@ calibrate_chunk :: proc(runner: ^Runner, bench: Bench) -> int {
 }
 
 @(private)
-measure_bench :: proc(
-	runner: ^Runner,
-	group: Group,
-	bench: Bench,
-	full_name: string,
-) -> Result {
-	// Memory probe baseline, when the bench registered one. Captured before
-	// any warmup so the delta measures only the timed region's growth.
-	memory_before := 0
+samples_complete :: proc(config: Config, samples: []f64) -> bool {
+	if len(samples) >= config.max_samples {
+		return true
+	}
+	if len(samples) < config.min_samples {
+		return false
+	}
+	return coefficient_of_variation(samples) <= config.noise_cv
+}
+
+@(private)
+apply_memory :: proc(result: ^Result, before, after: Memory_Reading) {
+	result.memory_available = false
+	result.memory = 0
+	result.memory_before = before
+	result.memory_after = after
+	result.memory_kind = before.kind
+	if !before.available ||
+	   !after.available ||
+	   before.kind != after.kind ||
+	   before.bytes < 0 ||
+	   after.bytes < 0 {return}
+	delta := after.bytes - before.bytes
+	if before.kind == .Peak_RSS_Growth && delta < 0 {
+		return
+	}
+	result.memory = delta
+	result.memory_available = true
+}
+
+@(private)
+measure_bench :: proc(runner: ^Runner, group: Group, bench: Bench, full_name: string) -> Result {
+	before: Memory_Reading
 	if bench.memory_probe != nil {
-		memory_before = bench.memory_probe()
+		before = bench.memory_probe(bench.user)
 	}
 
-	// Warm up the code paths and caches.
 	warmup_start := time.tick_now()
-	for time.duration_nanoseconds(time.tick_diff(warmup_start, time.tick_now())) <
-	    time.duration_nanoseconds(runner.config.warmup) {
-		bench.run(bench.user, 1, 0)
+	for time.tick_diff(warmup_start, time.tick_now()) < runner.config.warmup {
+		_ = sample_ns(bench, 1, 0)
 	}
-
 	chunk := calibrate_chunk(runner, bench)
-
-	// Hardware counters, when the platform and kernel allow them. Opened once
-	// and reused across samples; each sample resets, enables, and reads.
-	counters := counters_open()
+	scope := group.counter_scope if runner.config.collect_counters else Counter_Scope.Disabled
+	counters: Counter_Set
+	if scope == .Calling_Thread {
+		counters = counters_open()
+	}
 	defer counters_close(&counters)
-	total_counts: [COUNTER_COUNT]u64
-	total_ops := u64(0)
-
-	max_samples := max(runner.config.max_samples, 1)
-	min_samples := clamp(runner.config.min_samples, 1, max_samples)
-	per_op := make([dynamic]f64, 0, max_samples)
-	for sample_index in 0 ..< max_samples {
-		counters_begin(&counters)
-		elapsed := sample_ns(bench, chunk, sample_index)
-		counters_end(&counters)
-		append(&per_op, f64(elapsed) / f64(max(chunk, 1)))
-		if counters.usable {
-			for kind in Counter_Kind {
-				total_counts[kind] += counters.values[kind]
-			}
-			total_ops += u64(max(chunk, 1))
-		}
-		if len(per_op) >= min_samples {
-			if coefficient_of_variation(per_op[:]) <= runner.config.noise_cv {
-				break
-			}
+	total: Counter_Total
+	per_op := make([dynamic]f64, 0, runner.config.max_samples, runner.allocator)
+	defer delete(per_op)
+	for sample_index in 0 ..< runner.config.max_samples {
+		elapsed := sample_ns(bench, chunk, sample_index, &counters)
+		append(&per_op, f64(elapsed) / f64(chunk))
+		accumulate_counters(&total, &counters, chunk)
+		if samples_complete(runner.config, per_op[:]) {
+			break
 		}
 	}
-
+	after: Memory_Reading
+	if bench.memory_probe != nil {
+		after = bench.memory_probe(bench.user)
+	}
 	stats := compute_stats(per_op[:])
 	result := Result {
-		group      = group.name,
-		name       = full_name,
-		throughput = group.throughput,
-		chunk_size = chunk,
-		stats      = stats,
+		group         = group.name,
+		name          = full_name,
+		throughput    = group.throughput,
+		chunk_size    = chunk,
+		stats         = stats,
+		counter_scope = scope,
 	}
 	if stats.median > 0 {
 		result.ops_per_second = 1e9 / stats.median
 	}
-
-	// Report counters per throughput unit, matching the throughput column. A
-	// benchmark that counts several units per harness operation (a VM opcode
-	// suite counts 20000 opcodes per run) would otherwise report a native
-	// instruction count that is off by that factor.
-	if counters.usable && total_ops > 0 {
-		result.counters_available = true
-		units := f64(total_ops) * max(group.throughput.units_per_op, 1)
-		result.counters = Counters {
-			cycles = f64(total_counts[Counter_Kind.Cycles]) / units,
-			instructions = f64(total_counts[Counter_Kind.Instructions]) / units,
-			cache_references = f64(total_counts[Counter_Kind.Cache_References]) / units,
-			cache_misses = f64(total_counts[Counter_Kind.Cache_Misses]) / units,
-			branches = f64(total_counts[Counter_Kind.Branches]) / units,
-			branch_misses = f64(total_counts[Counter_Kind.Branch_Misses]) / units,
-			stalled_cycles_frontend = f64(total_counts[Counter_Kind.Stalled_Frontend]) / units,
-			stalled_cycles_backend = f64(total_counts[Counter_Kind.Stalled_Backend]) / units,
-			has_cycles = counters_has(&counters, .Cycles),
-			has_instructions = counters_has(&counters, .Instructions),
-			has_cache_references = counters_has(&counters, .Cache_References),
-			has_cache_misses = counters_has(&counters, .Cache_Misses),
-			has_branches = counters_has(&counters, .Branches),
-			has_branch_misses = counters_has(&counters, .Branch_Misses),
-			has_stalled_frontend = counters_has(&counters, .Stalled_Frontend),
-			has_stalled_backend = counters_has(&counters, .Stalled_Backend),
-		}
-	}
-
-	// Memory delta, when the bench registered a probe. The probe is called
-	// once before warmup and once after the last sample; the difference is
-	// the per-run memory growth. A negative delta (the process released more
-	// than it grew) is clamped to zero.
-	if bench.memory_probe != nil {
-		memory_after := bench.memory_probe()
-		delta := memory_after - memory_before
-		if delta > 0 {
-			result.memory = delta
-			result.memory_available = true
-		}
-	}
-
-	owned := make([]f64, len(per_op))
-	copy(owned, per_op[:])
-	result.samples = owned
-	delete(per_op)
+	apply_counters(&result, total)
+	apply_memory(&result, before, after)
+	result.samples = make([]f64, len(per_op), runner.allocator)
+	copy(result.samples, per_op[:])
 	return result
 }

@@ -36,6 +36,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libmbedtls-dev
 
+      - name: Standalone benchmark package
+        run: bash micromeasure/check-standalone.sh
+
       - name: Unit and integration tests
         run: scripts/test.sh all
 

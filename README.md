@@ -486,12 +486,11 @@ The [guide](mdbook/src/SUMMARY.md) walks through the examples, the language, and
 - [`apps/examples`](apps/examples): guide examples for equipment service, approval workflow,
   dependency planning, and structural values.
 - [`benchmarks`](benchmarks): microbenchmarks for the value, kernel, and runtime layers.
-  - [`scripts/kernel-bench.sh`](scripts/kernel-bench.sh) runs the kernel suite and writes
-    `benchmarks/results/kernel.tsv` as a committed baseline. Run it without a filter to update
-    the baseline; use `filter=<text>` for spot checks and `baseline` to compare against the
-    saved file. **Warning:** `quick` and `filter` runs overwrite the committed baseline with
-    lower-fidelity numbers — use them only for local spot checks, not for updating the
-    baseline.
+  - [`scripts/kernel-bench.sh`](scripts/kernel-bench.sh) writes `kernel-latest.tsv` and a structured JSON report.
+    Use `baseline` to compare against `benchmarks/results/kernel.tsv`.
+    Use `update-baseline` for an explicit full-suite baseline update.
+    Quick and filtered runs preserve the saved baseline.
+- [`micromeasure`](micromeasure/README.md): standalone Odin benchmark harness, with Linux counters and process memory observations.
 - [`scripts/mud.sh`](scripts/mud.sh): builds and runs the web host with the MUD fileins.
 - [`scripts/agent.sh`](scripts/agent.sh): builds and runs the web host with the agent fileins;
   model access needs `OPENROUTER_API_KEY`.

@@ -114,6 +114,7 @@ register_task_benches :: proc(runner: ^mm.Runner) {
 		"runtime/tasks",
 		mm.throughput_per_op(f64(TASK_BENCH_TASKS * TASK_BENCH_ROWS), "row"),
 	)
+	group.counter_scope = .Disabled // Work runs on scheduler threads.
 	for workers, index in worker_counts {
 		task_bench_states[index] = Task_Bench_State {
 			tasks   = TASK_BENCH_TASKS,

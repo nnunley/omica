@@ -1,7 +1,9 @@
 // Terminal reports and baseline persistence.
 package micromeasure
 
+import "core:encoding/json"
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -10,9 +12,17 @@ import "core:strings"
 // nanoseconds-per-operation values keyed by full benchmark name, the report
 // adds a delta column.
 report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
+	text := format_report(runner, baseline)
+	defer delete(text)
+	fmt.print(text)
+}
+
+// Returns caller-owned text. The percentage delta is descriptive, not a significance test.
+format_report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) -> string {
+	output: strings.Builder
+	strings.builder_init(&output)
 	if len(runner.results) == 0 {
-		fmt.println("no benchmarks ran")
-		return
+		return strings.clone("no benchmarks ran\n")
 	}
 
 	has_baseline := baseline != nil && len(baseline) > 0
@@ -35,11 +45,12 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 	}
 
 	header: strings.Builder
-	strings.builder_init(&header, context.temp_allocator)
-	strings.write_string(&header, pad("benchmark", name_width))
+	strings.builder_init(&header)
+	defer strings.builder_destroy(&header)
+	write_name(&header, "benchmark", name_width)
 	write_field(&header, 11, "%s", "ns/op")
 	write_field(&header, 15, "%s", "ops/s")
-	write_field(&header, 10, "%s", "p95")
+	write_field(&header, 10, "%s", "batch-p95")
 	write_field(&header, 8, "%s", "cv%")
 	write_field(&header, 5, "%s", "n")
 	write_field(&header, 12, "%s", "throughput")
@@ -48,25 +59,29 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 		write_field(&header, 8, "%s", "cyc/op")
 		write_field(&header, 7, "%s", "IPC")
 		write_field(&header, 7, "%s", "br/op")
+		write_field(&header, 14, "%s", "PMU scope")
+		write_field(&header, 8, "%s", "run%")
 	}
 	if has_memory {
-		write_field(&header, 12, "%s", "memory (B)")
+		write_field(&header, 12, "%s", "delta (B)")
+		write_field(&header, 20, "%s", "memory kind")
 	}
 	if has_baseline {
 		write_field(&header, 10, "%s", "delta")
 	}
-	fmt.println(strings.to_string(header))
+	fmt.sbprintf(&output, "%s\n", strings.to_string(header))
 
 	current_group := ""
 	for result in runner.results {
 		if result.group != current_group {
 			current_group = result.group
-			fmt.printf("[%s]\n", current_group)
+			fmt.sbprintf(&output, "[%s]\n", current_group)
 		}
 
 		line: strings.Builder
-		strings.builder_init(&line, context.temp_allocator)
-		strings.write_string(&line, pad(result.name, name_width))
+		strings.builder_init(&line)
+		defer strings.builder_destroy(&line)
+		write_name(&line, result.name, name_width)
 		write_field(&line, 11, "%.2f", result.stats.median)
 		write_field(&line, 15, "%.0f", result.ops_per_second)
 		write_field(&line, 10, "%.2f", result.stats.p95)
@@ -78,10 +93,7 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 		fmt.sbprintf(&line, " %s/s", result.throughput.unit)
 
 		if has_counters {
-			instructions, has_instructions := counter_value(
-				result.counters,
-				.Instructions,
-			)
+			instructions, has_instructions := counter_value(result.counters, .Instructions)
 			cycles, has_cycles := counter_value(result.counters, .Cycles)
 			branches, has_branches := counter_value(result.counters, .Branches)
 			if has_instructions {
@@ -94,7 +106,7 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 			} else {
 				write_field(&line, 8, "%s", "-")
 			}
-			if has_instructions && has_cycles && cycles > 0 {
+			if result.ipc_available && has_instructions && has_cycles && cycles > 0 {
 				write_field(&line, 7, "%.2f", instructions / cycles)
 			} else {
 				write_field(&line, 7, "%s", "-")
@@ -104,6 +116,26 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 			} else {
 				write_field(&line, 7, "%s", "-")
 			}
+			write_field(
+				&line,
+				14,
+				"%s",
+				"calling-thread" if result.counter_scope == .Calling_Thread else "disabled",
+			)
+			coverage := f64(1)
+			for kind in Counter_Kind {
+				if _, valid := counter_value(result.counters, kind); valid {
+					coverage = min(coverage, result.counter_coverage[kind])
+				}
+			}
+			if result.counters_available {
+				write_field(
+					&line,
+					8,
+					"%.1f",
+					100 * coverage,
+				)} else {write_field(&line, 8, "%s", "-")
+			}
 		}
 
 		if has_memory {
@@ -112,6 +144,12 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 			} else {
 				write_field(&line, 12, "%s", "-")
 			}
+			write_field(
+				&line,
+				20,
+				"%s",
+				memory_kind_name(result.memory_kind) if result.memory_available else "-",
+			)
 		}
 
 		if has_baseline {
@@ -122,8 +160,19 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 				write_field(&line, 10, "%s", "-")
 			}
 		}
-		fmt.println(strings.to_string(line))
+		fmt.sbprintf(&output, "%s\n", strings.to_string(line))
 	}
+	strings.write_string(
+		&output,
+		"Timing percentiles describe batch-average ns/op. CV and baseline deltas are descriptive.\n",
+	)
+	if has_memory {
+		strings.write_string(
+			&output,
+			"Memory spans warmup, calibration, and samples. RSS deltas are process observations, not allocation costs.\n",
+		)
+	}
+	return strings.to_string(output)
 }
 
 // Writes results as a tab-separated baseline file.
@@ -133,8 +182,12 @@ report :: proc(runner: ^Runner, baseline: map[string]f64 = nil) {
 // observation.
 save_report :: proc(path: string, runner: ^Runner) -> bool {
 	builder: strings.Builder
-	strings.builder_init(&builder, context.temp_allocator)
+	strings.builder_init(&builder)
+	defer strings.builder_destroy(&builder)
 	for result in runner.results {
+		if strings.contains_any(result.name, "\t\r\n") {
+			return false
+		}
 		if result.memory_available {
 			fmt.sbprintf(
 				&builder,
@@ -168,52 +221,126 @@ load_baseline :: proc(path: string) -> map[string]f64 {
 	defer delete(data)
 
 	baseline := make(map[string]f64)
-	lines := strings.split_lines(string(data), context.temp_allocator)
+	lines := strings.split_lines(string(data))
+	defer delete(lines)
 	for line in lines {
 		if line == "" {
 			continue
 		}
-		fields := strings.split(line, "\t", context.temp_allocator)
+		fields := strings.split(line, "\t")
+		defer delete(fields)
 		if len(fields) < 2 {
 			continue
 		}
 		value, parse_ok := strconv.parse_f64(fields[1])
-		if parse_ok {
+		if parse_ok && value > 0 && !math.is_nan(value) && !math.is_inf(value) {
 			// The name must outlive the file buffer.
-			baseline[strings.clone(fields[0])] = value
+			if _, found := baseline[fields[0]]; found {
+				baseline[fields[0]] = value
+			} else {
+				baseline[strings.clone(fields[0])] = value
+			}
 		}
 	}
 	return baseline
 }
 
-@(private)
-pad :: proc(name: string, width: int) -> string {
-	if len(name) >= width {
-		return name
+// Releases both the map and the owned benchmark-name strings.
+baseline_destroy :: proc(baseline: ^map[string]f64) {
+	for name in baseline^ {
+		delete(name, baseline^.allocator)
 	}
-	builder: strings.Builder
-	strings.builder_init(&builder, context.temp_allocator)
-	strings.write_string(&builder, name)
-	for _ in 0 ..< width - len(name) {
-		strings.write_byte(&builder, ' ')
-	}
-	return strings.to_string(builder)
+	delete(baseline^)
+	baseline^ = nil
 }
 
 @(private)
-write_field :: proc(
-	builder: ^strings.Builder,
-	width: int,
-	format: string,
-	args: ..any,
-) {
+write_name :: proc(builder: ^strings.Builder, name: string, width: int) {
+	strings.write_string(builder, name)
+	for _ in 0 ..< max(0, width - len(name)) {
+		strings.write_byte(builder, ' ')
+	}
+}
+
+memory_kind_name :: proc(kind: Memory_Kind) -> string {
+	switch kind {
+	case .Custom_Delta:
+		return "custom-delta"
+	case .Current_RSS_Delta:
+		return "current-rss-delta"
+	case .Peak_RSS_Growth:
+		return "peak-rss-growth"
+	}
+	return "unknown"
+}
+
+@(private)
+write_field :: proc(builder: ^strings.Builder, width: int, format: string, args: ..any) {
 	strings.write_byte(builder, ' ')
 	formatted: strings.Builder
-	strings.builder_init(&formatted, context.temp_allocator)
+	strings.builder_init(&formatted)
+	defer strings.builder_destroy(&formatted)
 	fmt.sbprintf(&formatted, format, ..args)
 	text := strings.to_string(formatted)
 	for _ in 0 ..< max(0, width - len(text)) {
 		strings.write_byte(builder, ' ')
 	}
 	strings.write_string(builder, text)
+}
+
+// Caller-supplied provenance. Strings are borrowed only during serialization.
+Report_Context :: struct {
+	compiler:    string,
+	build_flags: string,
+	machine:     string,
+	revision:    string,
+}
+
+// Version 1 retains raw samples, configuration, and per-counter availability.
+Report_Document :: struct {
+	format:           string,
+	version:          int,
+	config:           Config,
+	provenance:       Report_Context,
+	timing_unit:      string,
+	percentile_scope: string,
+	counter_unit:     string,
+	memory_scope:     string,
+	operating_system: string,
+	architecture:     string,
+	counter_names:    [COUNTER_COUNT]string,
+	results:          []Result,
+}
+
+save_json_report :: proc(path: string, runner: ^Runner, provenance := Report_Context{}) -> bool {
+	actual := provenance
+	if actual.compiler == "" {
+		actual.compiler = ODIN_VERSION
+	}
+	operating_system := fmt.aprintf("%v", ODIN_OS)
+	architecture := fmt.aprintf("%v", ODIN_ARCH)
+	defer delete(operating_system)
+	defer delete(architecture)
+	document := Report_Document {
+		format           = "micromeasure",
+		version          = 1,
+		config           = runner.config,
+		provenance       = actual,
+		operating_system = operating_system,
+		architecture     = architecture,
+		timing_unit      = "ns/harness-operation",
+		percentile_scope = "batch-average",
+		counter_unit     = "count/harness-operation",
+		memory_scope     = "whole-benchmark-including-warmup-and-calibration",
+		results          = runner.results[:],
+	}
+	for kind in Counter_Kind {
+		document.counter_names[kind] = counter_name(kind)
+	}
+	bytes, err := json.marshal(document, {pretty = true, use_enum_names = true})
+	if err != nil {
+		return false
+	}
+	defer delete(bytes)
+	return os.write_entire_file(path, bytes) == nil
 }

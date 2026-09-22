@@ -604,6 +604,14 @@ task_scale_states: [len(TASK_SCALE_THREAD_COUNTS)]Task_Scale_State
 
 @(private)
 register_kernel_concurrent_benches :: proc(runner: ^mm.Runner) {
+	first_group := len(runner.groups)
+	// Worker accounting is not implemented. Do not compare parent-only PMU
+	// counts with whole-workload counts from the corresponding serial cases.
+	defer {
+		for group in runner.groups[first_group:] {
+			group.counter_scope = .Disabled
+		}
+	}
 	disjoint := mm.group(
 		runner,
 		"kernel/concurrent/disjoint",

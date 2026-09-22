@@ -1,29 +1,49 @@
 // Measurement types for the harness.
 package micromeasure
 
+import "core:mem"
 import "core:time"
 
 // Timing and sampling configuration.
 Config :: struct {
 	// Time spent warming up each benchmark before calibration.
-	warmup: time.Duration,
+	warmup:           time.Duration,
 	// Target elapsed time for one sample.
-	target_sample: time.Duration,
+	target_sample:    time.Duration,
 	// Minimum number of samples to collect.
-	min_samples: int,
+	min_samples:      int,
 	// Maximum number of samples to collect.
-	max_samples: int,
+	max_samples:      int,
 	// Stop after min_samples when the coefficient of variation is at or below
 	// this value.
-	noise_cv: f64,
+	noise_cv:         f64,
+	// Linux user-space counters on the calling thread. Groups can disable them.
+	collect_counters: bool,
 }
+
+Counter_Scope :: enum {
+	Calling_Thread,
+	Disabled,
+}
+
+Memory_Kind :: enum {
+	Custom_Delta,
+	Current_RSS_Delta,
+	Peak_RSS_Growth,
+}
+Memory_Reading :: struct {
+	bytes:     int,
+	available: bool,
+	kind:      Memory_Kind,
+}
+Memory_Probe :: proc(user: rawptr) -> Memory_Reading
 
 // Throughput description for a benchmark.
 Throughput :: struct {
 	// Units processed by one operation.
 	units_per_op: f64,
 	// Label for the unit, for example "bytes" or "rows".
-	unit: string,
+	unit:         string,
 }
 
 // Returns a throughput spec of one operation per operation.
@@ -42,23 +62,26 @@ Bench_Proc :: proc(user: rawptr, chunk_size: int, chunk_num: int)
 
 // A registered benchmark.
 Bench :: struct {
-	name:      string,
-	run:       Bench_Proc,
-	user:      rawptr,
+	name:         string,
+	run:          Bench_Proc,
+	user:         rawptr,
 	// Optional upper bound for the calibrated chunk. Zero means no bound.
-	max_chunk: int,
-	// When non-nil, the harness calls it before the first warmup sample and
-	// after the last measured sample, and records the difference (in bytes)
-	// in the result's `memory` field. Use this for benchmarks that want to
-	// report a per-run memory delta rather than the process-lifetime peak.
-	memory_probe: proc() -> int,
+	max_chunk:    int,
+	// Hooks run outside timing and counters for every warmup, calibration,
+	// and measured invocation. Preparation receives the exact active chunk.
+	prepare:      Bench_Proc,
+	cleanup:      Bench_Proc,
+	// Observes the whole benchmark, including warmup, calibration, and hooks.
+	memory_probe: Memory_Probe,
 }
 
 // A named group of benchmarks with shared throughput configuration.
 Group :: struct {
-	name:       string,
-	throughput: Throughput,
-	benches:    [dynamic]Bench,
+	name:          string,
+	throughput:    Throughput,
+	benches:       [dynamic]Bench,
+	counter_scope: Counter_Scope,
+	allocator:     mem.Allocator,
 }
 
 // Robust statistics over per-operation samples.
@@ -77,45 +100,50 @@ Stats :: struct {
 // The measured result of one benchmark. Samples are nanoseconds per
 // operation.
 Result :: struct {
-	group:          string,
-	name:           string,
-	throughput:     Throughput,
-	chunk_size:     int,
-	samples:        []f64,
-	stats:          Stats,
-	ops_per_second: f64,
-	// Hardware counters for one operation, from the last measurement sample.
-	// `counters_available` is false when no counter could be opened, in which
-	// case the values are zero and the report omits them.
+	group:              string,
+	name:               string,
+	throughput:         Throughput,
+	chunk_size:         int,
+	samples:            []f64,
+	stats:              Stats,
+	ops_per_second:     f64,
+	// Mean counters per harness operation across all samples. A counter is
+	// unavailable if any sample has an invalid read or zero scheduling time.
 	counters:           Counters,
 	counters_available: bool,
-	// Optional memory observation for this benchmark, in bytes. When
-	// `memory_available` is false the value is zero and the report omits the
-	// column. A benchmark that measures memory growth records the delta
-	// (after - before) so the number is per-run rather than process-lifetime.
-	memory:            int,
-	memory_available:  bool,
+	counter_scope:      Counter_Scope,
+	// Minimum running/enabled fraction across samples, per counter.
+	counter_coverage:   [COUNTER_COUNT]f64,
+	// True only when cycles and instructions share a valid scheduling group.
+	ipc_available:      bool,
+	// Signed process/custom observation across the whole benchmark. This is
+	// not an allocation count or an individual operation's memory cost.
+	memory:             int,
+	memory_available:   bool,
+	memory_kind:        Memory_Kind,
+	memory_before:      Memory_Reading,
+	memory_after:       Memory_Reading,
 }
 
 // Per-operation hardware counter values. Only the counters the kernel actually
 // scheduled are meaningful; each `has_*` flag says which those are.
 Counters :: struct {
-	cycles:                 f64,
-	instructions:           f64,
-	cache_references:       f64,
-	cache_misses:           f64,
-	branches:               f64,
-	branch_misses:          f64,
+	cycles:                  f64,
+	instructions:            f64,
+	cache_references:        f64,
+	cache_misses:            f64,
+	branches:                f64,
+	branch_misses:           f64,
 	stalled_cycles_frontend: f64,
 	stalled_cycles_backend:  f64,
-	has_cycles:             bool,
-	has_instructions:       bool,
-	has_cache_references:   bool,
-	has_cache_misses:       bool,
-	has_branches:           bool,
-	has_branch_misses:      bool,
-	has_stalled_frontend:   bool,
-	has_stalled_backend:    bool,
+	has_cycles:              bool,
+	has_instructions:        bool,
+	has_cache_references:    bool,
+	has_cache_misses:        bool,
+	has_branches:            bool,
+	has_branch_misses:       bool,
+	has_stalled_frontend:    bool,
+	has_stalled_backend:     bool,
 }
 
 // Returns the per-operation value and availability flag for one counter kind.
@@ -140,4 +168,3 @@ counter_value :: proc(counters: Counters, kind: Counter_Kind) -> (f64, bool) {
 	}
 	return 0, false
 }
-

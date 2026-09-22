@@ -1,13 +1,4 @@
-// Memory measurement for benchmarks.
-//
-// Reports the process peak resident set size (VmHWM), read from the kernel's
-// own accounting. This is the right signal for "how much memory does a
-// growing relation hold": it is the high-water mark of pages actually faulted
-// into RAM, not the virtual reservation.
-//
-// VmHWM is process-lifetime and cannot be reset. A benchmark that wants a
-// per-run number records the value before the timed region and reports the
-// delta afterwards; the absolute number is still useful as a cross-check.
+// Linux process RSS observations. These are not allocation measurements.
 package micromeasure
 
 import "core:fmt"
@@ -15,48 +6,50 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 
-// Reads a named field from /proc/self/status (Linux). Returns 0 when the file
-// is unreadable or the field is absent. The field value is in kilobytes.
-read_status_field_kb :: proc(field: string) -> int {
+// Parses a nonnegative field in kB. A missing or malformed field is unavailable.
+@(private)
+parse_status_field_kb :: proc(data, field: string) -> (int, bool) {
+	remaining := data
+	for line in strings.split_lines_iterator(&remaining) {
+		if !strings.has_prefix(line, field) {
+			continue
+		}
+		rest := strings.trim_space(line[len(field):])
+		if !strings.has_suffix(rest, "kB") {
+			return 0, false
+		}
+		rest = strings.trim_space(rest[:len(rest) - 2])
+		kb, ok := strconv.parse_int(rest)
+		if !ok || kb < 0 || kb > max(int) / 1024 {
+			return 0, false
+		}
+		return kb, true
+	}
+	return 0, false
+}
+
+read_status_field_kb :: proc(field: string) -> (int, bool) {
+	when ODIN_OS != .Linux {return 0, false}
 	data, err := os.read_entire_file("/proc/self/status", context.allocator)
 	if err != nil {
-		return 0
+		return 0, false
 	}
 	defer delete(data)
-
-	lines := strings.split_lines(string(data), context.temp_allocator)
-	for line in lines {
-		if strings.has_prefix(line, field) {
-			rest := line[len(field):]
-			rest = strings.trim_space(rest)
-			// Strip the trailing " kB" suffix.
-			if strings.has_suffix(rest, "kB") {
-				rest = strings.trim_space(rest[:len(rest) - len("kB")])
-			}
-			kb, ok := strconv.parse_int(rest)
-			if !ok {
-				return 0
-			}
-			return kb
-		}
-	}
-	return 0
+	return parse_status_field_kb(string(data), field)
 }
 
-// Returns the process peak RSS in bytes, as known to the kernel (VmHWM).
-//
-// The value is monotonic for the lifetime of the process: the kernel does not
-// lower VmHWM. A benchmark that wants a per-run high-water records the value
-// before the timed region and reports the delta afterwards.
-peak_rss_bytes :: proc() -> int {
-	return read_status_field_kb("VmHWM:") * 1024
+// Process-lifetime high-water mark. Its delta is additional high-water growth.
+// Previous allocations can mask later activity, even when a filter is active.
+peak_rss_bytes :: proc(_: rawptr = nil) -> Memory_Reading {
+	kb, ok := read_status_field_kb("VmHWM:")
+	return Memory_Reading{bytes = kb * 1024, available = ok, kind = .Peak_RSS_Growth}
 }
 
-// Returns the current RSS in bytes, as known to the kernel (VmRSS). Useful
-// for measuring the working set of a timed region without the lifetime
-// high-water bias.
-current_rss_bytes :: proc() -> int {
-	return read_status_field_kb("VmRSS:") * 1024
+// Current process RSS. Its signed delta describes retained resident memory.
+// Temporary allocations released between probes are not visible.
+current_rss_bytes :: proc(_: rawptr = nil) -> Memory_Reading {
+	kb, ok := read_status_field_kb("VmRSS:")
+	return Memory_Reading{bytes = kb * 1024, available = ok, kind = .Current_RSS_Delta}
 }
 
 // Formats a byte count as a human-readable size (B, KiB, MiB, GiB).

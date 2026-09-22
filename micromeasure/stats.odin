@@ -10,7 +10,8 @@ compute_stats :: proc(samples: []f64) -> Stats {
 		return Stats{}
 	}
 
-	sorted := make([]f64, len(samples), context.temp_allocator)
+	sorted := make([]f64, len(samples))
+	defer delete(sorted)
 	copy(sorted, samples)
 	slice.sort_by(sorted, proc(a, b: f64) -> bool {
 		return a < b
@@ -42,7 +43,8 @@ compute_stats :: proc(samples: []f64) -> Stats {
 		stats.cv = stats.stddev / stats.mean
 	}
 
-	deviations := make([]f64, len(samples), context.temp_allocator)
+	deviations := make([]f64, len(samples))
+	defer delete(deviations)
 	for sample, i in samples {
 		deviations[i] = math.abs(sample - stats.median)
 	}
@@ -51,12 +53,11 @@ compute_stats :: proc(samples: []f64) -> Stats {
 	})
 	stats.mad = percentile_sorted(deviations, 0.50)
 
-	if stats.mad > 0 {
-		threshold := 3 * stats.mad
-		for sample in samples {
-			if math.abs(sample - stats.median) > threshold {
-				stats.outliers += 1
-			}
+	// With zero MAD, every value different from the median is an outlier.
+	threshold := 3 * stats.mad
+	for sample in samples {
+		if math.abs(sample - stats.median) > threshold {
+			stats.outliers += 1
 		}
 	}
 	return stats

@@ -1,6 +1,6 @@
 // Tests for the microbenchmark harness. The statistics and the counter
-// bookkeeping are deterministic, so they are tested directly; the timing path
-// is exercised by the benchmark suites.
+// bookkeeping are deterministic. Additional contract tests cover the runner,
+// memory observations, lifetime rules, and report persistence.
 package micromeasure
 
 import "core:testing"
@@ -49,8 +49,8 @@ test_coefficient_of_variation :: proc(t: ^testing.T) {
 @(test)
 test_counter_value_maps_kinds :: proc(t: ^testing.T) {
 	counters := Counters {
-		cycles       = 9.5,
-		instructions = 58.0,
+		cycles           = 9.5,
+		instructions     = 58.0,
 		has_cycles       = true,
 		has_instructions = false,
 	}
@@ -73,7 +73,7 @@ test_counters_open_reports_consistently :: proc(t: ^testing.T) {
 	// Unavailable counters must report zero, never a stale value.
 	if !set.usable {
 		for kind in Counter_Kind {
-			testing.expect_value(t, set.values[kind], u64(0))
+			testing.expect_value(t, set.values[kind], f64(0))
 		}
 	}
 }
@@ -83,16 +83,18 @@ test_read_status_field_kb_parses_vmhwm :: proc(t: ^testing.T) {
 	// The value is environment-dependent (the kernel must expose /proc/self/
 	// status), so this only checks the parse path: a non-negative integer, and
 	// zero when the file is unreadable.
-	hwm := read_status_field_kb("VmHWM:")
+	hwm, _ := read_status_field_kb("VmHWM:")
 	testing.expect(t, hwm >= 0)
-	rss := read_status_field_kb("VmRSS:")
+	rss, _ := read_status_field_kb("VmRSS:")
 	testing.expect(t, rss >= 0)
 	// A missing field must report zero, not a parse error.
-	testing.expect_value(t, read_status_field_kb("NoSuchField:"), 0)
+	value, ok := read_status_field_kb("NoSuchField:")
+	testing.expect_value(t, value, 0)
+	testing.expect(t, !ok)
 }
 
 @(test)
 test_peak_rss_bytes_is_non_negative :: proc(t: ^testing.T) {
 	// VmHWM is in kilobytes; the byte value is the field times 1024.
-	testing.expect(t, peak_rss_bytes() >= 0)
+	testing.expect(t, peak_rss_bytes().bytes >= 0)
 }
