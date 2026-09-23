@@ -21,12 +21,13 @@ asserts each triple into the relations declared here. Rules derive everything el
 - `30_graph.mica` — Broader (both directions), `RewrittenTo` transitive,
   TextUnit/TextUnitText retrieval wiring.
 
-Load order matters. Fileins lower rules one file at a time against the relations
-declared so far, so every relation a rule *body* reads must be declared in the same
-file or an earlier one: `20_constraints` reads `InstanceOf`/`Subsumes` from
-`10_taxonomy`. A body relation declared later fails with `could not lower a rule`.
-Heads are not restricted: `30_graph` derives `TextUnit`, which
-`apps/shared/retrieval.mica` declares after it. `scripts/bycycle-load.sh` fixes the order in its `ONTOLOGY` list.
+Load order does not constrain the rules: `world_load` declares every file's relations
+before it lowers any rule, so a rule may read or derive a relation declared in any
+file of the same load (the files load cleanly in reverse order). The file *set* does
+matter: `20_constraints` reads `InstanceOf`/`Subsumes` from `10_taxonomy`, and
+`30_graph` derives `TextUnit`, which `apps/shared/retrieval.mica` declares. Leave out
+a file that declares a body relation and loading fails with `could not lower a rule`.
+`scripts/bycycle-load.sh` lists the full set in `ONTOLOGY`.
 
 ## Retrieval
 
@@ -39,7 +40,7 @@ so the loader asserts it for every subject when given `--retrieval-actor NAME`
 ## Loading
 
 ```sh
-# 1. ontology + rules into a fresh store
+# 1. ontology + rules into a fresh store (refuses an existing store without --force)
 scripts/bycycle-load.sh init /tmp/bycycle-db
 
 # 2. facts (streaming, batched, resumable — safe to re-run after a kill)
@@ -61,13 +62,20 @@ with `--checkpoint` (the script passes it) the store is also checkpointed per ba
 A killed run resumes exactly where it stopped — no re-scan of already-loaded
 subjects. `GuidOf` rows pre-seed the identity map so forward references from new
 subjects resolve to existing identities. Set semantics make overlap idempotent.
+`--limit N` counts the subjects scanned by one run, so `--limit 1000` twice loads
+2,000 subjects. A failed load closes the store before exiting, so it leaves no `LOCK`.
 
 ## Identity mapping
 
 OpenCyc GUID fragments become Mica identities named `guid_<fragment>` (`.` and
 `-` mapped to `_`, the Mica ident charset). `GuidOf` maps identity → source GUID;
 `NamedIdentity` facts make `#guid_X` resolve after reboot. Functional
-Label/CycLabel/Comment keep the first value; repeats route to `Alias`.
+Label/CycLabel/Comment/WikiName/WikiURL keep the first value per subject. Repeated
+labels, CycL labels and comments route to `Alias`; repeated wiki names and URLs are
+counted under `dropped repeats`.
+
+Literal values are the element's text content: entities decoded, CDATA sections
+verbatim (OpenCyc comments hold HTML in CDATA), comments dropped.
 
 Only fragments of 20+ identifier characters count as GUIDs (OpenCyc's are 26). A
 resource with a shorter fragment (say `.../Dog`) is not loaded: as a subject it is

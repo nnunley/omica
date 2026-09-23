@@ -64,7 +64,8 @@ RDFS_COMMENT :: "rdfs:comment"
 USAGE :: "usage: owlstream --owl PATH [--store DIR] [--census] [--limit N] " +
 	"[--commit-batch N] [--durability none|group|strict] [--checkpoint] [--retrieval-actor NAME]\n" +
 	"  --census: print top-level element + child predicate frequencies, assert nothing\n" +
-	"  --limit N: stop after N subjects (default 0 = all)\n" +
+	"  --limit N: stop after scanning N subjects this run; subjects a resumed run\n" +
+	"             skips past do not count (default 0 = all)\n" +
 	"  --commit-batch N: queued facts per transaction commit (default 20000)\n" +
 	"  --checkpoint: checkpoint the store after every commit batch\n" +
 	"  --retrieval-actor NAME: assert CanRetrieveSubject(#NAME, subject) for every subject\n"
@@ -121,8 +122,13 @@ main :: proc() {
 			switch arguments[index] {
 			case "none":
 				durability = s.Durability.None
+			case "group":
+				durability = s.Durability.Group
 			case "strict":
 				durability = s.Durability.Strict
+			case:
+				fmt.eprintf("--durability: expected none, group or strict, got %q\n%s", arguments[index], USAGE)
+				os.exit(1)
 			}
 		case "--checkpoint":
 			checkpoint = true
@@ -181,10 +187,11 @@ main :: proc() {
 		time.duration_seconds(time.tick_since(t0)),
 	)
 
+	ok := true
 	if census_only {
 		run_census(xml_text)
 	} else {
-		run_load(
+		ok = run_load(
 			xml_text,
 			store_path,
 			owl_path,
@@ -197,6 +204,10 @@ main :: proc() {
 	}
 	if have_buf {
 		bytes.buffer_destroy(&buf)
+	}
+	// run_load has already closed the world, so exiting here leaves no LOCK.
+	if !ok {
+		os.exit(1)
 	}
 }
 

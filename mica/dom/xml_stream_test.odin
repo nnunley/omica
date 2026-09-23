@@ -77,18 +77,15 @@ test_dom_xml_element_text :: proc(t: ^testing.T) {
 			break
 		}
 	}
-	text, is_cdata, end, ok := dom_xml_element_text(STREAM_DOC, label)
+	text, end, ok := dom_xml_element_text(STREAM_DOC, label, context.temp_allocator)
 	testing.expect(t, ok)
-	testing.expect(t, !is_cdata)
-	testing.expect_value(t, text, "A &amp; B")
-	testing.expect_value(t, dom_xml_decode_entities_into(text, context.temp_allocator), "A & B")
+	testing.expect_value(t, text, "A & B")
 
 	comment, comment_ok := dom_xml_next_tag(STREAM_DOC, end)
 	testing.expect(t, comment_ok)
 	testing.expect_value(t, comment.name, "rdfs:comment")
-	ctext, c_cdata, cend, c_ok := dom_xml_element_text(STREAM_DOC, comment)
+	ctext, cend, c_ok := dom_xml_element_text(STREAM_DOC, comment, context.temp_allocator)
 	testing.expect(t, c_ok)
-	testing.expect(t, c_cdata, "comment body is CDATA")
 	testing.expect_value(t, ctext, `Has <a href="x">markup</a> & a bare <br> tag.`)
 
 	// Nested elements are skipped as a unit.
@@ -108,6 +105,69 @@ test_dom_xml_element_text_unterminated :: proc(t: ^testing.T) {
 	doc := `<a><b>never closed`
 	tag, ok := dom_xml_next_tag(doc, 0)
 	testing.expect(t, ok)
-	_, _, _, text_ok := dom_xml_element_text(doc, tag)
+	_, _, text_ok := dom_xml_element_text(doc, tag, context.temp_allocator)
 	testing.expect(t, !text_ok)
+	_, skip_ok := dom_xml_skip_element(doc, tag)
+	testing.expect(t, !skip_ok)
+	free_all(context.temp_allocator)
+}
+
+// Text content of the first element in doc, and whether the scan ended just
+// past the document's final close tag.
+@(private)
+stream_text_of :: proc(doc: string) -> (text: string, at_end: bool, ok: bool) {
+	tag, tag_ok := dom_xml_next_tag(doc, 0)
+	if !tag_ok {
+		return "", false, false
+	}
+	end: int
+	text, end, ok = dom_xml_element_text(doc, tag, context.temp_allocator)
+	return text, end == len(doc), ok
+}
+
+@(test)
+test_dom_xml_element_text_mixed_content :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	Case :: struct {
+		doc:      string,
+		expected: string,
+	}
+	cases := []Case {
+		// CDATA need not be flush against the open tag.
+		{"<c>\n    <![CDATA[A <b>bold</b> thing & more]]>\n  </c>", "\n    A <b>bold</b> thing & more\n  "},
+		// Text on both sides of a CDATA section; only the plain text decodes.
+		{"<c>x &amp; <![CDATA[&amp;]]> y</c>", "x & &amp; y"},
+		// Comments and processing instructions are not content.
+		{"<c>A<!--x-->B<?pi data?>C</c>", "ABC"},
+		// Nested element text is included in order; markup is not.
+		{"<c>one <b>two <i>three</i></b> four</c>", "one two three four"},
+		// A CDATA close inside a comment is not a CDATA close.
+		{"<c><!-- ]]> --><![CDATA[<x>]]></c>", "<x>"},
+		{"<c/>", ""},
+		{"<c></c>", ""},
+	}
+	for c in cases {
+		text, at_end, ok := stream_text_of(c.doc)
+		testing.expectf(t, ok, "%q: not ok", c.doc)
+		testing.expectf(t, at_end, "%q: end is not past the close tag", c.doc)
+		testing.expect_value(t, text, c.expected)
+	}
+}
+
+@(test)
+test_dom_xml_element_text_plain_is_a_slice :: proc(t: ^testing.T) {
+	doc := "<c>plain text</c>"
+	tag, _ := dom_xml_next_tag(doc, 0)
+	text, _, ok := dom_xml_element_text(doc, tag, context.temp_allocator)
+	testing.expect(t, ok)
+	testing.expect_value(t, raw_data(text), raw_data(doc[3:]))
+}
+
+@(test)
+test_dom_xml_element_text_unterminated_markup :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	for doc in ([]string{"<c><![CDATA[never closed</c>", "<c>a<!-- never closed</c>"}) {
+		_, _, ok := stream_text_of(doc)
+		testing.expectf(t, !ok, "%q: expected failure", doc)
+	}
 }

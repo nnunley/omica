@@ -1,7 +1,7 @@
 // Bycycle graph: symmetric broader-term navigation and rewrite chains.
 // RewriteOf is transitive; BroaderTerm reads both directions.
-// Load order: the TextUnit/TextUnitText heads below are declared in
-// apps/shared/retrieval.mica, loaded after this file; see the NOTE in
+// The TextUnit/TextUnitText heads below are declared in
+// apps/shared/retrieval.mica, which must be in the same load; see the NOTE in
 // 10_taxonomy.mica.
 
 make_relation(:Broader, 2)

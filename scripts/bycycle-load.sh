@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bycycle: load and query the OpenCyc OWL dump in a Mica store.
 #
-#   scripts/bycycle-load.sh init   STORE            # ontology + rules, fresh store
+#   scripts/bycycle-load.sh init   STORE [--force]  # ontology + rules, fresh store
 #   scripts/bycycle-load.sh load   STORE OWL_GZ     # stream facts (resumable)
 #   scripts/bycycle-load.sh query  STORE 'EXPR'     # eval against the store
 #   scripts/bycycle-load.sh repl   STORE            # interactive REPL
@@ -13,7 +13,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
-ODIN_BIN="${ODIN_BIN:-$(command -v odin)}"
+ODIN_BIN="${ODIN_BIN:-$(command -v odin || true)}"
+if [[ -z "${ODIN_BIN}" || ! -x "${ODIN_BIN}" ]]; then
+  echo "cannot find the Odin compiler; set ODIN_BIN" >&2
+  exit 1
+fi
 ONTOLOGY=(
   apps/bycycle/00_schema.mica
   apps/bycycle/10_taxonomy.mica
@@ -27,8 +31,16 @@ shift || true
 
 case "${cmd}" in
   init)
-    store="${1:?usage: bycycle-load.sh init STORE}"
-    rm -rf "${store}"
+    store="${1:?usage: bycycle-load.sh init STORE [--force]}"
+    # init starts from an empty store; refuse to discard a (possibly partly
+    # loaded, resumable) one unless asked.
+    if [[ -e "${store}" ]]; then
+      if [[ "${2:-}" != "--force" ]]; then
+        echo "${store} exists; pass --force to delete it and start over" >&2
+        exit 1
+      fi
+      rm -rf "${store}"
+    fi
     "${ODIN_BIN}" run tools/filein -- \
       --store "${store}" --unit bycycle "${ONTOLOGY[@]}" --checkpoint
     ;;

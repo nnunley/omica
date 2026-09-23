@@ -12,7 +12,6 @@ package main
 
 import "core:fmt"
 import "core:mem"
-import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:time"
@@ -81,9 +80,18 @@ FIELD_RELATION_NAMES :: [Field]string {
 OPTIONAL_FIELDS :: bit_set[Field]{.None, .Loader_State, .Can_Retrieve}
 
 // Functional single-valued relations: the kernel enforces the key, so a
-// second value for the same subject would fail the batch. Repeats route to
-// Alias (see queue_triple).
-FIRST_WINS_FIELDS :: bit_set[Field]{.Label, .Cycl, .Comment}
+// second value for the same subject would fail the batch. The first value wins;
+// repeats route to REPEAT_FIELD (see queue_triple).
+FIRST_WINS_FIELDS :: bit_set[Field]{.Label, .Cycl, .Comment, .Wiki_Name, .Wiki_URL}
+
+// Where a repeated first-wins value goes: a second label or comment is still
+// a name for the subject, so it lands in Alias; a second wiki name or URL has
+// no such home and is dropped (counted under dropped_repeats).
+REPEAT_FIELD :: #partial [Field]Field {
+	.Label   = .Alias,
+	.Cycl    = .Alias,
+	.Comment = .Alias,
+}
 
 // Relation ids resolved against the live world after filein load; 0 for an
 // optional relation the store lacks.
@@ -102,8 +110,12 @@ Loader_Stats :: struct {
 	// Resource objects discarded because their fragment is not a GUID (see
 	// is_guid). Counted apart from skipped: this is data loss, not policy.
 	dropped_resources: int,
+	// Repeated first-wins values with no REPEAT_FIELD home.
+	dropped_repeats: int,
 	// Every kernel commit: batch flushes and resume-state writes.
 	commits:    int,
+	// Resume-state writes that failed (see save_resume_state).
+	err_resume: int,
 	identities: int,
 	// Timing: wall seconds per phase, accumulated across batches.
 	scan_seconds:    f64,
@@ -243,6 +255,10 @@ predicate_field :: proc(child_tag: string) -> Field {
 // with checkpoint set, the store is checkpointed. A killed run resumes from
 // LoaderState; set semantics dedupe the replayed tail. When retrieval_actor
 // is non-empty every subject also gets CanRetrieveSubject(actor, subject).
+//
+// limit caps the subjects scanned by this run; subjects resumed past do not
+// count. Returns false on failure, after the world is closed (so the store's
+// LOCK is released); callers exit only after it returns.
 run_load :: proc(
 	xml_text: string,
 	store_path: string,
@@ -252,7 +268,7 @@ run_load :: proc(
 	durability: s.Durability,
 	checkpoint: bool,
 	retrieval_actor: string,
-) {
+) -> bool {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -265,7 +281,7 @@ run_load :: proc(
 	)
 	if !start.ok {
 		fmt.eprintf("failed to open store: %s\n", start.message)
-		os.exit(1)
+		return false
 	}
 	defer r.world_destroy(world)
 
@@ -278,11 +294,11 @@ run_load :: proc(
 			"loader relations missing: load the bycycle ontology into the store first " +
 			"(scripts/bycycle-load.sh init DIR)\n",
 		)
-		os.exit(1)
+		return false
 	}
 	if retrieval_actor != "" && ld.rels[.Can_Retrieve] == 0 {
 		fmt.eprintf("--retrieval-actor given but CanRetrieveSubject is not declared in the store\n")
-		os.exit(1)
+		return false
 	}
 
 	ld.identities = make(map[string]v.Value)
@@ -294,7 +310,7 @@ run_load :: proc(
 
 	if err := virtual.arena_init_growing(&ld.batch_arena); err != nil {
 		fmt.eprintf("arena init failed\n")
-		os.exit(1)
+		return false
 	}
 	defer virtual.arena_destroy(&ld.batch_arena)
 	ld.batch_alloc = virtual.arena_allocator(&ld.batch_arena)
@@ -303,7 +319,7 @@ run_load :: proc(
 	actor: v.Value
 	has_actor := retrieval_actor != ""
 	if has_actor {
-		actor = resolve_actor(&ld, retrieval_actor)
+		actor = resolve_actor(&ld, retrieval_actor) or_return
 	}
 
 	// Resume position: durable in LoaderState (Mica store), not derived
@@ -313,9 +329,11 @@ run_load :: proc(
 	scan_t0 := time.tick_now()
 	pos := 0
 	subjects_done := 0
+	scanned := 0
 	resume_pos, resume_subjects, has_resume := load_resume_state(&ld, owl_path)
 	if has_resume {
-		if resume_pos < len(xml_text) {
+		// A point at len(xml_text) is a finished load (no trailing newline).
+		if resume_pos <= len(xml_text) {
 			pos = resume_pos
 			subjects_done = resume_subjects
 			ld.stats.subjects = resume_subjects
@@ -329,7 +347,7 @@ run_load :: proc(
 			fmt.eprintf("  resume pos out of range, starting fresh\n")
 		}
 	}
-	for limit <= 0 || subjects_done < limit {
+	for limit <= 0 || scanned < limit {
 		tag, ok := dom.dom_xml_next_tag(xml_text, pos)
 		if !ok {
 			break
@@ -348,18 +366,17 @@ run_load :: proc(
 			}
 			continue
 		}
-		subj := intern_guid(&ld, frag)
+		subj := intern_guid(&ld, frag) or_return
 		ld.stats.subjects += 1
 		subjects_done += 1
+		scanned += 1
 		if has_actor {
 			queue(&ld, .Can_Retrieve, actor, subj)
 			ld.stats.internal += 1
 		}
-		scan_subject_children(&ld, xml_text, &pos, tag, subj)
+		scan_subject_children(&ld, xml_text, &pos, tag, subj) or_return
 		if len(ld.pending) >= commit_batch {
-			if !flush(&ld) {
-				os.exit(1)
-			}
+			flush(&ld) or_return
 			if checkpoint {
 				checkpoint_here(&ld)
 			}
@@ -379,9 +396,7 @@ run_load :: proc(
 			)
 		}
 	}
-	if !flush(&ld) {
-		os.exit(1)
-	}
+	flush(&ld) or_return
 	reset_batch(&ld)
 	ld.stats.scan_seconds += time.duration_seconds(time.tick_since(scan_t0))
 	if checkpoint {
@@ -393,16 +408,18 @@ run_load :: proc(
 
 	fmt.printf(
 		"done: %d subjects, %d triples, %d internal, %d asserted, %d skipped, " +
-		"%d dropped resources, %d commits, %d identities\n",
+		"%d dropped resources, %d dropped repeats, %d commits, %d identities\n",
 		ld.stats.subjects,
 		ld.stats.triples,
 		ld.stats.internal,
 		ld.stats.asserted,
 		ld.stats.skipped,
 		ld.stats.dropped_resources,
+		ld.stats.dropped_repeats,
 		ld.stats.commits,
 		ld.stats.identities,
 	)
+	return true
 }
 
 // Commits everything in pending as one transaction.
@@ -485,11 +502,12 @@ print_timing_summary :: proc(stats: ^Loader_Stats) {
 		)
 	}
 	fmt.eprintf(
-		"errors: assert %d commit %d identity %d checkpoint %d\n",
+		"errors: assert %d commit %d identity %d checkpoint %d resume %d\n",
 		stats.err_assert,
 		stats.err_commit,
 		stats.err_identity,
 		stats.err_checkpoint,
+		stats.err_resume,
 	)
 }
 
@@ -533,14 +551,15 @@ preseed_identities :: proc(ld: ^Loader) {
 // #name resolves in later evals this process) and queued as a NamedIdentity
 // fact (so it resolves after reboot). The fact rides the batch like any
 // other: a commit of its own would rerun the rule fixpoint once per identity.
-mint_identity :: proc(ld: ^Loader, name: string) -> v.Value {
+// Fails only when the identity space is exhausted.
+mint_identity :: proc(ld: ^Loader, name: string) -> (v.Value, bool) {
 	raw := ld.next_identity
 	ld.next_identity += 1
 	identity, ok := v.value_identity_raw(raw)
 	if !ok {
 		fmt.eprintf("identity space exhausted at %d\n", raw)
 		ld.stats.err_identity += 1
-		os.exit(1)
+		return {}, false
 	}
 	ld.world.ctx.identities[name] = identity
 	ld.stats.identities += 1
@@ -552,20 +571,20 @@ mint_identity :: proc(ld: ^Loader, name: string) -> v.Value {
 		}),
 	})
 	ld.stats.internal += 1
-	return identity
+	return identity, true
 }
 
 // Interns a GUID fragment to a named identity, queueing the GuidOf audit
 // fact. Reuses the map when seen before.
-intern_guid :: proc(ld: ^Loader, guid: string) -> v.Value {
+intern_guid :: proc(ld: ^Loader, guid: string) -> (identity: v.Value, ok: bool) {
 	if existing, found := ld.identities[guid]; found {
-		return existing
+		return existing, true
 	}
 	// Both the name and the map key outlive every batch, so they live on
 	// context.allocator: the name in world.ctx.identities, the key here
 	// (guid borrows xml_text, which also lives for the run, but a heap-stable
 	// key keeps the map independent of the input buffer).
-	identity := mint_identity(ld, sanitize_guid(guid, context.allocator))
+	identity = mint_identity(ld, sanitize_guid(guid, context.allocator)) or_return
 	ld.identities[strings.clone(guid, context.allocator)] = identity
 	append(&ld.pending, Pending_Assert {
 		relation = ld.rels[.Guid_Of],
@@ -575,14 +594,14 @@ intern_guid :: proc(ld: ^Loader, guid: string) -> v.Value {
 		}),
 	})
 	ld.stats.internal += 1
-	return identity
+	return identity, true
 }
 
 // Resolves the retrieval actor by name, minting it when the store has none
 // yet. A rerun finds the name through NamedIdentity at boot and reuses it.
-resolve_actor :: proc(ld: ^Loader, name: string) -> v.Value {
+resolve_actor :: proc(ld: ^Loader, name: string) -> (v.Value, bool) {
 	if existing, found := ld.world.ctx.identities[name]; found {
-		return existing
+		return existing, true
 	}
 	return mint_identity(ld, strings.clone(name, context.allocator))
 }
@@ -674,6 +693,11 @@ load_resume_state :: proc(ld: ^Loader, owl_path: string) -> (resume_pos: int, re
 // Writes (or replaces) the durable resume point. Called after each
 // checkpoint so a crash before the next checkpoint still resumes from
 // this position; the retried batch is idempotent under set semantics.
+//
+// A failed write is reported and counted (err_resume) but does not stop the
+// load: the batch's facts are already committed, so the only cost is that a
+// later resume starts from the previous point and replays more of the file,
+// which set semantics dedupe.
 save_resume_state :: proc(ld: ^Loader, owl_path: string, pos: int, subjects: int) {
 	rel := ld.rels[.Loader_State]
 	if rel == 0 {
@@ -702,24 +726,31 @@ save_resume_state :: proc(ld: ^Loader, owl_path: string, pos: int, subjects: int
 		}),
 	); err != .None {
 		k.transaction_destroy(&tx)
+		fmt.eprintf("resume state not saved at byte %d: assert failed: %v\n", pos, err)
+		ld.stats.err_resume += 1
 		return
 	}
 	committed, commit_err := k.transaction_commit(&tx)
 	k.transaction_destroy(&tx)
-	if commit_err == .None {
-		k.snapshot_release(committed)
-		ld.stats.commits += 1
+	if commit_err != .None {
+		fmt.eprintf("resume state not saved at byte %d: commit failed: %v\n", pos, commit_err)
+		ld.stats.err_resume += 1
+		return
 	}
+	k.snapshot_release(committed)
+	ld.stats.commits += 1
 }
 
 // Scans one subject's children, queueing one assertion per triple. Advances
 // *pos past the subject's close tag. A self-closing subject has no children.
-scan_subject_children :: proc(ld: ^Loader, xml_text: string, pos: ^int, subject: dom.Dom_Xml_Tag, subj: v.Value) {
+// Returns false only on a loader failure (identity exhaustion); truncated input
+// ends the subject early, and the caller's next scan finds the end of input.
+scan_subject_children :: proc(ld: ^Loader, xml_text: string, pos: ^int, subject: dom.Dom_Xml_Tag, subj: v.Value) -> bool {
 	depth := subject.kind == .Self_Close ? 0 : 1
 	for depth > 0 {
 		tag, ok := dom.dom_xml_next_tag(xml_text, pos^)
 		if !ok {
-			return
+			return true
 		}
 		pos^ = tag.end
 		switch tag.kind {
@@ -736,38 +767,37 @@ scan_subject_children :: proc(ld: ^Loader, xml_text: string, pos: ^int, subject:
 		}
 		resource, has_resource := dom.dom_xml_attr_value(tag.head, RESOURCE_ATTR)
 		if has_resource || tag.kind != .Open {
-			queue_triple(ld, subj, field, "", false, resource, has_resource)
+			queue_triple(ld, subj, field, "", resource, has_resource) or_return
 			continue
 		}
-		literal, is_cdata, end, text_ok := dom.dom_xml_element_text(xml_text, tag)
+		literal, end, text_ok := dom.dom_xml_element_text(xml_text, tag, ld.batch_alloc)
 		if !text_ok {
-			return
+			return true
 		}
 		// The element's body and close tag are consumed here, so the depth
 		// walk never sees the markup inside a comment.
 		pos^ = end
 		depth -= 1
-		queue_triple(ld, subj, field, literal, is_cdata, "", false)
+		queue_triple(ld, subj, field, literal, "", false) or_return
 	}
+	return true
 }
 
 // Queues one assertion for a triple. Resource objects that are GUIDs become
 // identities (interned); absolute URIs only survive on same_as (kept as
-// strings); literals are entity-decoded strings, except CDATA text, which
-// the source already wrote verbatim.
+// strings); literals arrive as decoded text content (dom_xml_element_text).
 queue_triple :: proc(
 	ld: ^Loader,
 	subj: v.Value,
 	field: Field,
 	literal: string,
-	is_cdata: bool,
 	resource: string,
 	has_resource: bool,
-) {
+) -> bool {
 	if has_resource {
 		frag := frag_of(resource)
 		if is_guid(frag) {
-			queue(ld, field, subj, intern_guid(ld, frag))
+			queue(ld, field, subj, intern_guid(ld, frag) or_return)
 			ld.stats.triples += 1
 		} else if field == .Same_As && resource != "" {
 			queue(ld, field, subj, v.value_string(ld.batch_alloc, resource))
@@ -775,29 +805,30 @@ queue_triple :: proc(
 		} else {
 			ld.stats.dropped_resources += 1
 		}
-		return
+		return true
 	}
-	// CDATA is written verbatim by the source (OpenCyc comments hold HTML),
-	// so only plain text is entity-decoded.
 	text := strings.trim_space(literal)
-	if !is_cdata {
-		text = dom.dom_xml_decode_entities_into(text, ld.batch_alloc)
-	}
 	if text == "" {
 		ld.stats.skipped += 1
-		return
+		return true
 	}
 	target := field
 	if field in FIRST_WINS_FIELDS {
 		if id, ok := v.value_as_identity(subj); ok {
 			seen := ld.label_seen[u64(id)]
 			if field in seen {
-				target = .Alias
+				repeats := REPEAT_FIELD
+				target = repeats[field]
 			} else {
 				ld.label_seen[u64(id)] = seen + {field}
 			}
 		}
 	}
+	if target == .None {
+		ld.stats.dropped_repeats += 1
+		return true
+	}
 	queue(ld, target, subj, v.value_string(ld.batch_alloc, text))
 	ld.stats.triples += 1
+	return true
 }

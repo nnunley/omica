@@ -1,8 +1,8 @@
 // Bycycle constraints: disjointness is symmetric; violations are derived
 // facts the checker queries. QuotedIsa/TypeGenls propagate like Isa/Genls
 // for the quoted (non-asserted) reading.
-// Load order: rule bodies read InstanceOf/Subsumes, so 10_taxonomy must load
-// first (see the NOTE in 10_taxonomy.mica).
+// Rule bodies read InstanceOf/Subsumes, so 10_taxonomy must be in the same
+// load (see the NOTE in 10_taxonomy.mica).
 
 make_relation(:InconsistentWith, 3)
 make_relation(:QuotedInstanceOf, 2)

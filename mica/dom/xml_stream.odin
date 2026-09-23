@@ -42,23 +42,11 @@ dom_xml_next_tag :: proc(text: string, pos: int) -> (tag: Dom_Xml_Tag, ok: bool)
 		i += rel
 		// Comments, CDATA and processing instructions are skipped whole:
 		// a `<` inside them is not a tag.
-		skip_to := ""
-		switch {
-		case strings.has_prefix(text[i:], "<!--"):
-			skip_to = "-->"
-		case strings.has_prefix(text[i:], DOM_XML_CDATA_OPEN):
-			skip_to = DOM_XML_CDATA_CLOSE
-		case text[i + 1] == '?':
-			skip_to = "?>"
-		case text[i + 1] == '!':
-			skip_to = ">"
-		}
-		if skip_to != "" {
-			stop := strings.index(text[i:], skip_to)
-			if stop < 0 {
+		if after, is_markup, markup_ok := dom_xml_skip_markup(text, i); is_markup {
+			if !markup_ok {
 				return {}, false
 			}
-			i += stop + len(skip_to)
+			i = after
 			continue
 		}
 		if text[i + 1] == '/' {
@@ -88,6 +76,34 @@ dom_xml_next_tag :: proc(text: string, pos: int) -> (tag: Dom_Xml_Tag, ok: bool)
 	return {}, false
 }
 
+// Reports whether text[i] (a `<`) opens a comment, CDATA section, processing
+// instruction or declaration rather than a tag, and if so the offset just past
+// it. ok=false when that markup is unterminated.
+@(private)
+dom_xml_skip_markup :: proc(text: string, i: int) -> (after: int, is_markup: bool, ok: bool) {
+	if i + 1 >= len(text) {
+		return 0, false, false
+	}
+	skip_to := ""
+	switch {
+	case strings.has_prefix(text[i:], "<!--"):
+		skip_to = "-->"
+	case strings.has_prefix(text[i:], DOM_XML_CDATA_OPEN):
+		skip_to = DOM_XML_CDATA_CLOSE
+	case text[i + 1] == '?':
+		skip_to = "?>"
+	case text[i + 1] == '!':
+		skip_to = ">"
+	case:
+		return 0, false, false
+	}
+	stop := strings.index(text[i:], skip_to)
+	if stop < 0 {
+		return 0, true, false
+	}
+	return i + stop + len(skip_to), true, true
+}
+
 // Extracts the value of a double-quoted attribute from a tag head. The value
 // is returned raw (entities undecoded) as a slice of head.
 dom_xml_attr_value :: proc(head: string, name: string) -> (value: string, ok: bool) {
@@ -110,37 +126,74 @@ dom_xml_attr_value :: proc(head: string, name: string) -> (value: string, ok: bo
 	}
 }
 
-// Returns the text between an open tag and its matching close, and the
-// offset just past that close. A CDATA section is unwrapped and taken
-// verbatim, with is_cdata set: its content is not entity-encoded and any
-// markup inside it is content, not structure, so it need not balance.
+// Returns the text content of an element and the offset just past its matching
+// close, like DOM textContent: character data is entity-decoded, CDATA sections
+// are taken verbatim wherever they appear (their markup is content and need not
+// balance), comments and processing instructions are dropped, and the text of
+// nested elements is included in document order. An element holding only plain
+// text without entities returns a slice of text; otherwise the result is built
+// in allocator.
 dom_xml_element_text :: proc(
 	text: string,
 	open: Dom_Xml_Tag,
+	allocator := context.allocator,
 ) -> (
 	body: string,
-	is_cdata: bool,
 	end: int,
 	ok: bool,
 ) {
-	rest := text[open.end:]
-	if strings.has_prefix(rest, DOM_XML_CDATA_OPEN) {
-		stop := strings.index(rest, DOM_XML_CDATA_CLOSE)
-		if stop < 0 {
-			return "", false, 0, false
-		}
-		close, close_ok := dom_xml_next_tag(text, open.end + stop + len(DOM_XML_CDATA_CLOSE))
-		if !close_ok || close.kind != .Close {
-			return "", false, 0, false
-		}
-		return rest[len(DOM_XML_CDATA_OPEN):stop], true, close.end, true
+	if open.kind == .Self_Close {
+		return "", open.end, true
 	}
+	builder: strings.Builder
+	built := false
 	depth := 1
 	pos := open.end
 	for {
-		tag, tag_ok := dom_xml_next_tag(text, pos)
+		rel := strings.index_byte(text[pos:], '<')
+		if rel < 0 {
+			return "", 0, false
+		}
+		lt := pos + rel
+		if strings.has_prefix(text[lt:], DOM_XML_CDATA_OPEN) {
+			stop := strings.index(text[lt:], DOM_XML_CDATA_CLOSE)
+			if stop < 0 {
+				return "", 0, false
+			}
+			if !built {
+				strings.builder_init(&builder, allocator)
+				built = true
+			}
+			dom_xml_write_decoded(&builder, text[pos:lt])
+			strings.write_string(&builder, text[lt + len(DOM_XML_CDATA_OPEN):lt + stop])
+			pos = lt + stop + len(DOM_XML_CDATA_CLOSE)
+			continue
+		}
+		after, is_markup, markup_ok := dom_xml_skip_markup(text, lt)
+		if is_markup && !markup_ok {
+			return "", 0, false
+		}
+		// The first markup closes a plain-text element: no copy unless the
+		// text holds entities.
+		if !built && !is_markup && depth == 1 && lt + 1 < len(text) && text[lt + 1] == '/' {
+			tag, tag_ok := dom_xml_next_tag(text, lt)
+			if !tag_ok {
+				return "", 0, false
+			}
+			return dom_xml_decode_entities_into(text[pos:lt], allocator), tag.end, true
+		}
+		if !built {
+			strings.builder_init(&builder, allocator)
+			built = true
+		}
+		dom_xml_write_decoded(&builder, text[pos:lt])
+		if is_markup {
+			pos = after
+			continue
+		}
+		tag, tag_ok := dom_xml_next_tag(text, lt)
 		if !tag_ok {
-			return "", false, 0, false
+			return "", 0, false
 		}
 		pos = tag.end
 		switch tag.kind {
@@ -149,7 +202,7 @@ dom_xml_element_text :: proc(
 		case .Close:
 			depth -= 1
 			if depth == 0 {
-				return text[open.end:tag.start], false, tag.end, true
+				return strings.to_string(builder), tag.end, true
 			}
 		case .Self_Close:
 		}
@@ -157,13 +210,30 @@ dom_xml_element_text :: proc(
 }
 
 // Skips from just past an open tag to just past its matching close tag,
-// returning that offset. A self-closing tag has no body.
+// returning that offset. A self-closing tag has no body. Nothing is allocated.
 dom_xml_skip_element :: proc(text: string, open: Dom_Xml_Tag) -> (end: int, ok: bool) {
 	if open.kind == .Self_Close {
 		return open.end, true
 	}
-	_, _, end, ok = dom_xml_element_text(text, open)
-	return end, ok
+	depth := 1
+	pos := open.end
+	for {
+		tag, tag_ok := dom_xml_next_tag(text, pos)
+		if !tag_ok {
+			return 0, false
+		}
+		pos = tag.end
+		switch tag.kind {
+		case .Open:
+			depth += 1
+		case .Close:
+			depth -= 1
+			if depth == 0 {
+				return tag.end, true
+			}
+		case .Self_Close:
+		}
+	}
 }
 
 // Decodes the predefined entities and numeric character references into

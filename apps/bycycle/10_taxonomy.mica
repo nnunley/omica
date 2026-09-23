@@ -1,10 +1,11 @@
 // Bycycle taxonomy: transitive closure over Isa/Genls.
 // The loader asserts only direct edges; these rules derive the rest.
-// NOTE: fileins lower rules one file at a time, against the relations
-// declared so far. Every relation a rule body reads must be declared in this
-// file or in one loaded before it (load order: ONTOLOGY in
-// scripts/bycycle-load.sh); otherwise loading fails with "could not lower a
-// rule". Head relations are not restricted this way.
+// NOTE: load order does not constrain these rules. world_load declares every
+// file's relations before it lowers any rule, so a rule may read or derive a
+// relation declared in any file of the same load. What matters is the file
+// set: leave out the file declaring a body relation (20_constraints reads
+// InstanceOf/Subsumes from here) and loading fails with "could not lower a
+// rule".
 
 make_relation(:Subsumes, 2)
 make_relation(:InstanceOf, 2)
