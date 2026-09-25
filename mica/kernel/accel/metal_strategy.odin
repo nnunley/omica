@@ -16,6 +16,15 @@ metal_strategy :: proc() -> Strategy {
 		membership_select = metal_membership_select,
 		cosine_query = metal_cosine_query,
 		cosine_queries = metal_cosine_queries,
+		membership_select2 = membership_select2_impl,
+		prepare_column = prepare_column_impl,
+		membership_select_prepared = membership_select_prepared_impl,
+		prepare_docs = prepare_docs_impl,
+		cosine_queries_prepared = cosine_queries_prepared_impl,
+		release = release_impl,
+		// A resident column pays off once a probe batch reaches the
+		// operator's own threshold.
+		resident_min_probes = MEMBERSHIP_MIN_ROWS,
 		join_equality = join_equality_impl,
 		// Not offered by default: no win over the kernel's CPU hash join on
 		// the engine join benchmark (Stage 3 measurements).

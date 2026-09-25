@@ -5,8 +5,11 @@
 // their operators stay on the row path.
 package kernel
 
+import "base:runtime"
 import "core:mem"
+import "core:mem/virtual"
 import "core:slice"
+import "core:sync"
 import accel "./accel"
 import v "../var"
 
@@ -95,6 +98,8 @@ Packed_Entry :: struct {
 Packed_Cache :: struct {
 	entries:   [dynamic]^Packed_Entry,
 	joins:     [dynamic]^Packed_Join_Entry,
+	// Cross-commit entries this evaluation reads, pinned until destroy.
+	shared:    [dynamic]^Shared_Packed_Entry,
 	allocator: mem.Allocator,
 	builds:    int,
 	prepares:  int,
@@ -121,6 +126,7 @@ packed_cache_create :: proc(allocator: mem.Allocator) -> ^Packed_Cache {
 	cache^ = Packed_Cache {
 		entries   = make([dynamic]^Packed_Entry, allocator),
 		joins     = make([dynamic]^Packed_Join_Entry, allocator),
+		shared    = make([dynamic]^Shared_Packed_Entry, allocator),
 		allocator = allocator,
 	}
 	return cache
@@ -134,6 +140,7 @@ packed_cache_destroy :: proc(cache: ^Packed_Cache) {
 	for entry in cache.entries {
 		accel.release_prepared(entry.strategy, &entry.prepared)
 	}
+	shared_packed_unpin(cache.shared[:])
 	packed_last_builds = cache.builds
 	packed_last_prepares = cache.prepares
 }
@@ -152,6 +159,16 @@ packed_cache_lookup :: proc(source: ^Relation_Source, relation: Relation_ID, wid
 			return e, e.ok
 		}
 	}
+	serial := shared_packed_serial(source, relation)
+	if serial != 0 {
+		if shared, hit := shared_packed_acquire(serial, width); hit {
+			append(&cache.shared, shared)
+			e := new(Packed_Entry, cache.allocator)
+			e^ = Packed_Entry{relation = relation, width = width, ok = shared.ok, keys = shared.keys}
+			append(&cache.entries, e)
+			return e, shared.ok
+		}
+	}
 	unbound := make([]v.Binding, width, cache.allocator)
 	batch, err := relation_source_scan_columns(source, relation, unbound, cache.allocator)
 	if err != .None {
@@ -161,11 +178,152 @@ packed_cache_lookup :: proc(source: ^Relation_Source, relation: Relation_ID, wid
 		return nil, false
 	}
 	keys, ok := packed_keys_from_columns(batch.columns[:width], batch.count, cache.allocator)
+	cache.builds += 1
+	if serial != 0 {
+		if shared := shared_packed_insert(serial, width, ok, keys); shared != nil {
+			append(&cache.shared, shared)
+			keys = shared.keys
+		}
+	}
 	e := new(Packed_Entry, cache.allocator)
 	e^ = Packed_Entry{relation = relation, width = width, ok = ok, keys = keys}
 	append(&cache.entries, e)
-	cache.builds += 1
 	return e, ok
+}
+
+// --- Cross-commit packed keys --------------------------------------------------
+//
+// Keys of a relation read purely from its extensional block depend only on
+// that block, which is immutable and shared by every snapshot that does not
+// change the relation. They are kept across evaluations and commits, keyed by
+// the block's process-unique serial (Relation_Block.serial) and the key
+// width. The table is static storage: entries live from insertion until
+// eviction, owned by the table's allocator (never an evaluation's arena), and
+// each evaluation pins the entries it reads until packed_cache_destroy.
+
+SHARED_PACKED_ENTRIES :: 16
+
+Shared_Packed_Entry :: struct {
+	serial: u64,
+	width:  int,
+	ok:     bool,
+	keys:   Packed_Keys,
+	arena:  ^virtual.Arena,
+	used:   u64,
+	pins:   int,
+}
+
+@(private)
+shared_packed: struct {
+	lock:      sync.Mutex,
+	entries:   [SHARED_PACKED_ENTRIES]Shared_Packed_Entry,
+	clock:     u64,
+	allocator: runtime.Allocator,
+}
+
+// The block serial when `relation` is read purely from its extensional block
+// on this source (a snapshot, readable, not computed, no derived or delta
+// rows); 0 otherwise, meaning "do not share".
+@(private)
+shared_packed_serial :: proc(source: ^Relation_Source, relation: Relation_ID) -> u64 {
+	if source.snapshot == nil || source.transaction != nil || !authority_can_read(source.authority, relation) {
+		return 0
+	}
+	if kernel := relation_source_kernel(source); kernel != nil && kernel_relation_is_computed(kernel, relation) {
+		return 0
+	}
+	if source.delta_active && source.delta != nil && relation == source.delta_relation {
+		return 0
+	}
+	if rules_derived_find(source.derived, relation) != nil {
+		return 0
+	}
+	if source.use_stored_derived && len(snapshot_derived_rows(source.snapshot, relation)) > 0 {
+		return 0
+	}
+	block, ok := snapshot_relation_block(source.snapshot, relation)
+	if !ok {
+		return 0
+	}
+	return block.serial
+}
+
+@(private)
+shared_packed_acquire :: proc(serial: u64, width: int) -> (^Shared_Packed_Entry, bool) {
+	sync.mutex_lock(&shared_packed.lock)
+	defer sync.mutex_unlock(&shared_packed.lock)
+	shared_packed.clock += 1
+	for &e in shared_packed.entries {
+		if e.arena != nil && e.serial == serial && e.width == width {
+			e.used = shared_packed.clock
+			e.pins += 1
+			return &e, true
+		}
+	}
+	return nil, false
+}
+
+// Copies `keys` into a new pinned entry, evicting the least recently used
+// unpinned one; nil when every entry is pinned (the caller keeps its copy).
+@(private)
+shared_packed_insert :: proc(serial: u64, width: int, ok: bool, keys: Packed_Keys) -> ^Shared_Packed_Entry {
+	sync.mutex_lock(&shared_packed.lock)
+	defer sync.mutex_unlock(&shared_packed.lock)
+	if shared_packed.allocator.procedure == nil {
+		shared_packed.allocator = runtime.heap_allocator()
+	}
+	owner := shared_packed.allocator
+	victim := -1
+	for e, i in shared_packed.entries {
+		if e.arena == nil {
+			victim = i
+			break
+		}
+		if e.pins == 0 && (victim < 0 || e.used < shared_packed.entries[victim].used) {
+			victim = i
+		}
+	}
+	if victim < 0 {
+		return nil
+	}
+	arena := new(virtual.Arena, owner)
+	if virtual.arena_init_growing(arena) != nil {
+		free(arena, owner)
+		return nil
+	}
+	e := &shared_packed.entries[victim]
+	if e.arena != nil {
+		virtual.arena_destroy(e.arena)
+		free(e.arena, owner)
+	}
+	alloc := virtual.arena_allocator(arena)
+	copied := Packed_Keys{width = keys.width, count = keys.count, columns = make([][]u64, len(keys.columns), alloc)}
+	for column, c in keys.columns {
+		copied.columns[c] = slice.clone(column, alloc)
+	}
+	shared_packed.clock += 1
+	e^ = Shared_Packed_Entry {
+		serial = serial,
+		width  = width,
+		ok     = ok,
+		keys   = copied,
+		arena  = arena,
+		used   = shared_packed.clock,
+		pins   = 1,
+	}
+	return e
+}
+
+@(private)
+shared_packed_unpin :: proc(entries: []^Shared_Packed_Entry) {
+	if len(entries) == 0 {
+		return
+	}
+	sync.mutex_lock(&shared_packed.lock)
+	defer sync.mutex_unlock(&shared_packed.lock)
+	for e in entries {
+		e.pins -= 1
+	}
 }
 
 // Sorted key columns (one or two relation positions) with each entry's source

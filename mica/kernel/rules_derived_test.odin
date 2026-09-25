@@ -136,3 +136,19 @@ test_rules_derived_freeze_limits_scans_not_dedup :: proc(t: ^testing.T) {
 	testing.expect_value(t, rules_derived_count(&d, Relation_ID(1)), 3)
 	testing.expect_value(t, rules_derived_count(&d, Relation_ID(2)), 1)
 }
+
+// Reserving for a batch is bounded: many candidate rows collapsing to a few
+// distinct ones must not size the evaluation-lifetime index by the batch.
+@(test)
+test_rules_derived_reserve_bounded_by_new_rows :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	d := rules_derived_create(context.temp_allocator)
+	n := 500_000
+	column := make([]v.Value, n, context.temp_allocator)
+	for i in 0 ..< n {
+		column[i] = must_int(i64(i % 10))
+	}
+	testing.expect_value(t, rules_derived_add_columns(&d, nil, Relation_ID(1), [][]v.Value{column}, n, context.temp_allocator), 10)
+	entry := rules_derived_find(&d, Relation_ID(1))
+	testing.expectf(t, len(entry.index) <= 2 * DERIVED_RESERVE_MAX, "index has %d slots for 10 rows", len(entry.index))
+}

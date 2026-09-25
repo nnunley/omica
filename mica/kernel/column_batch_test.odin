@@ -71,3 +71,25 @@ test_column_batch_select_none_empties :: proc(t: ^testing.T) {
 	column_batch_select(&b, []u32{}, context.temp_allocator)
 	testing.expect_value(t, column_batch_live(&b), 0)
 }
+
+// Every block gets a process-unique non-zero serial, so caches can key on a
+// block's identity without holding a reference to it.
+@(test)
+test_relation_block_serials_unique :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+	r := create_relation(&kernel, 1, "R", 1)
+	seen := make(map[u64]bool, context.temp_allocator)
+	for i in 0 ..< 5 {
+		tx := kernel_begin(&kernel)
+		transaction_assert(&tx, r, tuple_of(must_int(i64(i))))
+		commit_transaction(t, &tx)
+		block, ok := snapshot_relation_block(kernel.current, r)
+		testing.expect(t, ok)
+		testing.expect(t, block.serial != 0)
+		testing.expect(t, !seen[block.serial])
+		seen[block.serial] = true
+	}
+}

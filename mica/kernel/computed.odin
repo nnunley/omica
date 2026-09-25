@@ -17,10 +17,27 @@ Computed_Scan_Proc :: #type proc(
 	visit_user: rawptr,
 ) -> Kernel_Error
 
+// A batched scanner sees every key row of a rule step at once. `keys` has one
+// column per relation position (nil for unbound positions) holding `count`
+// key rows. Each result row is appended to `out` with the index of the key
+// row that produced it in `input_rows`. Like row scanners it may return
+// candidates; the kernel rechecks them against their key row. Denied reads of
+// backing relations are reported through source.error, as for row scanners.
+Computed_Batch_Scan_Proc :: #type proc(
+	user: rawptr,
+	source: ^Relation_Source,
+	keys: [][]v.Value,
+	count: int,
+	out: ^Column_Sink,
+	input_rows: ^[dynamic]u32,
+) -> Kernel_Error
+
 Computed_Relation :: struct {
 	relation:          Relation_ID,
 	required_bindings: []u16,
 	scan:              Computed_Scan_Proc,
+	// Optional; rule evaluation prefers it for multi-row steps.
+	batch_scan:        Computed_Batch_Scan_Proc,
 	user:              rawptr,
 }
 
@@ -70,6 +87,7 @@ kernel_register_computed_relation :: proc(
 		entry.required_bindings = make([]u16, len(required_bindings), registry.allocator)
 		copy(entry.required_bindings, required_bindings)
 		entry.scan = scan
+		entry.batch_scan = nil
 		entry.user = user
 		return .None
 	}
@@ -85,6 +103,26 @@ kernel_register_computed_relation :: proc(
 		},
 	)
 	return .None
+}
+
+// Adds a batched scanner to an already registered computed relation. It must
+// produce the same rows as the row scanner for every key row; it shares the
+// row scanner's user pointer and required bindings.
+kernel_register_computed_batch_scan :: proc(
+	kernel: ^Kernel,
+	relation: Relation_ID,
+	batch_scan: Computed_Batch_Scan_Proc,
+) -> Kernel_Error {
+	registry := &kernel.computed
+	sync.mutex_lock(&registry.lock)
+	defer sync.mutex_unlock(&registry.lock)
+	for &entry in registry.entries {
+		if entry.relation == relation {
+			entry.batch_scan = batch_scan
+			return .None
+		}
+	}
+	return .Unknown_Relation
 }
 
 // Removes registrations owned by one runtime world. The user pointer is also
@@ -203,4 +241,16 @@ computed_relation_visit :: proc(
 		user     = user,
 	}
 	return true, entry.scan(entry.user, source, bindings, computed_filter_visit, &filter)
+}
+
+// The batched scanner of a computed relation, if it has one.
+computed_batch_scanner :: proc(kernel: ^Kernel, relation: Relation_ID) -> (Computed_Batch_Scan_Proc, rawptr, bool) {
+	if kernel == nil {
+		return nil, nil, false
+	}
+	entry, found := computed_relation_lookup(kernel, relation)
+	if !found || entry.batch_scan == nil {
+		return nil, nil, false
+	}
+	return entry.batch_scan, entry.user, true
 }

@@ -1,5 +1,6 @@
 package accel
 
+import "core:mem/virtual"
 import "core:testing"
 
 @(private = "file")
@@ -142,4 +143,32 @@ test_release_prepared_zero_value_is_noop :: proc(t: ^testing.T) {
 	empty: Prepared
 	release_prepared(cpu_strategy(), &empty)
 	testing.expect(t, empty.handle == nil)
+}
+
+// A prepared copy is strategy-owned: it stays valid after the caller's
+// context.allocator (here a short-lived arena) is gone, and release frees it
+// whatever allocator is current then.
+@(test)
+test_cpu_prepared_outlives_caller_allocator :: proc(t: ^testing.T) {
+	s := cpu_strategy()
+	column: Prepared
+	docs: Prepared
+	{
+		scratch: virtual.Arena
+		testing.expect(t, virtual.arena_init_growing(&scratch) == nil)
+		context.allocator = virtual.arena_allocator(&scratch)
+		ok: bool
+		column, ok = prepare_column(s, []u64{1, 4, 9})
+		testing.expect(t, ok)
+		docs, ok = prepare_docs(s, []f32{1, 0, 0, 1}, 2, 2)
+		testing.expect(t, ok)
+		virtual.arena_destroy(&scratch)
+	}
+	selected, ok := membership_select_prepared(s, []u64{4, 5}, column, true, context.temp_allocator)
+	testing.expect(t, ok && len(selected) == 2 && selected[0] && !selected[1])
+	scores, scores_ok := cosine_queries_prepared(s, []f32{1, 0}, 1, docs, context.temp_allocator)
+	testing.expect(t, scores_ok && len(scores) == 2)
+	release_prepared(s, &column)
+	release_prepared(s, &docs)
+	free_all(context.temp_allocator)
 }

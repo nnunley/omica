@@ -17,6 +17,7 @@ package accel
 import "core:c"
 import "core:dynlib"
 import "core:fmt"
+import "base:runtime"
 import "core:log"
 import "core:mem"
 import "core:sync"
@@ -28,6 +29,8 @@ CUDA_COSINE_MIN_DOCS :: 1024
 // Fewest probes the CUDA join accepts (placement threshold; tuned on the
 // engine join benchmark).
 CUDA_JOIN_MIN_PROBES :: 4096
+// Batches of at least this many queries use the tiled cosine kernel.
+CUDA_TILED_COSINE_MIN_QUERIES :: 8
 
 // Upper bound on devices tracked; extra devices are ignored.
 @(private)
@@ -157,6 +160,41 @@ extern "C" __global__ void join_fill(const unsigned int* first,
         out_right[o + k] = right_rows[f + k];
     }
 }
+
+// Tiled cosine for query batches: each 16x16 block computes 16 queries
+// against 16 documents from 16-dimension slices staged in shared memory (the
+// document tile is padded to 17 columns against bank conflicts). Every thread
+// accumulates in dimension order; out-of-range threads load zeros, reach every
+// barrier, and write nothing.
+extern "C" __global__ void cosine_tiled(const float* queries,
+                                        const float* docs,
+                                        float* out,
+                                        unsigned int dim,
+                                        unsigned int n_docs,
+                                        unsigned int n_queries) {
+    __shared__ float qt[16][16];
+    __shared__ float dt[16][17];
+    unsigned int tx = threadIdx.x, ty = threadIdx.y;
+    unsigned int d0 = blockIdx.x * 16, q0 = blockIdx.y * 16;
+    float dot = 0.0f, qn = 0.0f, dn = 0.0f;
+    for (unsigned int k0 = 0; k0 < dim; k0 += 16) {
+        unsigned int k = k0 + tx;
+        unsigned int qrow = q0 + ty, drow = d0 + ty;
+        qt[ty][tx] = (qrow < n_queries && k < dim) ? queries[(unsigned long long)qrow * dim + k] : 0.0f;
+        dt[ty][tx] = (drow < n_docs && k < dim) ? docs[(unsigned long long)drow * dim + k] : 0.0f;
+        __syncthreads();
+        for (unsigned int kk = 0; kk < 16; kk++) {
+            float qv = qt[ty][kk];
+            float dv = dt[tx][kk];
+            dot += qv * dv; qn += qv * qv; dn += dv * dv;
+        }
+        __syncthreads();
+    }
+    unsigned int q = q0 + ty, d = d0 + tx;
+    if (q < n_queries && d < n_docs) {
+        out[(unsigned long long)q * n_docs + d] = dot / (sqrtf(qn) * sqrtf(dn) + 1e-9f);
+    }
+}
 `
 
 @(private)
@@ -255,6 +293,7 @@ Cuda_Device_State :: struct {
 	cosine:     CU_Function,
 	join_count: CU_Function,
 	join_fill:  CU_Function,
+	cosine_tiled: CU_Function,
 	name_buf:   [128]u8,
 	name:       string,
 	cc_major:   int,
@@ -374,6 +413,9 @@ cuda_device_locked :: proc(ordinal: int) -> ^Cuda_Device_State {
 	}
 	if r := drv.cuModuleGetFunction(&state.join_fill, state.module, "join_fill"); r != CU_SUCCESS {
 		return cuda_device_failed(ordinal, "cuModuleGetFunction(join_fill)", r)
+	}
+	if r := drv.cuModuleGetFunction(&state.cosine_tiled, state.module, "cosine_tiled"); r != CU_SUCCESS {
+		return cuda_device_failed(ordinal, "cuModuleGetFunction(cosine_tiled)", r)
 	}
 	state.ready = true
 	return state
@@ -503,6 +545,27 @@ cuda_launch :: proc(drv: ^Cuda_Driver, function: CU_Function, threads: int, para
 	return drv.cuCtxSynchronize() == CU_SUCCESS
 }
 
+// Launches `function` over whole 16x16 blocks covering width x height.
+@(private)
+cuda_launch_tiles :: proc(drv: ^Cuda_Driver, function: CU_Function, width, height: int, params: []rawptr) -> bool {
+	gx, gy := (width + 15) / 16, (height + 15) / 16
+	if gx > int(max(u32)) || gy > 65535 {
+		return false
+	}
+	if drv.cuLaunchKernel(function, c.uint(gx), c.uint(gy), 1, 16, 16, 1, 0, nil, raw_data(params), nil) != CU_SUCCESS {
+		return false
+	}
+	return drv.cuCtxSynchronize() == CU_SUCCESS
+}
+
+@(thread_local, private)
+cuda_cosine_tiled_used: bool
+
+// Whether the calling thread's last CUDA cosine used the tiled kernel (tests).
+cuda_last_cosine_tiled :: proc() -> bool {
+	return cuda_cosine_tiled_used
+}
+
 // Probes `left` against a sorted-unique column already on the current device.
 // Caller holds the mutex and has entered the device.
 @(private)
@@ -575,7 +638,9 @@ cuda_cosine_run_locked :: proc(
 	nd_u := u32(n_docs)
 	nq_u := u32(n_queries)
 	params := [?]rawptr{&d_queries, &d_docs_arg, &d_out, &dim_u, &nd_u, &nq_u}
-	if !cuda_launch(drv, state.cosine, total, params[:]) {
+	cuda_cosine_tiled_used = n_queries >= CUDA_TILED_COSINE_MIN_QUERIES
+	launched := cuda_cosine_tiled_used ? cuda_launch_tiles(drv, state.cosine_tiled, n_docs, n_queries, params[:]) : cuda_launch(drv, state.cosine, total, params[:])
+	if !launched {
 		return nil, false
 	}
 	out := make([]f32, total, allocator)
@@ -784,6 +849,9 @@ cuda_cosine_query_impl :: proc(
 Cuda_Resident :: struct {
 	device: int,
 	ptr:    CU_Device_Ptr,
+	// Owner of this header, fixed at prepare time: release may run under a
+	// different context allocator.
+	allocator: mem.Allocator,
 }
 
 // Uploads bytes to the selected device and wraps them as a resident handle.
@@ -808,8 +876,9 @@ cuda_upload_resident :: proc(data: rawptr, size: int) -> (handle: rawptr, ok: bo
 		drv.cuMemFree(ptr)
 		return nil, false
 	}
-	resident := new(Cuda_Resident)
-	resident^ = Cuda_Resident{device = cuda_backend.current, ptr = ptr}
+	owner := runtime.heap_allocator()
+	resident := new(Cuda_Resident, owner)
+	resident^ = Cuda_Resident{device = cuda_backend.current, ptr = ptr, allocator = owner}
 	return resident, true
 }
 
@@ -901,7 +970,7 @@ cuda_release_impl :: proc(handle: rawptr, kind: Prepared_Kind) {
 	if state.ready && cuda_backend.driver.cuCtxSetCurrent(state.ctx) == CU_SUCCESS {
 		cuda_backend.driver.cuMemFree(resident.ptr)
 	}
-	free(resident)
+	free(resident, resident.allocator)
 }
 
 // Equality join on the current device, inputs uploaded for this call only.

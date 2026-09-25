@@ -49,6 +49,11 @@ rules_derived_visible :: #force_inline proc(d: ^Rule_Derived, entry: ^Derived_Co
 
 DERIVED_INDEX_MIN :: 16
 
+// At most this many extra rows are reserved per batch: a batch whose candidates
+// collapse to few new rows must not size storage that lives for the whole
+// evaluation; larger results still grow by doubling past it.
+DERIVED_RESERVE_MAX :: 65_536
+
 // Creates an empty derived set whose storage is allocated from `alloc`.
 rules_derived_create :: proc(alloc: mem.Allocator) -> Rule_Derived {
 	return Rule_Derived{allocator = alloc, relations = make([dynamic]^Derived_Columns, 0, alloc)}
@@ -116,6 +121,34 @@ derived_index_grow :: proc(entry: ^Derived_Columns, alloc: mem.Allocator) {
 	entry.index = index
 }
 
+// Makes room for `extra` more rows in one step: the index is rebuilt at most
+// once (to stay at most half full) and the columns and hashes grow once,
+// instead of doubling repeatedly while a large batch is inserted.
+@(private)
+derived_reserve :: proc(entry: ^Derived_Columns, alloc: mem.Allocator, extra: int) {
+	want := len(entry.hashes) + extra
+	size := len(entry.index)
+	for 2 * want > size {
+		size *= 2
+	}
+	if size != len(entry.index) {
+		index := make([]u32, size, alloc)
+		mask := u64(size - 1)
+		for hash, row in entry.hashes {
+			slot := hash & mask
+			for index[slot] != 0 {
+				slot = (slot + 1) & mask
+			}
+			index[slot] = u32(row + 1)
+		}
+		entry.index = index
+	}
+	reserve(&entry.hashes, want)
+	for c in 0 ..< entry.arity {
+		reserve(&entry.columns[c], want)
+	}
+}
+
 // Inserts row `r` of `columns` unless an equal row exists. `hash` is its
 // `tuple_hash`.
 @(private)
@@ -162,6 +195,7 @@ rules_derived_add_columns :: proc(
 	}
 	hashes := make([]u64, count, scratch)
 	v.tuple_hash_columns(columns, nil, hashes)
+	derived_reserve(entry, d.allocator, min(count, DERIVED_RESERVE_MAX))
 	added := 0
 	for r in 0 ..< count {
 		if derived_insert(entry, d.allocator, hashes[r], columns, r) {

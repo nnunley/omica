@@ -1,6 +1,6 @@
 # Accelerating omica's rule and query engine
 
-Status: design approved 2026-09-23; Stages 0–4 implemented (2026-09-24); stages reordered after Stage 1 measurements. Work lands on `accel-cuda`, one
+Status: design approved 2026-09-23; Stages 0–6 implemented (2026-09-24); stages reordered after Stage 1 measurements. Work lands on `accel-cuda`, one
 branch per stage.
 
 ## Why
@@ -374,8 +374,8 @@ Each stage is its own commit series with its own tests.
 | 2 | Done. Columnar evaluation (Design §6): column batches between rule steps, column-major derived relations with a flat dedup index inside an evaluation (snapshots keep rows), a layered columnar scan, the columnar accel boundary, hash joins, and a per-application scratch arena. Computed relations keep their row scanners. The 262k negation runs 3.1× faster on the Mac CPU and 5.2× on ndn's; every measured workload got faster (see Stage 2 measurements). Deduplication is still 26–40% of an evaluation, so accelerated deduplication joins Stage 6. |
 | 3 | Done. `join_equality` (one or two key columns, pairs ordered by probe) on the CPU reference, CPU-parallel, Metal and CUDA, wired into the columnar positive join with sorted relation keys cached per evaluation and every decision counted under `.Positive_Join`. Measured slower than Stage 2's CPU hash join on both machines, so no strategy offers it by default (`join_min_probes = 0`); `*_join` benchmark variants force it on (see Stage 3 measurements). |
 | 4 | Done. Strict semi-naive evaluation: each round reads the result frozen at the round's start (`rules_derived_freeze`), so a derived relation is fixed for a whole round and packed keys are built once per round. A delta round now restricts one atom occurrence, not every atom of the relation: rules with two atoms of the same recursive relation (`T(x,z) :- T(x,y), T(y,z)`) had been missing results since before Stage 2 (a 41-node chain derived 508 of 820 paths); the oracle now includes that shape. Mac timings within noise of Stage 3 or better (`kernel/rules/large/*_chain_400` 6–9% faster). |
-| 5 | Cosine for `NearestEmbedding` with f64 re-scoring, as a native batched computed scanner (many queries, one `cosine_queries` call). Introduces the batched computed-scan interface (all bound keys as columns, results tagged with the key row that produced them) and reviews its authority checks, required bindings and rule scheduling. |
-| 6 | Faster GPU operators: a matrix-multiply cosine kernel (today one thread per query–document pair, no data reuse); packed keys and prepared device copies cached on immutable `Relation_Block`s across commits (deferred from Stage 1); Metal two-key membership and residency; thresholds from measurements; overlapping copies with compute. `accel/scale` and `kernel/rules_accel` track operator and engine speed throughout. |
+| 5 | Done. Batched computed scans (`Computed_Batch_Scan_Proc`, one call per rule step with every key row; authority checked first, nested denials surfaced, candidates rechecked, required bindings unchanged). `NearestEmbedding` is a native batched scanner: each index packed once (cached across commits by the backing blocks' serials), all of a step's queries scored in one `cosine_queries` call on the active strategy (`.Cosine` counted), the top `limit + 32` (plus every subject within 1e-4 of the window's last f32 score, so f32 ties cannot hide the f64 winner) re-scored in f64; results equal the row scanner's unless f32 error exceeds that band. 128 queries × 4,096 documents: 738 ms → 19 ms (CPU), 12 ms (CPU-parallel), 14 ms (Metal). |
+| 6 | Done. Derived columns and index reserved per head batch (capped at 65,536 extra rows; deduplication had been growth-bound: most rule workloads 1.8–2× faster); packed membership keys of extensional relations shared across commits by block serial; Metal two-key membership (from 65,536 probes), resident columns and documents, per-call buffers released; `NearestEmbedding` caches document matrices and user-counted resident copies (CPU strategies skip them); prepared copies owned by the strategy; tiled cosine kernels on Metal (64×8k×768: 24.9 → 7.0 ms, resident 4.2 ms) and CUDA (4.55 → 2.18 ms, resident 3.08 → 0.68 ms). Not done: copy/compute overlap (with resident documents only the queries move); GPU deduplication (needs a device-resident index across rounds; the CPU insert is still the largest step). |
 | 7 | Exporter, corpora, comparison against Rust mica, page update. |
 
 ### Why deduplication moved up (Stage 1 measurements)
@@ -433,6 +433,41 @@ Accelerated joins against the CPU hash join, whole evaluations, Mac M3 (medians;
 ndn (7800X3D + RTX 4070 Ti), joins on: `join_large_262k` 48.0 ms hash, 52.3 ms cpu-parallel join, 53.5 ms CUDA join; `visible_items_rule` on CUDA 1.81 → 2.14 ms with the join offered.
 
 Why the joins do not pay. After Stage 2 the CPU hash join is cheap: in `join_large_262k` the join step takes 3.7 ms of about 45–49 ms, while inserting the 262,144 head rows (deduplication) takes 31 ms. Sorting the relation's keys for the sorted-key operator costs 11 ms per evaluation (a radix sort; the first comparison sort cost 63 ms), more than the whole hash join. Accelerated joins become worth revisiting once sorted keys are cached across commits on immutable blocks (Stage 6), and deduplication is the next target.
+
+### Stage 5 measurements
+
+`retrieval_*_128q` (Mac M3): one rule, `Hit(q, s, score) :- Query(q, vec), NearestEmbedding(:docs, vec, 10, s, score, _)`, 128 queries of 128 dimensions against 4,096 documents; 1,280 rows and the same digest in every column.
+
+| Scanner | cpu | cpu-parallel | metal |
+|---|---|---|---|
+| row (per query, f64, before Stage 5) | 738 ms | 760 ms | 773 ms |
+| batched (Stage 5) | 19.3 ms | 12.4 ms | 14.0 ms |
+
+Most of the gain is structural: one pass over the index per step instead of one per query, and ranking by subject id instead of per-query maps and sorts. Scoring itself is about 8 ms of the CPU run. Metal uploads the document matrix on every call (it has no resident documents yet, Stage 6), which is why it trails the parallel CPU here.
+
+### Stage 6 measurements (Mac M3)
+
+Whole evaluations, medians, row digests unchanged:
+
+| Workload | Stage 5 | Stage 6 cpu | cpu-parallel | metal |
+|---|---|---|---|---|
+| 262k negation | 27.0 ms | 12.9 ms | 7.9 ms | 7.5 ms |
+| `visible_items_rule` | 1.54 ms | 0.80 ms | 0.80 ms | 0.84 ms (declines two-key below 65,536 probes) |
+| `join_large_262k` | 44.6 ms | 23.0 ms | 22.9 ms | 23.0 ms |
+| `transitive_chain_48` | 0.207 ms | 0.148 ms | | |
+| `rules/large/derived_load_20k` | 22.1 ms | 12.4 ms | | |
+
+Against the row evaluator before Stage 2, the 262k negation is 82.9 → 12.9 ms on one core and 7.5 ms with Metal (11×); `visible_items_rule` 7.4 → 0.8 ms (9×). Deduplication is still the largest step (16 of 23 ms in `join_large_262k`).
+
+ndn (7800X3D + RTX 4070 Ti), same workloads and digests:
+
+| Workload | before Stage 2 (cpu) | Stage 6 cpu | cpu-parallel | cuda |
+|---|---|---|---|---|
+| 262k negation | 139.4 ms | 20.8 ms | 16.0 ms | 15.8 ms |
+| `visible_items_rule` | 12.2 ms | 1.55 ms | 1.55 ms | 1.59 ms |
+| `join_large_262k` | — | 41.8 ms | 41.7 ms | 41.8 ms |
+| retrieval, 128 queries (row scanner → batched) | 442 ms | 17.1 ms | 8.3 ms | 8.2 ms |
+| cosine 64×8k×768 (operator; resident) | — | 45.3 ms | 4.3 ms | 2.2 ms (0.68 ms) |
 
 ## Relation to other work
 

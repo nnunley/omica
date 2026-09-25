@@ -10,6 +10,7 @@ import "core:mem"
 import "core:mem/virtual"
 
 import mm "../vendor/micromeasure/micromeasure-odin"
+import r "../mica/runtime"
 import accl "../mica/kernel/accel"
 import k "../mica/kernel"
 import v "../mica/var"
@@ -72,10 +73,11 @@ negation_state_init :: proc() -> ^Negation_State {
 // returns the total derived rows and an order-independent digest of their
 // contents (wrapping sum of per-row hashes mixed with the relation).
 @(private)
-engine_evaluate :: proc(scratch: ^virtual.Arena, scratch_alloc: mem.Allocator, rules: []k.Rule_Definition, snapshot: ^k.Snapshot) -> (total: u64, digest: u64) {
+engine_evaluate :: proc(scratch: ^virtual.Arena, scratch_alloc: mem.Allocator, rules: []k.Rule_Definition, snapshot: ^k.Snapshot, kernel: ^k.Kernel = nil) -> (total: u64, digest: u64) {
 	virtual.arena_free_all(scratch)
-	derived, err := k.rules_evaluate(scratch_alloc, rules, snapshot)
+	derived, err := k.rules_evaluate(scratch_alloc, rules, snapshot, kernel)
 	if err != .None {
+		fmt.eprintf("accel-check: evaluation failed: %v\n", err)
 		return 0, 0
 	}
 	for entry in derived.relations {
@@ -135,10 +137,79 @@ join_state_init :: proc() -> ^Negation_State {
 	return state
 }
 
+// Retrieval: 128 queries of 128 dimensions against 4,096 documents in one
+// rule, Hit(q, s, score) :- Query(q, vec), NearestEmbedding(:docs, vec, 10, s,
+// score, _). `batched` registers the batched scanner (one call per step,
+// scored on the active strategy); otherwise the row scanner runs per query.
+RETRIEVAL_DOCS :: 4096
+RETRIEVAL_QUERIES :: 128
+RETRIEVAL_DIM :: 128
+
+@(private)
+retrieval_state_init :: proc(batched: bool) -> ^Negation_State {
+	state := new(Negation_State)
+	if virtual.arena_init_growing(&state.arena) != nil || virtual.arena_init_growing(&state.scratch) != nil {
+		panic("failed to initialize retrieval benchmark arenas")
+	}
+	state.alloc = virtual.arena_allocator(&state.arena)
+	state.scratch_alloc = virtual.arena_allocator(&state.scratch)
+	k.kernel_init(&state.kernel)
+	contains := create_relation(&state.kernel, 50, "VectorIndexContains", 2)
+	embedding_of := create_relation(&state.kernel, 51, "EmbeddingOf", 2)
+	vector := create_relation(&state.kernel, 52, "EmbeddingVector", 2)
+	nearest := create_relation(&state.kernel, 53, "NearestEmbedding", 6)
+	query := create_relation(&state.kernel, 54, "Query", 2)
+	hit := create_relation(&state.kernel, 55, "Hit", 3)
+	assert(r.register_nearest_embedding(&state.kernel, nearest, nil, batched) == .None)
+
+	seed := u64(0x9e3779b97f4a7c15)
+	next := proc(seed: ^u64) -> f32 {
+		seed^ = seed^ * 6364136223846793005 + 1442695040888963407
+		return f32(seed^ >> 40) / f32(1 << 24) - 0.5
+	}
+	random_vector := proc(state: ^Negation_State, seed: ^u64, next: proc(^u64) -> f32) -> v.Value {
+		values := make([]v.Value, RETRIEVAL_DIM, state.alloc)
+		for i in 0 ..< RETRIEVAL_DIM {
+			values[i], _ = v.value_float(next(seed))
+		}
+		return v.value_list(state.alloc, values)
+	}
+	docs := v.value_symbol(v.symbol_intern("bench_docs"))
+	q, vec, s, score, ver := v.symbol_intern("q"), v.symbol_intern("vec"), v.symbol_intern("s"), v.symbol_intern("score"), v.symbol_intern("ver")
+	limit, _ := v.value_int(10)
+	rule := k.rule_new(hit, []k.Term{k.term_var(q), k.term_var(s), k.term_var(score)}, []k.Rule_Body_Item {
+		k.body_atom(k.atom_positive(query, []k.Term{k.term_var(q), k.term_var(vec)})),
+		k.body_atom(k.atom_positive(nearest, []k.Term{k.term_value(docs), k.term_var(vec), k.term_value(limit), k.term_var(s), k.term_var(score), k.term_var(ver)})),
+	})
+	snapshot, err := k.kernel_install_rule(&state.kernel, v.Identity(56), rule, "retrieval")
+	assert(err == .None)
+	k.snapshot_release(snapshot)
+	k.kernel_set_derivation(&state.kernel, false)
+	tx := k.kernel_begin(&state.kernel)
+	for d in 0 ..< RETRIEVAL_DOCS {
+		embedding := v.value_identity(bench_identity(u64(7_000_000 + d)))
+		subject := v.value_identity(bench_identity(u64(8_000_000 + d % 3000)))
+		assert(k.transaction_assert(&tx, contains, v.tuple_new(state.alloc, []v.Value{docs, embedding})) == .None)
+		assert(k.transaction_assert(&tx, embedding_of, v.tuple_new(state.alloc, []v.Value{embedding, subject})) == .None)
+		assert(k.transaction_assert(&tx, vector, v.tuple_new(state.alloc, []v.Value{embedding, random_vector(state, &seed, next)})) == .None)
+	}
+	for i in 0 ..< RETRIEVAL_QUERIES {
+		id := v.value_identity(bench_identity(u64(9_000_000 + i)))
+		assert(k.transaction_assert(&tx, query, v.tuple_new(state.alloc, []v.Value{id, random_vector(state, &seed, next)})) == .None)
+	}
+	committed, commit_err := k.transaction_commit(&tx)
+	assert(commit_err == .None)
+	k.snapshot_release(committed)
+	k.transaction_destroy(&tx)
+	state.snapshot = k.kernel_snapshot(&state.kernel)
+	state.rules = state.snapshot.rules
+	return state
+}
+
 @(private)
 negation_rows :: proc(user: rawptr) -> (u64, u64) {
 	s := (^Negation_State)(user)
-	return engine_evaluate(&s.scratch, s.scratch_alloc, s.rules, s.snapshot)
+	return engine_evaluate(&s.scratch, s.scratch_alloc, s.rules, s.snapshot, &s.kernel)
 }
 
 @(private)
@@ -177,8 +248,8 @@ engine_check :: proc(label: string, state: rawptr, rows: proc(rawptr) -> (u64, u
 	before := k.placement_counts_this_thread()
 	total, digest = rows(state)
 	delta := k.placement_counts_delta(before, k.placement_counts_this_thread())
-	completed = delta[.Negated_Membership][.Completed] + delta[.Positive_Join][.Completed]
-	fmt.eprintf("accel-check: %s %s rows=%d digest=%x negated_membership=%v positive_join=%v\n", label, strategy.name, total, digest, delta[.Negated_Membership], delta[.Positive_Join])
+	completed = delta[.Negated_Membership][.Completed] + delta[.Positive_Join][.Completed] + delta[.Cosine][.Completed]
+	fmt.eprintf("accel-check: %s %s rows=%d digest=%x negated_membership=%v positive_join=%v cosine=%v\n", label, strategy.name, total, digest, delta[.Negated_Membership], delta[.Positive_Join], delta[.Cosine])
 	return
 }
 
@@ -206,6 +277,8 @@ register_engine_accel_benches :: proc(runner: ^mm.Runner) {
 		{"visible_items_rule", visible_state_init(), visible_rows},
 		{"negation_large_262k", negation_state_init(), negation_rows},
 		{"join_large_262k", join_state_init(), negation_rows},
+		{"retrieval_row_128q", retrieval_state_init(false), negation_rows},
+		{"retrieval_batched_128q", retrieval_state_init(true), negation_rows},
 	}
 	// Each strategy with a join operator also runs with the join forced on
 	// (join_min_probes = 1), so accelerated and CPU hash joins sit side by side.

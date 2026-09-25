@@ -2,6 +2,7 @@
 package accel
 
 import "core:slice"
+import "core:sync"
 import "core:testing"
 
 // Metal's join equals the CPU reference exactly (same pairs, same order), for
@@ -9,6 +10,8 @@ import "core:testing"
 // no pairs. Skipped without a Metal device.
 @(test)
 test_metal_join_agrees_with_cpu :: proc(t: ^testing.T) {
+	sync.mutex_lock(&metal_tests_lock)
+	defer sync.mutex_unlock(&metal_tests_lock)
 	defer free_all(context.temp_allocator)
 	m := metal_strategy()
 	testing.expect(t, m.join_equality != nil)

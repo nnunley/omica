@@ -6,8 +6,14 @@
 package accel
 
 import "core:mem"
+import "core:sync"
 import "core:testing"
 import v "../../var"
+
+// Metal operators decline Busy instead of waiting and tests run on parallel
+// threads: tests that need an operator to complete hold this lock.
+@(private)
+metal_tests_lock: sync.Mutex
 
 @(test)
 test_metal_probe_no_crash :: proc(t: ^testing.T) {
@@ -84,6 +90,8 @@ strategy_agreement :: proc(
 
 @(test)
 test_strategies_agree_large :: proc(t: ^testing.T) {
+	sync.mutex_lock(&metal_tests_lock)
+	defer sync.mutex_unlock(&metal_tests_lock)
 	n := 8192
 	left := make([]u64, n, context.temp_allocator)
 	right := make([]u64, n / 2, context.temp_allocator)
@@ -108,6 +116,8 @@ test_strategies_agree_large :: proc(t: ^testing.T) {
 
 @(test)
 test_batch_cosine_agrees_across_strategies :: proc(t: ^testing.T) {
+	sync.mutex_lock(&metal_tests_lock)
+	defer sync.mutex_unlock(&metal_tests_lock)
 	m := metal_strategy()
 	if !m.available() {
 		return
@@ -159,6 +169,8 @@ test_batch_cosine_agrees_across_strategies :: proc(t: ^testing.T) {
 
 @(test)
 test_top_k_agrees_across_strategies :: proc(t: ^testing.T) {
+	sync.mutex_lock(&metal_tests_lock)
+	defer sync.mutex_unlock(&metal_tests_lock)
 	m := metal_strategy()
 	if !m.available() {
 		return
@@ -212,6 +224,8 @@ test_top_k_agrees_across_strategies :: proc(t: ^testing.T) {
 // reset: an operator must leave nothing behind in it.
 @(test)
 test_metal_membership_leaves_temp_allocator_clean :: proc(t: ^testing.T) {
+	sync.mutex_lock(&metal_tests_lock)
+	defer sync.mutex_unlock(&metal_tests_lock)
 	m := metal_strategy()
 	if !m.available() { // also initializes the backend before tracking
 		return

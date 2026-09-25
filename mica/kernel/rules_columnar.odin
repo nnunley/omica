@@ -418,28 +418,15 @@ positive_pairs_indexed :: proc(
 ) {
 	arity := len(plan.roles)
 	sink := column_sink_make(arity, step.scratch)
-	bindings := make([]v.Binding, arity, step.scratch)
 	l := make([dynamic]u32, 0, step.scratch)
 	r := make([dynamic]u32, 0, step.scratch)
-	for i in 0 ..< column_batch_live(batch) {
-		row := column_batch_row(batch, i)
-		for role, p in plan.roles {
-			switch role {
-			case .Constant:
-				bindings[p] = template[p]
-			case .Key:
-				bindings[p] = v.binding_of(batch.columns[plan.slot_of[p]][row])
-			case .New, .Repeat:
-				bindings[p] = {}
-			}
+	if scanner, user, has_batch := computed_batch_scanner(relation_source_kernel(step.source), plan.atom.relation); has_batch {
+		if batch_err := positive_scan_batched(step, plan, batch, template, scanner, user, &sink, &l, &r); batch_err != .None {
+			return {}, nil, nil, batch_err
 		}
-		before := sink.count
-		if scan_err := relation_source_scan_append(step.source, plan.atom.relation, bindings, &sink); scan_err != .None {
+	} else {
+		if scan_err := positive_scan_per_row(step, plan, batch, template, &sink, &l, &r); scan_err != .None {
 			return {}, nil, nil, scan_err
-		}
-		for k in before ..< sink.count {
-			append(&l, u32(row))
-			append(&r, u32(k))
 		}
 	}
 	rows = column_sink_batch(&sink)
@@ -456,6 +443,89 @@ positive_pairs_indexed :: proc(
 		}
 	}
 	return rows, l[:write], r[:write], .None
+}
+
+// One call to a computed relation's batched scanner with every live row's
+// keys (constants broadcast), under the same authority and nested-error rules
+// as relation_source_scan_append.
+@(private)
+positive_scan_batched :: proc(
+	step: ^Rule_Step,
+	plan: ^Atom_Plan,
+	batch: ^Column_Batch,
+	template: []v.Binding,
+	scanner: Computed_Batch_Scan_Proc,
+	user: rawptr,
+	sink: ^Column_Sink,
+	l, r: ^[dynamic]u32,
+) -> Kernel_Error {
+	source := step.source
+	if !authority_can_read(source.authority, plan.atom.relation) {
+		source.error = .Permission_Denied
+		return .Permission_Denied
+	}
+	n := column_batch_live(batch)
+	keys := make([][]v.Value, len(plan.roles), step.scratch)
+	for role, p in plan.roles {
+		#partial switch role {
+		case .Constant:
+			column := make([]v.Value, n, step.scratch)
+			for i in 0 ..< n {
+				column[i] = template[p].value
+			}
+			keys[p] = column
+		case .Key:
+			keys[p] = column_batch_live_column(batch, plan.slot_of[p], step.scratch)
+		}
+	}
+	input_rows := make([dynamic]u32, 0, n, step.scratch)
+	if err := scanner(user, source, keys, n, sink, &input_rows); err != .None {
+		source.error = err
+		return err
+	}
+	if source.error != .None {
+		return source.error
+	}
+	for input, k in input_rows {
+		append(l, u32(column_batch_row(batch, int(input))))
+		append(r, u32(k))
+	}
+	return .None
+}
+
+// One scan per live row with its keys bound (constants too).
+@(private)
+positive_scan_per_row :: proc(
+	step: ^Rule_Step,
+	plan: ^Atom_Plan,
+	batch: ^Column_Batch,
+	template: []v.Binding,
+	sink: ^Column_Sink,
+	l, r: ^[dynamic]u32,
+) -> Kernel_Error {
+	bindings := make([]v.Binding, len(plan.roles), step.scratch)
+	for i in 0 ..< column_batch_live(batch) {
+		row := column_batch_row(batch, i)
+		for role, p in plan.roles {
+			switch role {
+			case .Constant:
+				bindings[p] = template[p]
+			case .Key:
+				bindings[p] = v.binding_of(batch.columns[plan.slot_of[p]][row])
+			case .New, .Repeat:
+				bindings[p] = {}
+			}
+		}
+		before := sink.count
+		if scan_err := relation_source_scan_append(step.source, plan.atom.relation, bindings, sink); scan_err != .None {
+			return scan_err
+		}
+		for k in before ..< sink.count {
+			append(l, u32(row))
+			append(r, u32(k))
+		}
+	}
+	return .None
 }
 
 // One scan with constants bound; candidate rows pass the constant and

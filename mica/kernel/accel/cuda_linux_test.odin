@@ -397,3 +397,42 @@ test_cuda_join_agrees_with_cpu :: proc(t: ^testing.T) {
 	testing.expect(t, len(l) == 0 && len(r) == 0)
 	free_all(context.temp_allocator)
 }
+
+// The tiled cosine kernel (query batches) matches the CPU reference on shapes
+// that are not multiples of its 16x16 tile, resident or not.
+@(test)
+test_cuda_tiled_cosine_agrees :: proc(t: ^testing.T) {
+	sync.mutex_lock(&cuda_tests_lock)
+	defer sync.mutex_unlock(&cuda_tests_lock)
+	testing.expect(t, CUDA_TILED_COSINE_MIN_QUERIES > 1)
+	if !cuda_or_skip(t) {
+		return
+	}
+	g := cuda_strategy()
+	for shape in ([][3]int{{CUDA_TILED_COSINE_MIN_QUERIES, CUDA_COSINE_MIN_DOCS + 3, 37}, {33, CUDA_COSINE_MIN_DOCS + 17, 16}, {70, 2 * CUDA_COSINE_MIN_DOCS + 1, 131}}) {
+		n_queries, n_docs, dim := shape[0], shape[1], shape[2]
+		queries := make([]f32, n_queries * dim, context.temp_allocator)
+		docs := make([]f32, n_docs * dim, context.temp_allocator)
+		for i in 0 ..< len(queries) {
+			queries[i] = f32((i * 53) % 97) / 48 - 1
+		}
+		for i in 0 ..< len(docs) {
+			docs[i] = f32((i * 37) % 101) / 50 - 1
+		}
+		want, _ := cpu_strategy().cosine_queries(queries, docs, n_queries, n_docs, dim, context.temp_allocator)
+		got, ok := g.cosine_queries(queries, docs, n_queries, n_docs, dim, context.temp_allocator)
+		testing.expectf(t, ok, "shape %v declined (%v)", shape, last_decline_reason())
+		testing.expectf(t, cuda_last_cosine_tiled(), "shape %v: tiled kernel not used", shape)
+		prepared, prepared_ok := prepare_docs(g, docs, n_docs, dim)
+		testing.expect(t, prepared_ok)
+		resident, resident_ok := cosine_queries_prepared(g, queries, n_queries, prepared, context.temp_allocator)
+		release_prepared(g, &prepared)
+		testing.expect(t, resident_ok)
+		worst := f32(0)
+		for i in 0 ..< min(len(got), len(want), len(resident)) {
+			worst = max(worst, abs(got[i] - want[i]), abs(resident[i] - want[i]))
+		}
+		testing.expectf(t, len(got) == len(want) && len(resident) == len(want) && worst < 1e-4, "shape %v: worst difference %v", shape, worst)
+	}
+	free_all(context.temp_allocator)
+}

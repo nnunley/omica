@@ -3,6 +3,7 @@
 // with the Metal strategy over identical inputs.
 package accel
 
+import "base:runtime"
 import "core:mem"
 
 @(private)
@@ -166,14 +167,20 @@ cpu_inv_sqrt :: proc(x: f32) -> f32 {
 // to keep alive (or re-sort).
 @(private)
 Cpu_Prepared :: struct {
-	column: []u64,
-	docs:   []f32,
+	column:    []u64,
+	docs:      []f32,
+	// A prepared copy lives from prepare to release, which may run under
+	// different context allocators (an evaluation arena, a worker's temp):
+	// it is owned by this allocator, fixed at prepare time.
+	allocator: mem.Allocator,
 }
 
 @(private)
 cpu_prepare_column :: proc(sorted_unique: []u64) -> (handle: rawptr, ok: bool) {
-	p := new(Cpu_Prepared)
-	p.column = make([]u64, len(sorted_unique))
+	owner := runtime.heap_allocator()
+	p := new(Cpu_Prepared, owner)
+	p.allocator = owner
+	p.column = make([]u64, len(sorted_unique), owner)
 	copy(p.column, sorted_unique)
 	return p, true
 }
@@ -194,8 +201,10 @@ cpu_membership_select_prepared :: proc(
 
 @(private)
 cpu_prepare_docs :: proc(docs: []f32, n_docs: int, dim: int) -> (handle: rawptr, ok: bool) {
-	p := new(Cpu_Prepared)
-	p.docs = make([]f32, len(docs))
+	owner := runtime.heap_allocator()
+	p := new(Cpu_Prepared, owner)
+	p.allocator = owner
+	p.docs = make([]f32, len(docs), owner)
 	copy(p.docs, docs)
 	return p, true
 }
@@ -218,9 +227,10 @@ cpu_cosine_queries_prepared :: proc(
 @(private)
 cpu_release :: proc(handle: rawptr, kind: Prepared_Kind) {
 	p := (^Cpu_Prepared)(handle)
-	delete(p.column)
-	delete(p.docs)
-	free(p)
+	owner := p.allocator
+	delete(p.column, owner)
+	delete(p.docs, owner)
+	free(p, owner)
 }
 
 // Equality join by binary search of each probe in the sorted right keys;

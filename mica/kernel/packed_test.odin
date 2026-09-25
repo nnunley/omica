@@ -88,7 +88,9 @@ test_packed_cache_builds_once_per_evaluation :: proc(t: ^testing.T) {
 	result := rules_derived_create(virtual.arena_allocator(&evaluation))
 	err := rules_evaluate_source(virtual.arena_allocator(&evaluation), kernel.current.rules, &source, &result)
 	testing.expect_value(t, err, Kernel_Error.None)
-	testing.expect_value(t, packed_last_evaluation_builds(), 1)
+	// At most one gather: none when the commit's own evaluation already left
+	// Held's keys in the cross-commit cache.
+	testing.expect(t, packed_last_evaluation_builds() <= 1)
 	testing.expect_value(t, rules_derived_count(&result, free_a), 43)
 	testing.expect_value(t, rules_derived_count(&result, free_b), 43)
 }
@@ -216,4 +218,45 @@ test_packed_join_lookup_keys_on_row_count :: proc(t: ^testing.T) {
 	testing.expect(t, packed_join_lookup(cache, Relation_ID(7), []int{0}, 2) == nil)
 	testing.expect(t, packed_join_lookup(cache, Relation_ID(8), []int{1}, 2) == nil)
 	testing.expect(t, packed_join_lookup(cache, Relation_ID(7), []int{1, 0}, 2) == nil)
+}
+
+// Packed keys of an extensional relation survive across evaluations and
+// commits that leave its block alone; a commit that changes it repacks.
+@(test)
+test_packed_keys_shared_across_commits :: proc(t: ^testing.T) {
+	sync.mutex_lock(&strategy_tests_lock)
+	defer sync.mutex_unlock(&strategy_tests_lock)
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+	item := create_relation(&kernel, 1, "Item", 1)
+	held := create_relation(&kernel, 2, "Held", 1)
+	free := create_relation(&kernel, 3, "Free", 1)
+	x := v.symbol_intern("x")
+	rule := rule_new(free, []Term{term_var(x)}, []Rule_Body_Item {
+		body_atom(atom_positive(item, []Term{term_var(x)})),
+		body_atom(atom_negated(held, []Term{term_var(x)})),
+	})
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(960), rule, "Free(x) :- Item(x), not Held(x).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+	commit :: proc(t: ^testing.T, kernel: ^Kernel, relation: Relation_ID, n: int) {
+		tx := kernel_begin(kernel)
+		transaction_assert(&tx, relation, tuple_of(must_identity(u64(n))))
+		commit_transaction(t, &tx)
+	}
+	for i in 1 ..= 40 {
+		commit(t, &kernel, item, i)
+	}
+	commit(t, &kernel, held, 3)
+	testing.expect_value(t, packed_last_evaluation_builds(), 1) // Held changed: packed
+	commit(t, &kernel, item, 41)
+	testing.expect_value(t, packed_last_evaluation_builds(), 0) // Held unchanged: shared
+	commit(t, &kernel, held, 5)
+	testing.expect_value(t, packed_last_evaluation_builds(), 1) // Held changed again
+	rows := snapshot_derived_rows(kernel.current, free)
+	testing.expect_value(t, len(rows), 39)
+	testing.expect(t, !has_tuple(rows, tuple_of(must_identity(3))))
+	testing.expect(t, !has_tuple(rows, tuple_of(must_identity(5))))
 }

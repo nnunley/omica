@@ -60,6 +60,9 @@ Relation_Block :: struct {
 	indexes:      []Secondary_Index,
 	indexes_once: sync.Once,
 	refs:         i32,
+	// Process-unique, never reused: identifies this block's contents to
+	// caches that hold no reference to it.
+	serial:       u64,
 	arena:        ^Frame_Arena,
 	pool:         ^Arena_Pool,
 	storage:      mem.Allocator,
@@ -236,10 +239,19 @@ relation_block_build :: proc(
 		chunk_rows = make([]u32, len(chunks), alloc),
 		count      = len(rows),
 		refs       = 1,
+		serial     = relation_block_next_serial(),
 		storage    = alloc,
 	}
 	fill_chunk_rows(block)
 	return block
+}
+
+@(private)
+relation_block_serials: u64
+
+@(private)
+relation_block_next_serial :: proc() -> u64 {
+	return sync.atomic_add(&relation_block_serials, 1) + 1
 }
 
 // Builds a pooled block from `tuples`, sorting and deduplicating. Chunks and
@@ -267,6 +279,7 @@ relation_block_build_pooled :: proc(
 		chunk_rows = make([]u32, len(chunks), block_alloc),
 		count      = len(rows),
 		refs       = 1,
+		serial     = relation_block_next_serial(),
 		arena      = block_arena,
 		pool       = kernel.arena_pool,
 	}
@@ -351,6 +364,7 @@ relation_block_apply :: proc(
 		chunk_rows = make([]u32, len(spine), block_alloc),
 		count      = count,
 		refs       = 1,
+		serial     = relation_block_next_serial(),
 		arena      = block_arena,
 		pool       = kernel.arena_pool,
 	}

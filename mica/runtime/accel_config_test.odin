@@ -27,8 +27,9 @@ test_accel_mode_parse :: proc(t: ^testing.T) {
 }
 
 // The accelerator strategy is process-wide and tests run on parallel threads:
-// tests that set it and then assert it hold this lock.
-@(private = "file")
+// tests that set it and then assert it hold this lock (any test file in the
+// package).
+@(private)
 strategy_tests_lock: sync.Mutex
 
 // world_start installs the configured strategy before workers start; the
