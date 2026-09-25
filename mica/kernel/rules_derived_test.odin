@@ -97,7 +97,12 @@ test_derived_relations_from_is_canonical_rows :: proc(t: ^testing.T) {
 	d := rules_derived_create(context.temp_allocator)
 	columns := [][]v.Value{{must_int(3), must_int(1), must_int(2)}}
 	rules_derived_add_columns(&d, nil, Relation_ID(9), columns, 3, context.temp_allocator)
-	relations := derived_relations_from(context.temp_allocator, &d)
+	scratch: virtual.Arena
+	if err := virtual.arena_init_growing(&scratch); err != nil {
+		testing.fail_now(t, "arena init failed")
+	}
+	defer virtual.arena_destroy(&scratch)
+	relations := derived_relations_from(context.temp_allocator, &d, &scratch)
 	testing.expect_value(t, len(relations), 1)
 	testing.expect_value(t, relations[0].relation, Relation_ID(9))
 	want := v.canonicalize_tuples([]v.Tuple{tuple_of(must_int(3)), tuple_of(must_int(1)), tuple_of(must_int(2))}, context.temp_allocator)
@@ -244,9 +249,9 @@ test_derived_canonical_order_allocates_keys_and_order_only :: proc(t: ^testing.T
 	tracking: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&tracking, context.allocator)
 	defer mem.tracking_allocator_destroy(&tracking)
-	order, count, ok := derived_canonical_order(entry, mem.tracking_allocator(&tracking))
+	order := derived_canonical_order(entry, mem.tracking_allocator(&tracking))
 	defer delete(order, mem.tracking_allocator(&tracking))
-	testing.expect(t, ok)
+	count := len(order)
 	testing.expect_value(t, count, ROWS)
 	bound := ROWS * (2 * size_of(u64) + 2 * size_of(u32))
 	testing.expectf(t, int(tracking.total_memory_allocated) <= bound, "allocated %d bytes, bound %d", tracking.total_memory_allocated, bound)

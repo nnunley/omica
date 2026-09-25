@@ -11,6 +11,7 @@ package kernel
 import v "../var"
 import "base:runtime"
 import "core:mem"
+import "core:slice"
 import "core:mem/virtual"
 import "core:sync"
 
@@ -317,45 +318,26 @@ snapshot_active_rules :: proc(snapshot: ^Snapshot, alloc: mem.Allocator) -> []Ru
 // `alloc`: the canonical rows of each relation are deep-copied into one packed
 // value array, so the result references no evaluation storage and `alloc` (a
 // snapshot's frame arena, which never frees) holds only the rows. Sorting
-// happens in a temporary region of `scratch` (a private arena when nil) that
-// is rolled back after each relation, so its peak follows the largest
-// relation.
+// happens in a temporary region of `scratch`, rolled back after each
+// relation, so its peak follows the largest relation.
 derived_relations_from :: proc(
 	alloc: mem.Allocator,
 	derived: ^Rule_Derived,
-	scratch_arena: ^virtual.Arena = nil,
+	scratch: ^virtual.Arena,
 ) -> []Derived_Relation {
-	scratch := scratch_arena
-	own: virtual.Arena
-	if scratch == nil {
-		if virtual.arena_init_growing(&own) != nil {
-			panic("failed to initialize derived copy scratch arena")
-		}
-		scratch = &own
-	}
-	defer if scratch == &own {
-		virtual.arena_destroy(&own)
-	}
-
 	relations := make([]Derived_Relation, len(derived.relations), alloc)
 	for entry, i in derived.relations {
 		temp := virtual.arena_temp_begin(scratch)
-		temp_alloc := virtual.arena_allocator(scratch)
+		order := derived_canonical_order(entry, virtual.arena_allocator(scratch))
 		arity := entry.arity
-		tuples: []v.Tuple
-		if order, count, keyed := derived_canonical_order(entry, temp_alloc); keyed {
-			packed := make([]v.Value, count * arity, alloc)
-			tuples = make([]v.Tuple, count, alloc)
-			for r in 0 ..< count {
-				row := int(order[r])
-				values := packed[r * arity:(r + 1) * arity]
-				for c in 0 ..< arity {
-					values[c] = v.value_deep_copy(alloc, entry.columns[c][row])
-				}
-				tuples[r] = v.Tuple(values)
+		packed := make([]v.Value, len(order) * arity, alloc)
+		tuples := make([]v.Tuple, len(order), alloc)
+		for row, r in order {
+			values := packed[r * arity:(r + 1) * arity]
+			for c in 0 ..< arity {
+				values[c] = v.value_deep_copy(alloc, entry.columns[c][row])
 			}
-		} else {
-			tuples = derived_canonical_rows_cmp(entry, alloc, temp_alloc)
+			tuples[r] = v.Tuple(values)
 		}
 		virtual.arena_temp_end(temp)
 		relations[i] = Derived_Relation {
@@ -366,132 +348,58 @@ derived_relations_from :: proc(
 	return relations
 }
 
-// The canonical order of a relation's rows, computed from its columns: one
-// sort key per cell (`value_sort_key`), rows ordered by their keys and runs of
-// equal keys reduced to their first row, as `canonicalize_tuples` does. Returns
-// ok=false when a cell has no key (heap values), in which case the caller sorts
-// with `tuple_cmp`. The returned order is allocated from `alloc`.
-derived_canonical_order :: proc(
-	entry: ^Derived_Columns,
-	alloc: mem.Allocator,
-) -> (
-	order: []u32,
-	count: int,
-	ok: bool,
-) {
+// The canonical order of a relation's rows (as `canonicalize_tuples` orders
+// and deduplicates them), computed from its columns and allocated from
+// `alloc`. Rows whose cells all have sort keys are radix-sorted by key;
+// otherwise rows are compared with `value_cmp` column by column.
+derived_canonical_order :: proc(entry: ^Derived_Columns, alloc: mem.Allocator) -> []u32 {
 	rows := len(entry.hashes)
 	arity := entry.arity
+	order := make([]u32, rows, alloc)
+	for r in 0 ..< rows {
+		order[r] = u32(r)
+	}
 	keys := make([]u64, rows * arity, alloc)
+	defer delete(keys, alloc)
 	for c in 0 ..< arity {
 		for value, r in entry.columns[c][:rows] {
 			key, keyed := v.value_sort_key(value)
 			if !keyed {
-				delete(keys, alloc)
-				return nil, 0, false
+				return derived_compare_order(entry, order)
 			}
 			keys[r * arity + c] = key
 		}
 	}
-	order = make([]u32, rows, alloc)
-	for r in 0 ..< rows {
-		order[r] = u32(r)
-	}
-	derived_radix_sort(order, keys, arity, alloc)
+	v.key_order_sort(order, keys, arity, alloc)
+	return order[:v.key_order_dedup(order, keys, arity)]
+}
 
-	// Keep the first row of each run of equal keys (compacting in place:
-	// `count` never passes the current position).
-	for index in order {
-		if count > 0 {
-			previous := order[count - 1]
-			equal := true
-			for c in 0 ..< arity {
-				if keys[int(index) * arity + c] != keys[int(previous) * arity + c] {
-					equal = false
-					break
-				}
-			}
-			if equal {
-				continue
-			}
+// Sorts and deduplicates `order` by comparing rows column by column, for rows
+// with heap values.
+@(private)
+derived_compare_order :: proc(entry: ^Derived_Columns, order: []u32) -> []u32 {
+	slice.sort_by_with_data(order, proc(a, b: u32, user: rawptr) -> bool {
+		return derived_row_cmp((^Derived_Columns)(user), a, b) == .Less
+	}, entry)
+	count := 0
+	for row in order {
+		if count > 0 && derived_row_cmp(entry, order[count - 1], row) == .Equal {
+			continue
 		}
-		order[count] = index
+		order[count] = row
 		count += 1
 	}
-	delete(keys, alloc)
-	return order, count, true
+	return order[:count]
 }
 
-// Sorts `order` (row numbers) by the rows' keys, lexicographically by column:
-// a stable LSD radix sort over 8-bit digits, last column first. Digits equal
-// across every row are skipped, which drops most passes for identities that
-// share their high bytes.
 @(private)
-derived_radix_sort :: proc(order: []u32, keys: []u64, arity: int, alloc: mem.Allocator) {
-	if len(order) < 2 {
-		return
-	}
-	other := make([]u32, len(order), alloc)
-	defer delete(other, alloc)
-	a, b := order, other
-	for c := arity - 1; c >= 0; c -= 1 {
-		all_or, all_and := u64(0), ~u64(0)
-		for row in a {
-			k := keys[int(row) * arity + c]
-			all_or |= k
-			all_and &= k
-		}
-		varying := all_or ~ all_and
-		for shift := uint(0); shift < 64; shift += 8 {
-			if (varying >> shift) & 0xff == 0 {
-				continue
-			}
-			counts: [256]int
-			for row in a {
-				counts[(keys[int(row) * arity + c] >> shift) & 0xff] += 1
-			}
-			total := 0
-			for d in 0 ..< 256 {
-				counts[d], total = total, total + counts[d]
-			}
-			for row in a {
-				d := (keys[int(row) * arity + c] >> shift) & 0xff
-				b[counts[d]] = row
-				counts[d] += 1
-			}
-			a, b = b, a
+derived_row_cmp :: proc(entry: ^Derived_Columns, a, b: u32) -> v.Ordering {
+	for column in entry.columns {
+		if order := v.value_cmp(column[a], column[b]); order != .Equal {
+			return order
 		}
 	}
-	if raw_data(a) != raw_data(order) {
-		copy(order, a)
-	}
-}
-
-// Rows with heap values: gathered and canonicalized with `tuple_cmp` in
-// `scratch`, then deep-copied packed into `alloc`.
-@(private)
-derived_canonical_rows_cmp :: proc(entry: ^Derived_Columns, alloc, scratch: mem.Allocator) -> []v.Tuple {
-	count := len(entry.hashes)
-	arity := entry.arity
-	gathered := make([]v.Value, count * arity, scratch)
-	rows := make([]v.Tuple, count, scratch)
-	for row in 0 ..< count {
-		values := gathered[row * arity:(row + 1) * arity]
-		for c in 0 ..< arity {
-			values[c] = entry.columns[c][row]
-		}
-		rows[row] = v.Tuple(values)
-	}
-	canonical := v.canonicalize_tuples(rows, scratch)
-	packed := make([]v.Value, len(canonical) * arity, alloc)
-	tuples := make([]v.Tuple, len(canonical), alloc)
-	for row, r in canonical {
-		values := packed[r * arity:(r + 1) * arity]
-		for value, c in v.tuple_values(row) {
-			values[c] = v.value_deep_copy(alloc, value)
-		}
-		tuples[r] = v.Tuple(values)
-	}
-	return tuples
+	return .Equal
 }
 
 // Computes all derived relations for a snapshot from its active rules and
@@ -518,13 +426,18 @@ snapshot_compute_derived :: proc(snapshot: ^Snapshot, kernel: ^Kernel = nil) {
 	}
 	// Result rows on the heap: a growing relation frees each outgrown column,
 	// where the evaluation arena would keep every copy until the end.
-	derived, err := rules_evaluate(alloc, snapshot.rules, snapshot, kernel, runtime.heap_allocator())
-	if err != .None {
+	derived := rules_derived_create_backed(alloc, runtime.heap_allocator())
+	defer rules_derived_destroy(&derived)
+	source := Relation_Source {
+		kernel   = kernel,
+		snapshot = snapshot,
+		derived  = &derived,
+	}
+	if err := rules_evaluate_source(alloc, snapshot.rules, &source, &derived); err != .None {
 		snapshot.derived = nil
 		return
 	}
 	snapshot.derived = derived_relations_from(snapshot.allocator, &derived, arena)
-	rules_derived_destroy(&derived)
 }
 
 // Returns the buffer block for a relation, if any.

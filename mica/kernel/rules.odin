@@ -327,21 +327,17 @@ rules_evaluate :: proc(
 	definitions: []Rule_Definition,
 	snapshot: ^Snapshot,
 	kernel: ^Kernel = nil,
-	storage: mem.Allocator = {},
 ) -> (
 	Rule_Derived,
 	Kernel_Error,
 ) {
-	// `storage`, when given, holds the result's rows (see Rule_Derived.storage);
-	// the caller then releases them with rules_derived_destroy.
-	result := rules_derived_create_backed(alloc, storage.procedure != nil ? storage : alloc)
+	result := rules_derived_create(alloc)
 	source := Relation_Source {
 		kernel   = kernel,
 		snapshot = snapshot,
 		derived  = &result,
 	}
 	if err := rules_evaluate_source(alloc, definitions, &source, &result); err != .None {
-		rules_derived_destroy(&result)
 		return Rule_Derived{}, err
 	}
 	return result, .None
@@ -434,8 +430,7 @@ rules_evaluate_source :: proc(
 		// Seed the fixpoint with one full evaluation of the stratum.
 		rounds += 1
 		rules_derived_freeze(result)
-		virtual.arena_free_all(&rounds_arena[current_round])
-		delta := rules_derived_create(virtual.arena_allocator(&rounds_arena[current_round]))
+		delta := rules_round_delta(&rounds_arena[current_round])
 		for rule in stratum {
 			_, err := rules_apply(rule, source, result, &delta, alloc, scratch_alloc)
 			virtual.arena_free_all(&scratch)
@@ -449,8 +444,7 @@ rules_evaluate_source :: proc(
 			rounds += 1
 			rules_derived_freeze(result)
 			other := 1 - current_round
-			virtual.arena_free_all(&rounds_arena[other])
-			next := rules_derived_create(virtual.arena_allocator(&rounds_arena[other]))
+			next := rules_round_delta(&rounds_arena[other])
 			for rule in stratum {
 				for item, index in rule.body {
 					if item.kind != .Atom || item.atom.negated {
@@ -483,6 +477,13 @@ rules_evaluate_source :: proc(
 		rules_derived_thaw(result)
 	}
 	return .None
+}
+
+// An empty delta in `arena`, cleared of the delta it held two rounds ago.
+@(private)
+rules_round_delta :: proc(arena: ^virtual.Arena) -> Rule_Derived {
+	virtual.arena_free_all(arena)
+	return rules_derived_create(virtual.arena_allocator(arena))
 }
 
 @(thread_local, private)
