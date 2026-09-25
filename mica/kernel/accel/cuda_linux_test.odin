@@ -8,6 +8,7 @@ package accel
 
 import "core:log"
 import "core:os"
+import "core:slice"
 import "core:sync"
 import "core:testing"
 
@@ -313,21 +314,19 @@ test_cuda_membership2_agrees_with_cpu :: proc(t: ^testing.T) {
 		return
 	}
 	n := CUDA_MEMBERSHIP_MIN_ROWS * 2 + 3
-	right := make([]u64, 2 * n, context.temp_allocator)
+	right := [][]u64{make([]u64, n, context.temp_allocator), make([]u64, n, context.temp_allocator)}
+	left := [][]u64{make([]u64, n, context.temp_allocator), make([]u64, n, context.temp_allocator)}
 	for i in 0 ..< n {
 		// (i/4, (i%4) << 62): sorted lexicographically, top bit exercised.
-		right[2 * i], right[2 * i + 1] = u64(i / 4), u64(i % 4) << 62
-	}
-	left := make([]u64, 2 * n, context.temp_allocator)
-	for i in 0 ..< n {
-		left[2 * i], left[2 * i + 1] = u64((i * 2654435761) % n) / 4, u64(i % 6) << 62
+		right[0][i], right[1][i] = u64(i / 4), u64(i % 4) << 62
+		left[0][i], left[1][i] = u64((i * 2654435761) % n) / 4, u64(i % 6) << 62
 	}
 	for keep in ([]bool{true, false}) {
-		want, _ := membership_select_keys(cpu_strategy(), left, right, 2, keep, context.temp_allocator)
-		got, ok := membership_select_keys(cuda_strategy(), left, right, 2, keep, context.temp_allocator)
-		testing.expectf(t, ok, "keep=%v declined (%v)", keep, last_decline_reason())
-		if ok {
-			testing.expectf(t, slice_eq(got, want), "keep=%v differs", keep)
+		want, _ := membership_selection(cpu_strategy(), left, right, keep, context.temp_allocator)
+		got, res := membership_selection(cuda_strategy(), left, right, keep, context.temp_allocator)
+		testing.expectf(t, res == .Completed, "keep=%v: %v (%v)", keep, res, last_decline_reason())
+		if res == .Completed {
+			testing.expectf(t, slice.equal(got, want), "keep=%v differs", keep)
 		}
 	}
 	free_all(context.temp_allocator)

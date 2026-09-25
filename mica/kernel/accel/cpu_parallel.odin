@@ -122,30 +122,41 @@ cpu_parallel_membership_select :: proc(
 	return job.out, true
 }
 
+Cpu_Membership2_Job :: struct {
+	left_a, left_b, right_a, right_b: []u64,
+	keep:                             bool,
+	out:                              []bool,
+}
+
 @(private)
 cpu_parallel_membership2_rows :: proc(job: rawptr, first, last: int) {
-	j := (^Cpu_Membership_Job)(job)
+	j := (^Cpu_Membership2_Job)(job)
 	for i in first ..< last {
-		j.out[i] = cpu_sorted_contains_pair(j.right, j.left[2 * i], j.left[2 * i + 1]) == j.keep
+		j.out[i] = cpu_sorted_contains_pair(j.right_a, j.right_b, j.left_a[i], j.left_b[i]) == j.keep
 	}
 }
 
 @(private)
 cpu_parallel_membership_select2 :: proc(
-	left: []u64,
-	right: []u64,
+	left_a, left_b, right_a, right_b: []u64,
 	keep_matches: bool,
 	allocator: mem.Allocator,
 ) -> (
 	selected: []bool,
 	ok: bool,
 ) {
-	n := len(left) / 2
+	n := len(left_a)
 	if n < CPU_PARALLEL_MIN_PROBES {
-		return cpu_membership_select2(left, right, keep_matches, allocator)
+		return cpu_membership_select2(left_a, left_b, right_a, right_b, keep_matches, allocator)
 	}
 	last_decline = .None
-	job := Cpu_Membership_Job{left = left, right = right, keep = keep_matches}
+	job := Cpu_Membership2_Job {
+		left_a  = left_a,
+		left_b  = left_b,
+		right_a = right_a,
+		right_b = right_b,
+		keep    = keep_matches,
+	}
 	job.out = make([]bool, n, allocator)
 	if !cpu_parallel_for(n, &job, cpu_parallel_membership2_rows) {
 		cpu_parallel_membership2_rows(&job, 0, n)

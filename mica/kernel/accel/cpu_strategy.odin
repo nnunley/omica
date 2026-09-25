@@ -48,25 +48,24 @@ cpu_pair_less :: proc(a0, a1, b0, b1: u64) -> bool {
 }
 
 @(private)
-cpu_sorted_contains_pair :: proc(right: []u64, p0, p1: u64) -> bool {
-	lo, hi := 0, len(right) / 2
+cpu_sorted_contains_pair :: proc(right_a, right_b: []u64, p0, p1: u64) -> bool {
+	lo, hi := 0, len(right_a)
 	for lo < hi {
 		mid := lo + ((hi - lo) >> 1)
-		if cpu_pair_less(right[2 * mid], right[2 * mid + 1], p0, p1) {
+		if cpu_pair_less(right_a[mid], right_b[mid], p0, p1) {
 			lo = mid + 1
 		} else {
 			hi = mid
 		}
 	}
-	return lo < len(right) / 2 && right[2 * lo] == p0 && right[2 * lo + 1] == p1
+	return lo < len(right_a) && right_a[lo] == p0 && right_b[lo] == p1
 }
 
-// Two-key membership over interleaved pairs; the dispatcher
-// (membership_select_keys) has checked the shape and sort order.
+// Two-key membership over two columns per side; membership_selection has
+// checked the shape and sort order.
 @(private)
 cpu_membership_select2 :: proc(
-	left: []u64,
-	right: []u64,
+	left_a, left_b, right_a, right_b: []u64,
 	keep_matches: bool,
 	allocator: mem.Allocator,
 ) -> (
@@ -74,9 +73,9 @@ cpu_membership_select2 :: proc(
 	ok: bool,
 ) {
 	last_decline = .None
-	out := make([]bool, len(left) / 2, allocator)
+	out := make([]bool, len(left_a), allocator)
 	for i in 0 ..< len(out) {
-		out[i] = cpu_sorted_contains_pair(right, left[2 * i], left[2 * i + 1]) == keep_matches
+		out[i] = cpu_sorted_contains_pair(right_a, right_b, left_a[i], left_b[i]) == keep_matches
 	}
 	return out, true
 }

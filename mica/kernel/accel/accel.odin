@@ -2,14 +2,12 @@
 //
 // Staged integration: strategies are values (CPU reference, Metal, later
 // Vulkan/CUDA) invoked through explicit operator calls. The first kernel
-// caller is the negated single-column atom fast path
-// (`try_negated_atom_batch` in `rules.odin`), mirroring the Rust query
+// caller is negated membership over one or two key columns
+// (`negated_absent_packed` in `rules_columnar.odin`), mirroring the Rust query
 // engine's membership acceleration
 // (`crates/relation-kernel/src/batch.rs`). Cosine scoring is exposed through
 // `cosine_top_k` for retrieval use; no runtime computed-relation caller yet.
-// Everything else in rule evaluation stays row-wise until the columnar
-// projection lands. Benchmarks measure potential speedups; only wired paths
-// realize them.
+// Benchmarks measure potential speedups; only wired paths realize them.
 //
 // The contract mirrors the Rust `RelationAccelerator` trait
 // (`crates/relation-kernel/src/execution.rs`): optional, row-threshold gated,
@@ -33,10 +31,10 @@ Strategy :: struct {
 	// This is the fast path (one thread per query/doc pair on Metal); the
 	// single-query operator wraps it with n_queries=1.
 	cosine_queries: proc(queries: []f32, docs: []f32, n_queries: int, n_docs: int, dim: int, allocator: mem.Allocator) -> (scores: []f32, ok: bool),
-	// Two-key membership (optional; nil declines). left and right hold
-	// interleaved pairs (key i is keys[2i], keys[2i+1]); right is sorted-unique
-	// lexicographically.
-	membership_select2: proc(left: []u64, right: []u64, keep_matches: bool, allocator: mem.Allocator) -> (selected: []bool, ok: bool),
+	// Two-key membership (optional; nil declines). Each side is two columns;
+	// the right pairs (right_a[i], right_b[i]) are sorted-unique
+	// lexicographically. selected[i] = (left pair i in right) == keep_matches.
+	membership_select2: proc(left_a, left_b, right_a, right_b: []u64, keep_matches: bool, allocator: mem.Allocator) -> (selected: []bool, ok: bool),
 
 	// Residency (optional; nil declines). A prepared input is copied once into
 	// strategy-owned storage (device memory on a GPU) and reused across calls,
@@ -193,45 +191,97 @@ cosine_queries :: proc(
 	return s.cosine_queries(queries, docs, n_queries, n_docs, dim, allocator)
 }
 
-// Interleaved pairs, strictly ascending lexicographically.
-is_sorted_unique_pairs :: proc(keys: []u64) -> bool {
-	if len(keys) % 2 != 0 {
+// Two key columns whose pairs are strictly ascending lexicographically.
+is_sorted_unique_pairs :: proc(a, b: []u64) -> bool {
+	if len(a) != len(b) {
 		return false
 	}
-	for i := 2; i < len(keys); i += 2 {
-		a0, a1, b0, b1 := keys[i - 2], keys[i - 1], keys[i], keys[i + 1]
-		if a0 > b0 || (a0 == b0 && a1 >= b1) {
+	for i in 1 ..< len(a) {
+		if a[i - 1] > a[i] || (a[i - 1] == a[i] && b[i - 1] >= b[i]) {
 			return false
 		}
 	}
 	return true
 }
 
-// Membership over 1- or 2-word keys: width 1 is `membership_select`, width 2
-// is `membership_select2` over interleaved pairs. Other widths, a strategy
-// without the operator, or unsorted keys decline Unsupported.
-membership_select_keys :: proc(
+// Declined: the strategy declined (last_decline_reason says why). Invalid:
+// it returned a result of the wrong shape.
+Membership_Result :: enum u8 {
+	Completed,
+	Declined,
+	Invalid,
+}
+
+// Membership as a selection: the indexes, increasing, of the left rows whose
+// key is in `right` (keep_matches) or absent from it (!keep_matches). Each side
+// has one column per key position (1 or 2); `right` is sorted-unique,
+// lexicographically for two columns.
+membership_selection :: proc(
 	s: Strategy,
-	left, right: []u64,
-	width: int,
+	left, right: [][]u64,
 	keep_matches: bool,
 	allocator := context.allocator,
 ) -> (
-	selected: []bool,
-	ok: bool,
+	selection: []u32,
+	result: Membership_Result,
 ) {
-	switch width {
-	case 1:
-		return s.membership_select(left, right, keep_matches, allocator)
-	case 2:
-		if s.membership_select2 == nil || len(left) % 2 != 0 || !is_sorted_unique_pairs(right) {
-			last_decline = .Unsupported
-			return nil, false
-		}
-		return s.membership_select2(left, right, keep_matches, allocator)
+	if len(left) < 1 || len(left) > 2 || len(right) != len(left) {
+		last_decline = .Unsupported
+		return nil, .Declined
 	}
-	last_decline = .Unsupported
-	return nil, false
+	n := len(left[0])
+	selected: []bool
+	ok: bool
+	if len(left) == 1 {
+		selected, ok = s.membership_select(left[0], right[0], keep_matches, allocator)
+	} else {
+		if s.membership_select2 == nil || len(left[1]) != n || !is_sorted_unique_pairs(right[0], right[1]) {
+			last_decline = .Unsupported
+			return nil, .Declined
+		}
+		selected, ok = s.membership_select2(left[0], left[1], right[0], right[1], keep_matches, allocator)
+	}
+	return selection_from_mask(selected, ok, n, allocator)
+}
+
+// `membership_selection` against a prepared (resident) single-key column.
+membership_selection_prepared :: proc(
+	s: Strategy,
+	left: []u64,
+	p: Prepared,
+	keep_matches: bool,
+	allocator := context.allocator,
+) -> (
+	[]u32,
+	Membership_Result,
+) {
+	selected, ok := membership_select_prepared(s, left, p, keep_matches, allocator)
+	return selection_from_mask(selected, ok, len(left), allocator)
+}
+
+@(private)
+selection_from_mask :: proc(selected: []bool, ok: bool, n: int, allocator: mem.Allocator) -> ([]u32, Membership_Result) {
+	if !ok {
+		return nil, .Declined
+	}
+	if len(selected) != n {
+		return nil, .Invalid
+	}
+	count := 0
+	for keep in selected {
+		if keep {
+			count += 1
+		}
+	}
+	out := make([]u32, count, allocator)
+	write := 0
+	for keep, i in selected {
+		if keep {
+			out[write] = u32(i)
+			write += 1
+		}
+	}
+	return out, .Completed
 }
 
 // Encoded u64 column sort order expected by the membership operator: ascending.

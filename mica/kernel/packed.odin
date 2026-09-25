@@ -1,6 +1,6 @@
 // Packed keys: one or two relation positions as sorted-unique raw 64-bit
 // value words, for batched equality operators (membership now, joins in
-// Stage 2). Only fixed-width (immediate) values pack: for them raw-word
+// Stage 3). Only fixed-width (immediate) values pack: for them raw-word
 // equality is value equality. Heap values (strings, lists, ...) do not, and
 // their operators stay on the row path.
 package kernel
@@ -11,50 +11,67 @@ import accel "./accel"
 import v "../var"
 
 Packed_Keys :: struct {
-	width: int,
-	count: int,
-	// count * width words; pairs are interleaved (key i is keys[2i], keys[2i+1])
-	// and sorted lexicographically.
-	keys:  []u64,
+	width:   int,
+	count:   int,
+	// One column per key position, each `count` long. Two-position keys are
+	// the pairs (columns[0][i], columns[1][i]), sorted lexicographically.
+	columns: [][]u64,
 }
 
-packed_keys_from_rows :: proc(rows: []v.Tuple, positions: []u16, allocator: mem.Allocator) -> (keys: Packed_Keys, ok: bool) {
-	width := len(positions)
+// Packs rows 0..count-1 of `columns` (one per key position, 1 or 2) into
+// sorted-unique keys. Fails when a value is not fixed-width or a column is
+// shorter than `count`.
+packed_keys_from_columns :: proc(columns: [][]v.Value, count: int, allocator: mem.Allocator) -> (keys: Packed_Keys, ok: bool) {
+	width := len(columns)
 	if width < 1 || width > 2 {
 		return {}, false
 	}
-	words := make([]u64, len(rows) * width, allocator)
-	for r, i in rows {
-		cells := v.tuple_values(r)
-		for position, j in positions {
-			if int(position) >= len(cells) || !v.value_is_immediate(cells[position]) {
+	for column in columns {
+		if len(column) < count {
+			return {}, false
+		}
+		for value in column[:count] {
+			if !v.value_is_immediate(value) {
 				return {}, false
 			}
-			words[i * width + j] = u64(cells[position])
 		}
 	}
-	count := 0
+	out := make([][]u64, width, allocator)
 	if width == 1 {
+		words := make([]u64, count, allocator)
+		copy(words, slice.reinterpret([]u64, columns[0][:count]))
 		slice.sort(words)
+		n := 0
 		for w in words {
-			if count == 0 || words[count - 1] != w {
-				words[count] = w
-				count += 1
+			if n == 0 || words[n - 1] != w {
+				words[n] = w
+				n += 1
 			}
 		}
-	} else {
-		pairs := slice.reinterpret([][2]u64, words)
-		slice.sort_by(pairs, proc(a, b: [2]u64) -> bool {
-			return a[0] < b[0] || (a[0] == b[0] && a[1] < b[1])
-		})
-		for p in pairs {
-			if count == 0 || pairs[count - 1] != p {
-				pairs[count] = p
-				count += 1
-			}
+		out[0] = words[:n]
+		return Packed_Keys{width = 1, count = n, columns = out}, true
+	}
+	pairs := make([][2]u64, count, allocator)
+	for i in 0 ..< count {
+		pairs[i] = {u64(columns[0][i]), u64(columns[1][i])}
+	}
+	slice.sort_by(pairs, proc(a, b: [2]u64) -> bool {
+		return a[0] < b[0] || (a[0] == b[0] && a[1] < b[1])
+	})
+	n := 0
+	for p in pairs {
+		if n == 0 || pairs[n - 1] != p {
+			pairs[n] = p
+			n += 1
 		}
 	}
-	return Packed_Keys{width = width, count = count, keys = words[:count * width]}, true
+	a := make([]u64, n, allocator)
+	b := make([]u64, n, allocator)
+	for i in 0 ..< n {
+		a[i], b[i] = pairs[i][0], pairs[i][1]
+	}
+	out[0], out[1] = a, b
+	return Packed_Keys{width = 2, count = n, columns = out}, true
 }
 
 // Keys packed for one relation at positions 0..width-1, plus an optional
@@ -130,17 +147,15 @@ packed_cache_lookup :: proc(source: ^Relation_Source, relation: Relation_ID, wid
 			return e, e.ok
 		}
 	}
-	rows := make([dynamic]v.Tuple, 0, 64, cache.allocator)
 	unbound := make([]v.Binding, width, cache.allocator)
-	relation_source_scan_into(source, relation, unbound, &rows)
-	if source.error != .None {
-		// A computed relation that needs bound keys: no column; the caller's
-		// row path probes each binding.
+	batch, err := relation_source_scan_columns(source, relation, unbound, cache.allocator)
+	if err != .None {
+		// A computed relation that needs bound keys (or an unreadable one): no
+		// column; the caller's other paths handle each row.
 		source.error = .None
 		return nil, false
 	}
-	positions := []u16{0, 1}
-	keys, ok := packed_keys_from_rows(rows[:], positions[:width], cache.allocator)
+	keys, ok := packed_keys_from_columns(batch.columns[:width], batch.count, cache.allocator)
 	e := new(Packed_Entry, cache.allocator)
 	e^ = Packed_Entry{relation = relation, width = width, ok = ok, keys = keys}
 	append(&cache.entries, e)

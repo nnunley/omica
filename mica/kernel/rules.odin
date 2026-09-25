@@ -11,9 +11,7 @@ package kernel
 import v "../var"
 import "core:mem"
 import "core:mem/virtual"
-import "core:slice"
 import "core:strings"
-import accel "./accel"
 
 // A term in an atom, guard, or rule head.
 Term_Kind :: enum {
@@ -166,106 +164,6 @@ rule_definition_clone :: proc(
 	result.rule = rule_clone(alloc, definition.rule)
 	result.source = strings.clone(definition.source, alloc)
 	return result
-}
-
-// Derived facts accumulated during rule evaluation. All storage comes from the
-// evaluation arena supplied by the caller. Each relation keeps a hash bucket
-// map so membership checks do not scan the row set.
-Rule_Derived :: struct {
-	relations: [dynamic]Relation_ID,
-	rows:      [dynamic][dynamic]v.Tuple,
-	buckets:   [dynamic]map[u64][dynamic]int,
-}
-
-// Creates an empty derived set whose storage is allocated from `alloc`.
-rules_derived_create :: proc(alloc: mem.Allocator) -> Rule_Derived {
-	return Rule_Derived {
-		relations = make([dynamic]Relation_ID, 0, alloc),
-		rows = make([dynamic][dynamic]v.Tuple, 0, alloc),
-		buckets = make([dynamic]map[u64][dynamic]int, 0, alloc),
-	}
-}
-
-// Returns the rows derived for a relation.
-rules_derived_rows :: proc(derived: ^Rule_Derived, relation: Relation_ID) -> []v.Tuple {
-	for entry, i in derived.relations {
-		if entry == relation {
-			return derived.rows[i][:]
-		}
-	}
-	return nil
-}
-
-// Adds a derived tuple, returning true when it was new. The tuple and its
-// storage are owned by the evaluation arena.
-rules_derived_add :: proc(
-	derived: ^Rule_Derived,
-	alloc: mem.Allocator,
-	relation: Relation_ID,
-	tuple: v.Tuple,
-) -> bool {
-	hash := v.tuple_hash(tuple)
-	for entry, i in derived.relations {
-		if entry != relation {
-			continue
-		}
-		bucket := &derived.buckets[i]
-		if row_indexes, found := bucket[hash]; found {
-			for row_index in row_indexes {
-				if v.tuple_eq(derived.rows[i][row_index], tuple) {
-					return false
-				}
-			}
-		}
-		index := len(derived.rows[i])
-		append(&derived.rows[i], tuple)
-		row_indexes, found := bucket[hash]
-		if !found {
-			row_indexes = make([dynamic]int, 0, alloc)
-		}
-		append(&row_indexes, index)
-		bucket[hash] = row_indexes
-		return true
-	}
-
-	append(&derived.relations, relation)
-	rows := make([dynamic]v.Tuple, 0, alloc)
-	append(&rows, tuple)
-	append(&derived.rows, rows)
-
-	row_indexes := make([dynamic]int, 0, alloc)
-	append(&row_indexes, 0)
-	bucket := make(map[u64][dynamic]int, alloc)
-	bucket[hash] = row_indexes
-	append(&derived.buckets, bucket)
-	return true
-}
-
-// Visits derived rows matching a partial binding. Returns true when the
-// visitor stopped the scan.
-rules_derived_visit :: proc(
-	derived: ^Rule_Derived,
-	relation: Relation_ID,
-	bindings: []v.Binding,
-	visit: proc(user: rawptr, row: v.Tuple) -> bool,
-	user: rawptr,
-) -> bool {
-	if derived == nil {
-		return false
-	}
-	for entry, i in derived.relations {
-		if entry != relation {
-			continue
-		}
-		for row in derived.rows[i] {
-			if v.tuple_matches_bindings(row, bindings) {
-				if !visit(user, row) {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 // --- Validation and stratification ----------------------------------------
@@ -473,6 +371,16 @@ rules_evaluate_source :: proc(
 		source.packed = nil
 	}
 
+	// Batches, join tables and selections live in a scratch arena reset after
+	// every rule application; only derived rows (and packed keys) outlive it.
+	// context.allocator stays the evaluation arena for computed scanners.
+	scratch: virtual.Arena
+	if virtual.arena_init_growing(&scratch) != nil {
+		panic("failed to initialize rule scratch arena")
+	}
+	defer virtual.arena_destroy(&scratch)
+	scratch_alloc := virtual.arena_allocator(&scratch)
+
 	rules := make([]Rule, len(definitions), alloc)
 	write := 0
 	for definition in definitions {
@@ -500,7 +408,9 @@ rules_evaluate_source :: proc(
 		// Seed the fixpoint with one full evaluation of the stratum.
 		delta := rules_derived_create(alloc)
 		for rule in stratum {
-			if _, err := rules_apply(rule, source, result, &delta, alloc); err != .None {
+			_, err := rules_apply(rule, source, result, &delta, alloc, scratch_alloc)
+			virtual.arena_free_all(&scratch)
+			if err != .None {
 				return err
 			}
 		}
@@ -516,14 +426,15 @@ rules_evaluate_source :: proc(
 					if !stratum_heads[item.atom.relation] {
 						continue
 					}
-					if len(rules_derived_rows(&delta, item.atom.relation)) == 0 {
+					if rules_derived_count(&delta, item.atom.relation) == 0 {
 						continue
 					}
 
 					source.delta = &delta
 					source.delta_relation = item.atom.relation
 					source.delta_active = true
-					_, err := rules_apply(rule, source, result, &next, alloc)
+					_, err := rules_apply(rule, source, result, &next, alloc, scratch_alloc)
+					virtual.arena_free_all(&scratch)
 					source.delta_active = false
 					source.delta = nil
 					if err != .None {
@@ -594,125 +505,6 @@ slot_map_slot :: proc(mapping: ^Slot_Map, symbol: v.Symbol) -> int {
 }
 
 @(private)
-Unify_Context :: struct {
-	atom:    ^Atom,
-	binding: []v.Binding,
-	slots:   ^Slot_Map,
-	out:     ^[dynamic][]v.Binding,
-	alloc:   mem.Allocator,
-}
-
-@(private)
-unify_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
-	ctx := (^Unify_Context)(user)
-	next := make([]v.Binding, len(ctx.binding), ctx.alloc)
-	copy(next, ctx.binding)
-
-	for term, i in ctx.atom.terms {
-		value := v.tuple_values(row)[i]
-		switch term.kind {
-		case .Value:
-			if !v.value_eq(term.value, value) {
-				return true
-			}
-		case .Var:
-			slot := slot_map_slot(ctx.slots, term.symbol)
-			if next[slot].bound {
-				if !v.value_eq(next[slot].value, value) {
-					return true
-				}
-			} else {
-				next[slot] = v.binding_of(value)
-			}
-		}
-	}
-	append(ctx.out, next)
-	return true
-}
-
-@(private)
-apply_positive_atom :: proc(
-	atom: ^Atom,
-	bindings: [][]v.Binding,
-	slots: ^Slot_Map,
-	source: ^Relation_Source,
-	alloc: mem.Allocator,
-) -> (
-	[dynamic][]v.Binding,
-	Kernel_Error,
-) {
-	out: [dynamic][]v.Binding
-	for binding in bindings {
-		scan_bindings := make([]v.Binding, len(atom.terms), alloc)
-		for term, i in atom.terms {
-			switch term.kind {
-			case .Value:
-				scan_bindings[i] = v.binding_of(term.value)
-			case .Var:
-				slot := slot_map_slot(slots, term.symbol)
-				scan_bindings[i] = binding[slot]
-			}
-		}
-
-		unify := Unify_Context {
-			atom    = atom,
-			binding = binding,
-			slots   = slots,
-			out     = &out,
-			alloc   = alloc,
-		}
-		relation_source_visit(source, atom.relation, scan_bindings, unify_visit, &unify)
-		if source.error != .None {
-			return {}, source.error
-		}
-	}
-	return out, .None
-}
-
-@(private)
-term_is_bound :: proc(term: Term, binding: []v.Binding, slots: ^Slot_Map) -> bool {
-	if term.kind == .Value {
-		return true
-	}
-	slot := slot_map_slot(slots, term.symbol)
-	if slot < 0 || slot >= len(binding) {
-		return false
-	}
-	return binding[slot].bound
-}
-
-@(private)
-binding_all_bound :: proc(terms: []Term, bindings: [][]v.Binding, slots: ^Slot_Map) -> bool {
-	for binding in bindings {
-		for term in terms {
-			if !term_is_bound(term, binding, slots) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-@(private)
-term_evaluate :: proc(
-	term: Term,
-	binding: []v.Binding,
-	slots: ^Slot_Map,
-) -> (
-	v.Value,
-	Kernel_Error,
-) {
-	if term.kind == .Value {
-		return term.value, .None
-	}
-	slot := slot_map_slot(slots, term.symbol)
-	if slot < 0 || slot >= len(binding) || !binding[slot].bound {
-		return v.Value(0), .Unbound_Head_Variable
-	}
-	return binding[slot].value, .None
-}
-
-@(private)
 guard_holds :: proc(guard: Rule_Guard, left, right: v.Value) -> bool {
 	switch guard.op {
 	case .Eq:
@@ -733,192 +525,6 @@ guard_holds :: proc(guard: Rule_Guard, left, right: v.Value) -> bool {
 	return false
 }
 
-@(private)
-Negated_Visit_Context :: struct {
-	found: bool,
-}
-
-@(private)
-negated_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
-	ctx := (^Negated_Visit_Context)(user)
-	ctx.found = true
-	return false
-}
-
-@(private)
-apply_negated_atom :: proc(
-	atom: ^Atom,
-	bindings: [][]v.Binding,
-	slots: ^Slot_Map,
-	source: ^Relation_Source,
-	alloc: mem.Allocator,
-) -> (
-	[dynamic][]v.Binding,
-	Kernel_Error,
-) {
-	if !binding_all_bound(atom.terms, bindings, slots) {
-		return {}, .Unsafe_Negation
-	}
-
-	// Batch fast path: a fully-bound single-column atom over identity values
-	// is one sorted membership probe (row-order pass) instead of one
-	// per-binding existence scan. Anything else declines to the row path.
-	if batched, ok := try_negated_atom_batch(atom, bindings, slots, source, alloc); ok {
-		return batched, .None
-	}
-
-	out: [dynamic][]v.Binding
-	for binding in bindings {
-		scan_bindings := make([]v.Binding, len(atom.terms), alloc)
-		for term, i in atom.terms {
-			switch term.kind {
-			case .Value:
-				scan_bindings[i] = v.binding_of(term.value)
-			case .Var:
-				slot := slot_map_slot(slots, term.symbol)
-				scan_bindings[i] = binding[slot]
-			}
-		}
-		state := Negated_Visit_Context{}
-		relation_source_visit(source, atom.relation, scan_bindings, negated_visit, &state)
-		if source.error != .None {
-			return {}, source.error
-		}
-		if !state.found {
-			next := make([]v.Binding, len(binding), alloc)
-			copy(next, binding)
-			append(&out, next)
-		}
-	}
-	return out, .None
-}
-
-// Batch path for a fully-bound negated atom of one or two positions over
-// fixed-width values: one membership call against keys packed once per
-// evaluation (packed.odin). Returns (rows, true) when it ran; (nil, false)
-// declines to the row path. Every outcome is counted under
-// .Negated_Membership. Scratch comes from `alloc`, the evaluation arena.
-@(private)
-try_negated_atom_batch :: proc(
-	atom: ^Atom,
-	bindings: [][]v.Binding,
-	slots: ^Slot_Map,
-	source: ^Relation_Source,
-	alloc: mem.Allocator,
-) -> (
-	[dynamic][]v.Binding,
-	bool,
-) {
-	if len(bindings) == 0 {
-		return nil, false
-	}
-	width := len(atom.terms)
-	if width < 1 || width > 2 {
-		placement_record(.Negated_Membership, .Unsupported)
-		return nil, false
-	}
-
-	probes := make([]u64, len(bindings) * width, alloc)
-	for binding, i in bindings {
-		for term, j in atom.terms {
-			value, err := term_evaluate(term, binding, slots)
-			if err != .None || !v.value_is_immediate(value) {
-				placement_record(.Negated_Membership, .Not_Packable)
-				return nil, false
-			}
-			probes[i * width + j] = u64(value)
-		}
-	}
-
-	entry, found := packed_cache_lookup(source, atom.relation, width)
-	if !found {
-		placement_record(.Negated_Membership, entry == nil ? .Unsupported : .Not_Packable)
-		return nil, false
-	}
-
-	// keep_matches=false: a binding survives when its key is ABSENT. Single
-	// keys on a strategy that declares a residency threshold prepare one
-	// device copy per evaluation, once the step is large enough to pay for the
-	// upload, and probe it; everything else passes the keys per call.
-	strategy := accel.active_strategy()
-	selected: []bool
-	ok: bool
-	if width == 1 && !entry.prepare_tried && strategy.prepare_column != nil &&
-	   strategy.resident_min_probes > 0 && len(bindings) >= strategy.resident_min_probes {
-		entry.prepare_tried = true
-		source.packed.prepares += 1
-		if prepared, prepared_ok := accel.prepare_column(strategy, entry.keys.keys); prepared_ok {
-			entry.prepared, entry.strategy = prepared, strategy
-		}
-	}
-	if width == 1 && entry.prepared.handle != nil {
-		selected, ok = accel.membership_select_prepared(strategy, probes, entry.prepared, false, alloc)
-	} else {
-		selected, ok = accel.membership_select_keys(strategy, probes, entry.keys.keys, width, false, alloc)
-	}
-	completed := ok && len(selected) == len(bindings)
-	if !ok {
-		placement_record_decline(.Negated_Membership)
-	} else if !completed {
-		placement_record(.Negated_Membership, .Invalid_Result)
-	}
-	if !completed {
-		// The keys are already packed: the CPU reference finishes the step on
-		// them rather than discarding them for the per-binding row path, so a
-		// declining accelerator is never slower than the CPU strategy.
-		selected, ok = accel.membership_select_keys(accel.cpu_strategy(), probes, entry.keys.keys, width, false, alloc)
-		if !ok || len(selected) != len(bindings) {
-			return nil, false
-		}
-		placement_record(.Negated_Membership, .Cpu_Fallback)
-	} else {
-		placement_record(.Negated_Membership, .Completed)
-	}
-	out: [dynamic][]v.Binding
-	for binding, i in bindings {
-		if selected[i] {
-			next := make([]v.Binding, len(binding), alloc)
-			copy(next, binding)
-			append(&out, next)
-		}
-	}
-	return out, true
-}
-
-@(private)
-apply_guard :: proc(
-	guard: Rule_Guard,
-	bindings: [][]v.Binding,
-	slots: ^Slot_Map,
-	alloc: mem.Allocator,
-) -> (
-	[dynamic][]v.Binding,
-	Kernel_Error,
-) {
-	terms := []Term{guard.left, guard.right}
-	if !binding_all_bound(terms, bindings, slots) {
-		return {}, .Unsafe_Guard
-	}
-
-	out: [dynamic][]v.Binding
-	for binding in bindings {
-		left, left_err := term_evaluate(guard.left, binding, slots)
-		if left_err != .None {
-			return {}, left_err
-		}
-		right, right_err := term_evaluate(guard.right, binding, slots)
-		if right_err != .None {
-			return {}, right_err
-		}
-		if guard_holds(guard, left, right) {
-			next := make([]v.Binding, len(binding), alloc)
-			copy(next, binding)
-			append(&out, next)
-		}
-	}
-	return out, .None
-}
-
 // Chooses the next body item. Ready guards and negations run first as cheap
 // filters; otherwise the positive atom with the most bound variables wins,
 // breaking ties by estimated relation size so small relations drive the join.
@@ -926,7 +532,7 @@ apply_guard :: proc(
 pick_body_item :: proc(
 	rule: Rule,
 	used: []bool,
-	bindings: [][]v.Binding,
+	batch: ^Column_Batch,
 	slots: ^Slot_Map,
 	source: ^Relation_Source,
 ) -> (
@@ -939,15 +545,11 @@ pick_body_item :: proc(
 		}
 		switch item.kind {
 		case .Atom:
-			if !item.atom.negated {
-				continue
-			}
-			if binding_all_bound(item.atom.terms, bindings, slots) {
+			if item.atom.negated && terms_bound_in(item.atom.terms, batch, slots) {
 				return i, .None
 			}
 		case .Guard:
-			terms := []Term{item.guard.left, item.guard.right}
-			if binding_all_bound(terms, bindings, slots) {
+			if terms_bound_in([]Term{item.guard.left, item.guard.right}, batch, slots) {
 				return i, .None
 			}
 		}
@@ -971,7 +573,7 @@ pick_body_item :: proc(
 			ready := true
 			for position in required {
 				if int(position) >= len(item.atom.terms) ||
-				   !binding_all_bound([]Term{item.atom.terms[position]}, bindings, slots) {
+				   !term_bound_in(item.atom.terms[position], batch, slots) {
 					ready = false
 					break
 				}
@@ -980,7 +582,7 @@ pick_body_item :: proc(
 				continue
 			}
 		}
-		bound := atom_bound_count(&item.atom, bindings, slots)
+		bound := atom_bound_count(&item.atom, batch, slots)
 		rows := rules_source_cardinality(source, item.atom.relation)
 		if best < 0 || bound > best_bound || (bound == best_bound && rows < best_rows) {
 			best = index
@@ -1018,16 +620,12 @@ pick_body_item :: proc(
 	return -1, .Unsafe_Guard
 }
 
-// Counts the variable terms of an atom that are already bound.
+// Counts the variable terms of an atom that the batch binds.
 @(private)
-atom_bound_count :: proc(atom: ^Atom, bindings: [][]v.Binding, slots: ^Slot_Map) -> int {
-	if len(bindings) == 0 {
-		return 0
-	}
-	binding := bindings[0]
+atom_bound_count :: proc(atom: ^Atom, batch: ^Column_Batch, slots: ^Slot_Map) -> int {
 	count := 0
 	for term in atom.terms {
-		if term.kind == .Var && term_is_bound(term, binding, slots) {
+		if term.kind == .Var && term_bound_in(term, batch, slots) {
 			count += 1
 		}
 	}
@@ -1042,7 +640,7 @@ rules_source_cardinality :: proc(source: ^Relation_Source, relation: Relation_ID
 	   source.delta_active &&
 	   source.delta != nil &&
 	   relation == source.delta_relation {
-		return len(rules_derived_rows(source.delta, relation))
+		return rules_derived_count(source.delta, relation)
 	}
 	block: ^Relation_Block
 	if source != nil && source.snapshot != nil {
@@ -1058,84 +656,4 @@ rules_source_cardinality :: proc(source: ^Relation_Source, relation: Relation_ID
 		return 0
 	}
 	return relation_block_len(block)
-}
-
-@(private)
-rules_apply :: proc(
-	rule: Rule,
-	source: ^Relation_Source,
-	result: ^Rule_Derived,
-	delta: ^Rule_Derived,
-	alloc: mem.Allocator,
-) -> (
-	int,
-	Kernel_Error,
-) {
-	slots: Slot_Map
-	slot_map_init(&slots, rule, alloc)
-
-	bindings: [dynamic][]v.Binding
-	initial := make([]v.Binding, len(slots.symbols), alloc)
-	append(&bindings, initial)
-
-	used := make([]bool, len(rule.body), alloc)
-	remaining := len(rule.body)
-	for remaining > 0 {
-		index, pick_err := pick_body_item(rule, used, bindings[:], &slots, source)
-		if pick_err != .None {
-			return 0, pick_err
-		}
-		item := rule.body[index]
-		used[index] = true
-		remaining -= 1
-
-		next: [dynamic][]v.Binding
-		apply_err: Kernel_Error
-		switch item.kind {
-		case .Atom:
-			if item.atom.negated {
-				next, apply_err = apply_negated_atom(
-					&item.atom,
-					bindings[:],
-					&slots,
-					source,
-					alloc,
-				)
-			} else {
-				next, apply_err = apply_positive_atom(
-					&item.atom,
-					bindings[:],
-					&slots,
-					source,
-					alloc,
-				)
-			}
-		case .Guard:
-			next, apply_err = apply_guard(item.guard, bindings[:], &slots, alloc)
-		}
-		if apply_err != .None {
-			return 0, apply_err
-		}
-		bindings = next
-	}
-
-	added := 0
-	for binding in bindings {
-		values := make([]v.Value, len(rule.head_terms), alloc)
-		for term, i in rule.head_terms {
-			value, term_err := term_evaluate(term, binding, &slots)
-			if term_err != .None {
-				return 0, term_err
-			}
-			values[i] = value
-		}
-		tuple := v.tuple_from_slice(values)
-		if rules_derived_add(result, alloc, rule.head_relation, tuple) {
-			if delta != nil {
-				_ = rules_derived_add(delta, alloc, rule.head_relation, tuple)
-			}
-			added += 1
-		}
-	}
-	return added, .None
 }

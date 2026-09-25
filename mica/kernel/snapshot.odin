@@ -315,20 +315,24 @@ snapshot_active_rules :: proc(snapshot: ^Snapshot, alloc: mem.Allocator) -> []Ru
 
 
 // Converts an evaluation result into sorted relation row sets allocated from
-// `alloc`. Tuples are deep-copied so the result does not reference evaluation
-// scratch storage.
+// `alloc`: the column-major rows are transposed into deep-copied tuples, so
+// the result references no evaluation storage, then canonicalized.
 derived_relations_from :: proc(
 	alloc: mem.Allocator,
 	derived: ^Rule_Derived,
 ) -> []Derived_Relation {
 	relations := make([]Derived_Relation, len(derived.relations), alloc)
-	for relation, i in derived.relations {
-		rows := make([]v.Tuple, len(derived.rows[i]), alloc)
-		for row, j in derived.rows[i] {
-			rows[j] = v.tuple_deep_copy(alloc, row)
+	for entry, i in derived.relations {
+		rows := make([]v.Tuple, len(entry.hashes), alloc)
+		for row in 0 ..< len(rows) {
+			values := make([]v.Value, entry.arity, alloc)
+			for c in 0 ..< entry.arity {
+				values[c] = v.value_deep_copy(alloc, entry.columns[c][row])
+			}
+			rows[row] = v.Tuple(values)
 		}
 		relations[i] = Derived_Relation {
-			relation = relation,
+			relation = entry.relation,
 			tuples   = v.canonicalize_tuples(rows, alloc),
 		}
 	}

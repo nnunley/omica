@@ -50,25 +50,27 @@ extern "C" __global__ void membership(const unsigned long long* left,
     out[row] = (hit == (keep_matches != 0)) ? 1 : 0;
 }
 
-// Two-key membership: left and right hold interleaved (a, b) pairs; right is
-// sorted-unique lexicographically.
-extern "C" __global__ void membership2(const unsigned long long* left,
-                                       const unsigned long long* right,
+// Two-key membership: two columns per side; the right pairs are sorted-unique
+// lexicographically.
+extern "C" __global__ void membership2(const unsigned long long* left_a,
+                                       const unsigned long long* left_b,
+                                       const unsigned long long* right_a,
+                                       const unsigned long long* right_b,
                                        unsigned char* out,
                                        unsigned int left_len,
                                        unsigned int right_len,
                                        unsigned int keep_matches) {
     unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= left_len) return;
-    unsigned long long p0 = left[2ull * row], p1 = left[2ull * row + 1];
+    unsigned long long p0 = left_a[row], p1 = left_b[row];
     unsigned int lo = 0, hi = right_len;
     while (lo < hi) {
         unsigned int mid = lo + ((hi - lo) >> 1);
-        unsigned long long r0 = right[2ull * mid], r1 = right[2ull * mid + 1];
+        unsigned long long r0 = right_a[mid], r1 = right_b[mid];
         if (r0 < p0 || (r0 == p0 && r1 < p1)) lo = mid + 1;
         else hi = mid;
     }
-    bool hit = (lo < right_len && right[2ull * lo] == p0 && right[2ull * lo + 1] == p1);
+    bool hit = (lo < right_len && right_a[lo] == p0 && right_b[lo] == p1);
     out[row] = (hit == (keep_matches != 0)) ? 1 : 0;
 }
 
@@ -595,11 +597,10 @@ cuda_membership_select_impl :: proc(
 	return cuda_membership_run_locked(state, left, d_right, len(right_sorted_unique), keep_matches, allocator)
 }
 
-// Two-key membership over interleaved pairs, uploaded for this call only. The
-// dispatcher (membership_select_keys) has checked shape and sort order.
+// Two-key membership over two columns per side, uploaded for this call only.
+// membership_selection has checked shape and sort order.
 cuda_membership_select2_impl :: proc(
-	left: []u64,
-	right: []u64,
+	left_a, left_b, right_a, right_b: []u64,
 	keep_matches: bool,
 	allocator: mem.Allocator,
 ) -> (
@@ -607,7 +608,7 @@ cuda_membership_select2_impl :: proc(
 	accelerated: bool,
 ) {
 	last_decline = .Failed
-	n_left, n_right := len(left) / 2, len(right) / 2
+	n_left, n_right := len(left_a), len(right_a)
 	if !cuda_membership_admit(n_left, n_right) {
 		return nil, false
 	}
@@ -623,19 +624,23 @@ cuda_membership_select2_impl :: proc(
 	drv := &cuda_backend.driver
 	bufs: Cuda_Buffers
 	defer cuda_free_all(drv, &bufs)
-	left_bytes := len(left) * size_of(u64)
-	right_bytes := len(right) * size_of(u64)
-	d_left := cuda_alloc(drv, &bufs, left_bytes) or_return
-	d_right := cuda_alloc(drv, &bufs, right_bytes) or_return
+	left_bytes := n_left * size_of(u64)
+	right_bytes := n_right * size_of(u64)
+	d_left_a := cuda_alloc(drv, &bufs, left_bytes) or_return
+	d_left_b := cuda_alloc(drv, &bufs, left_bytes) or_return
+	d_right_a := cuda_alloc(drv, &bufs, right_bytes) or_return
+	d_right_b := cuda_alloc(drv, &bufs, right_bytes) or_return
 	d_out := cuda_alloc(drv, &bufs, n_left) or_return
-	if drv.cuMemcpyHtoD(d_left, raw_data(left), c.size_t(left_bytes)) != CU_SUCCESS ||
-	   drv.cuMemcpyHtoD(d_right, raw_data(right), c.size_t(right_bytes)) != CU_SUCCESS {
+	if drv.cuMemcpyHtoD(d_left_a, raw_data(left_a), c.size_t(left_bytes)) != CU_SUCCESS ||
+	   drv.cuMemcpyHtoD(d_left_b, raw_data(left_b), c.size_t(left_bytes)) != CU_SUCCESS ||
+	   drv.cuMemcpyHtoD(d_right_a, raw_data(right_a), c.size_t(right_bytes)) != CU_SUCCESS ||
+	   drv.cuMemcpyHtoD(d_right_b, raw_data(right_b), c.size_t(right_bytes)) != CU_SUCCESS {
 		return nil, false
 	}
 	left_len := u32(n_left)
 	right_len := u32(n_right)
 	keep := u32(keep_matches ? 1 : 0)
-	params := [?]rawptr{&d_left, &d_right, &d_out, &left_len, &right_len, &keep}
+	params := [?]rawptr{&d_left_a, &d_left_b, &d_right_a, &d_right_b, &d_out, &left_len, &right_len, &keep}
 	if !cuda_launch(drv, state.membership2, n_left, params[:]) {
 		return nil, false
 	}

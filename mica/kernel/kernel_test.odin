@@ -2386,7 +2386,7 @@ test_transaction_derived_invalidation :: proc(t: ^testing.T) {
 }
 
 // The negated single-column identity atom is the accelerator's first kernel
-// caller: `apply_negated_atom` routes it through `membership_select` as one
+// caller: `apply_negated_columns` routes it through `membership_select` as one
 // batch instead of one existence scan per binding. This test pins the wiring
 // with enough bindings to matter; the operator thresholds still apply, so it
 // passes on both CPU and Metal strategies.
@@ -3014,21 +3014,19 @@ test_rule_planner_prefers_selective_atom :: proc(t: ^testing.T) {
 	)
 	slots: Slot_Map
 	slot_map_init(&slots, rule, context.temp_allocator)
-	initial := make([]v.Binding, len(slots.symbols), context.temp_allocator)
-	bindings := make([][]v.Binding, 1, context.temp_allocator)
-	bindings[0] = initial
+	batch := column_batch_unit(len(slots.symbols), context.temp_allocator)
 	used := make([]bool, len(rule.body), context.temp_allocator)
 	source := Relation_Source{snapshot = kernel.current}
 
 	// Neither atom is bound, so the smaller relation drives the join.
-	index, err := pick_body_item(rule, used, bindings, &slots, &source)
+	index, err := pick_body_item(rule, used, &batch, &slots, &source)
 	testing.expect_value(t, err, Kernel_Error.None)
 	testing.expect_value(t, index, 1)
 
 	// Once Small binds y, Big remains the only unbound atom.
 	used[1] = true
-	bindings[0][slot_map_slot(&slots, y)] = v.binding_of(must_int(1))
-	index, err = pick_body_item(rule, used, bindings, &slots, &source)
+	column_batch_set(&batch, slot_map_slot(&slots, y), []v.Value{must_int(1)})
+	index, err = pick_body_item(rule, used, &batch, &slots, &source)
 	testing.expect_value(t, err, Kernel_Error.None)
 	testing.expect_value(t, index, 0)
 }

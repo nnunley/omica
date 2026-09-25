@@ -78,11 +78,11 @@ engine_evaluate :: proc(scratch: ^virtual.Arena, scratch_alloc: mem.Allocator, r
 	if err != .None {
 		return 0, 0
 	}
-	for relation in derived.relations {
-		rows := k.rules_derived_rows(&derived, relation)
-		total += u64(len(rows))
-		for row in rows {
-			digest += v.tuple_hash(row) ~ (u64(relation) * 0x9e3779b97f4a7c15)
+	for entry in derived.relations {
+		hashes := k.rules_derived_hashes(&derived, entry.relation)
+		total += u64(len(hashes))
+		for hash in hashes {
+			digest += hash ~ (u64(entry.relation) * 0x9e3779b97f4a7c15)
 		}
 	}
 	return

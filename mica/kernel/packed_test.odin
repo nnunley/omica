@@ -7,11 +7,6 @@ import accel "./accel"
 import v "../var"
 
 @(private = "file")
-row :: proc(values: ..v.Value) -> v.Tuple {
-	return v.tuple_new(context.temp_allocator, values)
-}
-
-@(private = "file")
 int_value :: proc(n: i64) -> v.Value {
 	value, _ := v.value_int(n)
 	return value
@@ -20,41 +15,37 @@ int_value :: proc(n: i64) -> v.Value {
 @(test)
 test_packed_keys_single_position_sorted_unique :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	rows := []v.Tuple{row(int_value(3), int_value(1)), row(int_value(1), int_value(2)), row(int_value(3), int_value(9))}
-	keys, ok := packed_keys_from_rows(rows, []u16{0}, context.temp_allocator)
+	keys, ok := packed_keys_from_columns([][]v.Value{{int_value(3), int_value(1), int_value(3)}}, 3, context.temp_allocator)
 	testing.expect(t, ok)
 	testing.expect_value(t, keys.width, 1)
 	testing.expect_value(t, keys.count, 2)
-	testing.expect_value(t, keys.keys[0], u64(int_value(1)))
-	testing.expect_value(t, keys.keys[1], u64(int_value(3)))
+	testing.expect_value(t, keys.columns[0][0], u64(int_value(1)))
+	testing.expect_value(t, keys.columns[0][1], u64(int_value(3)))
 }
 
 @(test)
 test_packed_keys_pairs_sorted_unique :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	a, b := must_identity(7), must_identity(5)
-	rows := []v.Tuple{row(a, b), row(b, a), row(a, b), row(b, b)}
-	keys, ok := packed_keys_from_rows(rows, []u16{0, 1}, context.temp_allocator)
+	keys, ok := packed_keys_from_columns([][]v.Value{{a, b, a, b}, {b, a, b, b}}, 4, context.temp_allocator)
 	testing.expect(t, ok)
 	testing.expect_value(t, keys.width, 2)
 	testing.expect_value(t, keys.count, 3)
-	for i in 1 ..< keys.count {
-		p0, p1, q0, q1 := keys.keys[2 * i - 2], keys.keys[2 * i - 1], keys.keys[2 * i], keys.keys[2 * i + 1]
-		testing.expect(t, p0 < q0 || (p0 == q0 && p1 < q1))
-	}
+	testing.expect(t, accel.is_sorted_unique_pairs(keys.columns[0], keys.columns[1]))
 }
 
 @(test)
 test_packed_keys_reject_heap_values_and_bad_widths :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	text := v.value_string(context.temp_allocator, "heap")
-	_, heap_ok := packed_keys_from_rows([]v.Tuple{row(text)}, []u16{0}, context.temp_allocator)
+	_, heap_ok := packed_keys_from_columns([][]v.Value{{text}}, 1, context.temp_allocator)
 	testing.expect(t, !heap_ok)
-	_, wide_ok := packed_keys_from_rows([]v.Tuple{row(int_value(1), int_value(2), int_value(3))}, []u16{0, 1, 2}, context.temp_allocator)
+	one := []v.Value{int_value(1)}
+	_, wide_ok := packed_keys_from_columns([][]v.Value{one, one, one}, 1, context.temp_allocator)
 	testing.expect(t, !wide_ok)
-	_, short_ok := packed_keys_from_rows([]v.Tuple{row(int_value(1))}, []u16{1}, context.temp_allocator)
+	_, short_ok := packed_keys_from_columns([][]v.Value{one}, 2, context.temp_allocator)
 	testing.expect(t, !short_ok)
-	empty, empty_ok := packed_keys_from_rows(nil, []u16{0}, context.temp_allocator)
+	empty, empty_ok := packed_keys_from_columns([][]v.Value{nil}, 0, context.temp_allocator)
 	testing.expect(t, empty_ok && empty.count == 0)
 }
 
@@ -98,8 +89,8 @@ test_packed_cache_builds_once_per_evaluation :: proc(t: ^testing.T) {
 	err := rules_evaluate_source(virtual.arena_allocator(&evaluation), kernel.current.rules, &source, &result)
 	testing.expect_value(t, err, Kernel_Error.None)
 	testing.expect_value(t, packed_last_evaluation_builds(), 1)
-	testing.expect_value(t, len(rules_derived_rows(&result, free_a)), 43)
-	testing.expect_value(t, len(rules_derived_rows(&result, free_b)), 43)
+	testing.expect_value(t, rules_derived_count(&result, free_a), 43)
+	testing.expect_value(t, rules_derived_count(&result, free_b), 43)
 }
 
 // Two rules negating the same relation, evaluated once; returns the Free
@@ -139,7 +130,7 @@ evaluate_shared_negation :: proc(t: ^testing.T) -> int {
 	source := Relation_Source{kernel = &kernel, snapshot = kernel.current, derived = &result}
 	err := rules_evaluate_source(virtual.arena_allocator(&evaluation), kernel.current.rules, &source, &result)
 	testing.expect_value(t, err, Kernel_Error.None)
-	return len(rules_derived_rows(&result, free_a))
+	return rules_derived_count(&result, free_a)
 }
 
 // The CPU strategies gain nothing from a prepared copy: never prepare.
