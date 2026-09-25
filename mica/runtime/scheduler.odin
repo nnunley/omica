@@ -127,12 +127,43 @@ Scheduler :: struct {
 	started: bool,
 }
 
+// Thread starts are retried this many times: creating a thread can fail
+// transiently under load (core:thread returns nil when pthread_create does).
+SCHEDULER_THREAD_START_ATTEMPTS :: 5
+
+// Test seam: when set, replaces thread creation for scheduler_init calls on
+// this thread.
+@(thread_local)
+scheduler_thread_start_hook: proc(data: rawptr, entry: proc(data: rawptr)) -> ^thread.Thread
+
+// Starts a thread, retrying failed creations with a short backoff; nil when
+// every attempt failed.
+@(private)
+scheduler_start_thread :: proc(data: rawptr, entry: proc(data: rawptr)) -> ^thread.Thread {
+	for attempt in 0 ..< SCHEDULER_THREAD_START_ATTEMPTS {
+		started: ^thread.Thread
+		if scheduler_thread_start_hook != nil {
+			started = scheduler_thread_start_hook(data, entry)
+		} else {
+			started = thread.create_and_start_with_data(data, entry)
+		}
+		if started != nil {
+			return started
+		}
+		time.sleep(time.Millisecond << uint(attempt))
+	}
+	return nil
+}
+
+// Initializes the scheduler and starts its worker and timer threads. Returns
+// false, with no thread left running, when the timer thread or every worker
+// cannot be started; `scheduler_destroy` is still safe afterwards.
 scheduler_init :: proc(
 	scheduler: ^Scheduler,
 	kernel: ^k.Kernel,
 	config := Scheduler_Config{workers = DEFAULT_SCHEDULER_WORKERS},
 	allocator := context.allocator,
-) {
+) -> bool {
 	scheduler.kernel = kernel
 	scheduler.allocator = allocator
 	scheduler.instruction_budget = config.instruction_budget
@@ -151,10 +182,18 @@ scheduler_init :: proc(
 	scheduler.started = true
 	worker_count := max(config.workers, 1)
 	for _ in 0 ..< worker_count {
-		worker := thread.create_and_start_with_data(scheduler, scheduler_worker_proc)
-		append(&scheduler.threads, worker)
+		// Only threads that started are tracked: shutdown joins every entry.
+		if worker := scheduler_start_thread(scheduler, scheduler_worker_proc); worker != nil {
+			append(&scheduler.threads, worker)
+		}
 	}
-	scheduler.timer = thread.create_and_start_with_data(scheduler, scheduler_timer_proc)
+	scheduler.timer = scheduler_start_thread(scheduler, scheduler_timer_proc)
+	if scheduler.timer == nil || len(scheduler.threads) == 0 {
+		// Without a timer, timed waits never wake: stop what did start.
+		scheduler_shutdown(scheduler)
+		return false
+	}
+	return true
 }
 
 scheduler_destroy :: proc(scheduler: ^Scheduler) {
@@ -203,8 +242,11 @@ scheduler_shutdown :: proc(scheduler: ^Scheduler) {
 			thread.destroy(worker)
 		}
 	}
-	thread.join(scheduler.timer)
-	thread.destroy(scheduler.timer)
+	if scheduler.timer != nil {
+		thread.join(scheduler.timer)
+		thread.destroy(scheduler.timer)
+		scheduler.timer = nil
+	}
 	clear(&scheduler.threads)
 	scheduler.started = false
 }

@@ -736,7 +736,7 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	if workers < 1 {
 		workers = 1
 	}
-	scheduler_init(
+	if !scheduler_init(
 		&world.scheduler,
 		world.kernel,
 		Scheduler_Config {
@@ -746,7 +746,10 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 			external_enabled = config.external_handler != nil,
 		},
 		allocator,
-	)
+	) {
+		scheduler_destroy(&world.scheduler)
+		return Run_Result{ok = false, message = "cannot start the scheduler's threads"}
+	}
 	world.started = true
 	world.env.scheduler = &world.scheduler
 
@@ -918,7 +921,7 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	if workers < 1 {
 		workers = 1
 	}
-	scheduler_init(
+	if !scheduler_init(
 		&world.scheduler,
 		world.kernel,
 		Scheduler_Config {
@@ -928,7 +931,10 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 			external_enabled = config.external_handler != nil,
 		},
 		allocator,
-	)
+	) {
+		scheduler_destroy(&world.scheduler)
+		return Run_Result{ok = false, message = "cannot start the scheduler's threads"}
+	}
 	world.started = true
 	world.env.scheduler = &world.scheduler
 	if config.actor != "" {
