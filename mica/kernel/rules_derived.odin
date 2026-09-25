@@ -23,6 +23,10 @@ Derived_Columns :: struct {
 
 Rule_Derived :: struct {
 	allocator: mem.Allocator,
+	// Columns, hashes and dedup indexes. Defaults to `allocator`; a freeing
+	// allocator (the heap) releases each outgrown buffer as a relation grows,
+	// where an arena keeps every copy, and then needs rules_derived_destroy.
+	storage:   mem.Allocator,
 	relations: [dynamic]^Derived_Columns,
 	// While frozen, scans see each relation as it was at the freeze; adds and
 	// deduplication still see every row.
@@ -56,7 +60,30 @@ DERIVED_RESERVE_MAX :: 65_536
 
 // Creates an empty derived set whose storage is allocated from `alloc`.
 rules_derived_create :: proc(alloc: mem.Allocator) -> Rule_Derived {
-	return Rule_Derived{allocator = alloc, relations = make([dynamic]^Derived_Columns, 0, alloc)}
+	return rules_derived_create_backed(alloc, alloc)
+}
+
+// Creates an empty derived set whose bookkeeping comes from `alloc` and whose
+// row storage (columns, hashes, indexes) comes from `storage`; release it with
+// rules_derived_destroy when `storage` is not an arena.
+rules_derived_create_backed :: proc(alloc, storage: mem.Allocator) -> Rule_Derived {
+	return Rule_Derived {
+		allocator = alloc,
+		storage = storage,
+		relations = make([dynamic]^Derived_Columns, 0, alloc),
+	}
+}
+
+// Frees the row storage of every relation.
+rules_derived_destroy :: proc(d: ^Rule_Derived) {
+	for entry in d.relations {
+		for &column in entry.columns {
+			delete(column)
+		}
+		delete(entry.hashes)
+		delete(entry.index, d.storage)
+		entry.index = nil
+	}
 }
 
 rules_derived_find :: proc(d: ^Rule_Derived, relation: Relation_ID) -> ^Derived_Columns {
@@ -87,11 +114,11 @@ rules_derived_entry :: proc(d: ^Rule_Derived, relation: Relation_ID, arity: int)
 		relation = relation,
 		arity    = arity,
 		columns  = make([][dynamic]v.Value, arity, d.allocator),
-		hashes   = make([dynamic]u64, 0, d.allocator),
-		index    = make([]u32, DERIVED_INDEX_MIN, d.allocator),
+		hashes   = make([dynamic]u64, 0, d.storage),
+		index    = make([]u32, DERIVED_INDEX_MIN, d.storage),
 	}
 	for c in 0 ..< arity {
-		entry.columns[c] = make([dynamic]v.Value, 0, d.allocator)
+		entry.columns[c] = make([dynamic]v.Value, 0, d.storage)
 	}
 	append(&d.relations, entry)
 	return entry
@@ -118,6 +145,7 @@ derived_index_grow :: proc(entry: ^Derived_Columns, alloc: mem.Allocator) {
 		}
 		index[slot] = u32(row + 1)
 	}
+	delete(entry.index, alloc)
 	entry.index = index
 }
 
@@ -141,6 +169,7 @@ derived_reserve :: proc(entry: ^Derived_Columns, alloc: mem.Allocator, extra: in
 			}
 			index[slot] = u32(row + 1)
 		}
+		delete(entry.index, alloc)
 		entry.index = index
 	}
 	// Grow geometrically: reserving exactly `want` reallocates on nearly every
@@ -200,13 +229,13 @@ rules_derived_add_columns :: proc(
 	}
 	hashes := make([]u64, count, scratch)
 	v.tuple_hash_columns(columns, nil, hashes)
-	derived_reserve(entry, d.allocator, min(count, DERIVED_RESERVE_MAX))
+	derived_reserve(entry, d.storage, min(count, DERIVED_RESERVE_MAX))
 	added := 0
 	for r in 0 ..< count {
-		if derived_insert(entry, d.allocator, hashes[r], columns, r) {
+		if derived_insert(entry, d.storage, hashes[r], columns, r) {
 			added += 1
 			if delta_entry != nil {
-				derived_insert(delta_entry, delta.allocator, hashes[r], columns, r)
+				derived_insert(delta_entry, delta.storage, hashes[r], columns, r)
 			}
 		}
 	}
@@ -221,7 +250,7 @@ rules_derived_add :: proc(d: ^Rule_Derived, relation: Relation_ID, tuple: v.Tupl
 	for c in 0 ..< len(values) {
 		columns[c] = values[c:c + 1]
 	}
-	return derived_insert(entry, d.allocator, v.tuple_hash(tuple), columns, 0)
+	return derived_insert(entry, d.storage, v.tuple_hash(tuple), columns, 0)
 }
 
 @(private)

@@ -327,17 +327,21 @@ rules_evaluate :: proc(
 	definitions: []Rule_Definition,
 	snapshot: ^Snapshot,
 	kernel: ^Kernel = nil,
+	storage: mem.Allocator = {},
 ) -> (
 	Rule_Derived,
 	Kernel_Error,
 ) {
-	result := rules_derived_create(alloc)
+	// `storage`, when given, holds the result's rows (see Rule_Derived.storage);
+	// the caller then releases them with rules_derived_destroy.
+	result := rules_derived_create_backed(alloc, storage.procedure != nil ? storage : alloc)
 	source := Relation_Source {
 		kernel   = kernel,
 		snapshot = snapshot,
 		derived  = &result,
 	}
 	if err := rules_evaluate_source(alloc, definitions, &source, &result); err != .None {
+		rules_derived_destroy(&result)
 		return Rule_Derived{}, err
 	}
 	return result, .None

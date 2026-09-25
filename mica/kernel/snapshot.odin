@@ -376,8 +376,8 @@ Derived_Key_Order :: struct {
 // The canonical order of a relation's rows, computed from its columns: one
 // sort key per cell (`value_sort_key`), rows ordered by their keys and runs of
 // equal keys reduced to their first row, as `canonicalize_tuples` does. Returns
-// ok=false, allocating nothing that outlives the call's arena, when a cell has
-// no key (heap values), in which case the caller sorts with `tuple_cmp`.
+// ok=false when a cell has no key (heap values), in which case the caller sorts
+// with `tuple_cmp`. The returned order is allocated from `alloc`.
 derived_canonical_order :: proc(
 	entry: ^Derived_Columns,
 	alloc: mem.Allocator,
@@ -393,6 +393,7 @@ derived_canonical_order :: proc(
 		for value, r in entry.columns[c][:rows] {
 			key, keyed := v.value_sort_key(value)
 			if !keyed {
+				delete(keys, alloc)
 				return nil, 0, false
 			}
 			keys[r * arity + c] = key
@@ -424,6 +425,7 @@ derived_canonical_order :: proc(
 		order[count] = index
 		count += 1
 	}
+	delete(keys, alloc)
 	return order, count, true
 }
 
@@ -492,12 +494,15 @@ snapshot_compute_derived :: proc(snapshot: ^Snapshot, kernel: ^Kernel = nil) {
 	if kernel != nil {
 		sync.atomic_add_explicit(&kernel.derivations, 1, .Release)
 	}
-	derived, err := rules_evaluate(alloc, snapshot.rules, snapshot, kernel)
+	// Result rows on the heap: a growing relation frees each outgrown column,
+	// where the evaluation arena would keep every copy until the end.
+	derived, err := rules_evaluate(alloc, snapshot.rules, snapshot, kernel, runtime.heap_allocator())
 	if err != .None {
 		snapshot.derived = nil
 		return
 	}
 	snapshot.derived = derived_relations_from(snapshot.allocator, &derived, arena)
+	rules_derived_destroy(&derived)
 }
 
 // Returns the buffer block for a relation, if any.

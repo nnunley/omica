@@ -244,6 +244,7 @@ test_derived_canonical_order_allocates_keys_and_order_only :: proc(t: ^testing.T
 	mem.tracking_allocator_init(&tracking, context.allocator)
 	defer mem.tracking_allocator_destroy(&tracking)
 	order, count, ok := derived_canonical_order(entry, mem.tracking_allocator(&tracking))
+	defer delete(order, mem.tracking_allocator(&tracking))
 	testing.expect(t, ok)
 	testing.expect_value(t, count, ROWS)
 	bound := ROWS * (2 * size_of(u64) + size_of(u32))
@@ -296,4 +297,32 @@ test_derived_relations_from_matches_canonicalize :: proc(t: ^testing.T) {
 			testing.expect_value(t, v.tuple_cmp(got[r], want[r]), v.Ordering.Equal)
 		}
 	}
+}
+
+// A derived set whose columns, hashes and index live on a freeing allocator
+// releases each outgrown buffer as it grows (in an arena every outgrown copy
+// stays), and gives everything back on destroy.
+@(test)
+test_rules_derived_heap_storage_frees_growth :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	tracking: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&tracking, context.allocator)
+	defer mem.tracking_allocator_destroy(&tracking)
+	d := rules_derived_create_backed(context.temp_allocator, mem.tracking_allocator(&tracking))
+	BATCHES :: 200
+	ROWS :: 1000
+	keys := make([]v.Value, ROWS, context.temp_allocator)
+	values := make([]v.Value, ROWS, context.temp_allocator)
+	for batch in 0 ..< BATCHES {
+		for r in 0 ..< ROWS {
+			keys[r] = must_int(i64(batch * ROWS + r))
+			values[r] = must_int(i64(r))
+		}
+		rules_derived_add_columns(&d, nil, Relation_ID(3), [][]v.Value{keys, values}, ROWS, context.temp_allocator)
+	}
+	entry := rules_derived_find(&d, Relation_ID(3))
+	live := BATCHES * ROWS * (2 * size_of(v.Value) + size_of(u64)) + len(entry.index) * size_of(u32)
+	testing.expectf(t, int(tracking.current_memory_allocated) <= 2 * live, "holds %d bytes for %d live", tracking.current_memory_allocated, live)
+	rules_derived_destroy(&d)
+	testing.expect_value(t, tracking.current_memory_allocated, i64(0))
 }
