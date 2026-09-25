@@ -46,7 +46,7 @@ if [[ ! -f "${repo_root}/vendor/micromeasure/micromeasure-odin/micromeasure.odin
   exit 1
 fi
 
-packages=(vendor/micromeasure/micromeasure-odin mica/var mica/buffer mica/kernel mica/vm mica/compiler mica/runtime mica/external mica/dom mica/store host/source host/web)
+packages=(vendor/micromeasure/micromeasure-odin mica/var mica/buffer mica/kernel mica/kernel/accel mica/vm mica/compiler mica/runtime mica/external mica/dom mica/store host/source host/web)
 bin_dir="${repo_root}/.cache/test-bin"
 log_dir="${repo_root}/.cache/test-logs"
 strict_leaks="${STRICT_LEAKS:-0}"
