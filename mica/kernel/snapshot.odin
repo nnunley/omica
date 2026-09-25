@@ -12,7 +12,6 @@ import v "../var"
 import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
-import "core:slice"
 import "core:sync"
 
 // A derived relation's rows, computed from rules at snapshot creation.
@@ -367,12 +366,6 @@ derived_relations_from :: proc(
 	return relations
 }
 
-@(private)
-Derived_Key_Order :: struct {
-	keys:  []u64,
-	arity: int,
-}
-
 // The canonical order of a relation's rows, computed from its columns: one
 // sort key per cell (`value_sort_key`), rows ordered by their keys and runs of
 // equal keys reduced to their first row, as `canonicalize_tuples` does. Returns
@@ -403,8 +396,7 @@ derived_canonical_order :: proc(
 	for r in 0 ..< rows {
 		order[r] = u32(r)
 	}
-	by := Derived_Key_Order{keys = keys, arity = arity}
-	slice.sort_by_with_data(order, derived_key_less, &by)
+	derived_radix_sort(order, keys, arity, alloc)
 
 	// Keep the first row of each run of equal keys (compacting in place:
 	// `count` never passes the current position).
@@ -429,19 +421,49 @@ derived_canonical_order :: proc(
 	return order, count, true
 }
 
+// Sorts `order` (row numbers) by the rows' keys, lexicographically by column:
+// a stable LSD radix sort over 8-bit digits, last column first. Digits equal
+// across every row are skipped, which drops most passes for identities that
+// share their high bytes.
 @(private)
-derived_key_less :: proc(a, b: u32, user: rawptr) -> bool {
-	by := (^Derived_Key_Order)(user)
-	base_a := int(a) * by.arity
-	base_b := int(b) * by.arity
-	for c in 0 ..< by.arity {
-		ka := by.keys[base_a + c]
-		kb := by.keys[base_b + c]
-		if ka != kb {
-			return ka < kb
+derived_radix_sort :: proc(order: []u32, keys: []u64, arity: int, alloc: mem.Allocator) {
+	if len(order) < 2 {
+		return
+	}
+	other := make([]u32, len(order), alloc)
+	defer delete(other, alloc)
+	a, b := order, other
+	for c := arity - 1; c >= 0; c -= 1 {
+		all_or, all_and := u64(0), ~u64(0)
+		for row in a {
+			k := keys[int(row) * arity + c]
+			all_or |= k
+			all_and &= k
+		}
+		varying := all_or ~ all_and
+		for shift := uint(0); shift < 64; shift += 8 {
+			if (varying >> shift) & 0xff == 0 {
+				continue
+			}
+			counts: [256]int
+			for row in a {
+				counts[(keys[int(row) * arity + c] >> shift) & 0xff] += 1
+			}
+			total := 0
+			for d in 0 ..< 256 {
+				counts[d], total = total, total + counts[d]
+			}
+			for row in a {
+				d := (keys[int(row) * arity + c] >> shift) & 0xff
+				b[counts[d]] = row
+				counts[d] += 1
+			}
+			a, b = b, a
 		}
 	}
-	return false
+	if raw_data(a) != raw_data(order) {
+		copy(order, a)
+	}
 }
 
 // Rows with heap values: gathered and canonicalized with `tuple_cmp` in

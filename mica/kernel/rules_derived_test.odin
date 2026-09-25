@@ -224,8 +224,9 @@ test_derived_relations_from_packs_rows :: proc(t: ^testing.T) {
 	testing.expectf(t, int(arena.total_used) <= packed + 4096, "snapshot copy holds %d bytes for %d packed", arena.total_used, packed)
 }
 
-// Sorting a relation for its snapshot copy needs only one u64 key per cell
-// and one u32 per row: no gathered rows, row headers or output array.
+// Sorting a relation for its snapshot copy needs only one u64 key per cell and
+// two u32 per row (the order and the radix sort's other buffer): no gathered
+// rows, row headers or output array.
 @(test)
 test_derived_canonical_order_allocates_keys_and_order_only :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
@@ -247,7 +248,7 @@ test_derived_canonical_order_allocates_keys_and_order_only :: proc(t: ^testing.T
 	defer delete(order, mem.tracking_allocator(&tracking))
 	testing.expect(t, ok)
 	testing.expect_value(t, count, ROWS)
-	bound := ROWS * (2 * size_of(u64) + size_of(u32))
+	bound := ROWS * (2 * size_of(u64) + 2 * size_of(u32))
 	testing.expectf(t, int(tracking.total_memory_allocated) <= bound, "allocated %d bytes, bound %d", tracking.total_memory_allocated, bound)
 	for i in 1 ..< count {
 		a, b := int(order[i - 1]), int(order[i])
