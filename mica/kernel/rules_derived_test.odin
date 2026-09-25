@@ -1,5 +1,7 @@
 package kernel
 
+import "core:fmt"
+import "core:mem"
 import "core:mem/virtual"
 import "core:testing"
 import v "../var"
@@ -206,7 +208,12 @@ test_derived_relations_from_packs_rows :: proc(t: ^testing.T) {
 		testing.fail_now(t, "arena init failed")
 	}
 	defer virtual.arena_destroy(&arena)
-	relations := derived_relations_from(virtual.arena_allocator(&arena), &d, context.temp_allocator)
+	scratch: virtual.Arena
+	if err := virtual.arena_init_growing(&scratch); err != nil {
+		testing.fail_now(t, "arena init failed")
+	}
+	defer virtual.arena_destroy(&scratch)
+	relations := derived_relations_from(virtual.arena_allocator(&arena), &d, &scratch)
 	testing.expect_value(t, len(relations), 1)
 	rows := relations[0].tuples
 	testing.expect_value(t, len(rows), ROWS)
@@ -215,4 +222,78 @@ test_derived_relations_from_packs_rows :: proc(t: ^testing.T) {
 	}
 	packed := ROWS * (size_of(v.Tuple) + 2 * size_of(v.Value))
 	testing.expectf(t, int(arena.total_used) <= packed + 4096, "snapshot copy holds %d bytes for %d packed", arena.total_used, packed)
+}
+
+// Sorting a relation for its snapshot copy needs only one u64 key per cell
+// and one u32 per row: no gathered rows, row headers or output array.
+@(test)
+test_derived_canonical_order_allocates_keys_and_order_only :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	d := rules_derived_create(context.temp_allocator)
+	ROWS :: 3000
+	keys := make([]v.Value, ROWS, context.temp_allocator)
+	values := make([]v.Value, ROWS, context.temp_allocator)
+	for r in 0 ..< ROWS {
+		keys[r] = must_int(i64((r * 7919) % ROWS))
+		values[r] = must_int(i64(r % 5))
+	}
+	rules_derived_add_columns(&d, nil, Relation_ID(5), [][]v.Value{keys, values}, ROWS, context.temp_allocator)
+	entry := rules_derived_find(&d, Relation_ID(5))
+
+	tracking: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&tracking, context.allocator)
+	defer mem.tracking_allocator_destroy(&tracking)
+	order, count, ok := derived_canonical_order(entry, mem.tracking_allocator(&tracking))
+	testing.expect(t, ok)
+	testing.expect_value(t, count, ROWS)
+	bound := ROWS * (2 * size_of(u64) + size_of(u32))
+	testing.expectf(t, int(tracking.total_memory_allocated) <= bound, "allocated %d bytes, bound %d", tracking.total_memory_allocated, bound)
+	for i in 1 ..< count {
+		a, b := int(order[i - 1]), int(order[i])
+		row_a := v.Tuple([]v.Value{entry.columns[0][a], entry.columns[1][a]})
+		row_b := v.Tuple([]v.Value{entry.columns[0][b], entry.columns[1][b]})
+		testing.expect_value(t, v.tuple_cmp(row_a, row_b), v.Ordering.Less)
+	}
+}
+
+// The snapshot copy equals canonicalize_tuples over the same rows, keyed
+// (ints, identities) or not (strings take the tuple_cmp path).
+@(test)
+test_derived_relations_from_matches_canonicalize :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	d := rules_derived_create(context.temp_allocator)
+	ROWS :: 2000
+	a := make([]v.Value, ROWS, context.temp_allocator)
+	b := make([]v.Value, ROWS, context.temp_allocator)
+	s := make([]v.Value, ROWS, context.temp_allocator)
+	for r in 0 ..< ROWS {
+		a[r] = must_int(i64((r * 31) % 97) - 40)
+		b[r] = must_int(i64(r))
+		s[r] = v.value_string(context.temp_allocator, fmt.tprintf("s%d", (r * 13) % 211))
+	}
+	rules_derived_add_columns(&d, nil, Relation_ID(1), [][]v.Value{a, b}, ROWS, context.temp_allocator)
+	rules_derived_add_columns(&d, nil, Relation_ID(2), [][]v.Value{s, a}, ROWS, context.temp_allocator)
+
+	scratch: virtual.Arena
+	if err := virtual.arena_init_growing(&scratch); err != nil {
+		testing.fail_now(t, "arena init failed")
+	}
+	defer virtual.arena_destroy(&scratch)
+	relations := derived_relations_from(context.temp_allocator, &d, &scratch)
+	for entry, i in d.relations {
+		rows := make([]v.Tuple, len(entry.hashes), context.temp_allocator)
+		for r in 0 ..< len(rows) {
+			values := make([]v.Value, entry.arity, context.temp_allocator)
+			for c in 0 ..< entry.arity {
+				values[c] = entry.columns[c][r]
+			}
+			rows[r] = v.Tuple(values)
+		}
+		want := v.canonicalize_tuples(rows, context.temp_allocator)
+		got := relations[i].tuples
+		testing.expect_value(t, len(got), len(want))
+		for r in 0 ..< min(len(got), len(want)) {
+			testing.expect_value(t, v.tuple_cmp(got[r], want[r]), v.Ordering.Equal)
+		}
+	}
 }
