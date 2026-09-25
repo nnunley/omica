@@ -1,5 +1,6 @@
 package kernel
 
+import "core:mem/virtual"
 import "core:testing"
 import v "../var"
 
@@ -151,4 +152,67 @@ test_rules_derived_reserve_bounded_by_new_rows :: proc(t: ^testing.T) {
 	testing.expect_value(t, rules_derived_add_columns(&d, nil, Relation_ID(1), [][]v.Value{column}, n, context.temp_allocator), 10)
 	entry := rules_derived_find(&d, Relation_ID(1))
 	testing.expectf(t, len(entry.index) <= 2 * DERIVED_RESERVE_MAX, "index has %d slots for 10 rows", len(entry.index))
+}
+
+// A relation grown by many small batches must not leave a copy of its columns
+// behind in the arena on every batch: growth is geometric, so the arena holds
+// at most a small multiple of the live rows (the full OpenCyc derivation used
+// 193 bytes per row, most of it abandoned column copies).
+@(test)
+test_rules_derived_batches_grow_geometrically :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.fail_now(t, "arena init failed")
+	}
+	defer virtual.arena_destroy(&arena)
+	alloc := virtual.arena_allocator(&arena)
+	d := rules_derived_create(alloc)
+	BATCHES :: 200
+	ROWS :: 1000
+	keys := make([]v.Value, ROWS, context.temp_allocator)
+	values := make([]v.Value, ROWS, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	for batch in 0 ..< BATCHES {
+		for r in 0 ..< ROWS {
+			keys[r] = must_int(i64(batch * ROWS + r))
+			values[r] = must_int(i64(r))
+		}
+		added := rules_derived_add_columns(&d, nil, Relation_ID(3), [][]v.Value{keys, values}, ROWS, context.temp_allocator)
+		testing.expect_value(t, added, ROWS)
+	}
+	entry := rules_derived_find(&d, Relation_ID(3))
+	live := BATCHES * ROWS * (2 * size_of(v.Value) + size_of(u64)) + len(entry.index) * size_of(u32)
+	testing.expectf(t, int(arena.total_used) < 4 * live, "arena holds %d bytes for %d live", arena.total_used, live)
+}
+
+// The copy into a snapshot holds only the canonical rows, packed: sort keys,
+// the unsorted row list and per-row allocations go to the scratch allocator
+// (the snapshot's frame arena never frees them).
+@(test)
+test_derived_relations_from_packs_rows :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	d := rules_derived_create(context.temp_allocator)
+	ROWS :: 5000
+	keys := make([]v.Value, ROWS, context.temp_allocator)
+	values := make([]v.Value, ROWS, context.temp_allocator)
+	for r in 0 ..< ROWS {
+		keys[r] = must_int(i64(ROWS - r))
+		values[r] = must_int(i64(r % 7))
+	}
+	rules_derived_add_columns(&d, nil, Relation_ID(4), [][]v.Value{keys, values}, ROWS, context.temp_allocator)
+
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.fail_now(t, "arena init failed")
+	}
+	defer virtual.arena_destroy(&arena)
+	relations := derived_relations_from(virtual.arena_allocator(&arena), &d, context.temp_allocator)
+	testing.expect_value(t, len(relations), 1)
+	rows := relations[0].tuples
+	testing.expect_value(t, len(rows), ROWS)
+	for i in 1 ..< len(rows) {
+		testing.expect_value(t, v.tuple_cmp(rows[i - 1], rows[i]), v.Ordering.Less)
+	}
+	packed := ROWS * (size_of(v.Tuple) + 2 * size_of(v.Value))
+	testing.expectf(t, int(arena.total_used) <= packed + 4096, "snapshot copy holds %d bytes for %d packed", arena.total_used, packed)
 }

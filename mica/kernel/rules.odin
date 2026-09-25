@@ -381,6 +381,21 @@ rules_evaluate_source :: proc(
 	defer virtual.arena_destroy(&scratch)
 	scratch_alloc := virtual.arena_allocator(&scratch)
 
+	// Deltas alternate between two round arenas: a round reads the previous
+	// delta from one and writes the next into the other, which is cleared
+	// first. Only two rounds' deltas are ever held; delta rows copy values
+	// whose payloads live in `alloc` or in snapshot blocks, not here.
+	rounds_arena: [2]virtual.Arena
+	for &round in rounds_arena {
+		if virtual.arena_init_growing(&round) != nil {
+			panic("failed to initialize rule round arena")
+		}
+	}
+	defer for &round in rounds_arena {
+		virtual.arena_destroy(&round)
+	}
+	current_round := 0
+
 	rules := make([]Rule, len(definitions), alloc)
 	write := 0
 	for definition in definitions {
@@ -415,7 +430,8 @@ rules_evaluate_source :: proc(
 		// Seed the fixpoint with one full evaluation of the stratum.
 		rounds += 1
 		rules_derived_freeze(result)
-		delta := rules_derived_create(alloc)
+		virtual.arena_free_all(&rounds_arena[current_round])
+		delta := rules_derived_create(virtual.arena_allocator(&rounds_arena[current_round]))
 		for rule in stratum {
 			_, err := rules_apply(rule, source, result, &delta, alloc, scratch_alloc)
 			virtual.arena_free_all(&scratch)
@@ -428,7 +444,9 @@ rules_evaluate_source :: proc(
 		for len(delta.relations) > 0 {
 			rounds += 1
 			rules_derived_freeze(result)
-			next := rules_derived_create(alloc)
+			other := 1 - current_round
+			virtual.arena_free_all(&rounds_arena[other])
+			next := rules_derived_create(virtual.arena_allocator(&rounds_arena[other]))
 			for rule in stratum {
 				for item, index in rule.body {
 					if item.kind != .Atom || item.atom.negated {
@@ -456,6 +474,7 @@ rules_evaluate_source :: proc(
 				}
 			}
 			delta = next
+			current_round = other
 		}
 		rules_derived_thaw(result)
 	}

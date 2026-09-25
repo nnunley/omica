@@ -315,25 +315,43 @@ snapshot_active_rules :: proc(snapshot: ^Snapshot, alloc: mem.Allocator) -> []Ru
 
 
 // Converts an evaluation result into sorted relation row sets allocated from
-// `alloc`: the column-major rows are transposed into deep-copied tuples, so
-// the result references no evaluation storage, then canonicalized.
+// `alloc`. Rows are gathered and canonicalized in `scratch` (value copies that
+// still point into evaluation storage); only the canonical rows are then
+// deep-copied into `alloc`, packed into one value array per relation, so the
+// result references no evaluation storage and `alloc` (a snapshot's frame
+// arena, which never frees) holds no sort keys or discarded row lists.
 derived_relations_from :: proc(
 	alloc: mem.Allocator,
 	derived: ^Rule_Derived,
+	scratch := context.allocator,
 ) -> []Derived_Relation {
 	relations := make([]Derived_Relation, len(derived.relations), alloc)
 	for entry, i in derived.relations {
-		rows := make([]v.Tuple, len(entry.hashes), alloc)
-		for row in 0 ..< len(rows) {
-			values := make([]v.Value, entry.arity, alloc)
-			for c in 0 ..< entry.arity {
-				values[c] = v.value_deep_copy(alloc, entry.columns[c][row])
+		count := len(entry.hashes)
+		arity := entry.arity
+		gathered := make([]v.Value, count * arity, scratch)
+		rows := make([]v.Tuple, count, scratch)
+		for row in 0 ..< count {
+			values := gathered[row * arity:(row + 1) * arity]
+			for c in 0 ..< arity {
+				values[c] = entry.columns[c][row]
 			}
 			rows[row] = v.Tuple(values)
 		}
+		canonical := v.canonicalize_tuples(rows, scratch)
+
+		packed := make([]v.Value, len(canonical) * arity, alloc)
+		tuples := make([]v.Tuple, len(canonical), alloc)
+		for row, r in canonical {
+			values := packed[r * arity:(r + 1) * arity]
+			for value, c in v.tuple_values(row) {
+				values[c] = v.value_deep_copy(alloc, value)
+			}
+			tuples[r] = v.Tuple(values)
+		}
 		relations[i] = Derived_Relation {
 			relation = entry.relation,
-			tuples   = v.canonicalize_tuples(rows, alloc),
+			tuples   = tuples,
 		}
 	}
 	return relations
@@ -366,7 +384,7 @@ snapshot_compute_derived :: proc(snapshot: ^Snapshot, kernel: ^Kernel = nil) {
 		snapshot.derived = nil
 		return
 	}
-	snapshot.derived = derived_relations_from(snapshot.allocator, &derived)
+	snapshot.derived = derived_relations_from(snapshot.allocator, &derived, alloc)
 }
 
 // Returns the buffer block for a relation, if any.

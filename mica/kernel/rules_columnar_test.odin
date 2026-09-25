@@ -484,3 +484,43 @@ test_strict_semi_naive_rounds :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(rows), 190)
 	testing.expect_value(t, rules_last_evaluation_rounds(), 20)
 }
+
+// Semi-naive rounds keep only the previous round's delta: a long chain runs
+// hundreds of rounds, and every round's delta held in the evaluation arena
+// until the end added a second copy of every derived row (the full OpenCyc
+// derivation held 3.5 GB for 17.9M rows).
+@(test)
+test_rounds_release_old_deltas :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+	e := create_relation(&kernel, 1, "E", 2)
+	path := create_relation(&kernel, 2, "T", 2)
+	x, y, z := v.symbol_intern("x"), v.symbol_intern("y"), v.symbol_intern("z")
+	X, Y, Z := term_var(x), term_var(y), term_var(z)
+	install(t, &kernel, 940, rule_new(path, []Term{X, Y}, []Rule_Body_Item{body_atom(atom_positive(e, []Term{X, Y}))}))
+	install(t, &kernel, 941, rule_new(path, []Term{X, Z}, []Rule_Body_Item {
+		body_atom(atom_positive(e, []Term{X, Y})),
+		body_atom(atom_positive(path, []Term{Y, Z})),
+	}))
+	NODES :: 300
+	tx := kernel_begin(&kernel)
+	for i in 0 ..< NODES - 1 {
+		transaction_assert(&tx, e, tuple_of(must_int(i64(i)), must_int(i64(i + 1))))
+	}
+	commit_transaction(t, &tx)
+
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.fail_now(t, "arena init failed")
+	}
+	defer virtual.arena_destroy(&arena)
+	derived, err := rules_evaluate(virtual.arena_allocator(&arena), kernel.current.rules, kernel.current, &kernel)
+	testing.expect_value(t, err, Kernel_Error.None)
+	rows := rules_derived_count(&derived, path)
+	testing.expect_value(t, rows, NODES * (NODES - 1) / 2)
+	entry := rules_derived_find(&derived, path)
+	live := rows * (2 * size_of(v.Value) + size_of(u64)) + len(entry.index) * size_of(u32)
+	testing.expectf(t, int(arena.total_used) < 3 * live, "evaluation arena holds %d bytes (%.2fx) for %d live", arena.total_used, f64(arena.total_used) / f64(live), live)
+}

@@ -296,6 +296,9 @@ arena_pool_return :: proc(pool: ^Arena_Pool, arena: ^Frame_Arena) {
 		return
 	}
 	frame_arena_reset(arena)
+	// A pooled arena keeps only a small budget: one that held a large derived
+	// copy would otherwise stay that large while idle or under a small user.
+	frame_arena_trim(arena, FRAME_POOL_KEEP)
 	sync.atomic_sub(&pool.live_arenas, 1)
 
 	// Return to the local shard; a thread's arenas tend to be reused by it.

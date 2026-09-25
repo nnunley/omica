@@ -758,7 +758,7 @@ transaction_evaluate_derived :: proc(transaction: ^Transaction) -> Kernel_Error 
 		return err
 	}
 
-	transaction.derived = derived_relations_from(transaction.allocator, &result)
+	transaction.derived = derived_relations_from(transaction.allocator, &result, alloc)
 	transaction.derived_valid = true
 	return .None
 }

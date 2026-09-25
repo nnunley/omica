@@ -143,9 +143,14 @@ derived_reserve :: proc(entry: ^Derived_Columns, alloc: mem.Allocator, extra: in
 		}
 		entry.index = index
 	}
-	reserve(&entry.hashes, want)
-	for c in 0 ..< entry.arity {
-		reserve(&entry.columns[c], want)
+	// Grow geometrically: reserving exactly `want` reallocates on nearly every
+	// batch, and in an arena each outgrown copy stays allocated.
+	if want > cap(entry.hashes) {
+		want = max(want, 2 * cap(entry.hashes))
+		reserve(&entry.hashes, want)
+		for c in 0 ..< entry.arity {
+			reserve(&entry.columns[c], want)
+		}
 	}
 }
 
