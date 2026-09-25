@@ -3,6 +3,7 @@ package mica_runtime
 import "core:fmt"
 import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 import k "../kernel"
 import vm "../vm"
@@ -767,4 +768,75 @@ test_scheduler_multiple_timers :: proc(t: ^testing.T) {
 	if !done_b {
 		_ = scheduler_cancel(&scheduler, id_b)
 	}
+}
+
+@(private = "file")
+Start_Failures :: struct {
+	calls:        int,
+	fail_every:   int, // fail calls where calls % fail_every == 0 (0: never)
+	fail_timer:   bool,
+}
+
+@(thread_local, private = "file")
+start_failures: Start_Failures
+
+// Fails some thread starts the way pthread_create can under load.
+@(private = "file")
+flaky_thread_start :: proc(data: rawptr, entry: proc(data: rawptr)) -> ^thread.Thread {
+	start_failures.calls += 1
+	if start_failures.fail_timer && entry == scheduler_timer_proc {
+		return nil
+	}
+	if start_failures.fail_every > 0 && start_failures.calls % start_failures.fail_every == 1 {
+		return nil
+	}
+	return thread.create_and_start_with_data(data, entry)
+}
+
+// A thread start that fails transiently is retried: every worker and the timer
+// run, and a task completes.
+@(test)
+test_scheduler_retries_failed_thread_starts :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	metadata := k.relation_metadata(k.Relation_ID(1), v.symbol_intern("Flag"), 1)
+	snapshot, err := k.kernel_create_relation(&kernel, metadata)
+	testing.expect_value(t, err, k.Kernel_Error.None)
+	k.snapshot_release(snapshot)
+	program := build_flag_program(k.Relation_ID(1), 1)
+
+	start_failures = {fail_every = 2}
+	scheduler_thread_start_hook = flaky_thread_start
+	defer scheduler_thread_start_hook = nil
+
+	scheduler: Scheduler
+	testing.expect(t, scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 3}))
+	defer scheduler_destroy(&scheduler)
+	testing.expect_value(t, len(scheduler.threads), 3)
+	for worker in scheduler.threads {
+		testing.expect(t, worker != nil)
+	}
+	testing.expect(t, scheduler.timer != nil)
+	testing.expect(t, start_failures.calls > 4)
+	id := scheduler_submit(&scheduler, scheduler_task(program, &kernel))
+	testing.expect_value(t, scheduler_wait(&scheduler, id).kind, Task_Outcome_Kind.Complete)
+}
+
+// A timer that never starts fails init; the started workers are stopped and
+// destroy never joins a nil thread.
+@(test)
+test_scheduler_init_fails_cleanly_without_timer :: proc(t: ^testing.T) {
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	start_failures = {fail_timer = true}
+	scheduler_thread_start_hook = flaky_thread_start
+	defer scheduler_thread_start_hook = nil
+
+	scheduler: Scheduler
+	testing.expect(t, !scheduler_init(&scheduler, &kernel, Scheduler_Config{workers = 2}))
+	testing.expect(t, !scheduler.started)
+	testing.expect_value(t, len(scheduler.threads), 0)
+	scheduler_destroy(&scheduler)
 }

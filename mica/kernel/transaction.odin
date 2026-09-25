@@ -748,7 +748,8 @@ transaction_evaluate_derived :: proc(transaction: ^Transaction) -> Kernel_Error 
 	}
 	alloc := virtual.arena_allocator(arena)
 
-	result := rules_derived_create(alloc)
+	result := rules_derived_create_backed(alloc, runtime.heap_allocator())
+	defer rules_derived_destroy(&result)
 	source := Relation_Source {
 		transaction = transaction,
 		derived     = &result,
@@ -758,7 +759,7 @@ transaction_evaluate_derived :: proc(transaction: ^Transaction) -> Kernel_Error 
 		return err
 	}
 
-	transaction.derived = derived_relations_from(transaction.allocator, &result)
+	transaction.derived = derived_relations_from(transaction.allocator, &result, arena)
 	transaction.derived_valid = true
 	return .None
 }

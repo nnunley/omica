@@ -147,18 +147,29 @@ nearest_embedding_scan :: proc(
 	return .None
 }
 
+// Registers NearestEmbedding's scanners on `relation`: the row scanner, plus
+// the batched one unless `batched` is false (benchmarks compare the two).
+register_nearest_embedding :: proc(
+	kernel: ^k.Kernel,
+	relation: k.Relation_ID,
+	user: rawptr,
+	batched := true,
+) -> k.Kernel_Error {
+	if err := k.kernel_register_computed_relation(kernel, relation, []u16{0, 1, 2}, nearest_embedding_scan, user); err != .None {
+		return err
+	}
+	if batched {
+		return k.kernel_register_computed_batch_scan(kernel, relation, nearest_embedding_batch_scan)
+	}
+	return .None
+}
+
 install_retrieval_computed_relation :: proc(env: ^Builtin_Env) -> Run_Result {
 	relation, found := env.ctx.relations["NearestEmbedding"]
 	if !found {
 		return Run_Result{ok = true}
 	}
-	if err := k.kernel_register_computed_relation(
-		env.kernel,
-		k.Relation_ID(relation),
-		[]u16{0, 1, 2},
-		nearest_embedding_scan,
-		rawptr(env),
-	); err != .None {
+	if err := register_nearest_embedding(env.kernel, k.Relation_ID(relation), rawptr(env)); err != .None {
 		return Run_Result{ok = false, message = "cannot register NearestEmbedding"}
 	}
 	return Run_Result{ok = true}

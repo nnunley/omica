@@ -55,6 +55,9 @@ Kernel :: struct {
 	// end instead of re-deriving per batch. Atomic: written by a controlling
 	// task, read on every commit path.
 	derivation_suspended: bool,
+	// Rule fixpoints this kernel has run over a snapshot (see
+	// kernel_derivation_count). Atomic: incremented on any commit path.
+	derivations:          u64,
 
 	// Relation metadata and rule definitions live here for the life of the
 	// kernel; blocks and snapshots reference their slices.
@@ -293,6 +296,9 @@ arena_pool_return :: proc(pool: ^Arena_Pool, arena: ^Frame_Arena) {
 		return
 	}
 	frame_arena_reset(arena)
+	// A pooled arena keeps only a small budget: one that held a large derived
+	// copy would otherwise stay that large while idle or under a small user.
+	frame_arena_trim(arena, FRAME_POOL_KEEP)
 	sync.atomic_sub(&pool.live_arenas, 1)
 
 	// Return to the local shard; a thread's arenas tend to be reused by it.
@@ -953,6 +959,11 @@ kernel_derivation_suspended :: proc(kernel: ^Kernel) -> bool {
 	return sync.atomic_load_explicit(&kernel.derivation_suspended, .Acquire)
 }
 
+// How many times the kernel has run the rule fixpoint over a snapshot.
+kernel_derivation_count :: proc(kernel: ^Kernel) -> u64 {
+	return sync.atomic_load_explicit(&kernel.derivations, .Acquire)
+}
+
 // Recomputes a snapshot's derived relations unless maintenance is suspended.
 @(private)
 kernel_compute_derived :: proc(kernel: ^Kernel, snapshot: ^Snapshot) {
@@ -980,7 +991,7 @@ kernel_set_derivation :: proc(kernel: ^Kernel, enabled: bool) -> bool {
 	for {
 		current := kernel_snapshot(kernel)
 		next := snapshot_fork(kernel, current)
-		snapshot_compute_derived(next)
+		snapshot_compute_derived(next, kernel)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)

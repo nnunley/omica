@@ -69,6 +69,13 @@ World_Config :: struct {
 	external_data:      rawptr,
 	// External worker threads. Values below one become one.
 	external_workers:   int,
+	// Accelerator strategy for rule evaluation, installed process-wide before
+	// the scheduler starts. Unchanged (the zero value) leaves the current
+	// strategy, which defaults to the single-core CPU reference.
+	accel:              Accel_Mode,
+	// Worker threads for Cpu_Parallel (and GPU modes' CPU fallback). Zero uses
+	// one per processor core.
+	accel_workers:      int,
 }
 
 // The `World_Config` a harness uses for the program under test. A harness must
@@ -126,6 +133,9 @@ world_start :: proc(
 	^World,
 	Run_Result,
 ) {
+	if installed := world_install_accel(config.accel, config.accel_workers); !installed.ok {
+		return nil, installed
+	}
 	world := new(World, allocator)
 	world.allocator = allocator
 	world.kernel = kernel
@@ -726,7 +736,7 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 	if workers < 1 {
 		workers = 1
 	}
-	scheduler_init(
+	if !scheduler_init(
 		&world.scheduler,
 		world.kernel,
 		Scheduler_Config {
@@ -736,7 +746,10 @@ world_load :: proc(world: ^World, paths: []string, config: World_Config) -> Run_
 			external_enabled = config.external_handler != nil,
 		},
 		allocator,
-	)
+	) {
+		scheduler_destroy(&world.scheduler)
+		return Run_Result{ok = false, message = "cannot start the scheduler's threads"}
+	}
 	world.started = true
 	world.env.scheduler = &world.scheduler
 
@@ -908,7 +921,7 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 	if workers < 1 {
 		workers = 1
 	}
-	scheduler_init(
+	if !scheduler_init(
 		&world.scheduler,
 		world.kernel,
 		Scheduler_Config {
@@ -918,7 +931,10 @@ world_boot :: proc(world: ^World, store: ^s.Store, config: World_Config) -> Run_
 			external_enabled = config.external_handler != nil,
 		},
 		allocator,
-	)
+	) {
+		scheduler_destroy(&world.scheduler)
+		return Run_Result{ok = false, message = "cannot start the scheduler's threads"}
+	}
 	world.started = true
 	world.env.scheduler = &world.scheduler
 	if config.actor != "" {
@@ -1013,7 +1029,20 @@ world_boot_program :: proc(world: ^World, store: ^s.Store) -> Run_Result {
 // reflection facts. The lowered bodies are not persisted, so they are parsed
 // and converted again here.
 @(private)
+// Each rule install would otherwise re-run the fixpoint over every stored
+// fact, once per rule; derivation is suspended while the rules install and
+// runs once when they are all in place.
 restore_rules :: proc(world: ^World) -> Run_Result {
+	k.kernel_set_derivation(world.kernel, false)
+	result := install_stored_rules(world)
+	if !k.kernel_set_derivation(world.kernel, true) && result.ok {
+		return Run_Result{ok = false, message = "cannot derive the restored rules"}
+	}
+	return result
+}
+
+@(private)
+install_stored_rules :: proc(world: ^World) -> Run_Result {
 	rule_rows: [dynamic]v.Tuple
 	defer delete(rule_rows)
 	k.kernel_scan_into(world.kernel, k.SYSTEM_RULE_ID, []v.Binding{{}}, &rule_rows)

@@ -25,6 +25,8 @@ Frame_Arena :: struct {
 
 FRAME_DEFAULT_BLOCK_SIZE :: 64 * 1024
 FRAME_MAX_BLOCK_SIZE :: 8 * 1024 * 1024
+// Bytes of blocks an arena keeps when it returns to the pool.
+FRAME_POOL_KEEP :: 1024 * 1024
 
 frame_arena_init :: proc(arena: ^Frame_Arena, block_size := FRAME_DEFAULT_BLOCK_SIZE) {
 	arena.block_size = block_size
@@ -146,4 +148,40 @@ frame_alloc_proc :: proc(
 		return nil, .Mode_Not_Implemented
 	}
 	return nil, nil
+}
+
+// Total bytes of the blocks an arena holds, used or not.
+frame_arena_capacity :: proc(arena: ^Frame_Arena) -> int {
+	total := 0
+	for block := arena.first; block != nil; block = block.next {
+		total += len(block.data)
+	}
+	return total
+}
+
+// Frees blocks beyond the first `keep` bytes (a block that would cross the
+// budget goes too) and restarts block growth, so a recycled arena does not
+// hold its largest-ever size. Call on an empty (reset) arena.
+frame_arena_trim :: proc(arena: ^Frame_Arena, keep: int) {
+	kept := 0
+	last: ^Frame_Block
+	block := arena.first
+	for block != nil && kept + len(block.data) <= keep {
+		kept += len(block.data)
+		last = block
+		block = block.next
+	}
+	for block != nil {
+		next := block.next
+		free(raw_data(block.data), runtime.default_allocator())
+		free(block, runtime.default_allocator())
+		block = next
+	}
+	if last == nil {
+		arena.first = nil
+	} else {
+		last.next = nil
+	}
+	arena.current = arena.first
+	arena.block_size = FRAME_DEFAULT_BLOCK_SIZE
 }
