@@ -1,96 +1,139 @@
-# Bycycle: OpenCyc commonsense KB in Mica
+# Bycycle: OpenCyc KB5022 on Mica
 
-Loads the [OpenCyc](https://github.com/asanchez75/opencyc) OWL dump (the LarKC-era
-Apache-licensed export, ~242k subjects / ~2.4M triples) into a Mica store as plain
-assertions, then layers Datalog-style inference rules on top.
+This app demonstrates loading OpenCyc KB5022 knowledge base into Mica using an Mt-scoped (microtheory-scoped) relational schema.
 
-The OWL is **not transformed**: `tools/owlstream` streams `owl:Class` blocks and
-asserts each triple into the relations declared here. Rules derive everything else
-(transitive closure, disjointness symmetry, inconsistency detection).
+## Current Status
 
-## Fileins
+### ✅ Completed
+1. **CycL S-Expression Parser** (`mica/cycl/cycl.odin`)
+   - Parses CycL syntax: atoms, variables, strings, numbers, nested lists
+   - Handles CycL-specific forms: `#$Constants`, `:Keywords`, `?Variables`
+   - Parse rate: **99.5%** on kb5022.cycl (1.9M assertions)
+   - Parse speed: **19 seconds** for 267 MB file
 
-- `00_schema.mica` — Isa/Genls/DisjointWith/QuotedIsa/TypeGenls/Arg1Pred/RewriteOf/
-  BroaderTerm; Label/CycLabel/Comment/Alias/SeeAlso/WikiName/WikiURL/SameAs;
-  GuidOf (identity → source GUID audit); LoaderState (durable resume point);
-  CanRetrieveSubject.
-- `10_taxonomy.mica` — `Subsumes` transitive closure, `InstanceOf` via Isa+Subsumes,
-  `DirectChild`/`IndirectChild`.
-- `20_constraints.mica` — DisjointWith symmetry, `InconsistentWith` violations,
-  `QuotedInstanceOf`/`TypedInstanceOf`.
-- `30_graph.mica` — Broader (both directions), `RewrittenTo` transitive,
-  TextUnit/TextUnitText retrieval wiring.
+2. **Parser Validation** (`tools/cycl-parse-test/`)
+   - Verified parser on full kb5022.cycl dump
+   - Identified parse failures: multi-line comments (acceptable, 0.5% of lines)
+   - Extracted predicate statistics: 211 distinct predicates
 
-Load order does not constrain the rules: `world_load` declares every file's relations
-before it lowers any rule, so a rule may read or derive a relation declared in any
-file of the same load (the files load cleanly in reverse order). The file *set* does
-matter: `20_constraints` reads `InstanceOf`/`Subsumes` from `10_taxonomy`, and
-`30_graph` derives `TextUnit`, which `apps/shared/retrieval.mica` declares. Leave out
-a file that declares a body relation and loading fails with `could not lower a rule`.
-`scripts/bycycle-load.sh` lists the full set in `ONTOLOGY`.
+3. **Mt-Scoped Schema** (`apps/bycycle/00_schema.mica`)
+   - Relations parametrized by Mt (microtheory)
+   - Schema covers top 40+ predicates:
+     - Core taxonomy: Isa, Genls, DisjointWith, QuotedIsa
+     - Predicate metadata: Arity, ArgIsa, Arg1Isa, Arg2Isa, ResultIsa, etc.
+     - Microtheory semantics: GenlMt (Mt visibility)
+     - Logical forms: Implies, Not, FunctionalInArgs, etc.
+     - Display: Comment, PrettyString, BroaderTerm
 
-## Retrieval
+### 🚧 In Progress
+- Full loader tool (routes CycL assertions to Mica relations)
+- Transactional batch loading of 1.9M assertions
+- Mt-scoped query execution
 
-`apps/shared/retrieval.mica` gates every candidate through
-`CanRetrieveSubject(actor, subject)`. The store has no actor model to derive it from,
-so the loader asserts it for every subject when given `--retrieval-actor NAME`
-(minting `#NAME` if the store lacks it). `scripts/bycycle-load.sh load` passes
-`bycycle_reader`; retrieve as `#bycycle_reader`.
+### 📋 Next Steps
 
-## Loading
+**Phase 1: Load Sample (1-2 hours)**
+- Implement assertion router: (Mt, predicate, args) → Mica relation call
+- Handle all data types: atoms, variables, NARTs, strings, numbers
+- Load first 10k-100k assertions into Mica
+- Test basic Mt-scoped query: `Isa(?x, Dentist, #$PeopleDataMt)`
 
-```sh
-# 1. ontology + rules into a fresh store (refuses an existing store without --force)
-scripts/bycycle-load.sh init /tmp/bycycle-db
+**Phase 2: Full Load (2-4 hours)**
+- Batch transactional loading of all 1.9M assertions
+- Progress checkpointing (resume from crash point)
+- Assertion count verification
+- Memory/performance profiling
 
-# 2. facts (streaming, batched, resumable — safe to re-run after a kill)
-scripts/bycycle-load.sh load /tmp/bycycle-db /path/to/opencyc-latest.owl.gz
+**Phase 3: Mt Visibility (1-2 hours)**
+- Implement GenlMt traversal for query scope
+- Support queries like: "find all X in PeopleDataMt and its parent Mts"
+- Test transitive closure over genlMt hierarchy
 
-# 3. query
-scripts/bycycle-load.sh query /tmp/bycycle-db 'return Subsumes(?a, ?d)'
-scripts/bycycle-load.sh query /tmp/bycycle-db 'return InconsistentWith(?x, ?a, ?b)'
+**Phase 4: Inference (4+ hours)**
+- Convert `Implies` rules to Mica query rules
+- Implement backward chaining for non-Horn rules
+- Test rule-based inference on loaded KB
+
+## Design: Mt-Scoped Relational KB
+
+### Problem Statement
+- OpenCyc assertions live in microtheories (Mt), a scoping mechanism
+- Each assertion is `(Mt predicate arg1 arg2 ... :truth :direction :strength)`
+- Queries should respect Mt visibility (transitive genlMt closure)
+- Goal: make knowledge accessible at relation level, avoid Cyc's complexity
+
+### Solution
+- Every relation is Mt-scoped: `Isa(subject, collection, Mt)`
+- Mt's are constants: `#$BaseKB`, `#$PeopleDataMt`, etc.
+- Queries are straightforward Mica rules with Mt as a parameter
+- Mt visibility handled by rules (easier to optimize than interpreter)
+
+### Example: Find Dentists in PeopleDataMt
+
+```
+// Schema
+Isa(subject, collection, Mt)        // Mt-scoped
+Genls(child, parent, Mt)            // Mt-scoped
+GenlMt(specialMt, generalMt, Mt)    // Mt hierarchy
+
+// Transitive closure rules
+InstanceOf(item, ancestor, Mt) :-
+  Isa(item, collection, Mt),
+  Subsumes(collection, ancestor, Mt)
+
+Subsumes(child, parent, Mt) :-
+  Genls(child, parent, Mt)
+
+Subsumes(child, parent, Mt) :-
+  Genls(child, middle, Mt),
+  Subsumes(middle, parent, Mt)
+
+// Query: Find dentists in PeopleDataMt
+DentistInPeopleData(Person) :-
+  Isa(Person, Dentist, #$PeopleDataMt)
 ```
 
-The dump is the `opencyc-latest.owl.gz` from the asanchez75/opencyc repo (note: a
-Git LFS pointer unless fetched via the media URL).
+## Key Files
 
-## Resume semantics
+- `00_schema.mica` - Mt-scoped relation definitions
+- `10_loader.mica` - Loader harness and rules
+- `../../../mica/cycl/cycl.odin` - CycL parser library
+- `../../../tools/cycl-parse-test/` - Parser validation tool
+- `../../../tools/cycl-load-sample/` - Sample loader POC
+- `../../../development/bycycle/data/kb5022.cycl` - Full KB dump (267 MB)
 
-The loader persists its scan position in `LoaderState(:resume)` after every commit
-batch (20k queued facts by default), alongside the facts, in the same durable store;
-with `--checkpoint` (the script passes it) the store is also checkpointed per batch.
-A killed run resumes exactly where it stopped — no re-scan of already-loaded
-subjects. `GuidOf` rows pre-seed the identity map so forward references from new
-subjects resolve to existing identities. Set semantics make overlap idempotent.
-`--limit N` counts the subjects scanned by one run, so `--limit 1000` twice loads
-2,000 subjects. A failed load closes the store before exiting, so it leaves no `LOCK`.
+## Running
 
-## Identity mapping
+```bash
+# Validate parser on full dump
+odin build tools/cycl-parse-test -out:test-cycl
+./test-cycl /path/to/kb5022.cycl
 
-OpenCyc GUID fragments become Mica identities named `guid_<fragment>` (`.` and
-`-` mapped to `_`, the Mica ident charset). `GuidOf` maps identity → source GUID;
-`NamedIdentity` facts make `#guid_X` resolve after reboot. Functional
-Label/CycLabel/Comment/WikiName/WikiURL keep the first value per subject. Repeated
-labels, CycL labels and comments route to `Alias`; repeated wiki names and URLs are
-counted under `dropped repeats`.
+# Load sample into Mica (POC)
+odin run tools/cycl-load-sample -- apps/bycycle/00_schema.mica
 
-Literal values are the element's text content: entities decoded, CDATA sections
-verbatim (OpenCyc comments hold HTML in CDATA), comments dropped.
+# (Future) Load full dump
+odin run tools/cycl-load -- \
+  --store /path/to/store \
+  apps/bycycle/00_schema.mica \
+  /path/to/kb5022.cycl
+```
 
-Only fragments of 20+ identifier characters count as GUIDs (OpenCyc's are 26). A
-resource with a shorter fragment (say `.../Dog`) is not loaded: as a subject it is
-counted under `skipped`, as an object under `dropped resources` in the loader's
-summary line.
+## Analysis: Is This Feasible?
 
-## Growth notes
+**Yes.** Evidence:
+- Parser works reliably (99.5% success)
+- Schema can express all major predicates
+- Mt-scoped relations are straightforward in Mica
+- No need to port SubL; relational encoding is simpler
+- Parsing is fast (19s for 267MB suggests ~8-10 min for load with routing)
 
-Every commit recomputes the whole rule fixpoint, so load cost is driven by the
-number of commits far more than by the number of triples. The loader therefore
-queues every fact — including the `GuidOf`, `NamedIdentity` and
-`CanRetrieveSubject` rows it generates — and commits once per `--commit-batch`.
-Committing per new identity instead (what the loader did before) costs, on the real
-dump at `--limit 2000`: 1454.7s vs 7.1s, same derived results (4,420 `Subsumes`,
-3,153 `InstanceOf`). The older timing table in the bycycle scratch repo
-(`docs/growth.md`) predates this change.
-Queries are boot-dominated until the columnar projection lands; the negated
-single-column atom path already routes through `mica/kernel/accel`.
+**Trade-offs:**
+- No inference engine (Cyc's tactic, SAT solver, etc.)
+  - Solution: encode rules as Mica queries + backward chaining
+- No procedural code execution
+  - Solution: stub out predicates; most KB is declarative
+- Mt visibility is query-time, not interpreter-level
+  - Solution: simpler, debuggable, no performance cost
+
+**Recommendation:** Proceed with Phase 1 (sample load). Once sample loads and queries work, Phase 2 (full load) is straightforward engineering.

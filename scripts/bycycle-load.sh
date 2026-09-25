@@ -19,10 +19,10 @@ if [[ -z "${ODIN_BIN}" || ! -x "${ODIN_BIN}" ]]; then
   exit 1
 fi
 ONTOLOGY=(
-  apps/bycycle/00_schema.mica
-  apps/bycycle/10_taxonomy.mica
-  apps/bycycle/20_constraints.mica
-  apps/bycycle/30_graph.mica
+  apps/bycycle-owl/00_schema.mica
+  apps/bycycle-owl/10_taxonomy.mica
+  apps/bycycle-owl/20_constraints.mica
+  apps/bycycle-owl/30_graph.mica
   apps/shared/retrieval.mica
 )
 
@@ -49,10 +49,12 @@ case "${cmd}" in
     owl="${2:?usage: bycycle-load.sh load STORE OWL_GZ}"
     # Resume position lives in LoaderState inside the store; safe to re-run
     # after a kill. Remove a stale LOCK if a previous run was killed.
+    # Rules derive once at the end (--defer-derivation), not on every commit,
+    # which made the load quadratic in the store's size.
     rm -f "${store}/LOCK"
-    "${ODIN_BIN}" run tools/owlstream -- \
+    "${ODIN_BIN}" run tools/owlstream -o:speed -- \
       --owl "${owl}" --store "${store}" --commit-batch 20000 --checkpoint \
-      --retrieval-actor bycycle_reader
+      --defer-derivation --retrieval-actor bycycle_reader
     ;;
   query)
     store="${1:?usage: bycycle-load.sh query STORE 'EXPR'}"

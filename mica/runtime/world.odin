@@ -1029,7 +1029,20 @@ world_boot_program :: proc(world: ^World, store: ^s.Store) -> Run_Result {
 // reflection facts. The lowered bodies are not persisted, so they are parsed
 // and converted again here.
 @(private)
+// Each rule install would otherwise re-run the fixpoint over every stored
+// fact, once per rule; derivation is suspended while the rules install and
+// runs once when they are all in place.
 restore_rules :: proc(world: ^World) -> Run_Result {
+	k.kernel_set_derivation(world.kernel, false)
+	result := install_stored_rules(world)
+	if !k.kernel_set_derivation(world.kernel, true) && result.ok {
+		return Run_Result{ok = false, message = "cannot derive the restored rules"}
+	}
+	return result
+}
+
+@(private)
+install_stored_rules :: proc(world: ^World) -> Run_Result {
 	rule_rows: [dynamic]v.Tuple
 	defer delete(rule_rows)
 	k.kernel_scan_into(world.kernel, k.SYSTEM_RULE_ID, []v.Binding{{}}, &rule_rows)

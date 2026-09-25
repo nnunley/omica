@@ -335,10 +335,10 @@ run_web_smoke() {
 
 # The bycycle ontology (mirror of ONTOLOGY in scripts/bycycle-load.sh).
 bycycle_fileins=(
-  apps/bycycle/00_schema.mica
-  apps/bycycle/10_taxonomy.mica
-  apps/bycycle/20_constraints.mica
-  apps/bycycle/30_graph.mica
+  apps/bycycle-owl/00_schema.mica
+  apps/bycycle-owl/10_taxonomy.mica
+  apps/bycycle-owl/20_constraints.mica
+  apps/bycycle-owl/30_graph.mica
   apps/shared/retrieval.mica
 )
 owl_fixture=tools/owlstream/testdata/fixture.owl
@@ -416,6 +416,24 @@ run_owlstream_checks() {
     pass "integration:owlstream-resume"
   else
     problem "integration:owlstream-resume (${tmp}/owl-resumed.log)"
+    diff <(echo "${owl_fingerprint_expected}") <(echo "${out}") || true
+  fi
+
+  # --defer-derivation: commits write facts only and the rules run once at the
+  # end of each run, so resumed slices must still leave every derived row.
+  run_timeout "${test_timeout}" "${filein}" --store "${tmp}/owl-deferred" --unit bycycle \
+    "${bycycle_fileins[@]}" --checkpoint >/dev/null
+  ok=1
+  for limit in 2 0; do
+    run_timeout "${test_timeout}" "${owlstream}" --owl "${owl_fixture}" \
+      --store "${tmp}/owl-deferred" --commit-batch 3 --checkpoint --limit "${limit}" \
+      --defer-derivation --retrieval-actor bycycle_reader >"${tmp}/owl-deferred.log" 2>&1 || ok=0
+  done
+  out="$(owl_fingerprint "${filein}" "${tmp}/owl-deferred")"
+  if [[ "${ok}" -eq 1 && "${out}" == "${owl_fingerprint_expected}" ]]; then
+    pass "integration:owlstream-deferred"
+  else
+    problem "integration:owlstream-deferred (${tmp}/owl-deferred.log)"
     diff <(echo "${owl_fingerprint_expected}") <(echo "${out}") || true
   fi
 

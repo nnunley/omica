@@ -358,6 +358,9 @@ snapshot_compute_derived :: proc(snapshot: ^Snapshot, kernel: ^Kernel = nil) {
 	}
 	alloc := virtual.arena_allocator(arena)
 
+	if kernel != nil {
+		sync.atomic_add_explicit(&kernel.derivations, 1, .Release)
+	}
 	derived, err := rules_evaluate(alloc, snapshot.rules, snapshot, kernel)
 	if err != .None {
 		snapshot.derived = nil

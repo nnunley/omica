@@ -36,6 +36,7 @@ main :: proc() {
 	disasm := false
 	accel_mode := r.Accel_Mode.Unchanged
 	accel_report := false
+	print_result := false
 	paths: [dynamic]string
 	defer delete(paths)
 
@@ -79,13 +80,15 @@ main :: proc() {
 			}
 		case arg == "--accel-report":
 			accel_report = true
+		case arg == "--result":
+			print_result = true
 		case:
 			append(&paths, arg)
 		}
 		index += 1
 	}
 	if len(paths) == 0 {
-		fmt.eprintln("usage: micabench [--samples N] [--budget-ms M] [--workers N] [--accel MODE] [--accel-report] <file.mica>...")
+		fmt.eprintln("usage: micabench [--samples N] [--budget-ms M] [--workers N] [--accel MODE] [--accel-report] [--result] <file.mica>...")
 		os.exit(2)
 	}
 
@@ -97,7 +100,7 @@ main :: proc() {
 			}
 			continue
 		}
-		if run_file(path, samples, budget_ms, workers, accel_mode, accel_report) {
+		if run_file(path, samples, budget_ms, workers, accel_mode, accel_report, print_result) {
 			reported += 1
 		}
 	}
@@ -146,7 +149,12 @@ parse_int :: proc(text: string, fallback: int) -> int {
 }
 
 @(private)
-run_file :: proc(path: string, samples, budget_ms, workers: int, accel_mode: r.Accel_Mode, accel_report: bool) -> bool {
+run_file :: proc(
+	path: string,
+	samples, budget_ms, workers: int,
+	accel_mode: r.Accel_Mode,
+	accel_report, print_result: bool,
+) -> bool {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -176,6 +184,11 @@ run_file :: proc(path: string, samples, budget_ms, workers: int, accel_mode: r.A
 	if probe.kind != .Complete {
 		fmt.eprintf("FAIL %s: bench: %s\n", path, probe.message)
 		return false
+	}
+	// The first call's value, so runs can be checked against another
+	// implementation of the same corpus.
+	if print_result {
+		fmt.printf("result\t%s\t%s\n", filepath.base(path), r.world_value_literal(world, probe.value, context.temp_allocator))
 	}
 
 	// Calibrate the inner repeat count so one sample spans ~budget_ms.

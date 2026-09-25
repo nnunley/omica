@@ -1,13 +1,13 @@
 // OWL fact loading: stream triples into kernel asserts.
 //
 // The loader opens (or boots) a world whose bycycle relations were declared
-// by the apps/bycycle fileins, then streams owl:Class blocks: one kernel
+// by the apps/bycycle-owl fileins, then streams owl:Class blocks: one kernel
 // transaction per --commit-batch queued facts, each triple becoming one
 // assertion. GUID subjects and GUID objects become named identities
 // (#guid_<sanitized>); literals become strings. A GuidOf functional relation
 // maps identity -> GUID string for audit; labels/comments live in
 // Label/Comment/Alias functional relations. The inferencing rules live in the
-// apps/bycycle fileins.
+// apps/bycycle-owl fileins.
 package main
 
 import "core:fmt"
@@ -122,6 +122,8 @@ Loader_Stats :: struct {
 	assert_seconds:  f64,
 	commit_seconds:  f64,
 	checkpoint_seconds: f64,
+	// The one fixpoint run at the end of a --defer-derivation load.
+	derive_seconds: f64,
 	// Error counters (omica has no telemetry package; loader-local).
 	err_assert:    int,
 	err_commit:    int,
@@ -268,6 +270,7 @@ run_load :: proc(
 	durability: s.Durability,
 	checkpoint: bool,
 	retrieval_actor: string,
+	defer_derivation: bool,
 ) -> bool {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
@@ -284,6 +287,14 @@ run_load :: proc(
 		return false
 	}
 	defer r.world_destroy(world)
+
+	// Every commit otherwise re-runs the whole rule fixpoint over the store,
+	// which makes a load quadratic in its size. Suspended, commits write
+	// facts only, and the fixpoint runs once below. A store persisted while
+	// suspended re-derives when it is reopened.
+	if defer_derivation {
+		r.world_set_derivation(world, false)
+	}
 
 	ld: Loader
 	ld.world = world
@@ -399,6 +410,14 @@ run_load :: proc(
 	flush(&ld) or_return
 	reset_batch(&ld)
 	ld.stats.scan_seconds += time.duration_seconds(time.tick_since(scan_t0))
+	if defer_derivation {
+		derive_t0 := time.tick_now()
+		if !r.world_set_derivation(world, true) {
+			fmt.eprintf("derivation resume failed\n")
+			return false
+		}
+		ld.stats.derive_seconds = time.duration_seconds(time.tick_since(derive_t0))
+	}
 	if checkpoint {
 		checkpoint_here(&ld)
 	}
@@ -483,13 +502,14 @@ queue :: proc(ld: ^Loader, field: Field, a, b: v.Value) {
 // Prints the load timing curve: wall per phase plus derived rates. Called
 // once at the end of run_load so a single pass reports the whole curve.
 print_timing_summary :: proc(stats: ^Loader_Stats) {
-	total := stats.scan_seconds + stats.assert_seconds + stats.commit_seconds + stats.checkpoint_seconds
+	total := stats.scan_seconds + stats.assert_seconds + stats.commit_seconds + stats.checkpoint_seconds + stats.derive_seconds
 	fmt.eprintf(
-		"timing: scan %.1fs assert %.1fs commit %.1fs checkpoint %.1fs total %.1fs\n",
+		"timing: scan %.1fs assert %.1fs commit %.1fs checkpoint %.1fs derive %.1fs total %.1fs\n",
 		stats.scan_seconds,
 		stats.assert_seconds,
 		stats.commit_seconds,
 		stats.checkpoint_seconds,
+		stats.derive_seconds,
 		total,
 	)
 	if stats.subjects > 0 && total > 0 {

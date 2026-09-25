@@ -1,34 +1,64 @@
-// Bycycle ontology: schema for OpenCyc facts loaded by tools/owlstream.
-// OWL facts pass through the loader as assertions; these relations are the
-// schema they land in. Core taxonomic relationships first; display and
-// provenance relations alongside. Inferencing rules below derive the
-// closure the loader does not materialize.
+// Bycycle ontology: schema for OpenCyc KB5022 loaded from text dump.
+// Every assertion in CycL is scoped to a microtheory (Mt).
+// Relations are Mt-scoped (except for some display/utility relations).
+//
+// Mt visibility: genlMt relates microtheories; queries should transitively
+// include facts from all ancestor Mts (per Cyc semantics).
 
-make_relation(:Isa, 2)
-make_relation(:Genls, 2)
-make_relation(:DisjointWith, 2)
-make_relation(:QuotedIsa, 2)
-make_relation(:TypeGenls, 2)
-make_relation(:Arg1Pred, 2)
-make_relation(:RewriteOf, 2)
-make_relation(:BroaderTerm, 2)
+// Core taxonomic relationships (Mt-scoped)
+make_relation(:Isa, 3)           // Isa(subject, collection, Mt)
+make_relation(:Genls, 3)         // Genls(child, parent, Mt)
+make_relation(:DisjointWith, 3)  // DisjointWith(a, b, Mt)
+make_relation(:QuotedIsa, 3)     // QuotedIsa(subject, collection, Mt)
 
+// Variant relationships
+make_relation(:TypeGenls, 3)     // TypeGenls(child, parent, Mt)
+
+// Predicate metadata (Mt-scoped)
+make_relation(:Arity, 3)         // Arity(predicate, arity_value, Mt)
+make_relation(:ArgIsa, 4)        // ArgIsa(predicate, argNum, argType, Mt)
+make_relation(:Arg1Isa, 3)       // Arg1Isa(predicate, argType, Mt)
+make_relation(:Arg2Isa, 3)       // Arg2Isa(predicate, argType, Mt)
+make_relation(:Arg3Isa, 3)       // Arg3Isa(predicate, argType, Mt)
+make_relation(:Arg1Genl, 3)      // Arg1Genl(predicate, genlArg, Mt)
+make_relation(:Arg2Genl, 3)      // Arg2Genl(predicate, genlArg, Mt)
+make_relation(:ArgFormat, 4)     // ArgFormat(predicate, argNum, format, Mt)
+make_relation(:Arg2Format, 3)    // Arg2Format(predicate, format, Mt)
+make_relation(:ResultIsa, 3)     // ResultIsa(predicate, resultType, Mt)
+
+// Predicate relationships
+make_relation(:GenlPreds, 3)     // GenlPreds(childPred, parentPred, Mt)
+make_relation(:ArgGenl, 4)       // ArgGenl(predicate, argNum, genlArg, Mt)
+
+// Metadata and properties
+make_relation(:Comment, 3)       // Comment(term, text, Mt)
+make_relation(:PrettyString, 3)  // PrettyString(term, text, Mt)
+make_relation(:BroaderTerm, 3)   // BroaderTerm(term, broaderTerm, Mt)
+
+// Microtheory relationships
+make_relation(:GenlMt, 3)        // GenlMt(specializedMt, generalMt, Mt)
+
+// Logical rules and special forms
+make_relation(:Implies, 3)       // Implies(antecedent, consequent, Mt)
+make_relation(:Not, 3)           // Not(formula, Mt)
+
+// Logical form properties
+make_relation(:FunctionalInArgs, 3)              // FunctionalInArgs(predicate, args, Mt)
+make_relation(:SingleEntryFormatInArgs, 3)      // SingleEntryFormatInArgs(predicate, args, Mt)
+make_relation(:StrictlyFunctionalInArgs, 3)     // StrictlyFunctionalInArgs(predicate, args, Mt)
+make_relation(:QuotedArgument, 3)               // QuotedArgument(predicate, argNum, Mt)
+make_relation(:ArgQuotedIsa, 3)                 // ArgQuotedIsa(predicate, argNum, Mt)
+
+// Display relations (not Mt-scoped, used for UI)
+make_functional_relation(:PrettyString-Canonical, 2, [0])
 make_functional_relation(:Label, 2, [0])
 make_functional_relation(:CycLabel, 2, [0])
-make_functional_relation(:Comment, 2, [0])
-make_relation(:Alias, 2)
-make_relation(:SeeAlso, 2)
 make_functional_relation(:WikiName, 2, [0])
 make_functional_relation(:WikiURL, 2, [0])
-make_relation(:SameAs, 2)
-make_relation(:CanRetrieveSubject, 2)
 
-// Audit: loader identity -> OpenCyc GUID string. Invertible mapping from
-// #guid_<fragment> names back to source GUIDs.
-make_functional_relation(:GuidOf, 2, [0])
+// Term of unit (NARTs)
+make_relation(:TermOfUnit, 3)    // TermOfUnit(nart, unit, Mt)
 
-// Loader durable resume point: functional key :resume ->
-// "owl_path\nbyte_offset\nsubjects_committed". Written after each checkpoint
-// so a killed run resumes exactly where it stopped (no re-scan of
-// already-loaded subjects).
+// Loader state: resume points for batch loading
 make_functional_relation(:LoaderState, 2, [0])
+make_functional_relation(:AssertionCount, 2, [0])

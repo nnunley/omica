@@ -62,13 +62,14 @@ RDFS_COMMENT :: "rdfs:comment"
 
 @(private)
 USAGE :: "usage: owlstream --owl PATH [--store DIR] [--census] [--limit N] " +
-	"[--commit-batch N] [--durability none|group|strict] [--checkpoint] [--retrieval-actor NAME]\n" +
+	"[--commit-batch N] [--durability none|group|strict] [--checkpoint] [--retrieval-actor NAME] [--defer-derivation]\n" +
 	"  --census: print top-level element + child predicate frequencies, assert nothing\n" +
 	"  --limit N: stop after scanning N subjects this run; subjects a resumed run\n" +
 	"             skips past do not count (default 0 = all)\n" +
 	"  --commit-batch N: queued facts per transaction commit (default 20000)\n" +
 	"  --checkpoint: checkpoint the store after every commit batch\n" +
-	"  --retrieval-actor NAME: assert CanRetrieveSubject(#NAME, subject) for every subject\n"
+	"  --retrieval-actor NAME: assert CanRetrieveSubject(#NAME, subject) for every subject\n" +
+	"  --defer-derivation: suspend rule derivation while loading; derive once at the end\n"
 
 main :: proc() {
 	owl_path := ""
@@ -78,6 +79,7 @@ main :: proc() {
 	commit_batch := 20000
 	checkpoint := false
 	retrieval_actor := ""
+	defer_derivation := false
 	durability := s.Durability.Group
 
 	arguments := os.args[1:]
@@ -132,6 +134,8 @@ main :: proc() {
 			}
 		case "--checkpoint":
 			checkpoint = true
+		case "--defer-derivation":
+			defer_derivation = true
 		case "--retrieval-actor":
 			index += 1
 			if index >= len(arguments) {
@@ -200,6 +204,7 @@ main :: proc() {
 			durability,
 			checkpoint,
 			retrieval_actor,
+			defer_derivation,
 		)
 	}
 	if have_buf {
