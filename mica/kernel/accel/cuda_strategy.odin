@@ -15,11 +15,13 @@ cuda_strategy :: proc() -> Strategy {
 		membership_select = cuda_membership_select,
 		cosine_query = cuda_cosine_query,
 		cosine_queries = cuda_cosine_queries,
+		membership_select2 = cuda_membership_select2_impl,
 		prepare_column = cuda_prepare_column_impl,
 		membership_select_prepared = cuda_membership_select_prepared_impl,
 		prepare_docs = cuda_prepare_docs_impl,
 		cosine_queries_prepared = cuda_cosine_queries_prepared_impl,
 		release = cuda_release_impl,
+		resident_min_probes = CUDA_MEMBERSHIP_MIN_ROWS,
 	}
 }
 

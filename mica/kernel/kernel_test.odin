@@ -1,9 +1,11 @@
 package kernel
 
 import "core:mem"
+import "core:sync"
 import "core:testing"
 import "core:time"
 import v "../var"
+import accel "./accel"
 
 @(private)
 must_int :: proc(n: i64) -> v.Value {
@@ -2428,6 +2430,330 @@ test_negated_atom_batch_path :: proc(t: ^testing.T) {
 	for i in 1 ..= 64 {
 		has := has_tuple(rows[:], tuple_of(must_identity(u64(i))))
 		testing.expectf(t, has == (i % 2 == 1), "item %d: has=%v", i, has)
+	}
+}
+
+// The accelerator strategy is process-wide and tests run on parallel threads.
+// Tests that install a strategy, or assert counts that depend on which one is
+// active, hold this lock.
+@(private)
+strategy_tests_lock: sync.Mutex
+
+// A negated computed relation that requires its column bound: the batch path's
+// unbound scan fails, so it must decline and let the row path probe each
+// binding (bound). Before the fix every item came out "odd".
+@(test)
+test_negated_batch_declines_on_computed_scan_error :: proc(t: ^testing.T) {
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	item := create_relation(&kernel, 1, "Item", 1)
+	even := create_relation(&kernel, 2, "Even", 1)
+	odd := create_relation(&kernel, 3, "Odd", 1)
+	testing.expect_value(
+		t,
+		kernel_register_computed_relation(
+			&kernel,
+			even,
+			[]u16{0},
+			proc(user: rawptr, source: ^Relation_Source, bindings: []v.Binding, visit: Computed_Visit_Proc, visit_user: rawptr) -> Kernel_Error {
+				id, ok := v.value_as_identity(bindings[0].value)
+				if ok && u64(id) % 2 == 0 {
+					visit(visit_user, v.tuple_new(context.temp_allocator, []v.Value{bindings[0].value}))
+				}
+				return .None
+			},
+		),
+		Kernel_Error.None,
+	)
+
+	x := v.symbol_intern("x")
+	rule := rule_new(
+		odd,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(item, []Term{term_var(x)})),
+			body_atom(atom_negated(even, []Term{term_var(x)})),
+		},
+	)
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(811), rule, "Odd(x) :- Item(x), not Even(x).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	tx := kernel_begin(&kernel)
+	for i in 1 ..= 64 {
+		transaction_assert(&tx, item, tuple_of(must_identity(u64(i))))
+	}
+	commit_transaction(t, &tx)
+
+	rows := kernel_rows(&kernel, odd, 1)
+	defer delete(rows)
+	testing.expect_value(t, len(rows), 32)
+	for i in 1 ..= 64 {
+		has := has_tuple(rows[:], tuple_of(must_identity(u64(i))))
+		testing.expectf(t, has == (i % 2 == 1), "item %d: has=%v", i, has)
+	}
+}
+
+// The batch path records its outcome: with the CPU reference strategy active,
+// the 64-item negation of test_negated_atom_batch_path completes on the batch
+// path at least once per evaluation.
+@(test)
+test_negated_batch_records_placement :: proc(t: ^testing.T) {
+	sync.mutex_lock(&strategy_tests_lock)
+	defer sync.mutex_unlock(&strategy_tests_lock)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+
+	item := create_relation(&kernel, 1, "Item", 1)
+	held := create_relation(&kernel, 2, "Held", 1)
+	free := create_relation(&kernel, 3, "Free", 1)
+	x := v.symbol_intern("x")
+	rule := rule_new(
+		free,
+		[]Term{term_var(x)},
+		[]Rule_Body_Item {
+			body_atom(atom_positive(item, []Term{term_var(x)})),
+			body_atom(atom_negated(held, []Term{term_var(x)})),
+		},
+	)
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(812), rule, "Free(x) :- Item(x), not Held(x).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	before := placement_counts_this_thread()
+	tx := kernel_begin(&kernel)
+	for i in 1 ..= 64 {
+		transaction_assert(&tx, item, tuple_of(must_identity(u64(i))))
+		if i % 2 == 0 {
+			transaction_assert(&tx, held, tuple_of(must_identity(u64(i))))
+		}
+	}
+	commit_transaction(t, &tx)
+	delta := placement_counts_delta(before, placement_counts_this_thread())
+	testing.expect(t, delta[.Negated_Membership][.Completed] >= 1)
+}
+
+// Two-position negation (visible_items shape) on the batch path, identical to
+// the row path's answer.
+@(test)
+test_negated_batch_two_positions :: proc(t: ^testing.T) {
+	sync.mutex_lock(&strategy_tests_lock)
+	defer sync.mutex_unlock(&strategy_tests_lock)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+	sees := create_relation(&kernel, 1, "Sees", 2)
+	hidden := create_relation(&kernel, 2, "Hidden", 2)
+	visible := create_relation(&kernel, 3, "Visible", 2)
+	a, i := v.symbol_intern("a"), v.symbol_intern("i")
+	rule := rule_new(visible, []Term{term_var(a), term_var(i)}, []Rule_Body_Item {
+		body_atom(atom_positive(sees, []Term{term_var(a), term_var(i)})),
+		body_atom(atom_negated(hidden, []Term{term_var(a), term_var(i)})),
+	})
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(813), rule, "Visible(a, i) :- Sees(a, i), not Hidden(a, i).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+	before := placement_counts_this_thread()
+	tx := kernel_begin(&kernel)
+	for actor in 1 ..= 8 {
+		for item in 100 ..< 132 {
+			transaction_assert(&tx, sees, tuple_of(must_identity(u64(actor)), must_identity(u64(item))))
+			if (actor + item) % 5 == 0 {
+				transaction_assert(&tx, hidden, tuple_of(must_identity(u64(actor)), must_identity(u64(item))))
+			}
+		}
+	}
+	commit_transaction(t, &tx)
+	rows := kernel_rows(&kernel, visible, 2)
+	defer delete(rows)
+	expected := 0
+	for actor in 1 ..= 8 {
+		for item in 100 ..< 132 {
+			shown := (actor + item) % 5 != 0
+			if shown {
+				expected += 1
+			}
+			has := has_tuple(rows[:], tuple_of(must_identity(u64(actor)), must_identity(u64(item))))
+			testing.expectf(t, has == shown, "actor %d item %d: has=%v", actor, item, has)
+		}
+	}
+	testing.expect_value(t, len(rows), expected)
+	delta := placement_counts_delta(before, placement_counts_this_thread())
+	testing.expect(t, delta[.Negated_Membership][.Completed] >= 1)
+}
+
+// Integer probes pack now (Stage 0 counted them Not_Packable); string probes
+// still take the row path and give the same answer.
+@(test)
+test_negated_batch_ints_pack_strings_do_not :: proc(t: ^testing.T) {
+	sync.mutex_lock(&strategy_tests_lock)
+	defer sync.mutex_unlock(&strategy_tests_lock)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+	item := create_relation(&kernel, 1, "Item", 1)
+	held := create_relation(&kernel, 2, "Held", 1)
+	free := create_relation(&kernel, 3, "Free", 1)
+	x := v.symbol_intern("x")
+	rule := rule_new(free, []Term{term_var(x)}, []Rule_Body_Item {
+		body_atom(atom_positive(item, []Term{term_var(x)})),
+		body_atom(atom_negated(held, []Term{term_var(x)})),
+	})
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(814), rule, "Free(x) :- Item(x), not Held(x).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+
+	before := placement_counts_this_thread()
+	tx := kernel_begin(&kernel)
+	for i in 1 ..= 40 {
+		n, _ := v.value_int(i64(i))
+		transaction_assert(&tx, item, tuple_of(n))
+		if i % 4 == 0 {
+			transaction_assert(&tx, held, tuple_of(n))
+		}
+	}
+	commit_transaction(t, &tx)
+	ints := placement_counts_delta(before, placement_counts_this_thread())
+	testing.expect(t, ints[.Negated_Membership][.Completed] >= 1)
+	rows := kernel_rows(&kernel, free, 1)
+	testing.expect_value(t, len(rows), 30)
+	delete(rows)
+
+	before = placement_counts_this_thread()
+	tx = kernel_begin(&kernel)
+	word := v.value_string(context.temp_allocator, "word")
+	transaction_assert(&tx, item, tuple_of(word))
+	commit_transaction(t, &tx)
+	strs := placement_counts_delta(before, placement_counts_this_thread())
+	testing.expect(t, strs[.Negated_Membership][.Not_Packable] >= 1)
+	rows = kernel_rows(&kernel, free, 1)
+	testing.expect_value(t, len(rows), 31)
+	delete(rows)
+	free_all(context.temp_allocator)
+}
+
+// Three-position negation declines, counted.
+@(test)
+test_negated_batch_three_positions_counted_unsupported :: proc(t: ^testing.T) {
+	sync.mutex_lock(&strategy_tests_lock)
+	defer sync.mutex_unlock(&strategy_tests_lock)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+	base := create_relation(&kernel, 1, "Base", 3)
+	block := create_relation(&kernel, 2, "Block", 3)
+	out := create_relation(&kernel, 3, "Out", 3)
+	a, b, c := v.symbol_intern("a"), v.symbol_intern("b"), v.symbol_intern("c")
+	rule := rule_new(out, []Term{term_var(a), term_var(b), term_var(c)}, []Rule_Body_Item {
+		body_atom(atom_positive(base, []Term{term_var(a), term_var(b), term_var(c)})),
+		body_atom(atom_negated(block, []Term{term_var(a), term_var(b), term_var(c)})),
+	})
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(815), rule, "Out(a,b,c) :- Base(a,b,c), not Block(a,b,c).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+	before := placement_counts_this_thread()
+	tx := kernel_begin(&kernel)
+	transaction_assert(&tx, base, tuple_of(must_identity(1), must_identity(2), must_identity(3)))
+	transaction_assert(&tx, base, tuple_of(must_identity(1), must_identity(2), must_identity(4)))
+	transaction_assert(&tx, block, tuple_of(must_identity(1), must_identity(2), must_identity(4)))
+	commit_transaction(t, &tx)
+	delta := placement_counts_delta(before, placement_counts_this_thread())
+	testing.expect(t, delta[.Negated_Membership][.Unsupported] >= 1)
+	rows := kernel_rows(&kernel, out, 3)
+	defer delete(rows)
+	testing.expect_value(t, len(rows), 1)
+}
+
+// A strategy that declines after the keys are packed must not throw them
+// away: the CPU reference finishes the step on the packed keys (Cpu_Fallback),
+// with the same answer.
+@(test)
+test_negated_batch_strategy_decline_falls_back_to_cpu_on_packed_keys :: proc(t: ^testing.T) {
+	sync.mutex_lock(&strategy_tests_lock)
+	defer sync.mutex_unlock(&strategy_tests_lock)
+	declining := accel.cpu_strategy()
+	declining.name = "declining"
+	declining.membership_select = proc(left: []u64, right: []u64, keep: bool, allocator: mem.Allocator) -> ([]bool, bool) {
+		return nil, false
+	}
+	declining.prepare_column = nil
+	accel.select_strategy(declining)
+	defer accel.use_cpu()
+
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+	item := create_relation(&kernel, 1, "Item", 1)
+	held := create_relation(&kernel, 2, "Held", 1)
+	free := create_relation(&kernel, 3, "Free", 1)
+	x := v.symbol_intern("x")
+	rule := rule_new(free, []Term{term_var(x)}, []Rule_Body_Item {
+		body_atom(atom_positive(item, []Term{term_var(x)})),
+		body_atom(atom_negated(held, []Term{term_var(x)})),
+	})
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(816), rule, "Free(x) :- Item(x), not Held(x).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+	before := placement_counts_this_thread()
+	tx := kernel_begin(&kernel)
+	for i in 1 ..= 30 {
+		transaction_assert(&tx, item, tuple_of(must_identity(u64(i))))
+		if i % 3 == 0 {
+			transaction_assert(&tx, held, tuple_of(must_identity(u64(i))))
+		}
+	}
+	commit_transaction(t, &tx)
+	delta := placement_counts_delta(before, placement_counts_this_thread())
+	testing.expect_value(t, delta[.Negated_Membership][.Completed], 0)
+	testing.expect_value(t, delta[.Negated_Membership][.Cpu_Fallback], 1)
+	rows := kernel_rows(&kernel, free, 1)
+	defer delete(rows)
+	testing.expect_value(t, len(rows), 20)
+}
+
+// Constants in a negated atom pack like variables.
+@(test)
+test_negated_batch_constant_term :: proc(t: ^testing.T) {
+	sync.mutex_lock(&strategy_tests_lock)
+	defer sync.mutex_unlock(&strategy_tests_lock)
+	kernel: Kernel
+	kernel_init(&kernel)
+	defer kernel_destroy(&kernel)
+	item := create_relation(&kernel, 1, "Item", 1)
+	tag := create_relation(&kernel, 2, "Tag", 2)
+	untagged := create_relation(&kernel, 3, "Untagged", 1)
+	x := v.symbol_intern("x")
+	fixed := must_identity(999)
+	rule := rule_new(untagged, []Term{term_var(x)}, []Rule_Body_Item {
+		body_atom(atom_positive(item, []Term{term_var(x)})),
+		body_atom(atom_negated(tag, []Term{term_var(x), term_value(fixed)})),
+	})
+	snapshot, err := kernel_install_rule(&kernel, v.Identity(817), rule, "Untagged(x) :- Item(x), not Tag(x, #fixed).")
+	testing.expect_value(t, err, Kernel_Error.None)
+	snapshot_release(snapshot)
+	before := placement_counts_this_thread()
+	tx := kernel_begin(&kernel)
+	for i in 1 ..= 20 {
+		transaction_assert(&tx, item, tuple_of(must_identity(u64(i))))
+		if i % 4 == 0 {
+			transaction_assert(&tx, tag, tuple_of(must_identity(u64(i)), fixed))
+		}
+		if i % 5 == 0 {
+			transaction_assert(&tx, tag, tuple_of(must_identity(u64(i)), must_identity(7)))
+		}
+	}
+	commit_transaction(t, &tx)
+	delta := placement_counts_delta(before, placement_counts_this_thread())
+	testing.expect_value(t, delta[.Negated_Membership][.Completed], 1)
+	rows := kernel_rows(&kernel, untagged, 1)
+	defer delete(rows)
+	testing.expect_value(t, len(rows), 15)
+	for i in 1 ..= 20 {
+		has := has_tuple(rows[:], tuple_of(must_identity(u64(i))))
+		testing.expectf(t, has == (i % 4 != 0), "item %d: has=%v", i, has)
 	}
 }
 

@@ -27,6 +27,10 @@ Relation_Source :: struct {
 	delta:              ^Rule_Derived,
 	delta_relation:     Relation_ID,
 	delta_active:       bool,
+	// Per-evaluation packed keys for negated membership (and later joins).
+	// Set by rules_evaluate_source for the duration of one evaluation; nil
+	// elsewhere, where operators use the row path.
+	packed:             ^Packed_Cache,
 	// Set when a computed scan cannot execute, for example because a required
 	// access key was unbound. Callers translate it to their query error.
 	error:              Kernel_Error,

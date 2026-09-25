@@ -50,6 +50,28 @@ extern "C" __global__ void membership(const unsigned long long* left,
     out[row] = (hit == (keep_matches != 0)) ? 1 : 0;
 }
 
+// Two-key membership: left and right hold interleaved (a, b) pairs; right is
+// sorted-unique lexicographically.
+extern "C" __global__ void membership2(const unsigned long long* left,
+                                       const unsigned long long* right,
+                                       unsigned char* out,
+                                       unsigned int left_len,
+                                       unsigned int right_len,
+                                       unsigned int keep_matches) {
+    unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= left_len) return;
+    unsigned long long p0 = left[2ull * row], p1 = left[2ull * row + 1];
+    unsigned int lo = 0, hi = right_len;
+    while (lo < hi) {
+        unsigned int mid = lo + ((hi - lo) >> 1);
+        unsigned long long r0 = right[2ull * mid], r1 = right[2ull * mid + 1];
+        if (r0 < p0 || (r0 == p0 && r1 < p1)) lo = mid + 1;
+        else hi = mid;
+    }
+    bool hit = (lo < right_len && right[2ull * lo] == p0 && right[2ull * lo + 1] == p1);
+    out[row] = (hit == (keep_matches != 0)) ? 1 : 0;
+}
+
 // One thread per (query, doc) pair, the same arithmetic as the CPU reference.
 extern "C" __global__ void cosine(const float* queries,
                                   const float* docs,
@@ -165,6 +187,7 @@ Cuda_Device_State :: struct {
 	ctx:        CU_Context,
 	module:     CU_Module,
 	membership: CU_Function,
+	membership2: CU_Function,
 	cosine:     CU_Function,
 	name_buf:   [128]u8,
 	name:       string,
@@ -273,6 +296,9 @@ cuda_device_locked :: proc(ordinal: int) -> ^Cuda_Device_State {
 	}
 	if r := drv.cuModuleGetFunction(&state.membership, state.module, "membership"); r != CU_SUCCESS {
 		return cuda_device_failed(ordinal, "cuModuleGetFunction(membership)", r)
+	}
+	if r := drv.cuModuleGetFunction(&state.membership2, state.module, "membership2"); r != CU_SUCCESS {
+		return cuda_device_failed(ordinal, "cuModuleGetFunction(membership2)", r)
 	}
 	if r := drv.cuModuleGetFunction(&state.cosine, state.module, "cosine"); r != CU_SUCCESS {
 		return cuda_device_failed(ordinal, "cuModuleGetFunction(cosine)", r)
@@ -443,6 +469,7 @@ cuda_membership_run_locked :: proc(
 		delete(out, allocator)
 		return nil, false
 	}
+	last_decline = .None
 	return out, true
 }
 
@@ -484,18 +511,49 @@ cuda_cosine_run_locked :: proc(
 		delete(out, allocator)
 		return nil, false
 	}
+	last_decline = .None
 	return out, true
 }
 
+// Size checks for membership: small inputs decline Below_Threshold, inputs
+// past the kernels' u32 indexing decline Unsupported.
 @(private)
-cuda_membership_eligible :: proc(left_len: int, right_len: int) -> bool {
-	return left_len >= CUDA_MEMBERSHIP_MIN_ROWS && right_len > 0 && left_len <= int(max(u32)) && right_len <= int(max(u32))
+cuda_membership_admit :: proc(left_len: int, right_len: int) -> bool {
+	if left_len < CUDA_MEMBERSHIP_MIN_ROWS || right_len == 0 {
+		last_decline = .Below_Threshold
+		return false
+	}
+	if left_len > int(max(u32)) || right_len > int(max(u32)) {
+		last_decline = .Unsupported
+		return false
+	}
+	return true
 }
 
+// Size and shape checks for cosine, with the same reasons as membership.
 @(private)
-cuda_cosine_eligible :: proc(n_queries: int, n_docs: int, dim: int) -> bool {
-	return n_docs >= CUDA_COSINE_MIN_DOCS && n_queries >= 1 && dim >= 1 &&
-		n_docs <= int(max(u32)) && n_queries <= int(max(u32)) && dim <= int(max(u32))
+cuda_cosine_admit :: proc(n_queries: int, n_docs: int, dim: int) -> bool {
+	if n_docs < CUDA_COSINE_MIN_DOCS {
+		last_decline = .Below_Threshold
+		return false
+	}
+	if n_queries < 1 || dim < 1 || n_docs > int(max(u32)) || n_queries > int(max(u32)) || dim > int(max(u32)) {
+		last_decline = .Unsupported
+		return false
+	}
+	return true
+}
+
+// Operators never wait for the device: a held backend lock declines Busy so
+// the caller runs its CPU path (the same rule as Rust mica's admission).
+// Device setup, uploads and release still wait.
+@(private)
+cuda_operator_try_lock :: proc() -> bool {
+	if !sync.mutex_try_lock(&cuda_backend.mutex) {
+		last_decline = .Busy
+		return false
+	}
+	return true
 }
 
 // Membership probe against a sorted-unique right column, uploaded for this
@@ -509,13 +567,21 @@ cuda_membership_select_impl :: proc(
 	selected: []bool,
 	accelerated: bool,
 ) {
-	if !cuda_membership_eligible(len(left), len(right_sorted_unique)) || !is_sorted_unique(right_sorted_unique) {
+	last_decline = .Failed
+	if !cuda_membership_admit(len(left), len(right_sorted_unique)) {
 		return nil, false
 	}
-	sync.mutex_lock(&cuda_backend.mutex)
+	if !is_sorted_unique(right_sorted_unique) {
+		last_decline = .Unsupported
+		return nil, false
+	}
+	if !cuda_operator_try_lock() {
+		return nil, false
+	}
 	defer sync.mutex_unlock(&cuda_backend.mutex)
 	state := cuda_enter_locked()
 	if state == nil {
+		last_decline = .Unavailable
 		return nil, false
 	}
 	drv := &cuda_backend.driver
@@ -527,6 +593,59 @@ cuda_membership_select_impl :: proc(
 		return nil, false
 	}
 	return cuda_membership_run_locked(state, left, d_right, len(right_sorted_unique), keep_matches, allocator)
+}
+
+// Two-key membership over interleaved pairs, uploaded for this call only. The
+// dispatcher (membership_select_keys) has checked shape and sort order.
+cuda_membership_select2_impl :: proc(
+	left: []u64,
+	right: []u64,
+	keep_matches: bool,
+	allocator: mem.Allocator,
+) -> (
+	selected: []bool,
+	accelerated: bool,
+) {
+	last_decline = .Failed
+	n_left, n_right := len(left) / 2, len(right) / 2
+	if !cuda_membership_admit(n_left, n_right) {
+		return nil, false
+	}
+	if !cuda_operator_try_lock() {
+		return nil, false
+	}
+	defer sync.mutex_unlock(&cuda_backend.mutex)
+	state := cuda_enter_locked()
+	if state == nil {
+		last_decline = .Unavailable
+		return nil, false
+	}
+	drv := &cuda_backend.driver
+	bufs: Cuda_Buffers
+	defer cuda_free_all(drv, &bufs)
+	left_bytes := len(left) * size_of(u64)
+	right_bytes := len(right) * size_of(u64)
+	d_left := cuda_alloc(drv, &bufs, left_bytes) or_return
+	d_right := cuda_alloc(drv, &bufs, right_bytes) or_return
+	d_out := cuda_alloc(drv, &bufs, n_left) or_return
+	if drv.cuMemcpyHtoD(d_left, raw_data(left), c.size_t(left_bytes)) != CU_SUCCESS ||
+	   drv.cuMemcpyHtoD(d_right, raw_data(right), c.size_t(right_bytes)) != CU_SUCCESS {
+		return nil, false
+	}
+	left_len := u32(n_left)
+	right_len := u32(n_right)
+	keep := u32(keep_matches ? 1 : 0)
+	params := [?]rawptr{&d_left, &d_right, &d_out, &left_len, &right_len, &keep}
+	if !cuda_launch(drv, state.membership2, n_left, params[:]) {
+		return nil, false
+	}
+	out := make([]bool, n_left, allocator)
+	if drv.cuMemcpyDtoH(raw_data(out), d_out, c.size_t(n_left)) != CU_SUCCESS {
+		delete(out, allocator)
+		return nil, false
+	}
+	last_decline = .None
+	return out, true
 }
 
 // Cosine similarity of `queries` (n_queries x dim) against `docs`
@@ -543,16 +662,21 @@ cuda_cosine_queries_impl :: proc(
 	scores: []f32,
 	accelerated: bool,
 ) {
-	if !cuda_cosine_eligible(n_queries, n_docs, dim) {
+	last_decline = .Failed
+	if !cuda_cosine_admit(n_queries, n_docs, dim) {
 		return nil, false
 	}
 	if len(queries) < n_queries * dim || len(docs) < n_docs * dim {
+		last_decline = .Unsupported
 		return nil, false
 	}
-	sync.mutex_lock(&cuda_backend.mutex)
+	if !cuda_operator_try_lock() {
+		return nil, false
+	}
 	defer sync.mutex_unlock(&cuda_backend.mutex)
 	state := cuda_enter_locked()
 	if state == nil {
+		last_decline = .Unavailable
 		return nil, false
 	}
 	drv := &cuda_backend.driver
@@ -590,9 +714,14 @@ Cuda_Resident :: struct {
 // Uploads bytes to the selected device and wraps them as a resident handle.
 @(private)
 cuda_upload_resident :: proc(data: rawptr, size: int) -> (handle: rawptr, ok: bool) {
-	sync.mutex_lock(&cuda_backend.mutex)
+	// Called from rule evaluation: like the operators, never wait for the
+	// device (spec §2); a busy backend declines and the step runs unprepared.
+	if !cuda_operator_try_lock() {
+		return nil, false
+	}
 	defer sync.mutex_unlock(&cuda_backend.mutex)
 	if cuda_enter_locked() == nil {
+		last_decline = .Unavailable
 		return nil, false
 	}
 	drv := &cuda_backend.driver
@@ -644,13 +773,17 @@ cuda_membership_select_prepared_impl :: proc(
 	selected: []bool,
 	accelerated: bool,
 ) {
-	if !cuda_membership_eligible(len(left), rows) {
+	last_decline = .Failed
+	if !cuda_membership_admit(len(left), rows) {
 		return nil, false
 	}
-	sync.mutex_lock(&cuda_backend.mutex)
+	if !cuda_operator_try_lock() {
+		return nil, false
+	}
 	defer sync.mutex_unlock(&cuda_backend.mutex)
 	state := cuda_enter_resident_locked(column)
 	if state == nil {
+		last_decline = .Unavailable
 		return nil, false
 	}
 	return cuda_membership_run_locked(state, left, (^Cuda_Resident)(column).ptr, rows, keep_matches, allocator)
@@ -668,13 +801,17 @@ cuda_cosine_queries_prepared_impl :: proc(
 	scores: []f32,
 	accelerated: bool,
 ) {
-	if !cuda_cosine_eligible(n_queries, n_docs, dim) {
+	last_decline = .Failed
+	if !cuda_cosine_admit(n_queries, n_docs, dim) {
 		return nil, false
 	}
-	sync.mutex_lock(&cuda_backend.mutex)
+	if !cuda_operator_try_lock() {
+		return nil, false
+	}
 	defer sync.mutex_unlock(&cuda_backend.mutex)
 	state := cuda_enter_resident_locked(docs)
 	if state == nil {
+		last_decline = .Unavailable
 		return nil, false
 	}
 	return cuda_cosine_run_locked(state, queries, n_queries, (^Cuda_Resident)(docs).ptr, n_docs, dim, allocator)

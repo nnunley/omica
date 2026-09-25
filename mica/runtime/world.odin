@@ -69,6 +69,13 @@ World_Config :: struct {
 	external_data:      rawptr,
 	// External worker threads. Values below one become one.
 	external_workers:   int,
+	// Accelerator strategy for rule evaluation, installed process-wide before
+	// the scheduler starts. Unchanged (the zero value) leaves the current
+	// strategy, which defaults to the single-core CPU reference.
+	accel:              Accel_Mode,
+	// Worker threads for Cpu_Parallel (and GPU modes' CPU fallback). Zero uses
+	// one per processor core.
+	accel_workers:      int,
 }
 
 // The `World_Config` a harness uses for the program under test. A harness must
@@ -126,6 +133,9 @@ world_start :: proc(
 	^World,
 	Run_Result,
 ) {
+	if installed := world_install_accel(config.accel, config.accel_workers); !installed.ok {
+		return nil, installed
+	}
 	world := new(World, allocator)
 	world.allocator = allocator
 	world.kernel = kernel

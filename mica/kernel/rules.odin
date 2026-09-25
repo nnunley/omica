@@ -467,6 +467,11 @@ rules_evaluate_source :: proc(
 
 	source.delta = nil
 	source.delta_active = false
+	source.packed = packed_cache_create(alloc)
+	defer {
+		packed_cache_destroy(source.packed)
+		source.packed = nil
+	}
 
 	rules := make([]Rule, len(definitions), alloc)
 	write := 0
@@ -788,15 +793,11 @@ apply_negated_atom :: proc(
 	return out, .None
 }
 
-// Batch fast path for a negated single-column atom over identity values.
-//
-// When every probe value is an identity and the relation's rows project to a
-// single identity column (one probe per incoming binding), the whole filter
-// is one `membership_select` call against a sorted-unique column instead of
-// N existence scans. Returns (rows, true) when the shape holds; (nil, false)
-// declines to the row path for any other shape. Columnar projection of the
-// relation is Ryan's work; until it lands the column is gathered row-wise
-// here, so this path exercises the operator wiring, not the data layout.
+// Batch path for a fully-bound negated atom of one or two positions over
+// fixed-width values: one membership call against keys packed once per
+// evaluation (packed.odin). Returns (rows, true) when it ran; (nil, false)
+// declines to the row path. Every outcome is counted under
+// .Negated_Membership. Scratch comes from `alloc`, the evaluation arena.
 @(private)
 try_negated_atom_batch :: proc(
 	atom: ^Atom,
@@ -808,83 +809,71 @@ try_negated_atom_batch :: proc(
 	[dynamic][]v.Binding,
 	bool,
 ) {
-	if len(atom.terms) != 1 || len(bindings) == 0 {
+	if len(bindings) == 0 {
+		return nil, false
+	}
+	width := len(atom.terms)
+	if width < 1 || width > 2 {
+		placement_record(.Negated_Membership, .Unsupported)
 		return nil, false
 	}
 
-	// Evaluate all probe values first: every term must be identity-bound.
-	// Constant (.Value) terms are only usable when they are identities.
-	probes := make([]v.Value, len(bindings), alloc)
+	probes := make([]u64, len(bindings) * width, alloc)
 	for binding, i in bindings {
-		value, err := term_evaluate(atom.terms[0], binding, slots)
-		if err != .None || v.value_tag(value) != .Identity {
-			delete(probes)
+		for term, j in atom.terms {
+			value, err := term_evaluate(term, binding, slots)
+			if err != .None || !v.value_is_immediate(value) {
+				placement_record(.Negated_Membership, .Not_Packable)
+				return nil, false
+			}
+			probes[i * width + j] = u64(value)
+		}
+	}
+
+	entry, found := packed_cache_lookup(source, atom.relation, width)
+	if !found {
+		placement_record(.Negated_Membership, entry == nil ? .Unsupported : .Not_Packable)
+		return nil, false
+	}
+
+	// keep_matches=false: a binding survives when its key is ABSENT. Single
+	// keys on a strategy that declares a residency threshold prepare one
+	// device copy per evaluation, once the step is large enough to pay for the
+	// upload, and probe it; everything else passes the keys per call.
+	strategy := accel.active_strategy()
+	selected: []bool
+	ok: bool
+	if width == 1 && !entry.prepare_tried && strategy.prepare_column != nil &&
+	   strategy.resident_min_probes > 0 && len(bindings) >= strategy.resident_min_probes {
+		entry.prepare_tried = true
+		source.packed.prepares += 1
+		if prepared, prepared_ok := accel.prepare_column(strategy, entry.keys.keys); prepared_ok {
+			entry.prepared, entry.strategy = prepared, strategy
+		}
+	}
+	if width == 1 && entry.prepared.handle != nil {
+		selected, ok = accel.membership_select_prepared(strategy, probes, entry.prepared, false, alloc)
+	} else {
+		selected, ok = accel.membership_select_keys(strategy, probes, entry.keys.keys, width, false, alloc)
+	}
+	completed := ok && len(selected) == len(bindings)
+	if !ok {
+		placement_record_decline(.Negated_Membership)
+	} else if !completed {
+		placement_record(.Negated_Membership, .Invalid_Result)
+	}
+	if !completed {
+		// The keys are already packed: the CPU reference finishes the step on
+		// them rather than discarding them for the per-binding row path, so a
+		// declining accelerator is never slower than the CPU strategy.
+		selected, ok = accel.membership_select_keys(accel.cpu_strategy(), probes, entry.keys.keys, width, false, alloc)
+		if !ok || len(selected) != len(bindings) {
 			return nil, false
 		}
-		probes[i] = value
+		placement_record(.Negated_Membership, .Cpu_Fallback)
+	} else {
+		placement_record(.Negated_Membership, .Completed)
 	}
-
-// Gather the relation's first column row-wise (temporary; the columnar
-	// projection will replace this with a contiguous read). Atom arity was
-	// validated at install, so full-width unbound bindings match every row.
-	rows := make([dynamic]v.Tuple, 0, 64, context.temp_allocator)
-	defer delete(rows)
-	unbound := make([]v.Binding, len(atom.terms), context.temp_allocator)
-	relation_source_scan_into(source, atom.relation, unbound, &rows)
-	defer delete(rows)
-	arity_ok := true
-	for row in rows {
-		if v.tuple_arity(row) < 1 {
-			arity_ok = false
-			break
-		}
-	}
-	if !arity_ok {
-		delete(probes)
-		return nil, false
-	}
-	column := make([]u64, len(rows), context.temp_allocator)
-	ident_ok := true
-	for row, i in rows {
-		cell := v.tuple_values(row)[0]
-		if v.value_tag(cell) != .Identity {
-			ident_ok = false
-			break
-		}
-		column[i] = u64(cell)
-	}
-	if !ident_ok {
-		delete(probes)
-		return nil, false
-	}
-	slice.sort(column)
-	sorted_unique := column[:]
-	write := 0
-	for i in 1 ..< len(column) {
-		if column[i] != column[write] {
-			write += 1
-			column[write] = column[i]
-		}
-	}
-	if len(column) > 0 {
-		sorted_unique = column[:write + 1]
-	}
-
-	// keep_matches=false: a binding survives when its probe is ABSENT.
-	// Membership across a strategy boundary can only leak on decline if the
-	// strategy allocated: every path either returns before allocating or
-	// frees on decline, so temp ownership here is sound.
-	selected, selected_ok := accel.active_strategy().membership_select(
-		accel.encode_identities(probes, context.temp_allocator),
-		sorted_unique,
-		false,
-		context.temp_allocator,
-	)
-	if !selected_ok {
-		delete(probes)
-		return nil, false
-	}
-	defer delete(selected, context.temp_allocator)
 	out: [dynamic][]v.Binding
 	for binding, i in bindings {
 		if selected[i] {
@@ -893,7 +882,6 @@ try_negated_atom_batch :: proc(
 			append(&out, next)
 		}
 	}
-	delete(probes)
 	return out, true
 }
 

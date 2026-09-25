@@ -8,6 +8,7 @@ package accel
 
 import "core:log"
 import "core:os"
+import "core:sync"
 import "core:testing"
 
 @(private = "file")
@@ -15,6 +16,12 @@ require_cuda :: proc() -> bool {
 	value, found := os.lookup_env("MICA_REQUIRE_CUDA", context.temp_allocator)
 	return found && value == "1"
 }
+
+// CUDA operators decline Busy instead of waiting, and Odin runs tests on
+// parallel threads, so tests that need an operator to complete take this
+// lock to run one at a time.
+@(private = "file")
+cuda_tests_lock: sync.Mutex
 
 // Available CUDA or a test failure when MICA_REQUIRE_CUDA=1.
 @(private = "file")
@@ -60,6 +67,8 @@ test_cosine_small_declines_cuda :: proc(t: ^testing.T) {
 
 @(test)
 test_membership_unsorted_right_declines_cuda :: proc(t: ^testing.T) {
+	sync.mutex_lock(&cuda_tests_lock)
+	defer sync.mutex_unlock(&cuda_tests_lock)
 	if !cuda_or_skip(t) {
 		return
 	}
@@ -88,7 +97,7 @@ membership_agrees :: proc(t: ^testing.T, device: int) {
 	for keep in ([]bool{true, false}) {
 		want, want_ok := c.membership_select(left, right, keep, context.temp_allocator)
 		got, got_ok := g.membership_select(left, right, keep, context.temp_allocator)
-		testing.expectf(t, want_ok && got_ok, "device %d keep=%v: cpu %v cuda %v", device, keep, want_ok, got_ok)
+		testing.expectf(t, want_ok && got_ok, "device %d keep=%v: cpu %v cuda %v (%v)", device, keep, want_ok, got_ok, last_decline_reason())
 		if !want_ok || !got_ok {
 			return
 		}
@@ -118,7 +127,7 @@ cosine_agrees :: proc(t: ^testing.T, device: int) {
 	}
 	want, want_ok := cpu_strategy().cosine_queries(queries, docs, n_queries, n_docs, dim, context.temp_allocator)
 	got, got_ok := cuda_strategy().cosine_queries(queries, docs, n_queries, n_docs, dim, context.temp_allocator)
-	testing.expectf(t, want_ok && got_ok, "device %d: cpu %v cuda %v", device, want_ok, got_ok)
+	testing.expectf(t, want_ok && got_ok, "device %d: cpu %v cuda %v (%v)", device, want_ok, got_ok, last_decline_reason())
 	if !want_ok || !got_ok {
 		return
 	}
@@ -140,6 +149,8 @@ cosine_agrees :: proc(t: ^testing.T, device: int) {
 
 @(test)
 test_cuda_agrees_with_cpu_on_every_device :: proc(t: ^testing.T) {
+	sync.mutex_lock(&cuda_tests_lock)
+	defer sync.mutex_unlock(&cuda_tests_lock)
 	if !cuda_or_skip(t) {
 		return
 	}
@@ -173,6 +184,8 @@ test_cuda_select_device_out_of_range :: proc(t: ^testing.T) {
 // probes and queries, give the CPU reference's results on every usable device.
 @(test)
 test_cuda_prepared_agrees_with_cpu_on_every_device :: proc(t: ^testing.T) {
+	sync.mutex_lock(&cuda_tests_lock)
+	defer sync.mutex_unlock(&cuda_tests_lock)
 	if !cuda_or_skip(t) {
 		return
 	}
@@ -237,6 +250,8 @@ test_cuda_prepared_agrees_with_cpu_on_every_device :: proc(t: ^testing.T) {
 // while another is selected. Needs two usable devices.
 @(test)
 test_cuda_prepared_declines_on_other_device :: proc(t: ^testing.T) {
+	sync.mutex_lock(&cuda_tests_lock)
+	defer sync.mutex_unlock(&cuda_tests_lock)
 	if !cuda_or_skip(t) {
 		return
 	}
@@ -266,5 +281,75 @@ test_cuda_prepared_declines_on_other_device :: proc(t: ^testing.T) {
 	testing.expect(t, !cross_ok)
 	cuda_select_device(usable[0])
 	release_prepared(g, &prepared)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_cuda_decline_reasons :: proc(t: ^testing.T) {
+	sync.mutex_lock(&cuda_tests_lock)
+	defer sync.mutex_unlock(&cuda_tests_lock)
+	g := cuda_strategy()
+	_, small_ok := g.membership_select([]u64{1, 2, 3}, []u64{2}, true, context.temp_allocator)
+	testing.expect(t, !small_ok)
+	testing.expect_value(t, last_decline_reason(), Decline.Below_Threshold)
+	if !cuda_or_skip(t) {
+		return
+	}
+	// A held backend lock makes the operator decline Busy instead of waiting.
+	left := make([]u64, CUDA_MEMBERSHIP_MIN_ROWS, context.temp_allocator)
+	sync.mutex_lock(&cuda_backend.mutex)
+	_, busy_ok := g.membership_select(left, []u64{1}, true, context.temp_allocator)
+	sync.mutex_unlock(&cuda_backend.mutex)
+	testing.expect(t, !busy_ok)
+	testing.expect_value(t, last_decline_reason(), Decline.Busy)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_cuda_membership2_agrees_with_cpu :: proc(t: ^testing.T) {
+	sync.mutex_lock(&cuda_tests_lock)
+	defer sync.mutex_unlock(&cuda_tests_lock)
+	if !cuda_or_skip(t) {
+		return
+	}
+	n := CUDA_MEMBERSHIP_MIN_ROWS * 2 + 3
+	right := make([]u64, 2 * n, context.temp_allocator)
+	for i in 0 ..< n {
+		// (i/4, (i%4) << 62): sorted lexicographically, top bit exercised.
+		right[2 * i], right[2 * i + 1] = u64(i / 4), u64(i % 4) << 62
+	}
+	left := make([]u64, 2 * n, context.temp_allocator)
+	for i in 0 ..< n {
+		left[2 * i], left[2 * i + 1] = u64((i * 2654435761) % n) / 4, u64(i % 6) << 62
+	}
+	for keep in ([]bool{true, false}) {
+		want, _ := membership_select_keys(cpu_strategy(), left, right, 2, keep, context.temp_allocator)
+		got, ok := membership_select_keys(cuda_strategy(), left, right, 2, keep, context.temp_allocator)
+		testing.expectf(t, ok, "keep=%v declined (%v)", keep, last_decline_reason())
+		if ok {
+			testing.expectf(t, slice_eq(got, want), "keep=%v differs", keep)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+// Uploads are reached from rule evaluation: a held backend lock makes a
+// prepare decline Busy instead of waiting.
+@(test)
+test_cuda_prepare_declines_busy_instead_of_waiting :: proc(t: ^testing.T) {
+	sync.mutex_lock(&cuda_tests_lock)
+	defer sync.mutex_unlock(&cuda_tests_lock)
+	if !cuda_or_skip(t) {
+		return
+	}
+	column := make([]u64, CUDA_MEMBERSHIP_MIN_ROWS, context.temp_allocator)
+	for i in 0 ..< len(column) {
+		column[i] = u64(i)
+	}
+	sync.mutex_lock(&cuda_backend.mutex)
+	_, ok := prepare_column(cuda_strategy(), column)
+	sync.mutex_unlock(&cuda_backend.mutex)
+	testing.expect(t, !ok)
+	testing.expect_value(t, last_decline_reason(), Decline.Busy)
 	free_all(context.temp_allocator)
 }

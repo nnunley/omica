@@ -5,6 +5,7 @@
 #+build darwin
 package accel
 
+import "core:mem"
 import "core:testing"
 import v "../../var"
 
@@ -205,4 +206,31 @@ test_top_k_agrees_across_strategies :: proc(t: ^testing.T) {
 			cpu_hits[i].score,
 		)
 	}
+}
+
+// Metal operators run on scheduler workers, whose temp allocator is never
+// reset: an operator must leave nothing behind in it.
+@(test)
+test_metal_membership_leaves_temp_allocator_clean :: proc(t: ^testing.T) {
+	m := metal_strategy()
+	if !m.available() { // also initializes the backend before tracking
+		return
+	}
+	left := make([]u64, MEMBERSHIP_MIN_ROWS)
+	defer delete(left)
+	for i in 0 ..< len(left) {
+		left[i] = u64(i)
+	}
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	selected: []bool
+	ok: bool
+	{
+		context.temp_allocator = mem.tracking_allocator(&track)
+		selected, ok = m.membership_select(left, []u64{1, 2, 3}, true, context.allocator)
+	}
+	testing.expect(t, ok)
+	delete(selected)
+	testing.expectf(t, len(track.allocation_map) == 0, "%d temp allocation(s) left behind", len(track.allocation_map))
 }

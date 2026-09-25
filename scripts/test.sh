@@ -396,6 +396,22 @@ run_integration() {
     problem "integration:store-mutation: expected true, got '${out}'"
   fi
 
+  # --accel selects a strategy; results match the default.
+  capture "${tmp}/accel.log" "${test_timeout}" "${filein}" --store "${tmp}/db" \
+    --accel cpu-parallel --eval 'return ReadyForUse(#sensor_17)' || true
+  out="$(cat "${tmp}/accel.log")"
+  default_out="$(cat "${tmp}/eval.log")"
+  if [[ ( "${out}" == "true" || "${out}" == "false" ) && "${out}" == "${default_out}" ]]; then
+    pass "integration:filein-accel"
+  else
+    problem "integration:filein-accel: expected the default run's '${default_out}', got '${out}'"
+  fi
+  if run_timeout "${test_timeout}" "${filein}" --accel warp-drive --eval 'return 1' >/dev/null 2>&1; then
+    problem "integration:filein-accel-invalid: an unknown --accel value was accepted"
+  else
+    pass "integration:filein-accel-invalid"
+  fi
+
   # REPL evaluates a line.
   printf '1 + 1\n' > "${tmp}/repl.in"
   capture "${tmp}/repl.log" 30 "${repl}" < "${tmp}/repl.in" || true

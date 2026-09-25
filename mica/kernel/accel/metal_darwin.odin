@@ -177,23 +177,33 @@ membership_select_impl :: proc(
 	selected: []bool,
 	accelerated: bool,
 ) {
+	last_decline = .Failed
 	if len(left) < MEMBERSHIP_MIN_ROWS || len(right_sorted_unique) == 0 {
+		last_decline = .Below_Threshold
 		return nil, false
 	}
 	if !is_sorted_unique(right_sorted_unique) {
+		last_decline = .Unsupported
 		return nil, false
 	}
 	be := ensure_backend()
 	if !be.enabled {
+		last_decline = .Unavailable
 		return nil, false
 	}
-	sync.mutex_lock(&be.mutex)
+	// Never wait for the device: a busy accelerator declines and the caller
+	// runs its CPU path.
+	if !sync.mutex_try_lock(&be.mutex) {
+		last_decline = .Busy
+		return nil, false
+	}
 	defer sync.mutex_unlock(&be.mutex)
 
 	lbuf := be.device->newBufferWithSlice(left, MTL.ResourceStorageModeShared)
 	rbuf := be.device->newBufferWithSlice(right_sorted_unique, MTL.ResourceStorageModeShared)
-	flags := make([]u32, len(left), context.temp_allocator)
-	fbuf := be.device->newBufferWithSlice(flags, MTL.ResourceStorageModeShared)
+	// The shader writes every flag, so the buffer needs no host copy (and no
+	// scratch from the worker thread's never-reset temp allocator).
+	fbuf := be.device->newBufferWithLength(NS.UInteger(len(left) * 4), MTL.ResourceStorageModeShared)
 	ll := u32(len(left))
 	rl := u32(len(right_sorted_unique))
 	km := u32(keep_matches ? 1 : 0)
@@ -214,6 +224,7 @@ membership_select_impl :: proc(
 	for i in 0 ..< len(left) {
 		out[i] = raw[i * 4] != 0
 	}
+	last_decline = .None
 	return out, true
 }
 
@@ -230,17 +241,24 @@ cosine_queries_impl :: proc(
 	scores: []f32,
 	accelerated: bool,
 ) {
-	if n_docs < COSINE_MIN_DOCS || n_queries < 1 || dim < 1 {
+	last_decline = .Failed
+	if n_docs < COSINE_MIN_DOCS {
+		last_decline = .Below_Threshold
 		return nil, false
 	}
-	if len(queries) < n_queries * dim || len(docs) < n_docs * dim {
+	if n_queries < 1 || dim < 1 || len(queries) < n_queries * dim || len(docs) < n_docs * dim {
+		last_decline = .Unsupported
 		return nil, false
 	}
 	be := ensure_backend()
 	if !be.enabled {
+		last_decline = .Unavailable
 		return nil, false
 	}
-	sync.mutex_lock(&be.mutex)
+	if !sync.mutex_try_lock(&be.mutex) {
+		last_decline = .Busy
+		return nil, false
+	}
 	defer sync.mutex_unlock(&be.mutex)
 
 	total := n_queries * n_docs
@@ -266,6 +284,7 @@ cosine_queries_impl :: proc(
 	raw := obuf->contents()
 	out := make([]f32, total, allocator)
 	copy(mem.slice_to_bytes(out), raw[:total * 4])
+	last_decline = .None
 	return out, true
 }
 

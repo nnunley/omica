@@ -390,6 +390,7 @@ top_k_loop :: proc(state: ^Accel_State, chunk: int, s: accl.Strategy) {
 
 register_accel_benches :: proc(runner: ^mm.Runner) {
 	fmt.eprintf("accel: CPU dot kernel %v\n", accl.cpu_dot_kernel())
+	register_engine_accel_benches(runner)
 	state := accel_state_init()
 	compare := mm.group(runner, "accel/compare")
 	mm.bench(compare, "membership_cpu_8k", state, bench_cpu_membership)

@@ -6,17 +6,16 @@
 // worker thread, so fanning out inside an operator can oversubscribe cores.
 // Admission bounds that: one parallel call runs at a time process-wide, and a
 // call arriving while it runs executes serially on its own thread instead of
-// waiting (the same non-blocking decline as a busy GPU).
+// waiting (the same non-blocking decline as a busy GPU). Workers come from the
+// process-wide pool in cpu_pool.odin, created once.
 package accel
 
-import "core:log"
 import "core:mem"
 import "core:os"
 import "core:sync"
-import "core:thread"
 
-// Below these sizes a call runs serially: thread start-up (tens of
-// microseconds per worker) would exceed the saving.
+// Below these sizes a call runs serially: waking the pool and splitting the
+// work would exceed the saving.
 CPU_PARALLEL_MIN_PROBES :: 65536
 // Query/document pairs for cosine.
 CPU_PARALLEL_MIN_PAIRS :: 16384
@@ -30,8 +29,8 @@ cpu_parallel_busy: bool
 @(private)
 cpu_parallel_spawn_failures: int
 
-// Worker threads that failed to start since process start; their chunks ran
-// on the calling thread instead.
+// Pool threads that failed to start; the pool runs with that many fewer
+// workers.
 cpu_parallel_spawn_failure_count :: proc() -> int {
 	return sync.atomic_load(&cpu_parallel_spawn_failures)
 }
@@ -48,6 +47,7 @@ cpu_parallel_strategy :: proc(workers := 0) -> Strategy {
 	s := cpu_strategy()
 	s.name = "cpu_parallel"
 	s.membership_select = cpu_parallel_membership_select
+	s.membership_select2 = cpu_parallel_membership_select2
 	s.cosine_query = cpu_parallel_cosine_query
 	s.cosine_queries = cpu_parallel_cosine_queries
 	s.membership_select_prepared = cpu_parallel_membership_select_prepared
@@ -60,18 +60,10 @@ use_cpu_parallel :: proc(workers := 0) {
 	select_strategy(cpu_parallel_strategy(workers))
 }
 
-// One contiguous slice of an operator's rows, run on one thread.
-@(private)
-Cpu_Chunk :: struct {
-	job:   rawptr,
-	first: int,
-	last:  int,
-	run:   proc(job: rawptr, first, last: int),
-}
-
-// Runs run(job, first, last) over [0, total) split into worker-sized chunks,
-// the calling thread taking the first. Returns false, having run nothing,
-// when another parallel call holds the workers.
+// Runs run(job, first, last) over [0, total) split into worker-sized chunks
+// on the process-wide pool (cpu_pool.odin), the calling thread taking the
+// first. Returns false, having run nothing, when another parallel call holds
+// the workers.
 @(private)
 cpu_parallel_for :: proc(total: int, job: rawptr, run: proc(job: rawptr, first, last: int)) -> bool {
 	workers := min(sync.atomic_load(&cpu_parallel_workers), total)
@@ -83,38 +75,8 @@ cpu_parallel_for :: proc(total: int, job: rawptr, run: proc(job: rawptr, first, 
 		return false
 	}
 	defer sync.atomic_store(&cpu_parallel_busy, false)
-	chunk := (total + workers - 1) / workers
-	threads := make([]^thread.Thread, workers - 1, context.temp_allocator)
-	started := 0
-	for w in 1 ..< workers {
-		first := w * chunk
-		if first >= total {
-			break
-		}
-		last := min(first + chunk, total)
-		th := thread.create_and_start_with_poly_data(
-			Cpu_Chunk{job = job, first = first, last = last, run = run},
-			proc(c: Cpu_Chunk) {c.run(c.job, c.first, c.last)},
-		)
-		if th == nil {
-			// Thread creation can fail; the caller runs the chunk itself so the
-			// result stays complete. Observed intermittently on Linux under the
-			// test runner (errno 0, so not an allocation failure; core:thread
-			// discards pthread_create's error code).
-			if sync.atomic_add(&cpu_parallel_spawn_failures, 1) == 0 {
-				log.warn("accel: worker thread creation failed; running its chunk on the caller (logged once)")
-			}
-			run(job, first, last)
-			continue
-		}
-		threads[started] = th
-		started += 1
-	}
-	run(job, 0, min(chunk, total))
-	for th in threads[:started] {
-		thread.join(th)
-		thread.destroy(th)
-	}
+	cpu_pool_start()
+	cpu_pool_run(workers, total, job, run)
 	return true
 }
 
@@ -148,12 +110,45 @@ cpu_parallel_membership_select :: proc(
 		return cpu_membership_select(left, right_sorted_unique, keep_matches, allocator)
 	}
 	if !is_sorted_unique(right_sorted_unique) {
+		last_decline = .Unsupported
 		return nil, false
 	}
+	last_decline = .None
 	job := Cpu_Membership_Job{left = left, right = right_sorted_unique, keep = keep_matches}
 	job.out = make([]bool, len(left), allocator)
 	if !cpu_parallel_for(len(left), &job, cpu_parallel_membership_rows) {
 		cpu_parallel_membership_rows(&job, 0, len(left))
+	}
+	return job.out, true
+}
+
+@(private)
+cpu_parallel_membership2_rows :: proc(job: rawptr, first, last: int) {
+	j := (^Cpu_Membership_Job)(job)
+	for i in first ..< last {
+		j.out[i] = cpu_sorted_contains_pair(j.right, j.left[2 * i], j.left[2 * i + 1]) == j.keep
+	}
+}
+
+@(private)
+cpu_parallel_membership_select2 :: proc(
+	left: []u64,
+	right: []u64,
+	keep_matches: bool,
+	allocator: mem.Allocator,
+) -> (
+	selected: []bool,
+	ok: bool,
+) {
+	n := len(left) / 2
+	if n < CPU_PARALLEL_MIN_PROBES {
+		return cpu_membership_select2(left, right, keep_matches, allocator)
+	}
+	last_decline = .None
+	job := Cpu_Membership_Job{left = left, right = right, keep = keep_matches}
+	job.out = make([]bool, n, allocator)
+	if !cpu_parallel_for(n, &job, cpu_parallel_membership2_rows) {
+		cpu_parallel_membership2_rows(&job, 0, n)
 	}
 	return job.out, true
 }
@@ -212,8 +207,10 @@ cpu_parallel_cosine_queries :: proc(
 		return cpu_cosine_queries(queries, docs, n_queries, n_docs, dim, allocator)
 	}
 	if n_queries < 1 || n_docs < 1 || dim < 1 || len(queries) < n_queries * dim || len(docs) < n_docs * dim {
+		last_decline = .Unsupported
 		return nil, false
 	}
+	last_decline = .None
 	job := Cpu_Cosine_Job{queries = queries, docs = docs, n_docs = n_docs, dim = dim}
 	job.out = make([]f32, n_queries * n_docs, allocator)
 	total := n_queries * n_docs

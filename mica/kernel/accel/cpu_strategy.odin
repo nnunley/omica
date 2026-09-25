@@ -22,6 +22,7 @@ cpu_membership_select :: proc(
 	selected: []bool,
 	ok: bool,
 ) {
+	last_decline = .None
 	if len(right_sorted_unique) == 0 {
 		out := make([]bool, len(left), allocator)
 		for i in 0 ..< len(left) {
@@ -30,12 +31,52 @@ cpu_membership_select :: proc(
 		return out, true
 	}
 	if !is_sorted_unique(right_sorted_unique) {
+		last_decline = .Unsupported
 		return nil, false
 	}
 	out := make([]bool, len(left), allocator)
 	for probe, i in left {
 		hit := cpu_sorted_contains(right_sorted_unique, probe)
 		out[i] = (hit == keep_matches)
+	}
+	return out, true
+}
+
+@(private)
+cpu_pair_less :: proc(a0, a1, b0, b1: u64) -> bool {
+	return a0 < b0 || (a0 == b0 && a1 < b1)
+}
+
+@(private)
+cpu_sorted_contains_pair :: proc(right: []u64, p0, p1: u64) -> bool {
+	lo, hi := 0, len(right) / 2
+	for lo < hi {
+		mid := lo + ((hi - lo) >> 1)
+		if cpu_pair_less(right[2 * mid], right[2 * mid + 1], p0, p1) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo < len(right) / 2 && right[2 * lo] == p0 && right[2 * lo + 1] == p1
+}
+
+// Two-key membership over interleaved pairs; the dispatcher
+// (membership_select_keys) has checked the shape and sort order.
+@(private)
+cpu_membership_select2 :: proc(
+	left: []u64,
+	right: []u64,
+	keep_matches: bool,
+	allocator: mem.Allocator,
+) -> (
+	selected: []bool,
+	ok: bool,
+) {
+	last_decline = .None
+	out := make([]bool, len(left) / 2, allocator)
+	for i in 0 ..< len(out) {
+		out[i] = cpu_sorted_contains_pair(right, left[2 * i], left[2 * i + 1]) == keep_matches
 	}
 	return out, true
 }
@@ -93,10 +134,9 @@ cpu_cosine_queries :: proc(
 	scores: []f32,
 	ok: bool,
 ) {
-	if n_queries < 1 || n_docs < 1 || dim < 1 {
-		return nil, false
-	}
-	if len(queries) < n_queries * dim || len(docs) < n_docs * dim {
+	last_decline = .None
+	if n_queries < 1 || n_docs < 1 || dim < 1 || len(queries) < n_queries * dim || len(docs) < n_docs * dim {
+		last_decline = .Unsupported
 		return nil, false
 	}
 	out := make([]f32, n_queries * n_docs, allocator)

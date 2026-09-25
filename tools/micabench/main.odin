@@ -34,6 +34,8 @@ main :: proc() {
 	budget_ms := DEFAULT_BUDGET_MS
 	workers := DEFAULT_WORKERS
 	disasm := false
+	accel_mode := r.Accel_Mode.Unchanged
+	accel_report := false
 	paths: [dynamic]string
 	defer delete(paths)
 
@@ -65,13 +67,25 @@ main :: proc() {
 			}
 		case strings.has_prefix(arg, "--workers="):
 			workers = parse_int(arg[len("--workers="):], DEFAULT_WORKERS)
+		case arg == "--accel":
+			index += 1
+			if index < len(args) {
+				mode, ok := r.accel_mode_parse(args[index])
+				if !ok {
+					fmt.eprintf("--accel: expected %s, got %q\n", r.ACCEL_MODE_NAMES, args[index])
+					os.exit(2)
+				}
+				accel_mode = mode
+			}
+		case arg == "--accel-report":
+			accel_report = true
 		case:
 			append(&paths, arg)
 		}
 		index += 1
 	}
 	if len(paths) == 0 {
-		fmt.eprintln("usage: micabench [--samples N] [--budget-ms M] [--workers N] <file.mica>...")
+		fmt.eprintln("usage: micabench [--samples N] [--budget-ms M] [--workers N] [--accel MODE] [--accel-report] <file.mica>...")
 		os.exit(2)
 	}
 
@@ -83,7 +97,7 @@ main :: proc() {
 			}
 			continue
 		}
-		if run_file(path, samples, budget_ms, workers) {
+		if run_file(path, samples, budget_ms, workers, accel_mode, accel_report) {
 			reported += 1
 		}
 	}
@@ -132,7 +146,7 @@ parse_int :: proc(text: string, fallback: int) -> int {
 }
 
 @(private)
-run_file :: proc(path: string, samples, budget_ms, workers: int) -> bool {
+run_file :: proc(path: string, samples, budget_ms, workers: int, accel_mode: r.Accel_Mode, accel_report: bool) -> bool {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -141,13 +155,14 @@ run_file :: proc(path: string, samples, budget_ms, workers: int) -> bool {
 		&kernel,
 		[]string{path},
 		context.allocator,
-		r.World_Config{workers = workers},
+		r.World_Config{workers = workers, accel = accel_mode},
 	)
 	if !start.ok {
 		fmt.eprintf("FAIL %s: %s\n", path, start.message)
 		return false
 	}
 	defer r.world_destroy(world)
+	before := k.placement_counts()
 
 	// Optional one-time setup.
 	if setup := r.world_call(world, "setup", nil); setup.kind == .Complete {
@@ -204,6 +219,16 @@ run_file :: proc(path: string, samples, budget_ms, workers: int) -> bool {
 	minimum := results[0]
 	name := filepath.base(path)
 	fmt.printf("%s\t%d\t%d\t%d\n", name, median, minimum, samples)
+	if accel_report {
+		delta := k.placement_counts_delta(before, k.placement_counts())
+		for op in k.Placement_Operator {
+			for outcome in k.Placement_Outcome {
+				if delta[op][outcome] > 0 {
+					fmt.printf("accel: %v %v %d\n", op, outcome, delta[op][outcome])
+				}
+			}
+		}
+	}
 	return true
 }
 
