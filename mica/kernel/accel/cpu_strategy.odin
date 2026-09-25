@@ -222,3 +222,27 @@ cpu_release :: proc(handle: rawptr, kind: Prepared_Kind) {
 	delete(p.docs)
 	free(p)
 }
+
+// Equality join by binary search of each probe in the sorted right keys;
+// join_pairs has checked the shape and sort order.
+@(private)
+cpu_join_equality :: proc(
+	left, right: [][]u64,
+	right_rows: []u32,
+	allocator: mem.Allocator,
+) -> (
+	left_out, right_out: []u32,
+	ok: bool,
+) {
+	last_decline = .None
+	n := len(left[0])
+	l := make([dynamic]u32, 0, n, allocator)
+	r := make([dynamic]u32, 0, n, allocator)
+	for i in 0 ..< n {
+		for j := join_lower_bound(left, i, right); j < len(right_rows) && join_key_cmp(left, i, right, j) == 0; j += 1 {
+			append(&l, u32(i))
+			append(&r, right_rows[j])
+		}
+	}
+	return l[:], r[:], true
+}

@@ -103,3 +103,36 @@ test_derived_relations_from_is_canonical_rows :: proc(t: ^testing.T) {
 		testing.expect(t, v.tuple_eq(row, want[i]))
 	}
 }
+
+// A frozen result shows scans only the rows present at the freeze, while
+// deduplication still sees every row; relations first created while frozen
+// are invisible until the thaw.
+@(test)
+test_rules_derived_freeze_limits_scans_not_dedup :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	d := rules_derived_create(context.temp_allocator)
+	rules_derived_add(&d, Relation_ID(1), tuple_of(must_int(1)))
+	rules_derived_add(&d, Relation_ID(1), tuple_of(must_int(2)))
+	rules_derived_freeze(&d)
+	testing.expect(t, rules_derived_add(&d, Relation_ID(1), tuple_of(must_int(3))))
+	testing.expect(t, !rules_derived_add(&d, Relation_ID(1), tuple_of(must_int(3))))
+	testing.expect(t, !rules_derived_add(&d, Relation_ID(1), tuple_of(must_int(1))))
+	testing.expect(t, rules_derived_add(&d, Relation_ID(2), tuple_of(must_int(9))))
+	testing.expect_value(t, rules_derived_count(&d, Relation_ID(1)), 2)
+	testing.expect_value(t, rules_derived_count(&d, Relation_ID(2)), 0)
+
+	seen := 0
+	rules_derived_visit(&d, Relation_ID(1), []v.Binding{{}}, proc(user: rawptr, row: v.Tuple) -> bool {
+		(^int)(user)^ += 1
+		return true
+	}, &seen)
+	testing.expect_value(t, seen, 2)
+	source := Relation_Source{derived = &d}
+	batch, err := relation_source_scan_columns(&source, Relation_ID(1), []v.Binding{{}}, context.temp_allocator)
+	testing.expect_value(t, err, Kernel_Error.None)
+	testing.expect_value(t, batch.count, 2)
+
+	rules_derived_thaw(&d)
+	testing.expect_value(t, rules_derived_count(&d, Relation_ID(1)), 3)
+	testing.expect_value(t, rules_derived_count(&d, Relation_ID(2)), 1)
+}

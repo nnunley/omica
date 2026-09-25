@@ -1,7 +1,6 @@
 # Accelerating omica's rule and query engine
 
-Status: design approved 2026-09-23; Stages 0, 1 and 2 implemented
-(2026-09-24); stages reordered after Stage 1 measurements. Work lands on `accel-cuda`, one
+Status: design approved 2026-09-23; Stages 0–4 implemented (2026-09-24); stages reordered after Stage 1 measurements. Work lands on `accel-cuda`, one
 branch per stage.
 
 ## Why
@@ -373,8 +372,8 @@ Each stage is its own commit series with its own tests.
 | 0 | Done. `World_Config.accel` and flags, persistent worker pool, placement counters, fixes to the negated-atom path. |
 | 1 | Done. Packed keys (cached per evaluation, not per block: see Stage 6); negated membership over one or two positions of fixed-width values. |
 | 2 | Done. Columnar evaluation (Design §6): column batches between rule steps, column-major derived relations with a flat dedup index inside an evaluation (snapshots keep rows), a layered columnar scan, the columnar accel boundary, hash joins, and a per-application scratch arena. Computed relations keep their row scanners. The 262k negation runs 3.1× faster on the Mac CPU and 5.2× on ndn's; every measured workload got faster (see Stage 2 measurements). Deduplication is still 26–40% of an evaluation, so accelerated deduplication joins Stage 6. |
-| 3 | Accelerated positive joins replacing Stage 2's CPU hash join behind the same interface; thresholds tuned on real workloads. |
-| 4 | Strict semi-naive evaluation with per-round packing. |
+| 3 | Done. `join_equality` (one or two key columns, pairs ordered by probe) on the CPU reference, CPU-parallel, Metal and CUDA, wired into the columnar positive join with sorted relation keys cached per evaluation and every decision counted under `.Positive_Join`. Measured slower than Stage 2's CPU hash join on both machines, so no strategy offers it by default (`join_min_probes = 0`); `*_join` benchmark variants force it on (see Stage 3 measurements). |
+| 4 | Done. Strict semi-naive evaluation: each round reads the result frozen at the round's start (`rules_derived_freeze`), so a derived relation is fixed for a whole round and packed keys are built once per round. A delta round now restricts one atom occurrence, not every atom of the relation: rules with two atoms of the same recursive relation (`T(x,z) :- T(x,y), T(y,z)`) had been missing results since before Stage 2 (a 41-node chain derived 508 of 820 paths); the oracle now includes that shape. Mac timings within noise of Stage 3 or better (`kernel/rules/large/*_chain_400` 6–9% faster). |
 | 5 | Cosine for `NearestEmbedding` with f64 re-scoring, as a native batched computed scanner (many queries, one `cosine_queries` call). Introduces the batched computed-scan interface (all bound keys as columns, results tagged with the key row that produced them) and reviews its authority checks, required bindings and rule scheduling. |
 | 6 | Faster GPU operators: a matrix-multiply cosine kernel (today one thread per query–document pair, no data reuse); packed keys and prepared device copies cached on immutable `Relation_Block`s across commits (deferred from Stage 1); Metal two-key membership and residency; thresholds from measurements; overlapping copies with compute. `accel/scale` and `kernel/rules_accel` track operator and engine speed throughout. |
 | 7 | Exporter, corpora, comparison against Rust mica, page update. |
@@ -420,6 +419,20 @@ Rule workloads without negation (`kernel/rules`, CPU):
 Memory. The evaluation arena is 4–5× smaller (the closure: 11 → 2 MB; the 20k load: 16 → 4 MB) and scratch stays under 1 MB. Peak RSS of the negation run fell (Mac 400 → 275 MB, ndn 658 → 525 MB). The `rules/large` run's process RSS rose 7% (Mac) and 12% (ndn), but that measures a pre-existing retention of about 6 MB per suspended-load cycle multiplied by micromeasure's time-based warmup, which runs the faster code more cycles; over a fixed 10 cycles Stage 2 peaks lower (Mac 89 → 73 MB, ndn 123 → 108 MB). The retention is recorded for follow-up.
 
 Where the time goes now. Timing the head insert directly, deduplication (`rules_derived_add_columns`) is 26–30% of the 262k negation and about 40% of `visible_items_rule`; the membership probe itself is a few milliseconds. Deduplication stays the largest single cost, so it moves into Stage 6 as a batched hash-insert candidate for the accelerators.
+
+### Stage 3 measurements
+
+Accelerated joins against the CPU hash join, whole evaluations, Mac M3 (medians; digests identical in every column). "hash" is the default path; "`_join`" forces the strategy's `join_equality` on every eligible positive join.
+
+| Workload | cpu (hash) | cpu-parallel: hash / join | metal: hash / join |
+|---|---|---|---|
+| `join_large_262k` (262,144 × 65,536 on one key) | 44.6 ms | 45.6 / 49.6 ms | 44.1 / 51.0 ms |
+| `visible_items_rule` | 1.54 ms | 1.56 / 2.19 ms | 1.57 / 2.44 ms |
+| 262k negation | 27.4 ms | 18.4 / 18.8 ms | 17.1 / 17.8 ms |
+
+ndn (7800X3D + RTX 4070 Ti), joins on: `join_large_262k` 48.0 ms hash, 52.3 ms cpu-parallel join, 53.5 ms CUDA join; `visible_items_rule` on CUDA 1.81 → 2.14 ms with the join offered.
+
+Why the joins do not pay. After Stage 2 the CPU hash join is cheap: in `join_large_262k` the join step takes 3.7 ms of about 45–49 ms, while inserting the 262,144 head rows (deduplication) takes 31 ms. Sorting the relation's keys for the sorted-key operator costs 11 ms per evaluation (a radix sort; the first comparison sort cost 63 ms), more than the whole hash join. Accelerated joins become worth revisiting once sorted keys are cached across commits on immutable blocks (Stage 6), and deduplication is the next target.
 
 ## Relation to other work
 

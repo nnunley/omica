@@ -161,3 +161,59 @@ test_failed_prepare_is_not_retried :: proc(t: ^testing.T) {
 	testing.expect_value(t, evaluate_shared_negation(t), 43)
 	testing.expect_value(t, packed_last_evaluation_prepares(), 1)
 }
+
+// Sorted by (key, row), whatever the key bits: duplicates, top-bit keys, two
+// columns, and candidate rows given in increasing order (as the kernel does).
+@(test)
+test_packed_join_keys_sorted_by_key_then_row :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	rng := Property_Rng{state = 0xdeadbeefcafe}
+	for width in 1 ..= 2 {
+		n := 5000
+		columns := make([][]v.Value, width, context.temp_allocator)
+		for c in 0 ..< width {
+			columns[c] = make([]v.Value, n, context.temp_allocator)
+			for i in 0 ..< n {
+				r := property_next(&rng)
+				// Mix small duplicate-heavy keys with full 64-bit ones.
+				columns[c][i] = v.Value(i % 3 == 0 ? r : (r % 17) | (u64(c) << 63))
+			}
+		}
+		rows := make([dynamic]u32, context.temp_allocator)
+		for i in 0 ..< n {
+			if i % 4 != 1 {
+				append(&rows, u32(i))
+			}
+		}
+		keys := packed_join_keys(columns, rows[:], context.temp_allocator)
+		testing.expect_value(t, len(keys.rows), len(rows))
+		seen := make(map[u32]bool, context.temp_allocator)
+		for j in 0 ..< len(keys.rows) {
+			row := keys.rows[j]
+			seen[row] = true
+			for c in 0 ..< width {
+				testing.expect_value(t, keys.columns[c][j], u64(columns[c][row]))
+			}
+			if j > 0 {
+				order := accel.join_key_cmp(keys.columns, j - 1, keys.columns, j)
+				testing.expectf(t, order < 0 || (order == 0 && keys.rows[j - 1] < row), "width %d: entries %d and %d out of order", width, j - 1, j)
+			}
+		}
+		testing.expect_value(t, len(seen), len(rows))
+	}
+}
+
+// Cached sorted join keys are found only at the row count they were built
+// for: a relation that grew since must be packed again.
+@(test)
+test_packed_join_lookup_keys_on_row_count :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cache := packed_cache_create(context.temp_allocator)
+	keys := packed_join_keys([][]v.Value{{int_value(2), int_value(1)}}, []u32{0, 1}, context.temp_allocator)
+	packed_join_store(cache, Relation_ID(7), []int{1}, 2, keys)
+	testing.expect(t, packed_join_lookup(cache, Relation_ID(7), []int{1}, 2) != nil)
+	testing.expect(t, packed_join_lookup(cache, Relation_ID(7), []int{1}, 3) == nil)
+	testing.expect(t, packed_join_lookup(cache, Relation_ID(7), []int{0}, 2) == nil)
+	testing.expect(t, packed_join_lookup(cache, Relation_ID(8), []int{1}, 2) == nil)
+	testing.expect(t, packed_join_lookup(cache, Relation_ID(7), []int{1, 0}, 2) == nil)
+}

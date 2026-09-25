@@ -17,11 +17,34 @@ Derived_Columns :: struct {
 	// Row index + 1 per slot, 0 when empty. Power-of-two length, at most half
 	// full.
 	index:    []u32,
+	// Rows scans see while the set is frozen (strict semi-naive rounds).
+	visible:  int,
 }
 
 Rule_Derived :: struct {
 	allocator: mem.Allocator,
 	relations: [dynamic]^Derived_Columns,
+	// While frozen, scans see each relation as it was at the freeze; adds and
+	// deduplication still see every row.
+	frozen:    bool,
+}
+
+// Freezes what scans see: each relation's current rows, and nothing of a
+// relation first created while frozen.
+rules_derived_freeze :: proc(d: ^Rule_Derived) {
+	for entry in d.relations {
+		entry.visible = len(entry.hashes)
+	}
+	d.frozen = true
+}
+
+rules_derived_thaw :: proc(d: ^Rule_Derived) {
+	d.frozen = false
+}
+
+// Rows of `entry` that scans see.
+rules_derived_visible :: #force_inline proc(d: ^Rule_Derived, entry: ^Derived_Columns) -> int {
+	return d.frozen ? entry.visible : len(entry.hashes)
 }
 
 DERIVED_INDEX_MIN :: 16
@@ -43,9 +66,10 @@ rules_derived_find :: proc(d: ^Rule_Derived, relation: Relation_ID) -> ^Derived_
 	return nil
 }
 
+// Rows scans see (all rows unless frozen).
 rules_derived_count :: proc(d: ^Rule_Derived, relation: Relation_ID) -> int {
 	entry := rules_derived_find(d, relation)
-	return entry == nil ? 0 : len(entry.hashes)
+	return entry == nil ? 0 : rules_derived_visible(d, entry)
 }
 
 @(private)
@@ -184,7 +208,7 @@ rules_derived_visit :: proc(
 	if entry == nil || len(bindings) != entry.arity {
 		return false
 	}
-	for row in 0 ..< len(entry.hashes) {
+	for row in 0 ..< rules_derived_visible(d, entry) {
 		matches := true
 		for binding, c in bindings {
 			if binding.bound && !v.value_eq(entry.columns[c][row], binding.value) {

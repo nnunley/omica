@@ -16,6 +16,10 @@ metal_strategy :: proc() -> Strategy {
 		membership_select = metal_membership_select,
 		cosine_query = metal_cosine_query,
 		cosine_queries = metal_cosine_queries,
+		join_equality = join_equality_impl,
+		// Not offered by default: no win over the kernel's CPU hash join on
+		// the engine join benchmark (Stage 3 measurements).
+		join_min_probes = 0,
 	}
 }
 

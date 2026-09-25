@@ -52,6 +52,11 @@ cpu_parallel_strategy :: proc(workers := 0) -> Strategy {
 	s.cosine_queries = cpu_parallel_cosine_queries
 	s.membership_select_prepared = cpu_parallel_membership_select_prepared
 	s.cosine_queries_prepared = cpu_parallel_cosine_queries_prepared
+	s.join_equality = cpu_parallel_join_equality
+	// Not offered by default: at 262k rows the kernel's CPU hash join takes
+	// ~4 ms while sorting the relation's keys alone takes ~11 ms (Stage 3
+	// measurements). Set it to offer the join (tests, benchmarks).
+	s.join_min_probes = 0
 	return s
 }
 
@@ -258,4 +263,84 @@ cpu_parallel_cosine_queries_prepared :: proc(
 	ok: bool,
 ) {
 	return cpu_parallel_cosine_queries(queries, (^Cpu_Prepared)(docs).docs, n_queries, n_docs, dim, allocator)
+}
+
+Cpu_Join_Job :: struct {
+	left, right: [][]u64,
+	right_rows:  []u32,
+	first:       []u32,
+	count:       []u32,
+	offset:      []u32,
+	l, r:        []u32,
+}
+
+// Pass 1: each probe's first sorted match and how many entries match.
+@(private)
+cpu_parallel_join_count_rows :: proc(job: rawptr, first, last: int) {
+	j := (^Cpu_Join_Job)(job)
+	for i in first ..< last {
+		start := join_lower_bound(j.left, i, j.right)
+		end := start
+		for end < len(j.right_rows) && join_key_cmp(j.left, i, j.right, end) == 0 {
+			end += 1
+		}
+		j.first[i] = u32(start)
+		j.count[i] = u32(end - start)
+	}
+}
+
+// Pass 2: each probe writes its pairs at its prefix-sum offset.
+@(private)
+cpu_parallel_join_fill_rows :: proc(job: rawptr, first, last: int) {
+	j := (^Cpu_Join_Job)(job)
+	for i in first ..< last {
+		o, f := int(j.offset[i]), int(j.first[i])
+		for k in 0 ..< int(j.count[i]) {
+			j.l[o + k] = u32(i)
+			j.r[o + k] = j.right_rows[f + k]
+		}
+	}
+}
+
+// Equality join in two parallel passes (count, then fill at prefix-sum
+// offsets), so pairs stay ordered by left row without merging.
+@(private)
+cpu_parallel_join_equality :: proc(
+	left, right: [][]u64,
+	right_rows: []u32,
+	allocator: mem.Allocator,
+) -> (
+	left_out, right_out: []u32,
+	ok: bool,
+) {
+	n := len(left[0])
+	if n < CPU_PARALLEL_MIN_PROBES {
+		return cpu_join_equality(left, right, right_rows, allocator)
+	}
+	last_decline = .None
+	job := Cpu_Join_Job {
+		left       = left,
+		right      = right,
+		right_rows = right_rows,
+		first      = make([]u32, n, allocator),
+		count      = make([]u32, n, allocator),
+		offset     = make([]u32, n, allocator),
+	}
+	defer delete(job.first, allocator)
+	defer delete(job.count, allocator)
+	defer delete(job.offset, allocator)
+	if !cpu_parallel_for(n, &job, cpu_parallel_join_count_rows) {
+		cpu_parallel_join_count_rows(&job, 0, n)
+	}
+	total := 0
+	for i in 0 ..< n {
+		job.offset[i] = u32(total)
+		total += int(job.count[i])
+	}
+	job.l = make([]u32, total, allocator)
+	job.r = make([]u32, total, allocator)
+	if !cpu_parallel_for(n, &job, cpu_parallel_join_fill_rows) {
+		cpu_parallel_join_fill_rows(&job, 0, n)
+	}
+	return job.l, job.r, true
 }

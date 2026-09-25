@@ -20,9 +20,11 @@ rules_small_batch_rows := 16
 
 @(private)
 Rule_Step :: struct {
-	slots:   ^Slot_Map,
-	source:  ^Relation_Source,
-	scratch: mem.Allocator,
+	slots:       ^Slot_Map,
+	source:      ^Relation_Source,
+	scratch:     mem.Allocator,
+	// The body atom this application restricts to source.delta, or -1.
+	delta_index: int,
 }
 
 @(private)
@@ -74,6 +76,7 @@ rules_apply :: proc(
 	delta: ^Rule_Derived,
 	alloc: mem.Allocator,
 	scratch: mem.Allocator,
+	delta_index := -1,
 ) -> (
 	int,
 	Kernel_Error,
@@ -85,6 +88,7 @@ rules_apply :: proc(
 		slots   = &slots,
 		source  = source,
 		scratch = scratch,
+		delta_index = delta_index,
 	}
 	batch := column_batch_unit(len(slots.symbols), scratch)
 	used := make([]bool, len(rule.body), scratch)
@@ -94,7 +98,7 @@ rules_apply :: proc(
 		if column_batch_live(&batch) == 0 {
 			return 0, .None
 		}
-		index, pick_err := pick_body_item(rule, used, &batch, &slots, source)
+		index, pick_err := pick_body_item(rule, used, &batch, &slots, source, delta_index)
 		if pick_err != .None {
 			return 0, pick_err
 		}
@@ -106,7 +110,10 @@ rules_apply :: proc(
 			if item.atom.negated {
 				err = apply_negated_columns(&step, &item.atom, &batch)
 			} else {
+				// Only the chosen occurrence reads the delta.
+				source.delta_active = index == delta_index && source.delta != nil
 				batch, err = apply_positive_columns(&step, &item.atom, &batch)
+				source.delta_active = false
 			}
 		case .Guard:
 			err = apply_guard_columns(&step, item.guard, &batch)
@@ -483,6 +490,11 @@ positive_pairs_hashed :: proc(
 		}
 	}
 	live := column_batch_live_rows(batch, step.scratch)
+	if len(plan.keys) > 0 {
+		if l, r, ok := positive_pairs_accelerated(step, plan, batch, &rows, candidates[:], live); ok {
+			return rows, l, r, .None
+		}
+	}
 	if len(plan.keys) == 0 {
 		m := len(live) * len(candidates)
 		left = make([]u32, m, step.scratch)
@@ -558,4 +570,98 @@ positive_gather :: proc(
 		out.bound[s], out.fixed[s] = true, rows.fixed[p]
 	}
 	return out
+}
+
+// The relation side's sorted join keys over `candidates`. Cached for the
+// evaluation when the candidates are every row of a relation whose rows only
+// accumulate (no constants or repeated variables, not delta-restricted); the
+// row count is part of the key.
+@(private)
+positive_join_keys :: proc(step: ^Rule_Step, plan: ^Atom_Plan, rows: ^Column_Batch, candidates: []u32) -> Packed_Join_Keys {
+	key_columns := make([][]v.Value, len(plan.keys), step.scratch)
+	for p, j in plan.keys {
+		key_columns[j] = rows.columns[p]
+	}
+	source := step.source
+	cacheable := source.packed != nil &&
+		!(source.delta_active && source.delta != nil && plan.atom.relation == source.delta_relation)
+	for role in plan.roles {
+		cacheable = cacheable && (role == .Key || role == .New)
+	}
+	if !cacheable {
+		return packed_join_keys(key_columns, candidates, step.scratch)
+	}
+	if e := packed_join_lookup(source.packed, plan.atom.relation, plan.keys, rows.count); e != nil {
+		return e.keys
+	}
+	keys := packed_join_keys(key_columns, candidates, source.packed.allocator)
+	packed_join_store(source.packed, plan.atom.relation, plan.keys, rows.count, keys)
+	return keys
+}
+
+// Batched equality join on the active strategy: the relation's sorted keys,
+// the batch's key columns as probes, one call. ok=false leaves the step to
+// the CPU hash join. Counted under .Positive_Join when the strategy offers a
+// join (the CPU reference, join_min_probes 0, never does).
+@(private)
+positive_pairs_accelerated :: proc(
+	step: ^Rule_Step,
+	plan: ^Atom_Plan,
+	batch: ^Column_Batch,
+	rows: ^Column_Batch,
+	candidates, live: []u32,
+) -> (
+	left, right: []u32,
+	ok: bool,
+) {
+	strategy := accel.active_strategy()
+	if strategy.join_equality == nil || strategy.join_min_probes <= 0 {
+		return
+	}
+	width := len(plan.keys)
+	if width > 2 {
+		placement_record(.Positive_Join, .Unsupported)
+		return
+	}
+	for p in plan.keys {
+		if !rows.fixed[p] || !batch.fixed[plan.slot_of[p]] {
+			placement_record(.Positive_Join, .Not_Packable)
+			return
+		}
+	}
+	if len(live) < strategy.join_min_probes {
+		placement_record(.Positive_Join, .Below_Threshold)
+		return
+	}
+	keys := positive_join_keys(step, plan, rows, candidates)
+	probe := make([][]u64, width, step.scratch)
+	for p, j in plan.keys {
+		column := batch.columns[plan.slot_of[p]]
+		if batch.selection == nil {
+			probe[j] = slice.reinterpret([]u64, column[:batch.count])
+		} else {
+			gathered := make([]u64, len(live), step.scratch)
+			for r, i in live {
+				gathered[i] = u64(column[r])
+			}
+			probe[j] = gathered
+		}
+	}
+	l, r, result := accel.join_pairs(strategy, probe, keys.columns, keys.rows, step.scratch)
+	switch result {
+	case .Completed:
+		placement_record(.Positive_Join, .Completed)
+		if batch.selection != nil {
+			for &x in l {
+				x = live[x]
+			}
+		}
+		return l, r, true
+	case .Declined:
+		placement_record_decline(.Positive_Join)
+	case .Invalid:
+		placement_record(.Positive_Join, .Invalid_Result)
+	}
+	placement_record(.Positive_Join, .Cpu_Fallback)
+	return
 }

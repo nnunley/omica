@@ -210,11 +210,11 @@ relation_source_scan_append :: proc(
 	}
 
 	if source.delta_active && source.delta != nil && relation == source.delta_relation {
-		column_sink_append_derived(sink, rules_derived_find(source.delta, relation), bindings)
+		column_sink_append_derived(sink, source.delta, relation, bindings)
 		return .None
 	}
 	if source.derived != nil {
-		column_sink_append_derived(sink, rules_derived_find(source.derived, relation), bindings)
+		column_sink_append_derived(sink, source.derived, relation, bindings)
 	}
 	if source.use_stored_derived {
 		stored: []v.Tuple
@@ -253,11 +253,12 @@ relation_source_scan_columns :: proc(
 // Appends the rows of `entry` matching `bindings` (value_eq on bound
 // positions); all rows at once when nothing is bound.
 @(private)
-column_sink_append_derived :: proc(sink: ^Column_Sink, entry: ^Derived_Columns, bindings: []v.Binding) {
+column_sink_append_derived :: proc(sink: ^Column_Sink, d: ^Rule_Derived, relation: Relation_ID, bindings: []v.Binding) {
+	entry := rules_derived_find(d, relation)
 	if entry == nil || len(bindings) != entry.arity {
 		return
 	}
-	rows := len(entry.hashes)
+	rows := rules_derived_visible(d, entry)
 	any_bound := false
 	for binding in bindings {
 		if binding.bound {
@@ -267,7 +268,7 @@ column_sink_append_derived :: proc(sink: ^Column_Sink, entry: ^Derived_Columns, 
 	}
 	if !any_bound {
 		for c in 0 ..< entry.arity {
-			append(&sink.columns[c], ..entry.columns[c][:])
+			append(&sink.columns[c], ..entry.columns[c][:rows])
 		}
 		sink.count += rows
 		return

@@ -25,6 +25,9 @@ import "core:sync"
 // the CPU reference. Same starting points as Metal; tune from the benchmarks.
 CUDA_MEMBERSHIP_MIN_ROWS :: 4096
 CUDA_COSINE_MIN_DOCS :: 1024
+// Fewest probes the CUDA join accepts (placement threshold; tuned on the
+// engine join benchmark).
+CUDA_JOIN_MIN_PROBES :: 4096
 
 // Upper bound on devices tracked; extra devices are ignored.
 @(private)
@@ -94,6 +97,65 @@ extern "C" __global__ void cosine(const float* queries,
         d2 += a * b; qn += a * a; dn += b * b;
     }
     out[tid] = d2 / (sqrtf(qn) * sqrtf(dn) + 1e-9f);
+}
+
+// Equality join over one or two key columns (see accel.join_pairs):
+// join_count finds each probe's equal range in the sorted right keys, the
+// host turns counts into offsets, join_fill writes each probe's pairs there.
+__device__ int join_key_cmp(unsigned long long a0, unsigned long long a1,
+                            unsigned long long b0, unsigned long long b1,
+                            unsigned int width) {
+    if (a0 < b0) return -1;
+    if (a0 > b0) return 1;
+    if (width == 1) return 0;
+    if (a1 < b1) return -1;
+    if (a1 > b1) return 1;
+    return 0;
+}
+
+extern "C" __global__ void join_count(const unsigned long long* left_a,
+                                      const unsigned long long* left_b,
+                                      const unsigned long long* right_a,
+                                      const unsigned long long* right_b,
+                                      unsigned int* first,
+                                      unsigned int* count,
+                                      unsigned int left_len,
+                                      unsigned int right_len,
+                                      unsigned int width) {
+    unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= left_len) return;
+    unsigned long long p0 = left_a[row], p1 = width == 2 ? left_b[row] : 0;
+    unsigned int lo = 0, hi = right_len;
+    while (lo < hi) {
+        unsigned int mid = lo + ((hi - lo) >> 1);
+        if (join_key_cmp(right_a[mid], width == 2 ? right_b[mid] : 0, p0, p1, width) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    unsigned int start = lo;
+    hi = right_len;
+    while (lo < hi) {
+        unsigned int mid = lo + ((hi - lo) >> 1);
+        if (join_key_cmp(right_a[mid], width == 2 ? right_b[mid] : 0, p0, p1, width) <= 0) lo = mid + 1;
+        else hi = mid;
+    }
+    first[row] = start;
+    count[row] = lo - start;
+}
+
+extern "C" __global__ void join_fill(const unsigned int* first,
+                                     const unsigned int* count,
+                                     const unsigned int* offset,
+                                     const unsigned int* right_rows,
+                                     unsigned int* out_left,
+                                     unsigned int* out_right,
+                                     unsigned int left_len) {
+    unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= left_len) return;
+    unsigned int o = offset[row], f = first[row], c = count[row];
+    for (unsigned int k = 0; k < c; k++) {
+        out_left[o + k] = row;
+        out_right[o + k] = right_rows[f + k];
+    }
 }
 `
 
@@ -191,6 +253,8 @@ Cuda_Device_State :: struct {
 	membership: CU_Function,
 	membership2: CU_Function,
 	cosine:     CU_Function,
+	join_count: CU_Function,
+	join_fill:  CU_Function,
 	name_buf:   [128]u8,
 	name:       string,
 	cc_major:   int,
@@ -305,6 +369,12 @@ cuda_device_locked :: proc(ordinal: int) -> ^Cuda_Device_State {
 	if r := drv.cuModuleGetFunction(&state.cosine, state.module, "cosine"); r != CU_SUCCESS {
 		return cuda_device_failed(ordinal, "cuModuleGetFunction(cosine)", r)
 	}
+	if r := drv.cuModuleGetFunction(&state.join_count, state.module, "join_count"); r != CU_SUCCESS {
+		return cuda_device_failed(ordinal, "cuModuleGetFunction(join_count)", r)
+	}
+	if r := drv.cuModuleGetFunction(&state.join_fill, state.module, "join_fill"); r != CU_SUCCESS {
+		return cuda_device_failed(ordinal, "cuModuleGetFunction(join_fill)", r)
+	}
 	state.ready = true
 	return state
 }
@@ -395,7 +465,7 @@ cuda_enter_locked :: proc() -> ^Cuda_Device_State {
 // Device allocations for one operator call, freed together.
 @(private)
 Cuda_Buffers :: struct {
-	ptrs:  [8]CU_Device_Ptr,
+	ptrs:  [16]CU_Device_Ptr,
 	count: int,
 }
 
@@ -832,4 +902,97 @@ cuda_release_impl :: proc(handle: rawptr, kind: Prepared_Kind) {
 		cuda_backend.driver.cuMemFree(resident.ptr)
 	}
 	free(resident)
+}
+
+// Equality join on the current device, inputs uploaded for this call only.
+// join_pairs has checked shape and sort order.
+cuda_join_equality_impl :: proc(
+	left, right: [][]u64,
+	right_rows: []u32,
+	allocator: mem.Allocator,
+) -> (
+	left_out, right_out: []u32,
+	accelerated: bool,
+) {
+	last_decline = .Failed
+	n, m := len(left[0]), len(right_rows)
+	if n < CUDA_JOIN_MIN_PROBES {
+		last_decline = .Below_Threshold
+		return nil, nil, false
+	}
+	if n > int(max(u32)) || m > int(max(u32)) {
+		last_decline = .Unsupported
+		return nil, nil, false
+	}
+	if !cuda_operator_try_lock() {
+		return nil, nil, false
+	}
+	defer sync.mutex_unlock(&cuda_backend.mutex)
+	state := cuda_enter_locked()
+	if state == nil {
+		last_decline = .Unavailable
+		return nil, nil, false
+	}
+	drv := &cuda_backend.driver
+	bufs: Cuda_Buffers
+	defer cuda_free_all(drv, &bufs)
+	width := len(left)
+	upload :: proc(drv: ^Cuda_Driver, bufs: ^Cuda_Buffers, data: []$T) -> (ptr: CU_Device_Ptr, ok: bool) {
+		bytes := len(data) * size_of(T)
+		ptr = cuda_alloc(drv, bufs, bytes) or_return
+		if bytes > 0 && drv.cuMemcpyHtoD(ptr, raw_data(data), c.size_t(bytes)) != CU_SUCCESS {
+			return 0, false
+		}
+		return ptr, true
+	}
+	d_la := upload(drv, &bufs, left[0]) or_return
+	d_ra := upload(drv, &bufs, right[0]) or_return
+	d_lb, d_rb := d_la, d_ra
+	if width == 2 {
+		d_lb = upload(drv, &bufs, left[1]) or_return
+		d_rb = upload(drv, &bufs, right[1]) or_return
+	}
+	d_first := cuda_alloc(drv, &bufs, n * 4) or_return
+	d_count := cuda_alloc(drv, &bufs, n * 4) or_return
+	left_len, right_len, w := u32(n), u32(m), u32(width)
+	count_params := [?]rawptr{&d_la, &d_lb, &d_ra, &d_rb, &d_first, &d_count, &left_len, &right_len, &w}
+	if !cuda_launch(drv, state.join_count, n, count_params[:]) {
+		return nil, nil, false
+	}
+	counts := make([]u32, n, context.temp_allocator)
+	if drv.cuMemcpyDtoH(raw_data(counts), d_count, c.size_t(n * 4)) != CU_SUCCESS {
+		return nil, nil, false
+	}
+	offsets := make([]u32, n, context.temp_allocator)
+	total := 0
+	for i in 0 ..< n {
+		offsets[i] = u32(total)
+		total += int(counts[i])
+	}
+	if total == 0 {
+		last_decline = .None
+		return nil, nil, true
+	}
+	if total > int(max(u32)) {
+		last_decline = .Unsupported
+		return nil, nil, false
+	}
+	d_offset := upload(drv, &bufs, offsets) or_return
+	d_rows := upload(drv, &bufs, right_rows) or_return
+	d_outl := cuda_alloc(drv, &bufs, total * 4) or_return
+	d_outr := cuda_alloc(drv, &bufs, total * 4) or_return
+	fill_params := [?]rawptr{&d_first, &d_count, &d_offset, &d_rows, &d_outl, &d_outr, &left_len}
+	if !cuda_launch(drv, state.join_fill, n, fill_params[:]) {
+		return nil, nil, false
+	}
+	left_out = make([]u32, total, allocator)
+	right_out = make([]u32, total, allocator)
+	if drv.cuMemcpyDtoH(raw_data(left_out), d_outl, c.size_t(total * 4)) != CU_SUCCESS ||
+	   drv.cuMemcpyDtoH(raw_data(right_out), d_outr, c.size_t(total * 4)) != CU_SUCCESS {
+		delete(left_out, allocator)
+		delete(right_out, allocator)
+		return nil, nil, false
+	}
+	last_decline = .None
+	return left_out, right_out, true
 }

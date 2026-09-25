@@ -94,6 +94,7 @@ Packed_Entry :: struct {
 // the evaluation and one gather serves every rule and round.
 Packed_Cache :: struct {
 	entries:   [dynamic]^Packed_Entry,
+	joins:     [dynamic]^Packed_Join_Entry,
 	allocator: mem.Allocator,
 	builds:    int,
 	prepares:  int,
@@ -117,7 +118,11 @@ packed_last_evaluation_builds :: proc() -> int {
 
 packed_cache_create :: proc(allocator: mem.Allocator) -> ^Packed_Cache {
 	cache := new(Packed_Cache, allocator)
-	cache^ = Packed_Cache{entries = make([dynamic]^Packed_Entry, allocator), allocator = allocator}
+	cache^ = Packed_Cache {
+		entries   = make([dynamic]^Packed_Entry, allocator),
+		joins     = make([dynamic]^Packed_Join_Entry, allocator),
+		allocator = allocator,
+	}
 	return cache
 }
 
@@ -161,4 +166,111 @@ packed_cache_lookup :: proc(source: ^Relation_Source, relation: Relation_ID, wid
 	append(&cache.entries, e)
 	cache.builds += 1
 	return e, ok
+}
+
+// Sorted key columns (one or two relation positions) with each entry's source
+// row, for batched equality joins (accel.join_pairs). Entries are sorted by
+// key, then row.
+Packed_Join_Keys :: struct {
+	columns: [][]u64,
+	rows:    []u32,
+}
+
+@(private)
+Packed_Join_Sort_Entry :: struct {
+	k0, k1: u64,
+	row:    u32,
+}
+
+// Packs `rows` (increasing) of the fixed-width key `columns` (1 or 2) into
+// sorted keys, ordered by key then row. A stable LSD radix sort over 8-bit
+// digits, low column first; digits equal across every key are skipped, which
+// drops most passes for identities that share their high bytes. Rows start
+// in increasing order and every pass is stable, so equal keys keep row order.
+packed_join_keys :: proc(columns: [][]v.Value, rows: []u32, allocator: mem.Allocator) -> Packed_Join_Keys {
+	width, n := len(columns), len(rows)
+	a := make([]Packed_Join_Sort_Entry, n, allocator)
+	b := make([]Packed_Join_Sort_Entry, n, allocator)
+	defer delete(a, allocator)
+	defer delete(b, allocator)
+	for r, i in rows {
+		a[i] = {u64(columns[0][r]), width == 2 ? u64(columns[1][r]) : 0, r}
+	}
+	for c := width - 1; c >= 0; c -= 1 {
+		all_or, all_and := u64(0), ~u64(0)
+		for e in a {
+			k := c == 0 ? e.k0 : e.k1
+			all_or |= k
+			all_and &= k
+		}
+		varying := all_or ~ all_and
+		for shift := uint(0); shift < 64; shift += 8 {
+			if (varying >> shift) & 0xff == 0 {
+				continue
+			}
+			counts: [256]int
+			for e in a {
+				k := c == 0 ? e.k0 : e.k1
+				counts[(k >> shift) & 0xff] += 1
+			}
+			total := 0
+			for d in 0 ..< 256 {
+				counts[d], total = total, total + counts[d]
+			}
+			for e in a {
+				k := c == 0 ? e.k0 : e.k1
+				d := (k >> shift) & 0xff
+				b[counts[d]] = e
+				counts[d] += 1
+			}
+			a, b = b, a
+		}
+	}
+	keys := Packed_Join_Keys {
+		columns = make([][]u64, width, allocator),
+		rows    = make([]u32, n, allocator),
+	}
+	for c in 0 ..< width {
+		keys.columns[c] = make([]u64, n, allocator)
+	}
+	for e, i in a {
+		keys.columns[0][i] = e.k0
+		if width == 2 {
+			keys.columns[1][i] = e.k1
+		}
+		keys.rows[i] = e.row
+	}
+	return keys
+}
+
+// Sorted join keys for (relation, positions) at a given row count. Rows only
+// accumulate during an evaluation, so an equal count means the same rows.
+Packed_Join_Entry :: struct {
+	relation:  Relation_ID,
+	positions: [2]int,
+	width:     int,
+	count:     int,
+	keys:      Packed_Join_Keys,
+}
+
+packed_join_lookup :: proc(cache: ^Packed_Cache, relation: Relation_ID, positions: []int, count: int) -> ^Packed_Join_Entry {
+	if cache == nil {
+		return nil
+	}
+	for e in cache.joins {
+		if e.relation == relation && e.width == len(positions) && e.count == count &&
+		   e.positions[0] == positions[0] && (e.width == 1 || e.positions[1] == positions[1]) {
+			return e
+		}
+	}
+	return nil
+}
+
+packed_join_store :: proc(cache: ^Packed_Cache, relation: Relation_ID, positions: []int, count: int, keys: Packed_Join_Keys) {
+	e := new(Packed_Join_Entry, cache.allocator)
+	e^ = Packed_Join_Entry{relation = relation, width = len(positions), count = count, keys = keys}
+	for p, i in positions {
+		e.positions[i] = p
+	}
+	append(&cache.joins, e)
 }

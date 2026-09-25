@@ -8,12 +8,16 @@ import MTL "vendor:darwin/Metal"
 import NS "core:sys/darwin/Foundation"
 import "core:sync"
 import "core:mem"
+import "core:slice"
 import "core:strings"
 
 // Minimum rows before GPU dispatch is considered. Below this the PCIe-less
 // unified-memory launch overhead still exceeds the CPU scan.
 MEMBERSHIP_MIN_ROWS :: 4096
 COSINE_MIN_DOCS :: 1024
+// Fewest probes the Metal join accepts (placement threshold; tuned on the
+// engine join benchmark).
+METAL_JOIN_MIN_PROBES :: 4096
 
 MEMBERSHIP_SHADER :: `
 #include <metal_stdlib>
@@ -65,6 +69,66 @@ kernel void cosine(device const float* queries [[buffer(0)]],
 }
 `
 
+// Equality join over one or two key columns: join_count finds each probe's
+// equal range in the sorted right keys, the host turns counts into offsets,
+// join_fill writes each probe's pairs at its offset (pairs stay ordered by
+// probe). Width 1 binds the first columns again as the unused second ones.
+JOIN_SHADER :: `
+#include <metal_stdlib>
+using namespace metal;
+inline int key_cmp(ulong a0, ulong a1, ulong b0, ulong b1, uint width) {
+    if (a0 < b0) return -1;
+    if (a0 > b0) return 1;
+    if (width == 1) return 0;
+    if (a1 < b1) return -1;
+    if (a1 > b1) return 1;
+    return 0;
+}
+kernel void join_count(device const ulong* left_a [[buffer(0)]],
+                       device const ulong* left_b [[buffer(1)]],
+                       device const ulong* right_a [[buffer(2)]],
+                       device const ulong* right_b [[buffer(3)]],
+                       device uint* first [[buffer(4)]],
+                       device uint* count [[buffer(5)]],
+                       constant uint& left_len [[buffer(6)]],
+                       constant uint& right_len [[buffer(7)]],
+                       constant uint& width [[buffer(8)]],
+                       uint row [[thread_position_in_grid]]) {
+    if (row >= left_len) return;
+    ulong p0 = left_a[row], p1 = width == 2 ? left_b[row] : 0;
+    uint lo = 0, hi = right_len;
+    while (lo < hi) {
+        uint mid = lo + ((hi - lo) >> 1);
+        if (key_cmp(right_a[mid], width == 2 ? right_b[mid] : 0, p0, p1, width) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    uint start = lo;
+    hi = right_len;
+    while (lo < hi) {
+        uint mid = lo + ((hi - lo) >> 1);
+        if (key_cmp(right_a[mid], width == 2 ? right_b[mid] : 0, p0, p1, width) <= 0) lo = mid + 1;
+        else hi = mid;
+    }
+    first[row] = start;
+    count[row] = lo - start;
+}
+kernel void join_fill(device const uint* first [[buffer(0)]],
+                      device const uint* count [[buffer(1)]],
+                      device const uint* offset [[buffer(2)]],
+                      device const uint* right_rows [[buffer(3)]],
+                      device uint* out_left [[buffer(4)]],
+                      device uint* out_right [[buffer(5)]],
+                      constant uint& left_len [[buffer(6)]],
+                      uint row [[thread_position_in_grid]]) {
+    if (row >= left_len) return;
+    uint o = offset[row], f = first[row], c = count[row];
+    for (uint k = 0; k < c; k++) {
+        out_left[o + k] = row;
+        out_right[o + k] = right_rows[f + k];
+    }
+}
+`
+
 @(private)
 Backend :: struct {
 	mutex:        sync.Mutex,
@@ -72,6 +136,8 @@ Backend :: struct {
 	queue:        ^MTL.CommandQueue,
 	membership:   ^MTL.ComputePipelineState,
 	cosine:       ^MTL.ComputePipelineState,
+	join_count:   ^MTL.ComputePipelineState,
+	join_fill:    ^MTL.ComputePipelineState,
 	pool:         ^NS.AutoreleasePool,
 	probed:       bool,
 	enabled:      bool,
@@ -101,13 +167,17 @@ ensure_backend :: proc() -> ^Backend {
 	}
 	membership := compile(device, MEMBERSHIP_SHADER, "membership")
 	cosine := compile(device, COSINE_SHADER, "cosine")
-	if membership == nil || cosine == nil {
+	join_count := compile(device, JOIN_SHADER, "join_count")
+	join_fill := compile(device, JOIN_SHADER, "join_fill")
+	if membership == nil || cosine == nil || join_count == nil || join_fill == nil {
 		backend.device = nil
 		backend.queue = nil
 		return &backend
 	}
 	backend.membership = membership
 	backend.cosine = cosine
+	backend.join_count = join_count
+	backend.join_fill = join_fill
 	backend.enabled = true
 	return &backend
 }
@@ -299,4 +369,90 @@ cosine_query_impl :: proc(
 	accelerated: bool,
 ) {
 	return cosine_queries_impl(query, docs, 1, n_docs, dim, allocator)
+}
+
+// Equality join (see JOIN_SHADER). Every buffer it creates is released
+// before returning. Declines below METAL_JOIN_MIN_PROBES probes, when busy,
+// and on any allocation failure.
+join_equality_impl :: proc(
+	left, right: [][]u64,
+	right_rows: []u32,
+	allocator: mem.Allocator,
+) -> (
+	left_out, right_out: []u32,
+	accelerated: bool,
+) {
+	last_decline = .Failed
+	n, m := len(left[0]), len(right_rows)
+	if n < METAL_JOIN_MIN_PROBES {
+		last_decline = .Below_Threshold
+		return nil, nil, false
+	}
+	be := ensure_backend()
+	if !be.enabled {
+		last_decline = .Unavailable
+		return nil, nil, false
+	}
+	if !sync.mutex_try_lock(&be.mutex) {
+		last_decline = .Busy
+		return nil, nil, false
+	}
+	defer sync.mutex_unlock(&be.mutex)
+
+	buffers := make([dynamic]^MTL.Buffer, 0, 16, context.temp_allocator)
+	defer for b in buffers {
+		if b != nil {
+			b->release()
+		}
+	}
+	keep :: proc(buffers: ^[dynamic]^MTL.Buffer, b: ^MTL.Buffer) -> ^MTL.Buffer {
+		append(buffers, b)
+		return b
+	}
+	width := len(left)
+	la := keep(&buffers, be.device->newBufferWithSlice(left[0], MTL.ResourceStorageModeShared))
+	lb := la
+	ra := keep(&buffers, be.device->newBufferWithSlice(right[0], MTL.ResourceStorageModeShared))
+	rb := ra
+	if width == 2 {
+		lb = keep(&buffers, be.device->newBufferWithSlice(left[1], MTL.ResourceStorageModeShared))
+		rb = keep(&buffers, be.device->newBufferWithSlice(right[1], MTL.ResourceStorageModeShared))
+	}
+	first := keep(&buffers, be.device->newBufferWithLength(NS.UInteger(n * 4), MTL.ResourceStorageModeShared))
+	count := keep(&buffers, be.device->newBufferWithLength(NS.UInteger(n * 4), MTL.ResourceStorageModeShared))
+	ln := keep(&buffers, be.device->newBufferWithSlice(([]u32{u32(n)})[:], MTL.ResourceStorageModeShared))
+	rn := keep(&buffers, be.device->newBufferWithSlice(([]u32{u32(m)})[:], MTL.ResourceStorageModeShared))
+	wd := keep(&buffers, be.device->newBufferWithSlice(([]u32{u32(width)})[:], MTL.ResourceStorageModeShared))
+	for b in buffers {
+		if b == nil {
+			return nil, nil, false
+		}
+	}
+	dispatch(be, be.join_count, []^MTL.Buffer{la, lb, ra, rb, first, count, ln, rn, wd}, n)
+
+	counts := slice.reinterpret([]u32, count->contents()[:n * 4])
+	offsets := make([]u32, n, context.temp_allocator)
+	total := 0
+	for i in 0 ..< n {
+		offsets[i] = u32(total)
+		total += int(counts[i])
+	}
+	if total == 0 {
+		last_decline = .None
+		return nil, nil, true
+	}
+	ob := keep(&buffers, be.device->newBufferWithSlice(offsets, MTL.ResourceStorageModeShared))
+	rr := keep(&buffers, be.device->newBufferWithSlice(right_rows, MTL.ResourceStorageModeShared))
+	outl := keep(&buffers, be.device->newBufferWithLength(NS.UInteger(total * 4), MTL.ResourceStorageModeShared))
+	outr := keep(&buffers, be.device->newBufferWithLength(NS.UInteger(total * 4), MTL.ResourceStorageModeShared))
+	if ob == nil || rr == nil || outl == nil || outr == nil {
+		return nil, nil, false
+	}
+	dispatch(be, be.join_fill, []^MTL.Buffer{first, count, ob, rr, outl, outr, ln}, n)
+	left_out = make([]u32, total, allocator)
+	right_out = make([]u32, total, allocator)
+	copy(left_out, slice.reinterpret([]u32, outl->contents()[:total * 4]))
+	copy(right_out, slice.reinterpret([]u32, outr->contents()[:total * 4]))
+	last_decline = .None
+	return left_out, right_out, true
 }

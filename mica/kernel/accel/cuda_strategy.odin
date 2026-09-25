@@ -22,6 +22,10 @@ cuda_strategy :: proc() -> Strategy {
 		cosine_queries_prepared = cuda_cosine_queries_prepared_impl,
 		release = cuda_release_impl,
 		resident_min_probes = CUDA_MEMBERSHIP_MIN_ROWS,
+		join_equality = cuda_join_equality_impl,
+		// Not offered by default: no win over the kernel's CPU hash join on
+		// the engine join benchmark (Stage 3 measurements).
+		join_min_probes = 0,
 	}
 }
 

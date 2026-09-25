@@ -88,6 +88,53 @@ engine_evaluate :: proc(scratch: ^virtual.Arena, scratch_alloc: mem.Allocator, r
 	return
 }
 
+// 262,144 A rows (x, y) with y in 0..<65,536, and B rows (y, z) for every y:
+// Out(x, z) :- A(x, y), B(y, z) derives 262,144 rows through one join keyed
+// on y, large enough for every accelerator's threshold.
+JOIN_A_ROWS :: 262_144
+JOIN_B_ROWS :: 65_536
+
+@(private)
+join_state_init :: proc() -> ^Negation_State {
+	state := new(Negation_State)
+	if virtual.arena_init_growing(&state.arena) != nil || virtual.arena_init_growing(&state.scratch) != nil {
+		panic("failed to initialize join benchmark arenas")
+	}
+	state.alloc = virtual.arena_allocator(&state.arena)
+	state.scratch_alloc = virtual.arena_allocator(&state.scratch)
+	k.kernel_init(&state.kernel)
+	a := create_relation(&state.kernel, 40, "JoinA", 2)
+	b := create_relation(&state.kernel, 41, "JoinB", 2)
+	out := create_relation(&state.kernel, 42, "JoinOut", 2)
+	x, y, z := v.symbol_intern("x"), v.symbol_intern("y"), v.symbol_intern("z")
+	rule := k.rule_new(out, []k.Term{k.term_var(x), k.term_var(z)}, []k.Rule_Body_Item {
+		k.body_atom(k.atom_positive(a, []k.Term{k.term_var(x), k.term_var(y)})),
+		k.body_atom(k.atom_positive(b, []k.Term{k.term_var(y), k.term_var(z)})),
+	})
+	snapshot, err := k.kernel_install_rule(&state.kernel, v.Identity(43), rule, "join_large")
+	assert(err == .None)
+	k.snapshot_release(snapshot)
+	k.kernel_set_derivation(&state.kernel, false)
+	tx := k.kernel_begin(&state.kernel)
+	for i in 0 ..< JOIN_A_ROWS {
+		xv := v.value_identity(bench_identity(u64(1_000_000 + i)))
+		yv := v.value_identity(bench_identity(u64(3_000_000 + i % JOIN_B_ROWS)))
+		assert(k.transaction_assert(&tx, a, v.tuple_new(state.alloc, []v.Value{xv, yv})) == .None)
+	}
+	for j in 0 ..< JOIN_B_ROWS {
+		yv := v.value_identity(bench_identity(u64(3_000_000 + j)))
+		zv := v.value_identity(bench_identity(u64(5_000_000 + j)))
+		assert(k.transaction_assert(&tx, b, v.tuple_new(state.alloc, []v.Value{yv, zv})) == .None)
+	}
+	committed, commit_err := k.transaction_commit(&tx)
+	assert(commit_err == .None)
+	k.snapshot_release(committed)
+	k.transaction_destroy(&tx)
+	state.snapshot = k.kernel_snapshot(&state.kernel)
+	state.rules = state.snapshot.rules
+	return state
+}
+
 @(private)
 negation_rows :: proc(user: rawptr) -> (u64, u64) {
 	s := (^Negation_State)(user)
@@ -130,8 +177,8 @@ engine_check :: proc(label: string, state: rawptr, rows: proc(rawptr) -> (u64, u
 	before := k.placement_counts_this_thread()
 	total, digest = rows(state)
 	delta := k.placement_counts_delta(before, k.placement_counts_this_thread())
-	completed = delta[.Negated_Membership][.Completed]
-	fmt.eprintf("accel-check: %s %s rows=%d digest=%x negated_membership=%v\n", label, strategy.name, total, digest, delta[.Negated_Membership])
+	completed = delta[.Negated_Membership][.Completed] + delta[.Positive_Join][.Completed]
+	fmt.eprintf("accel-check: %s %s rows=%d digest=%x negated_membership=%v positive_join=%v\n", label, strategy.name, total, digest, delta[.Negated_Membership], delta[.Positive_Join])
 	return
 }
 
@@ -158,6 +205,19 @@ register_engine_accel_benches :: proc(runner: ^mm.Runner) {
 	workloads := []Workload {
 		{"visible_items_rule", visible_state_init(), visible_rows},
 		{"negation_large_262k", negation_state_init(), negation_rows},
+		{"join_large_262k", join_state_init(), negation_rows},
+	}
+	// Each strategy with a join operator also runs with the join forced on
+	// (join_min_probes = 1), so accelerated and CPU hash joins sit side by side.
+	base_count := len(strategies) // the loop appends: bound it first
+	for i in 0 ..< base_count {
+		s := strategies[i]
+		if s.join_equality != nil && s.name != "cpu" {
+			forced := s
+			forced.name = fmt.aprintf("%s_join", s.name)
+			forced.join_min_probes = 1
+			append(&strategies, forced)
+		}
 	}
 	group := mm.group(runner, "kernel/rules_accel")
 	for w in workloads {

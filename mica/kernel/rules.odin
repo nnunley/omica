@@ -394,6 +394,11 @@ rules_evaluate_source :: proc(
 		return .None
 	}
 
+	rounds := 0
+	defer rules_last_rounds = rounds
+	// Every exit, errors included, leaves the result readable in full.
+	defer rules_derived_thaw(result)
+
 	strata, ok := rules_stratify(rules, alloc)
 	if !ok {
 		return .Unstratified_Negation
@@ -405,7 +410,11 @@ rules_evaluate_source :: proc(
 			stratum_heads[rule.head_relation] = true
 		}
 
+		// Strict semi-naive: every pass reads the result as it stood when the
+		// pass began; rows it derives become visible in the next round.
 		// Seed the fixpoint with one full evaluation of the stratum.
+		rounds += 1
+		rules_derived_freeze(result)
 		delta := rules_derived_create(alloc)
 		for rule in stratum {
 			_, err := rules_apply(rule, source, result, &delta, alloc, scratch_alloc)
@@ -417,6 +426,8 @@ rules_evaluate_source :: proc(
 
 		// Each round evaluates the delta variants of every recursive atom.
 		for len(delta.relations) > 0 {
+			rounds += 1
+			rules_derived_freeze(result)
 			next := rules_derived_create(alloc)
 			for rule in stratum {
 				for item, index in rule.body {
@@ -430,10 +441,12 @@ rules_evaluate_source :: proc(
 						continue
 					}
 
+					// This variant restricts only body atom `index` to the
+					// previous round's rows; other atoms of the same relation
+					// read it whole (rules_apply toggles delta_active per scan).
 					source.delta = &delta
 					source.delta_relation = item.atom.relation
-					source.delta_active = true
-					_, err := rules_apply(rule, source, result, &next, alloc, scratch_alloc)
+					_, err := rules_apply(rule, source, result, &next, alloc, scratch_alloc, index)
 					virtual.arena_free_all(&scratch)
 					source.delta_active = false
 					source.delta = nil
@@ -444,8 +457,18 @@ rules_evaluate_source :: proc(
 			}
 			delta = next
 		}
+		rules_derived_thaw(result)
 	}
 	return .None
+}
+
+@(thread_local, private)
+rules_last_rounds: int
+
+// Rounds of the calling thread's most recent evaluation: one seed pass per
+// stratum plus each semi-naive round (tests).
+rules_last_evaluation_rounds :: proc() -> int {
+	return rules_last_rounds
 }
 
 @(private)
@@ -535,6 +558,7 @@ pick_body_item :: proc(
 	batch: ^Column_Batch,
 	slots: ^Slot_Map,
 	source: ^Relation_Source,
+	delta_index := -1,
 ) -> (
 	int,
 	Kernel_Error,
@@ -584,6 +608,9 @@ pick_body_item :: proc(
 		}
 		bound := atom_bound_count(&item.atom, batch, slots)
 		rows := rules_source_cardinality(source, item.atom.relation)
+		if index == delta_index && source.delta != nil {
+			rows = rules_derived_count(source.delta, item.atom.relation)
+		}
 		if best < 0 || bound > best_bound || (bound == best_bound && rows < best_rows) {
 			best = index
 			best_bound = bound

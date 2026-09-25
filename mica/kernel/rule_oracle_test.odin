@@ -238,6 +238,8 @@ oracle_program :: proc(rng: ^Property_Rng, rel: Oracle_Relations, domain: []v.Va
 	if on(rng) {append(&layers[0], rule_new(rel.p, heads(X, Y), body(pos(rel.f, X, Y), pos(rel.n, X))))}
 	if on(rng) {append(&layers[0], rule_new(rel.q, heads(X), body(pos(rel.p, X, Y), body_guard(rule_guard(.Lt, Y, d)))))}
 	if on(rng) {append(&layers[0], rule_new(rel.q, heads(X), body(pos(rel.n, X), pos(rel.f, Y, Y))))}
+	// Two atoms of the same recursive relation.
+	if on(rng) {append(&layers[0], rule_new(rel.p, heads(X, Z), body(pos(rel.p, X, Y), pos(rel.p, Y, Z))))}
 	// Layer 1
 	if on(rng) {append(&layers[1], rule_new(rel.r, heads(X), body(pos(rel.q, X), neg(rel.n, X))))}
 	if on(rng) {append(&layers[1], rule_new(rel.s, heads(X, Y), body(pos(rel.p, X, Y), neg(rel.m, X, Y))))}
@@ -255,6 +257,12 @@ oracle_program :: proc(rng: ^Property_Rng, rel: Oracle_Relations, domain: []v.Va
 oracle_strategies :: proc() -> [dynamic]accel.Strategy {
 	out := make([dynamic]accel.Strategy)
 	append(&out, accel.cpu_strategy(), accel.cpu_parallel_strategy())
+	// The CPU reference join offered for every positive join: exercises the
+	// accelerated join path (packed keys, cache, pair mapping) on every program.
+	cpu_join := accel.cpu_strategy()
+	cpu_join.name = "cpu_join"
+	cpu_join.join_min_probes = 1
+	append(&out, cpu_join)
 	when ODIN_OS == .Darwin {
 		if s := accel.metal_strategy(); s.available() {
 			append(&out, s)
