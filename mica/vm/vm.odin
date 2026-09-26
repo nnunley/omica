@@ -183,9 +183,12 @@ VM :: struct {
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.program = program
 	state.allocator = allocator
-	state.registers = make([dynamic]v.Value)
-	state.frames = make([dynamic]Frame)
-	state.builtins = make([dynamic]VM_Builtin)
+	// Every container uses the task's allocator, not the context allocator of
+	// the thread that creates the VM: a host thread creates a task that a
+	// scheduler worker then runs and grows.
+	state.registers = make([dynamic]v.Value, allocator)
+	state.frames = make([dynamic]Frame, allocator)
+	state.builtins = make([dynamic]VM_Builtin, allocator)
 	state.request = .None
 	state.request_spec = -1
 	state.request_value = v.Value(0)
@@ -193,9 +196,9 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.pending_resume = -1
 	state.max_call_depth = DEFAULT_MAX_CALL_DEPTH
 	state.entry_function = -1
-	state.handlers = make([dynamic]Handler)
-	state.pending_returns = make([dynamic]Pending_Return)
-	state.pending_raises = make([dynamic]Pending_Raise)
+	state.handlers = make([dynamic]Handler, allocator)
+	state.pending_returns = make([dynamic]Pending_Return, allocator)
+	state.pending_raises = make([dynamic]Pending_Raise, allocator)
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
 	state.status = .Ready

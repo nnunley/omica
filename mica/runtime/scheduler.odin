@@ -9,6 +9,7 @@
 // generation so a task that is resumed by other means ignores its stale timer.
 package mica_runtime
 
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
@@ -1166,6 +1167,10 @@ scheduler_spawn_child :: proc(scheduler: ^Scheduler, parent: ^Task) -> Task_ID {
 
 @(private)
 scheduler_worker_proc :: proc(data: rawptr) {
+	// Implicit allocations on this thread use the process heap, never the
+	// creating thread's context allocator, which need not be thread-safe (a
+	// test runner's or an arena). World threads allocate concurrently.
+	context.allocator = runtime.heap_allocator()
 	// A private temporary scratch arena for this worker. Task execution
 	// allocates temporaries through `context.temp_allocator`; a dedicated
 	// arena keeps each worker's scratch independent and releases it when the
@@ -1259,6 +1264,10 @@ scheduler_worker_proc :: proc(data: rawptr) {
 
 @(private)
 scheduler_timer_proc :: proc(data: rawptr) {
+	// Implicit allocations on this thread use the process heap, never the
+	// creating thread's context allocator, which need not be thread-safe (a
+	// test runner's or an arena). World threads allocate concurrently.
+	context.allocator = runtime.heap_allocator()
 	// Private temporary scratch arena; see `scheduler_worker_proc`.
 	temp_arena: virtual.Arena
 	if err := virtual.arena_init_growing(&temp_arena); err == nil {

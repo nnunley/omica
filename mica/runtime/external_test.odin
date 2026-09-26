@@ -2,6 +2,7 @@
 // stream delivery to a mailbox.
 package mica_runtime
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:testing"
@@ -86,7 +87,7 @@ external_world :: proc(
 	world, start := world_start(
 		kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config {
 			workers          = 1,
 			external_handler = handler,

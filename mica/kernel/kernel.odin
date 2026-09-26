@@ -243,7 +243,7 @@ arena_pool_shard :: proc(pool: ^Arena_Pool) -> ^Arena_Pool_Shard {
 
 arena_pool_init :: proc(pool: ^Arena_Pool) {
 	for index in 0 ..< ARENA_POOL_SHARDS {
-		pool.shards[index].arenas = make([dynamic]^Frame_Arena)
+		pool.shards[index].arenas = make([dynamic]^Frame_Arena, runtime.default_allocator())
 	}
 }
 
@@ -322,10 +322,13 @@ kernel_init :: proc(kernel: ^Kernel) {
 	kernel.world_allocator = virtual.arena_allocator(kernel.world)
 	kernel.arena_pool = new(Arena_Pool, runtime.default_allocator())
 	arena_pool_init(kernel.arena_pool)
-	kernel.retired = make([dynamic]^Snapshot)
-	kernel.pending_commits = make([dynamic]^Commit_Entry)
-	capability_store_init(&kernel.capabilities)
-	changes_init(&kernel.changes)
+	// Every thread of a world shares the kernel, so its containers use the
+	// process heap, never the context allocator of the thread that calls
+	// kernel_init (which need not be thread-safe).
+	kernel.retired = make([dynamic]^Snapshot, runtime.default_allocator())
+	kernel.pending_commits = make([dynamic]^Commit_Entry, runtime.default_allocator())
+	capability_store_init(&kernel.capabilities, runtime.default_allocator())
+	changes_init(&kernel.changes, allocator = runtime.default_allocator())
 	buf.store_init(&kernel.buffer_store, runtime.default_allocator())
 	buffer_history_init(&kernel.buffer_history, runtime.default_allocator())
 	buffer_result_ring_init(&kernel.buffer_results, runtime.default_allocator())

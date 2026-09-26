@@ -2,6 +2,7 @@
 // relations the agent tools query.
 package source
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
@@ -114,7 +115,7 @@ test_index_workspace_tree_with_root :: proc(t: ^testing.T, root_kind: string) {
 	world, start := r.world_start(
 		&kernel,
 		[]string{schema_path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		r.World_Config{workers = 1},
 	)
 	if !start.ok {
@@ -214,7 +215,7 @@ test_index_skips_world_without_schema :: proc(t: ^testing.T) {
 	world, start := r.world_start(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		r.World_Config{workers = 1},
 	)
 	if !start.ok {

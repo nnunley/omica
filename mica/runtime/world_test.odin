@@ -1,6 +1,7 @@
 // Tests for the long-lived world API.
 package mica_runtime
 
+import "base:runtime"
 import "core:os"
 import "core:testing"
 import k "../kernel"
@@ -32,7 +33,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, result := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, result := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "world start failed: %s", result.message)
 	if !result.ok {
 		return
@@ -68,7 +69,7 @@ test_world_unknown_selector :: proc(t: ^testing.T) {
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, result := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, result := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "world start failed: %s", result.message)
 	if !result.ok {
 		return
@@ -101,7 +102,7 @@ end
 	world, result := world_start(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config{workers = 2},
 	)
 	testing.expectf(t, result.ok, "world start failed: %s", result.message)
@@ -143,7 +144,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
