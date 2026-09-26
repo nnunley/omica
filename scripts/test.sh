@@ -464,12 +464,13 @@ run_owlstream_checks() {
 }
 
 # bycycle-load.sh must not break another process's store lock: a command on
-# a locked store fails and leaves LOCK in place, and only the explicit
-# `unlock` subcommand removes a stale one.
+# a locked store fails and leaves LOCK in place, and `unlock` removes a lock
+# only when its recorded owner is gone (--force for an unknown owner).
 run_bycycle_lock_checks() {
-  local tmp="$1" store="$1/bycycle-locked" out
+  local tmp="$1" filein="$2" store="$1/bycycle-locked" out host
+  host="$(hostname)"
   mkdir -p "${store}"
-  : > "${store}/LOCK"
+  printf 'pid 999999\nhost %s\n' "${host}" > "${store}/LOCK"
   if out="$(scripts/bycycle-load.sh query "${store}" 'return 1' 2>&1)"; then
     problem "integration:bycycle-lock: query on a locked store succeeded"
   elif [[ ! -e "${store}/LOCK" ]]; then
@@ -479,10 +480,26 @@ run_bycycle_lock_checks() {
   else
     pass "integration:bycycle-lock"
   fi
-  if scripts/bycycle-load.sh unlock "${store}" >/dev/null 2>&1 && [[ ! -e "${store}/LOCK" ]]; then
-    pass "integration:bycycle-unlock"
+  if FILEIN_BIN="${filein}" scripts/bycycle-load.sh unlock "${store}" >/dev/null 2>&1 \
+    && [[ ! -e "${store}/LOCK" ]]; then
+    pass "integration:bycycle-unlock-stale"
   else
-    problem "integration:bycycle-unlock: unlock did not remove a stale LOCK"
+    problem "integration:bycycle-unlock-stale: unlock did not remove a lock whose owner is gone"
+  fi
+  printf 'pid %s\nhost %s\n' "$$" "${host}" > "${store}/LOCK"
+  if ! FILEIN_BIN="${filein}" scripts/bycycle-load.sh unlock "${store}" >/dev/null 2>&1 \
+    && [[ -e "${store}/LOCK" ]]; then
+    pass "integration:bycycle-unlock-live"
+  else
+    problem "integration:bycycle-unlock-live: unlock removed a running owner's lock"
+  fi
+  : > "${store}/LOCK"
+  if ! FILEIN_BIN="${filein}" scripts/bycycle-load.sh unlock "${store}" >/dev/null 2>&1 \
+    && FILEIN_BIN="${filein}" scripts/bycycle-load.sh unlock "${store}" --force >/dev/null 2>&1 \
+    && [[ ! -e "${store}/LOCK" ]]; then
+    pass "integration:bycycle-unlock-force"
+  else
+    problem "integration:bycycle-unlock-force: an ownerless lock needs --force, and --force removes it"
   fi
 }
 
@@ -566,7 +583,7 @@ run_integration() {
   fi
 
   run_owlstream_checks "${filein}" "${bin_dir}/owlstream" "${tmp}"
-  run_bycycle_lock_checks "${tmp}"
+  run_bycycle_lock_checks "${tmp}" "${filein}"
 
   # REPL evaluates a line.
   printf '1 + 1\n' > "${tmp}/repl.in"

@@ -8,7 +8,9 @@ import "core:strings"
 import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:sync"
+import "core:sys/posix"
 import "core:thread"
 import "core:time"
 import k "../kernel"
@@ -480,8 +482,88 @@ store_release :: proc(store: ^Store) {
 	}
 }
 
-// Creates the exclusive `LOCK` file. A second process on the same store fails
-// with a clear message; a stale lock after a crash must be removed by hand.
+// The process that holds a store's LOCK, as recorded in the file.
+Lock_Owner :: struct {
+	pid:  int,
+	host: string,
+}
+
+// What `store_unlock` did.
+Unlock_Result :: enum {
+	Not_Locked,
+	Removed,
+	// The recorded owner is a running process on this host.
+	Owner_Running,
+	// The owner is on another host, whose processes cannot be checked.
+	Owner_Elsewhere,
+	// The lock records no owner (written by an older version).
+	Owner_Unknown,
+}
+
+// This machine's host name, for recording and checking lock owners.
+lock_this_host :: proc(allocator := context.temp_allocator) -> string {
+	buffer: [256]u8
+	if posix.gethostname(raw_data(buffer[:]), len(buffer)) != .OK {
+		return ""
+	}
+	return strings.clone(string(cstring(raw_data(buffer[:]))), allocator)
+}
+
+// The owner recorded in `path`'s LOCK ("pid N" and "host H" lines); false when
+// there is no lock or it records no owner.
+lock_read_owner :: proc(path: string, allocator := context.temp_allocator) -> (owner: Lock_Owner, known: bool) {
+	lock_path, _ := filepath.join([]string{path, "LOCK"}, context.temp_allocator)
+	data, read_error := os.read_entire_file(lock_path, context.temp_allocator)
+	if read_error != nil {
+		return {}, false
+	}
+	has_pid, has_host := false, false
+	for line in strings.split_lines(string(data), context.temp_allocator) {
+		if strings.has_prefix(line, "pid ") {
+			owner.pid, has_pid = strconv.parse_int(strings.trim_space(line[len("pid "):]))
+		} else if strings.has_prefix(line, "host ") {
+			owner.host = strings.clone(strings.trim_space(line[len("host "):]), allocator)
+			has_host = true
+		}
+	}
+	return owner, has_pid && has_host
+}
+
+// Whether `owner` is a process still running on this machine. A process of
+// another user answers EPERM, which also means it exists.
+lock_owner_running :: proc(owner: Lock_Owner) -> bool {
+	if posix.kill(posix.pid_t(owner.pid), posix.Signal(0)) == .OK {
+		return true
+	}
+	return posix.errno() != .ESRCH
+}
+
+// Removes `path`'s LOCK when its recorded owner is on this host and no longer
+// running (a crash left it behind). A live owner, an owner on another host
+// and a lock without an owner are left in place unless `force` is set.
+store_unlock :: proc(path: string, force := false) -> Unlock_Result {
+	lock_path, _ := filepath.join([]string{path, "LOCK"}, context.temp_allocator)
+	if !os.exists(lock_path) {
+		return .Not_Locked
+	}
+	if !force {
+		owner, known := lock_read_owner(path)
+		switch {
+		case !known:
+			return .Owner_Unknown
+		case owner.host != lock_this_host():
+			return .Owner_Elsewhere
+		case lock_owner_running(owner):
+			return .Owner_Running
+		}
+	}
+	os.remove(lock_path)
+	return .Removed
+}
+
+// Creates the exclusive `LOCK` file, recording this process as its owner. A
+// second process on the same store fails with a message naming the owner and
+// whether it still runs; `store_unlock` removes a lock whose owner is gone.
 @(private)
 store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
 	if directory_error := os.make_directory_all(path, os.Permissions_Default); directory_error != nil {
@@ -503,7 +585,17 @@ store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
 	}
 	file, open_error := os.open(lock_path, os.O_RDWR | os.O_CREATE | os.O_EXCL)
 	if open_error == .Exist {
-		store.last_error = "store is locked by another process"
+		owner, known := lock_read_owner(path)
+		switch {
+		case !known:
+			store.last_error = fmt.aprintf("store is locked, and the lock records no owner (an older version wrote it); if nothing is using the store, remove it with: filein --store %s --unlock --force", path, allocator = store.allocator)
+		case owner.host != lock_this_host():
+			store.last_error = fmt.aprintf("store is locked by pid %d on host %s", owner.pid, owner.host, allocator = store.allocator)
+		case lock_owner_running(owner):
+			store.last_error = fmt.aprintf("store is locked by pid %d, which is running", owner.pid, allocator = store.allocator)
+		case:
+			store.last_error = fmt.aprintf("store lock is stale: pid %d is no longer running; remove it with: filein --store %s --unlock", owner.pid, path, allocator = store.allocator)
+		}
 		delete(lock_path, store.allocator)
 		return false
 	}
@@ -516,6 +608,8 @@ store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
 		delete(lock_path, store.allocator)
 		return false
 	}
+	owner_text := fmt.tprintf("pid %d\nhost %s\n", os.get_pid(), lock_this_host())
+	os.write(file, transmute([]u8)owner_text)
 	os.close(file)
 	store.lock_path = lock_path
 	store.lock_acquired = true

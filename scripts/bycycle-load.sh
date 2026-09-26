@@ -5,11 +5,11 @@
 #   scripts/bycycle-load.sh load   STORE OWL_GZ     # stream facts (resumable)
 #   scripts/bycycle-load.sh query  STORE 'EXPR'     # eval against the store
 #   scripts/bycycle-load.sh repl   STORE            # interactive REPL
-#   scripts/bycycle-load.sh unlock STORE            # remove a stale LOCK
+#   scripts/bycycle-load.sh unlock STORE [--force]  # remove a stale LOCK
 #
 # A store's LOCK file is its exclusive lock (the store creates it with
-# O_CREAT|O_EXCL). Commands refuse a locked store; if no process is using the
-# store (a killed run left the lock behind), `unlock` removes it.
+# O_CREAT|O_EXCL and records its owner's pid and host). Commands refuse a
+# locked store; `unlock` removes a lock whose owner is no longer running.
 #
 # The OWL dump is opencyc-latest.owl.gz from asanchez75/opencyc (Git LFS —
 # fetch via the media.githubusercontent.com URL, not the raw one).
@@ -34,8 +34,10 @@ ONTOLOGY=(
 # Refuses to touch a store another process holds (or a killed run left locked).
 require_unlocked() {
   if [[ -e "$1/LOCK" ]]; then
-    echo "$1 is locked by another process (or a killed run left its LOCK)." >&2
-    echo "If nothing is using it, run: scripts/bycycle-load.sh unlock $1" >&2
+    local owner
+    owner="$(tr '\n' ' ' < "$1/LOCK")"
+    echo "$1 is locked${owner:+ (${owner% })}." >&2
+    echo "If its owner is no longer running, run: scripts/bycycle-load.sh unlock $1" >&2
     exit 1
   fi
 }
@@ -82,19 +84,14 @@ case "${cmd}" in
     "${ODIN_BIN}" run tools/repl -- --store "${store}"
     ;;
   unlock)
-    store="${1:?usage: bycycle-load.sh unlock STORE}"
-    if [[ ! -e "${store}/LOCK" ]]; then
-      echo "${store} is not locked"
-      exit 0
+    # Removes the lock only when its recorded owner is no longer running on
+    # this host; pass --force for a lock with no owner or from another host.
+    store="${1:?usage: bycycle-load.sh unlock STORE [--force]}"
+    if [[ -n "${FILEIN_BIN:-}" ]]; then
+      "${FILEIN_BIN}" --store "${store}" --unlock ${2:+"$2"}
+    else
+      "${ODIN_BIN}" run tools/filein -- --store "${store}" --unlock ${2:+"$2"}
     fi
-    # Refuse while any process still has the store's files open.
-    if command -v lsof >/dev/null 2>&1 && lsof +D "${store}" >/dev/null 2>&1; then
-      echo "${store} is in use by another process; not removing its LOCK" >&2
-      lsof +D "${store}" >&2 || true
-      exit 1
-    fi
-    rm -f "${store}/LOCK"
-    echo "removed stale lock ${store}/LOCK"
     ;;
   *)
     echo "usage: bycycle-load.sh {init|load|query|repl|unlock} ..." >&2

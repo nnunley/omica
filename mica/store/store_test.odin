@@ -1,5 +1,6 @@
 package store
 
+import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -1733,4 +1734,91 @@ test_volatile_buffer_content_is_not_persisted :: proc(t: ^testing.T) {
 		k.snapshot_buffer_text(snapshot, restored.id, context.temp_allocator),
 		"",
 	)
+}
+
+// The store's LOCK records its owner, so a lock left by a crashed process can
+// be told apart from a live one and removed by an explicit unlock.
+@(test)
+test_lock_records_owner :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_lock_owner")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+	store: Store
+	testing.expect(t, store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}))
+	defer store_destroy(&store)
+	owner, known := lock_read_owner(path)
+	testing.expect(t, known)
+	testing.expect_value(t, owner.pid, os.get_pid())
+	testing.expect(t, owner.host == lock_this_host())
+}
+
+@(private = "file")
+write_lock :: proc(t: ^testing.T, path, text: string) {
+	os.make_directory_all(path)
+	lock_path, _ := filepath.join([]string{path, "LOCK"}, context.temp_allocator)
+	testing.expect(t, os.write_entire_file(lock_path, transmute([]u8)text) == nil)
+}
+
+@(private = "file")
+lock_exists :: proc(path: string) -> bool {
+	lock_path, _ := filepath.join([]string{path, "LOCK"}, context.temp_allocator)
+	return os.exists(lock_path)
+}
+
+// A lock whose owner is recorded on this host and no longer running is
+// stale: opening names it as stale, and unlock removes it.
+@(test)
+test_unlock_removes_stale_lock :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_lock_stale")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+	// No process has pid 999999 on the test machines (pid_max is lower).
+	write_lock(t, path, fmt.tprintf("pid 999999\nhost %s\n", lock_this_host()))
+	store: Store
+	testing.expect(t, !store_open(&store, Store_Options{mode = .File, path = path, durability = .Group}))
+	testing.expectf(t, strings.contains(store.last_error, "stale"), "open error: %s", store.last_error)
+	store_destroy(&store)
+
+	testing.expect_value(t, store_unlock(path), Unlock_Result.Removed)
+	testing.expect(t, !lock_exists(path))
+	reopened: Store
+	testing.expect(t, store_open(&reopened, Store_Options{mode = .File, path = path, durability = .Group}))
+	store_destroy(&reopened)
+}
+
+// A live owner's lock is never removed without force; neither is one whose
+// owner is unknown (an empty lock from an older version) or on another host.
+@(test)
+test_unlock_refuses_live_or_unknown_owner :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_lock_live")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	write_lock(t, path, fmt.tprintf("pid %d\nhost %s\n", os.get_pid(), lock_this_host()))
+	testing.expect_value(t, store_unlock(path), Unlock_Result.Owner_Running)
+	testing.expect(t, lock_exists(path))
+
+	write_lock(t, path, "")
+	testing.expect_value(t, store_unlock(path), Unlock_Result.Owner_Unknown)
+	testing.expect(t, lock_exists(path))
+
+	write_lock(t, path, "pid 999999\nhost some-other-host\n")
+	testing.expect_value(t, store_unlock(path), Unlock_Result.Owner_Elsewhere)
+	testing.expect(t, lock_exists(path))
+
+	testing.expect_value(t, store_unlock(path, force = true), Unlock_Result.Removed)
+	testing.expect(t, !lock_exists(path))
+	testing.expect_value(t, store_unlock(path), Unlock_Result.Not_Locked)
 }
