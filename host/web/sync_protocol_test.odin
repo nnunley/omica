@@ -134,7 +134,7 @@ test_editor_output_evicts_sync_output_but_not_editor_results :: proc(t: ^testing
 	sync_host_init(&host, nil)
 	defer sync_host_destroy(&host)
 	session := sync_host_ensure_session(&host, 7)
-	for sequence in 0 ..< SYNC_OUTPUT_LIMIT - 1 {
+	for _ in 0 ..< SYNC_OUTPUT_LIMIT - 1 {
 		_ = sync_session_post_editor(session, "{\"through_sequence\":1}")
 	}
 	envelope := Sync_Envelope {

@@ -642,13 +642,13 @@ normalize_responses_event :: proc(
 
 	case "response.failed", "error":
 		message := "Responses API stream failed"
-		if error_value, found := lookup(json, "error"); found {
+		if error_value, has_error_field := lookup(json, "error"); has_error_field {
 			if text, has_text := lookup_text(error_value, "message"); has_text {
 				message = text
 			}
-		} else if response, found := lookup(json, "response"); found {
-			if error_value, has_error := lookup(response, "error"); has_error {
-				if text, has_text := lookup_text(error_value, "message"); has_text {
+		} else if response, has_response := lookup(json, "response"); has_response {
+			if response_error, has_error := lookup(response, "error"); has_error {
+				if text, has_text := lookup_text(response_error, "message"); has_text {
 					message = text
 				}
 			}
@@ -709,8 +709,8 @@ normalize_chat_event :: proc(
 		return
 	}
 	for choice in choices {
-		delta, found := lookup(choice, "delta")
-		if !found {
+		delta, has_delta := lookup(choice, "delta")
+		if !has_delta {
 			continue
 		}
 		if content, has_content := lookup_text(delta, "content"); has_content {

@@ -266,7 +266,7 @@ test_tree_release_is_iterative_and_recycles :: proc(t: ^testing.T) {
 
 	pieces: [dynamic]Piece
 	pieces = make([dynamic]Piece, alloc)
-	for index in 0 ..< 4000 {
+	for _ in 0 ..< 4000 {
 		chunk := chunk_create(&store.chunks, "a", .Original, alloc)
 		append(&pieces, Piece{chunk = chunk, start = 0, length = chunk.scalars})
 		chunk_release(chunk)
@@ -431,7 +431,7 @@ test_tree_middle_edit_copies_logarithmic_nodes :: proc(t: ^testing.T) {
 	pieces: [dynamic]Piece
 	pieces = make([dynamic]Piece, alloc)
 	line := "line: the quick brown fox\n"
-	for index in 0 ..< 2048 {
+	for _ in 0 ..< 2048 {
 		chunk := chunk_create(&store.chunks, line, .Original, alloc)
 		append(&pieces, Piece{chunk = chunk, start = 0, length = chunk.scalars})
 	}

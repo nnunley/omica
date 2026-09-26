@@ -10,7 +10,6 @@ package kernel
 
 import v "../var"
 import "core:mem"
-import "core:mem/virtual"
 import "core:strings"
 
 // A term in an atom, guard, or rule head.
@@ -502,7 +501,7 @@ rules_evaluate_source :: proc(
 		for len(delta.relations) > 0 {
 			next := rules_derived_create(alloc)
 			for rule in stratum {
-				for item, index in rule.body {
+				for item in rule.body {
 					if item.kind != .Atom || item.atom.negated {
 						continue
 					}

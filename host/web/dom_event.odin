@@ -68,7 +68,7 @@ dom_event_decode :: proc(body: []u8, allocator: mem.Allocator) -> (Dom_Event, bo
 		}
 		for entry in field_entries {
 			name: string
-			if text, is_text := v.value_as_string(entry.key); is_text {
+			if text, key_is_text := v.value_as_string(entry.key); key_is_text {
 				name = text
 			} else if symbol, is_symbol := v.value_as_symbol(entry.key); is_symbol {
 				symbol_name, has_name := v.symbol_name(symbol)

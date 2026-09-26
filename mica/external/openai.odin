@@ -154,8 +154,8 @@ wire_body :: proc(
 
 	switch wire_api {
 	case .Chat_Completions:
-		messages, found := lookup(payload, "messages")
-		if !found {
+		messages, has_messages := lookup(payload, "messages")
+		if !has_messages {
 			return "", "missing \"messages\"", false
 		}
 		append(&entries, symbol_entry("messages", messages))
@@ -165,8 +165,8 @@ wire_body :: proc(
 		append(&entries, symbol_entry("stream", v.value_bool(streaming)))
 
 	case .Responses:
-		input, found := lookup(payload, "input")
-		if !found {
+		input, has_input := lookup(payload, "input")
+		if !has_input {
 			return "", "missing \"input\"", false
 		}
 		append(&entries, symbol_entry("input", input))

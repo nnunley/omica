@@ -22,12 +22,12 @@ tuple_from_slice :: proc(values: []Value) -> Tuple {
 
 // Returns the values of a tuple.
 tuple_values :: proc(t: Tuple) -> []Value {
-	return transmute([]Value)t
+	return ([]Value)(t)
 }
 
 // Returns the number of values in a tuple.
 tuple_arity :: proc(t: Tuple) -> int {
-	return len(transmute([]Value)t)
+	return len(([]Value)(t))
 }
 
 // Creates a tuple from selected positions of another tuple. Positions beyond

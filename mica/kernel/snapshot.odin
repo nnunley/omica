@@ -12,7 +12,6 @@ import v "../var"
 import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
-import "core:slice"
 import "core:sync"
 
 // A derived relation's rows, computed from rules at snapshot creation.

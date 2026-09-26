@@ -10,7 +10,6 @@ package kernel
 
 import buf "../buffer"
 import v "../var"
-import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
@@ -926,7 +925,7 @@ transaction_commit :: proc(transaction: ^Transaction) -> (^Snapshot, Kernel_Erro
 	// exhausted. Rebuild the candidate against the newest snapshot and retry a
 	// bounded number of times before reporting a conflict to the task.
 	published: ^Snapshot
-	for attempt in 0 ..< TRANSACTION_RETRY_LIMIT {
+	for _ in 0 ..< TRANSACTION_RETRY_LIMIT {
 		current := kernel_snapshot(kernel)
 		if current.version != transaction.base.version {
 			if err := transaction_validate_conflicts(transaction, current); err != .None {

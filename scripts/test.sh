@@ -222,7 +222,9 @@ run_unit() {
   for pkg in "${packages[@]}"; do
     log="${log_dir}/$(slugify "unit:${pkg}").log"
     rc=0
-    capture "${log}" "${test_timeout}" "${odin_bin}" test "${pkg}" || rc=$?
+    # -vet makes unused declarations, shadowing and needless transmutes
+    # errors, so a new one cannot hide among old ones.
+    capture "${log}" "${test_timeout}" "${odin_bin}" test "${pkg}" -vet || rc=$?
     inspect "unit:${pkg}" "${log}" "${rc}"
   done
   if command -v node >/dev/null 2>&1 && [[ -f "${repo_root}/host/web/sync-client.test.mjs" ]]; then
@@ -271,7 +273,7 @@ build_tools() {
   note "build tools"
   local tool
   for tool in filein repl webhost parse_corpus; do
-    if run_timeout "${test_timeout}" "${odin_bin}" build "tools/${tool}" \
+    if run_timeout "${test_timeout}" "${odin_bin}" build "tools/${tool}" -vet \
       -out:"${bin_dir}/${tool}"; then
       pass "build:${tool}"
     else

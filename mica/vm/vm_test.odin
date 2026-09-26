@@ -1,6 +1,5 @@
 package vm
 
-import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:testing"

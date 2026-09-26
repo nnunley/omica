@@ -12,8 +12,6 @@ package kernel
 
 import "base:runtime"
 import "core:mem"
-import "core:mem/virtual"
-import "core:slice"
 import "core:sync"
 import v "../var"
 
