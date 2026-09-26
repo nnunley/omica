@@ -47,6 +47,8 @@ Builtin_Env :: struct {
 
 	// Source text per filein unit, keyed by unit name.
 	unit_sources:             map[string]string,
+	// The world's programs, one per verb, for dispatch. Nil for a bare task.
+	programs:                 ^Program_Registry,
 
 	// Runtime context identities returned by `endpoint()`, `actor()`, and
 	// `principal()`.

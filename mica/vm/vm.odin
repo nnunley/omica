@@ -14,7 +14,6 @@ import "core:fmt"
 import "core:math"
 import "core:mem"
 import "core:mem/virtual"
-import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -1167,7 +1166,8 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 			callee_program := callable.program
 			if callee_program == nil {
-				callee_program = program
+				vm_fail(state, "E_DISPATCH", "function belongs to a program that no longer exists")
+				break
 			}
 			function_index := int(callable.function)
 			if function_index < 0 || function_index >= len(callee_program.functions) {
@@ -1187,7 +1187,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			for capture, index in callable.captures {
 				state.registers[callee_base + index] = capture
 			}
-			if !vm_bind_params(state, callee, args, callee_base + capture_count) {
+			if !vm_bind_params(state, callee_program, callee, args, callee_base + capture_count) {
 				break
 			}
 			vm_zero_locals(state, callee_base + capture_count, callee.param_count, callee_top)
@@ -1219,7 +1219,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			callee_base := len(state.registers)
 			callee_top := callee_base + callee.register_count
 			vm_registers_open(state, callee_top)
-			if !vm_bind_params(state, callee, args, callee_base) {
+			if !vm_bind_params(state, program, callee, args, callee_base) {
 				break
 			}
 			vm_zero_locals(state, callee_base, callee.param_count, callee_top)
@@ -1286,7 +1286,8 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 			callee_program := callable.program
 			if callee_program == nil {
-				callee_program = program
+				vm_fail(state, "E_DISPATCH", "function belongs to a program that no longer exists")
+				break
 			}
 			function_index := int(callable.function)
 			if function_index < 0 || function_index >= len(callee_program.functions) {
@@ -1305,7 +1306,7 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			for capture, index in callable.captures {
 				state.registers[callee_base + index] = capture
 			}
-			if !vm_bind_params(state, callee, args, callee_base + capture_count) {
+			if !vm_bind_params(state, callee_program, callee, args, callee_base + capture_count) {
 				break
 			}
 			vm_zero_locals(state, callee_base + capture_count, callee.param_count, callee_top)
@@ -1320,6 +1321,13 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 					caller_dst = instr.a,
 				},
 			)
+
+		case .Positional_Dispatch_Splice:
+			args, args_ok := vm_list_args(state, base, instr.c)
+			if !args_ok {
+				break
+			}
+			vm_positional_dispatch_args(state, base, instr.a, state.registers[base + int(instr.b)], args)
 
 		case .Push_Finally:
 			append(
@@ -1493,8 +1501,10 @@ vm_unwind :: proc(state: ^VM) -> bool {
 	// Drop the dead frames' registers, mirroring Return: only the handler
 	// frame's window stays live. Without this, errors caught in a loop grow
 	// the register file on every iteration.
-	if frame.function >= 0 && frame.function < len(state.program.functions) {
-		function := state.program.functions[frame.function]
+	// The handler frame can belong to another program than the failing frame.
+	frame_program := frame.program if frame.program != nil else state.program
+	if frame.function >= 0 && frame.function < len(frame_program.functions) {
+		function := frame_program.functions[frame.function]
 		if frame.register_base + function.register_count < len(state.registers) {
 			vm_registers_close(state, frame.register_base + function.register_count)
 		}
@@ -2182,7 +2192,7 @@ vm_call_function :: proc(
 	for capture, index in captures {
 		state.registers[callee_base + index] = capture
 	}
-	if !vm_bind_params(state, callee, args, callee_base + capture_count) {
+	if !vm_bind_params(state, callee_program, callee, args, callee_base + capture_count) {
 		return false
 	}
 	vm_zero_locals(state, callee_base + capture_count, callee.param_count, callee_top)
@@ -2202,20 +2212,32 @@ vm_call_function :: proc(
 
 @(private)
 vm_positional_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
+	argument_count := int(instr.flags)
+	args := make([]v.Value, argument_count, state.scratch_allocator)
+	for index in 0 ..< argument_count {
+		args[index] = state.registers[base + int(instr.c) + index]
+	}
+	return vm_positional_dispatch_args(state, base, instr.a, state.registers[base + int(instr.b)], args)
+}
+
+// Dispatches `selector` with positional `args`; the destination register
+// receives the method's return value.
+@(private)
+vm_positional_dispatch_args :: proc(
+	state: ^VM,
+	base: int,
+	destination: i32,
+	selector: v.Value,
+	args: []v.Value,
+) -> bool {
 	program := state.program
 	if state.source == nil {
 		vm_fail(state, "E_NO_SOURCE", "dispatch has no relation source")
 		return false
 	}
-	selector := state.registers[base + int(instr.b)]
 	if _, is_symbol := v.value_as_symbol(selector); !is_symbol {
 		vm_fail(state, "E_TYPE", "receiver dispatch selector is not a symbol")
 		return false
-	}
-	argument_count := int(instr.flags)
-	args := make([]v.Value, argument_count, state.scratch_allocator)
-	for index in 0 ..< argument_count {
-		args[index] = state.registers[base + int(instr.c) + index]
 	}
 	relations := k.Dispatch_Relations {
 		method_selector = k.Relation_ID(program.dispatch_method_selector_relation),
@@ -2250,7 +2272,7 @@ vm_positional_dispatch :: proc(state: ^VM, base: int, instr: Instruction) -> boo
 		vm_fail(state, "E_DISPATCH", "ambiguous method dispatch")
 		return false
 	}
-	return vm_call_dispatch_entry(state, base, instr.a, entries[0], args)
+	return vm_call_dispatch_entry(state, base, destination, entries[0], args)
 }
 
 @(private)
@@ -2602,8 +2624,15 @@ vm_bind_params_range :: proc(
 }
 
 @(private)
-vm_bind_params :: proc(state: ^VM, callee: ^Function, args: []v.Value, param_base: int) -> bool {
-	program := state.program
+vm_bind_params :: proc(
+	state: ^VM,
+	program: ^Program,
+	callee: ^Function,
+	args: []v.Value,
+	param_base: int,
+) -> bool {
+	// `program` owns `callee` and the default constants it names, which is
+	// not the current program when a call crosses into another program.
 	required := int(callee.required_count)
 	non_rest := callee.param_count
 	if callee.has_rest {

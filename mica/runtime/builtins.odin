@@ -1451,22 +1451,22 @@ rule_active_builtin :: proc(
 	k.snapshot_release(updated)
 
 	if state.transaction != nil {
-		if err := k.transaction_retract(
+		if retract_err := k.transaction_retract(
 			state.transaction,
 			k.SYSTEM_ACTIVE_RULE_ID,
 			v.tuple_new(context.temp_allocator, []v.Value{rule_value, v.value_bool(!active)}),
-		); err != .None {
+		); retract_err != .None {
 			return builtin_error(
 				state,
 				"E_KERNEL",
 				"rule update could not retract the previous state",
 			)
 		}
-		if err := k.transaction_assert(
+		if assert_err := k.transaction_assert(
 			state.transaction,
 			k.SYSTEM_ACTIVE_RULE_ID,
 			v.tuple_new(context.temp_allocator, []v.Value{rule_value, v.value_bool(active)}),
-		); err != .None {
+		); assert_err != .None {
 			return builtin_error(
 				state,
 				"E_KERNEL",
@@ -2185,8 +2185,7 @@ builtin_string_concat :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool)
 
 @(private)
 builtin_string_append :: proc(state: ^vm.VM, args: []v.Value) -> (v.Value, bool) {
-	base, base_ok := v.value_as_string(args[0])
-	if !base_ok {
+	if _, base_ok := v.value_as_string(args[0]); !base_ok {
 		return builtin_error(state, "E_TYPE", "string_append expects a string")
 	}
 	text, text_ok := v.value_as_string(args[1])
@@ -3201,6 +3200,8 @@ assemble_op :: proc(value: v.Value) -> (vm.Op, bool) {
 		return vm.Op.Builtin_Call_Splice, true
 	case "Call_Value_Splice":
 		return vm.Op.Call_Value_Splice, true
+	case "Positional_Dispatch_Splice":
+		return vm.Op.Positional_Dispatch_Splice, true
 	}
 	return vm.Op.Load_Const, false
 }

@@ -347,22 +347,22 @@ compile_program :: proc(
 			preload_constants(&emitter, pending.fn.body)
 		}
 		scope_enter(&emitter)
-		return_register := -1
+		body_register := -1
 		if pending.fn.has_expression_body {
 			register, has_value := emit_expr(&emitter, pending.fn.expression_body)
 			if has_value {
-				return_register = register
+				body_register = register
 			}
 		} else {
 			register, has_value := emit_block(&emitter, pending.fn.body)
 			if has_value {
-				return_register = register
+				body_register = register
 			}
 		}
-		if return_register < 0 {
-			return_register = emit_constant(&emitter, v.value_empty_relation())
+		if body_register < 0 {
+			body_register = emit_constant(&emitter, v.value_empty_relation())
 		}
-		vm.builder_emit(&builder, .Return, 0, i32(return_register), 0, 0)
+		vm.builder_emit(&builder, .Return, 0, i32(body_register), 0, 0)
 		scope_leave(&emitter)
 		builder.functions[pending.index].register_count = emitter.max_register
 		vm.builder_end_function(&builder)
@@ -2518,12 +2518,19 @@ emit_splice_call :: proc(
 		)
 		return destination, true
 	}
-	push_error(emitter, fmt.aprintf(
-		"unknown callable: %s",
-		text,
-		allocator = emitter.allocator,
-	))
-	return -1, false
+	// Verbs resolve late: a spliced call to a name that is not a local or a
+	// builtin dispatches positionally, like an unspliced call.
+	selector := emit_constant(emitter, v.value_symbol(v.symbol_intern(text)))
+	destination := alloc_register(emitter)
+	vm.builder_emit(
+		emitter.builder,
+		.Positional_Dispatch_Splice,
+		0,
+		i32(destination),
+		i32(selector),
+		i32(args_register),
+	)
+	return destination, true
 }
 
 // Lowers `receiver:selector(args)`. Positional arguments dispatch by method
