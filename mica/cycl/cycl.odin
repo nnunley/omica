@@ -232,8 +232,10 @@ parse_node :: proc(lex: ^Lexer, allocator: mem.Allocator) -> (Node, bool) {
 		return Atom(fmt.aprintf("#$%s", atom)), true
 		
 	} else if lex.ch == ':' {
+		// The atom reader includes the leading colon (it is an atom
+		// character), so the keyword is the atom as read.
 		atom := lexer_read_atom(lex)
-		return Atom(fmt.aprintf(":%s", atom)), true
+		return Atom(fmt.aprintf("%s", atom)), true
 		
 	} else if lex.ch == '-' || lex.ch == '+' {
 		ch := lex.ch
