@@ -200,6 +200,19 @@ log tail through maintenance, commit by commit; a mismatch (or a missing
 section) runs the full derivation as today. Derived rows are never written
 through the fact path, so a restore cannot turn them into facts.
 
+**Volatile inputs are never restored from.** A volatile relation
+(`Relation_Durability.Volatile`) is not persisted, and a volatile computed
+relation (section 5) has no checkpoint-time value, so a derived relation that
+depends on either, through rules at any depth, can be wrong after a reopen
+even though every fingerprint input matches: with `D(x) :- V(x)` and volatile
+`V`, a checkpoint of a non-empty `V` reopened with no log tail would restore a
+non-empty `D` over an empty `V`. The checkpoint therefore omits the derived
+blocks of every relation whose dependency closure (over active rules, and
+computed relations' declared dependencies) reaches a volatile relation or a
+volatile computed relation, and boot recomputes those strata after restoring
+the rest. The dependency closure uses the same rule graph as `rules_stratify`;
+relations' durability flags are part of the fingerprint's catalog shape.
+
 Ryan is planning on-disk columnar storage; this section deliberately reuses
 the existing chunk/page format so that whatever layout replaces it for facts
 applies to derived blocks unchanged. Rust mica offers no precedent: its store
@@ -219,6 +232,7 @@ ones:
 | Crash between checkpoint sections | `test_file_wal_truncated_tail`, `test_file_checkpoint_survives_chunk_reuse` |
 | Fast boot vs fallback | `test_run_store_boot_derives_once`: 0 derivations on a matching fingerprint, 1 on a mismatch |
 | Fingerprint inputs | one new table-driven test: changing each input forces a full derivation |
+| Volatile dependencies | the same table-driven test: `D(x) :- V(x)` with volatile `V` (and a volatile computed relation) checkpointed non-empty and reopened with no log tail yields empty `D`, recomputed rather than restored |
 | Computed dependencies | the read-tracking check runs under the existing NearestEmbedding and buffer tests |
 | Transaction views | `test_transaction_derived_invalidation`, `test_scan_columns_transaction_overlay_and_derived_layers` |
 | Negation, rule disable, rebase | `test_stratified_negation_updates_with_facts`, `test_disable_rule_removes_derived_facts`, `test_kernel_whole_rebase_records_delta_against_winner` (their commits become maintained) |
@@ -257,7 +271,8 @@ Each stage ships on its own with the suite green.
   into test failures (section 5).
 - **Persistence.** A stale fingerprint or a torn checkpoint would survive
   reboots; the fingerprint covers every input, facts and derived blocks share a
-  version, and crash tests cover the sections (section 11).
+  version, crash tests cover the sections, and derived relations with volatile
+  inputs are recomputed at boot instead of restored (sections 10, 11).
 - **Rebase.** A commit that loses a publication race recomputes its change set
   against the new base, or falls back.
 
