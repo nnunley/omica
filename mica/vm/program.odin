@@ -228,17 +228,49 @@ Function :: struct {
 	defaults:       []i32,
 }
 
-// An interned callable: a program function plus the values captured when its
-// fn literal was evaluated. Callables live on the program so function values
-// remain valid across tasks that share the program.
+// An interned callable: a function of `program` plus the values captured when
+// its fn literal was evaluated. A function value is an index into a registry.
 Callable_Info :: struct {
+	program:  ^Program,
 	function: i32,
 	captures: []v.Value,
 }
 
+// Callables shared by every program that points at the registry. A world's
+// programs share one, so a function value made in one method can be called
+// from another. A program built on its own owns a private registry.
+Callable_Registry :: struct {
+	mutex:     sync.Mutex,
+	items:     [dynamic]Callable_Info,
+	allocator: mem.Allocator,
+}
+
+callable_registry_new :: proc(alloc: mem.Allocator) -> ^Callable_Registry {
+	registry := new(Callable_Registry, alloc)
+	registry.items = make([dynamic]Callable_Info, alloc)
+	registry.allocator = alloc
+	return registry
+}
+
+callable_registry_destroy :: proc(registry: ^Callable_Registry) {
+	if registry == nil {
+		return
+	}
+	alloc := registry.allocator
+	for callable in registry.items {
+		if callable.captures != nil {
+			free(raw_data(callable.captures), alloc)
+		}
+	}
+	delete(registry.items)
+	free(registry, alloc)
+}
+
 Program :: struct {
-	callables_mutex: sync.Mutex,
-	callables:       [dynamic]Callable_Info,
+	// Registry for function values made by this program. Shared across a
+	// world's programs; `owns_callables` says whether this program frees it.
+	callables:       ^Callable_Registry,
+	owns_callables:  bool,
 	code:      []Instruction,
 	constants: []v.Value,
 	functions: []Function,
@@ -521,7 +553,8 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 	}
 	program.builtins = make([]v.Symbol, len(builder.builtins), alloc)
 	copy(program.builtins, builder.builtins[:])
-	program.callables = make([dynamic]Callable_Info, alloc)
+	program.callables = callable_registry_new(alloc)
+	program.owns_callables = true
 	program.entry = builder.entry
 	program.dispatch_method_selector_relation = builder.dispatch_method_selector_relation
 	program.dispatch_param_relation = builder.dispatch_param_relation
@@ -530,15 +563,19 @@ builder_build :: proc(builder: ^Builder, alloc: mem.Allocator) -> ^Program {
 	return program
 }
 
-program_destroy :: proc(program: ^Program, alloc: mem.Allocator) {
-	for callable in program.callables {
-		if callable.captures != nil {
-			free(raw_data(callable.captures), alloc)
-		}
+// Points `program` at a shared registry, freeing its private one.
+program_share_callables :: proc(program: ^Program, registry: ^Callable_Registry) {
+	if program.owns_callables {
+		callable_registry_destroy(program.callables)
 	}
-	// `callables` is a dynamic array, so it frees through the allocator it was
-	// created with (`alloc` in `builder_build`).
-	delete(program.callables)
+	program.callables = registry
+	program.owns_callables = false
+}
+
+program_destroy :: proc(program: ^Program, alloc: mem.Allocator) {
+	if program.owns_callables {
+		callable_registry_destroy(program.callables)
+	}
 	free(raw_data(program.code), alloc)
 	free(raw_data(program.constants), alloc)
 	for function in program.functions {
