@@ -8,36 +8,20 @@
 
 ## Abstract
 
-This document specifies `apps/quality`, a Mica application that measures the
-quality of omica's own source, both Mica and Odin. It reports complexity,
-maintainability, near-duplication, defect density, test reachability, rule
-and relation health, and grant checks as queryable diagnostic facts. It also
-reports a numeric score that an agent or reviewer can track. The document is
-for omica contributors and for agents that call the tool.
+This document specifies `apps/quality`, a Mica application that measures
+omica's own Mica and Odin source. It scores the corpus with the erosion and
+verbosity metrics of SlopCodeBench [SCB], adds dead-code, coverage, defect
+and testing terms, and checks rule, relation and grant health. Every finding
+is a fact in a Mica relation, so the command-line report, the agent tool and
+ad hoc queries all read the same data.
 
 ## Motivation
 
-At the time of writing (September 2026, upstream `main` at 74193f5), omica
-holds about 89,000 lines of Odin in 157 files and about 25,500 lines of Mica
-across `apps/`. The only quality signals are the test suite
-(`scripts/test.sh`) and review. Nothing reports which procs or verbs are
-hardest to change, which code the tests never reach, which relations nothing
-reads, or which grants name things that do not exist. In the last 180 days,
-106 commits began with `fix`. The files they touched cluster in
-`mica/runtime` (75 file changes), `host/web` (51) and `mica/store` (33), and
-nothing today connects that churn to the complexity of the code involved.
-Dead or always-empty relations and dangling grants fail silently in a
-relational system, because a query over a missing fact returns an empty
-result, not an error.
-
-omica already has most of the machinery such a tool needs. The Mica parser
-in `apps/compiler/parse.mica` produces a relational syntax tree. The compiler
-records relations, rules, units and grants as catalogue relations. Ryan
-Daum's bootstrap proposal ([BOOTSTRAP]) argues for program facts, rules for
-transitive analyses, and diagnostics as facts. This document applies that
-design to a smaller, self-contained problem. The quality tool is useful on
-its own, and it is an early test of the relational-program-facts approach
-before the bootstrap generator depends on it.
+omica has no measure of which code is hard to change, which code the tests
+never reach, or which relations and grants are broken. In a relational
+system the last two fail silently: a query over a missing fact returns an
+empty result, not an error. The parser, compiler and catalogue already hold
+most of what a measuring tool needs; this document specifies that tool.
 
 ## Terminology
 
@@ -46,46 +30,48 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 document are to be interpreted as described in BCP 14 (RFC 2119, RFC 8174)
 when, and only when, they appear in all capitals, as shown here.
 
-- **corpus** — the set of `.mica` and `.odin` files one run analyses.
+- **corpus** — the `.mica` and `.odin` files one run analyses.
 - **run world** — the disposable Mica world one run creates, analyses and discards.
 - **syntax fact** — a row `(node, role, target, ordinal)` describing one edge of a syntax tree, in the shape `parse_rows` produces.
-- **routine** — a unit that complexity measures apply to: a Mica verb, a Mica `fn` literal bound at top level, or an Odin procedure.
+- **callable** — a Mica verb, a top-level Mica `fn`, or an Odin procedure. Nested function literals are part of their enclosing callable.
 - **rule** — a Mica relation rule (`Head(...) :- Body`).
-- **branch point** — a syntax node that adds one independent path through a routine (listed in "Complexity measures").
-- **diagnostic** — a row of the `quality/Diagnostic` relation: one finding with a code, severity, subject node and message.
-- **term** — one scored dimension (for example, cyclomatic complexity) with a value from 0 to 100.
-- **score** — the weighted combination of terms for a file, a language, or the whole corpus.
-- **test root** — a place where static test reachability starts: a top-level expression in a Mica test file, or an Odin procedure carrying `@(test)`.
+- **SLOC** — source lines: lines inside a span that carry at least one token. Blank and comment-only lines do not count.
+- **branch point** — a syntax node that adds one independent path through a callable (listed under "Complexity").
+- **diagnostic** — a row of `quality/Diagnostic`: one finding with a code, severity, subject and message.
+- **term** — one scored dimension, a number in [0, 1] where 0 is perfect.
+- **composite** — the weighted mean of the present terms.
+- **test root** — where test reachability starts: a top-level expression in a Mica test file, or an Odin procedure marked `@(test)`.
 
 ## Specification
 
-This document defines the quality tool: its inputs, the facts it derives,
-the measures and their definitions, the scoring, the diagnostics, and its two
-surfaces (a command-line report and an agent tool verb). It does NOT define
-the git relations of the source host beyond the columns the tool reads; the
-source host owns them. It does NOT define a pull-request workflow. A PR
-delta is an extension point (see Out of Scope).
+This document defines the tool's inputs, the facts it derives, its measures,
+its terms and composite, its diagnostics, and its two surfaces: a
+command-line report and an agent tool verb. It does NOT define the source
+host's git relations beyond the columns the tool reads; the source host owns
+them.
 
-**One disposable world per run.** Each run loads its corpus into a fresh
-run world with no store, reads it, and discards it. No state carries from one
-run to the next. This follows [BOOTSTRAP] section 5.2 and makes results a
-function of the inputs alone.
+**One disposable world per run.** Each run loads the corpus into a fresh run
+world without a store, analyses it, and discards it. Results depend only on
+the inputs. This follows [BOOTSTRAP] section 5.2.
 
-**Facts in, facts out.** Every input the tool consumes and every finding it
-produces is a relation in the run world. Reports are renderings of those
-relations, never a separate data path.
+**Facts in, facts out.** Every input and every finding is a relation in the
+run world. Reports render those relations; nothing bypasses them.
 
-**Analyses by rule, construction by verb.** Transitive analyses (reachability,
-relation health) are stratified rules that do not allocate identities.
-Counting measures and report rendering are ordinary verbs over a frozen
-snapshot. This matches [BOOTSTRAP] section 5.1.
+**Rules analyse, verbs count.** Transitive analyses (reachability, relation
+health) are stratified rules that allocate no identities. Counting measures
+and rendering are verbs over a frozen snapshot. This follows [BOOTSTRAP]
+section 5.1.
+
+**Every score is a share.** Each term lies in [0, 1], 0 is perfect, and each
+moves whenever any input moves. A clamped scale would hide improvement to the
+worst code, which is where improvement matters most.
 
 ### Data model
 
 Inputs, loaded into the run world:
 
 ```
--- Catalogue relations the ordinary compiler already writes (mica/kernel/dispatch.odin):
+-- Catalogue relations the compiler already writes (mica/kernel/dispatch.odin):
 --   Relation, RelationName, Arity, FunctionalKey, ConflictPolicy,
 --   Rule, RuleHead, RuleSource, ActiveRule,
 --   UnitSource, MethodSource, NamedIdentity,
@@ -97,20 +83,20 @@ RECORD SyntaxFact:                      -- relation quality/Syntax
     file        : String                -- corpus-relative path
     node        : Integer               -- node id, unique within the file
     role        : Symbol                -- :kind, :child, :callee, :op, :name, :line, ...
-    target      : Value                 -- a node id, or an attribute value for attribute roles
+    target      : Value                 -- a node id, or an attribute value
     ordinal     : Integer               -- position among siblings with the same role
 
-RECORD Routine:                         -- relation quality/Routine
+RECORD Callable:                        -- relation quality/Callable
     file        : String
-    node        : Integer               -- the routine's root node
+    node        : Integer               -- the callable's root node
     name        : String                -- verb name, or package.proc for Odin
     language    : Language
     first_line  : Integer
     last_line   : Integer
 
 RECORD CallEdge:                        -- relation quality/Calls (derived)
-    caller      : Routine
-    callee      : Routine | Unresolved  -- Unresolved for proc values and dynamic dispatch
+    caller      : Callable
+    callee      : Callable | Unresolved -- Unresolved for proc values and dynamic dispatch
 
 ENUM Language:
     MICA
@@ -122,47 +108,46 @@ Outputs:
 ```
 RECORD Diagnostic:                      -- relation quality/Diagnostic
     id          : Integer
-    code        : DiagnosticCode
+    code        : DiagnosticCode        -- Appendix A
     severity    : Severity
     file        : String
     node        : Integer | None        -- None for file- or corpus-level findings
-    message     : String                -- one sentence naming the measured value and its threshold
+    message     : String                -- names the measured value and its threshold
 
 RECORD Evidence:                        -- relation quality/Evidence
     diagnostic  : Integer               -- Diagnostic.id
     position    : Integer
-    detail      : Value                 -- e.g. a call-path element, a duplicate region, a commit id
+    detail      : Value                 -- a call-path step, a clone region, a commit id
 
-RECORD TermScore:                       -- relation quality/Term
+RECORD Term:                            -- relation quality/Term
     scope       : String                -- a file path, "mica", "odin", or "corpus"
-    term        : Symbol                -- see the Scoring table
-    value       : Float                 -- raw measured value
-    score       : Float                 -- 0..100
+    name        : Symbol                -- :erosion, :verbosity, :uncovered, :dead, :defects, :testing
+    raw         : Float                 -- the measured input before shaping
+    value       : Float | None          -- in [0, 1]; None when the input is missing
 
 ENUM Severity:
-    ERROR       -- a definite defect: a dangling grant, or a rule head that is also asserted directly
+    ERROR       -- a definite defect, such as a dangling grant
     WARNING     -- over a threshold
-    NOTE        -- informational; does not affect the score
+    NOTE        -- informational
 ```
 
 **Field constraints:** `Diagnostic.id` values are dense from 1 in emission
-order, and emission order is deterministic (see [R-deterministic]). `message`
-never embeds absolute paths or timestamps.
-
-`DiagnosticCode` values and their meanings are listed in Appendix A.
+order, which is deterministic ([R-deterministic]). `message` holds no
+absolute paths or timestamps.
 
 ### Configuration
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `--since` | Date or commit | 180 days before the run | Start of the defect-density window, resolved once to an explicit commit range that is printed in the report header |
-| `--format` | `text` \| `mica` | `text` | Report rendering. `mica` prints the report as one Mica map value. |
-| `--top` | Integer | `25` | Number of ranked issues printed in `text` format |
-| `--root` | Path | current directory | Repository root; every corpus path is relative to it |
+| `--since` | Date or commit | 180 days before the run | Start of the defect window; resolved once to a commit range and printed |
+| `--format` | `text` \| `mica` | `text` | `mica` prints the report as one Mica map value |
+| `--top` | Integer | `25` | Ranked issues shown in `text` format |
+| `--root` | Path | current directory | Repository root; corpus paths are relative to it |
 | paths | Path list | `apps`, `mica`, `host`, `tools` | Corpus roots, walked for `.mica` and `.odin` files |
 
-The 180-day default matches let-go's tool and covers about two release
-cycles of history without letting old churn dominate.
+All thresholds, squash constants and weights live in one table in
+`apps/quality/`; no other code holds a number. Their defaults appear under
+"Terms".
 
 **Resolution precedence** (highest first):
 
@@ -172,9 +157,8 @@ cycles of history without letting old churn dominate.
 
 ### Loading
 
-The tool MUST load the corpus's `.mica` files into the run world through the
-same filein path an ordinary world uses, so that the catalogue relations
-reflect exactly what the compiler records. [R-load-via-filein]
+The tool MUST load the corpus's `.mica` files through the ordinary filein
+path, so the catalogue relations hold exactly what the compiler records. [R-load-via-filein]
 
 ```transcript @R-load-via-filein
 $ tools/quality --format mica tests/quality/fixtures/decls | grep -c ':relation :Seen'
@@ -182,10 +166,10 @@ $ tools/quality --format mica tests/quality/fixtures/decls | grep -c ':relation 
 ? 0
 ```
 
-The run world MUST have no store and MUST NOT grant the corpus any host
-effect: no network, external-request, or subscription capability. [R-sandboxed-world]
-Loading runs the corpus's top-level expressions; this rule bounds what a
-hostile or broken corpus can do (see Security Considerations).
+The run world MUST have no store and MUST NOT give the corpus any host
+effect: no network, external-request or subscription capability. [R-sandboxed-world]
+Loading runs the corpus's top-level expressions, so this rule bounds what a
+hostile or broken corpus can do.
 
 ```transcript @R-sandboxed-world
 $ tools/quality tests/quality/fixtures/effects | grep Q_LOAD
@@ -193,7 +177,7 @@ tests/quality/fixtures/effects/fetch.mica:1 Q_LOAD ERROR external_request is not
 ? 0
 ```
 
-The tool MUST obtain Mica syntax facts from `parse_rows` in
+The tool MUST take Mica syntax facts from `parse_rows` in
 `apps/compiler/parse.mica`, applied to each `UnitSource` text. [R-mica-syntax-from-parser]
 
 ```transcript @R-mica-syntax-from-parser
@@ -202,10 +186,9 @@ $ tools/quality --format mica tests/quality/fixtures/one-verb | grep -c ':kind :
 ? 0
 ```
 
-The tool MUST obtain Odin syntax facts from `core:odin/parser`, through a
+The tool MUST take Odin syntax facts from `core:odin/parser`, through a
 helper `tools/quality-facts` that writes rows in the `quality/Syntax` shape. [R-odin-syntax-from-core]
-Using the compiler's own parser keeps the facts exact as Odin evolves; a
-second Odin parser written in Mica would drift.
+The language's own parser stays exact as Odin changes; a second parser would drift.
 
 ```transcript @R-odin-syntax-from-core
 $ tools/quality-facts tests/quality/fixtures/one-proc/p.odin | grep -c 'proc_lit'
@@ -213,8 +196,8 @@ $ tools/quality-facts tests/quality/fixtures/one-proc/p.odin | grep -c 'proc_lit
 ? 0
 ```
 
-A file that fails to parse MUST produce one `Q_PARSE` diagnostic of severity
-`ERROR` and MUST NOT stop the run. [R-parse-failure-isolated]
+A file that fails to parse MUST yield one `Q_PARSE` diagnostic and MUST NOT
+stop the run. [R-parse-failure-isolated]
 
 ```transcript @R-parse-failure-isolated
 $ tools/quality --format text tests/quality/fixtures/broken
@@ -223,23 +206,20 @@ file tests/quality/fixtures/broken/good.mica: scored
 ? 0
 ```
 
-### Complexity measures
-
-Every measure below applies to every routine in both languages.
+### Complexity
 
 **Branch points.**
 
 | Language | Branch points (each adds 1) |
 |---|---|
-| Mica | each conditional `IfBranch` (not the final `else`), each `MatchCase` after the first, `While`, `For`, `Comprehension`, `Catch`, and each `and`/`or` `Binary` |
-| Odin | each `if`/`when` condition (including `else if`), `for`, each `case` clause after the first in `switch`, each `&&`/`\|\|`, and each `or_return`, `or_else`, `or_break`, `or_continue` |
+| Mica | each conditional `IfBranch` (not a final `else`), each `MatchCase` after the first, `While`, `For`, `Comprehension`, `Catch`, and each `and`/`or` |
+| Odin | each `if`/`when` condition (including `else if`), `for`, each `case` after the first in a `switch`, each `&&`/`\|\|`, and each `or_return`, `or_else`, `or_break`, `or_continue` |
 
-Cyclomatic complexity of a routine MUST be 1 plus the number of its branch
-points, excluding branch points inside nested routine literals, which count
-toward those literals. [R-cyclomatic]
+The cyclomatic complexity (CC) of a callable MUST be 1 plus its branch
+points, including those of nested function literals. [R-cyclomatic]
 
 <!-- evidence: @R-cyclomatic -->
-| language | routine body | cyclomatic |
+| language | callable body | CC |
 |---|---|---|
 | mica | `return x` | 1 |
 | mica | `if a return 1 elseif b return 2 else return 3 end` | 3 |
@@ -250,14 +230,14 @@ toward those literals. [R-cyclomatic]
 | odin | `x := f() or_return` | 2 |
 | odin | `switch k { case .A: f() case .B: g() case: h() }` | 3 |
 
-Cognitive complexity of a routine MUST follow [COGNITIVE]: add 1 for each
-branch point, plus the current nesting depth for each branch point that opens
-a nested block (`if`, `for`, `while`, `switch`, `match`, `try`), plus 1 for
-each `break` or `continue` that targets a label, plus 1 for each direct
-recursive call. A run of the same boolean operator counts once. [R-cognitive]
+The cognitive complexity of a callable MUST follow [COGNITIVE]. Each branch
+point adds 1. A branch point that opens a nested block (`if`, `for`,
+`while`, `switch`, `match`, `try`) also adds its nesting depth. Each labelled
+`break` or `continue` adds 1, and so does each direct recursive call. A run
+of one boolean operator counts once. [R-cognitive]
 
 <!-- evidence: @R-cognitive -->
-| language | routine body | cognitive |
+| language | callable body | cognitive |
 |---|---|---|
 | odin | `if a { return 1 }` | 1 |
 | odin | `for x in xs { if x > 0 { n += 1 } }` | 3 |
@@ -265,18 +245,18 @@ recursive call. A run of the same boolean operator counts once. [R-cognitive]
 | odin | `if a && b \|\| c { return 1 }` | 3 |
 | mica | `for x in xs if x > 0 n = n + 1 end end` | 3 |
 
-Maximum nesting depth, routine length (lines excluding blank and
-comment-only lines), parameter count, fan-out (distinct resolved callees) and
-fan-in (distinct resolved callers) MUST be computed for every routine. [R-shape-measures]
+For every callable the tool MUST also compute maximum nesting depth, SLOC,
+parameter count, fan-out (distinct resolved callees) and fan-in (distinct
+resolved callers). [R-shape-measures]
 
 <!-- evidence: @R-shape-measures -->
-| language | routine | nesting | length | parameters |
+| language | callable | nesting | SLOC | parameters |
 |---|---|---|---|---|
 | odin | `f :: proc(a, b: int) -> int { if a > 0 { for i in 0..<b { a += i } }; return a }` | 2 | 1 | 2 |
 | mica | `verb f(a, b) if a > 0 for i in b a = a + i end end return a end` | 2 | 1 | 2 |
 
-For each rule, the tool MUST compute rule complexity: the number of body
-atoms, with each negated atom counting 2. [R-rule-complexity]
+For every rule the tool MUST compute rule complexity: its body atoms, with
+each negated atom counting 2. [R-rule-complexity]
 
 <!-- evidence: @R-rule-complexity -->
 | rule | rule complexity |
@@ -285,27 +265,12 @@ atoms, with each negated atom counting 2. [R-rule-complexity]
 | `Path(?x, ?z) :- Edge(?x, ?y), Path(?y, ?z)` | 2 |
 | `Allowed(?x) :- Person(?x), not Banned(?x)` | 3 |
 
-### Maintainability and duplication
+### Duplication and verbose code
 
-The maintainability index of a file MUST be
-`clamp(171 − 5.2·ln(V) − 0.23·CC_total − 16.2·ln(LOC) + 50·sin(√(2.4·CR)), 0, 100)`.
-Here `V` is Halstead volume from the file's syntax facts: operators are node
-kinds and operator tokens, and operands are names and literals. `CC_total`
-is the sum of routine cyclomatic complexity, `LOC` counts non-blank lines,
-and `CR` is the ratio of comment lines to all lines. [R-maintainability]
-This is the formula let-go's tool uses, so scores are comparable across the
-two projects.
-
-<!-- evidence: @R-maintainability -->
-| V | CC_total | LOC | CR | index |
-|---|---|---|---|---|
-| 1 | 1 | 1 | 0 | 100 |
-| 1000 | 20 | 200 | 0 | 44.6 |
-
-Near-duplication MUST use winnowing ([WINNOW]) with k = 25 tokens and window
+Clone detection MUST use winnowing [WINNOW] with k = 25 tokens and window
 w = 40. Tokens come from `lex` in `apps/compiler/lex.mica` for Mica and from
 `core:odin/tokenizer` for Odin. Identifiers normalize to `ID`, string and
-numeric literals to `STR` and `NUM`, and comments are dropped. Files are
+numeric literals to `STR` and `NUM`, and comments drop out. Files are
 compared only with files of the same language. [R-duplication]
 
 ```transcript @R-duplication
@@ -314,8 +279,8 @@ $ tools/quality tests/quality/fixtures/dup | grep -c Q_DUP
 ? 0
 ```
 
-Each duplicate region pair MUST produce one `Q_DUP` diagnostic whose evidence
-names both regions by file and line range. [R-dup-evidence]
+Each clone pair MUST yield one `Q_DUP` diagnostic whose evidence names both
+regions by file and line range. [R-dup-evidence]
 
 ```transcript @R-dup-evidence
 $ tools/quality tests/quality/fixtures/dup | grep Q_DUP
@@ -323,20 +288,37 @@ tests/quality/fixtures/dup/a.odin:3 Q_DUP WARNING 31 tokens duplicated with test
 ? 0
 ```
 
+Verbose-code rules flag lines that add code without adding behavior. They
+are rules over syntax facts that derive `quality/Flagged(file, line, rule)`.
+The initial set MUST include at least: a branch whose arms are identical; a
+`return` of a boolean literal chosen by a condition that is itself the
+result; a variable assigned and returned on the next line with no other use;
+and an Odin `if cond { return true } return false`. [R-verbose-rules]
+[SCB] uses 137 such rules for Python; this set starts small and grows, and
+every rule is a Mica rule anyone can read.
+
+<!-- evidence: @R-verbose-rules -->
+| language | code | flagged |
+|---|---|---|
+| mica | `if a return 1 else return 1 end` | yes |
+| mica | `let r = f(x)` then `return r` | yes |
+| mica | `return f(x)` | no |
+| odin | `if ok { return true }; return false` | yes |
+| odin | `return ok` | no |
+
 ### History
 
-Defect density of a file MUST be the number of commits in the `--since`
-window whose subject matches `^fix` and which touch the file, divided by the
-file's non-blank lines in thousands. [R-defect-density]
-The count reads the source host's git relations (see Compatibility); the tool
-never shells out to `git`.
+A file's defect count MUST be the number of commits in the `--since` window
+whose subject matches `^fix` and which touch the file. Its defect rate is
+that count per thousand SLOC. [R-defect-density]
+The count reads the source host's git relations; the tool never runs `git`.
 
 <!-- evidence: @R-defect-density -->
-| fix commits touching file | non-blank lines | defects per KLOC | term score |
-|---|---|---|---|
-| 0 | 500 | 0 | 100 |
-| 1 | 500 | 2 | 60 |
-| 3 | 500 | 6 | 0 |
+| fix commits touching file | SLOC | defects per KSLOC |
+|---|---|---|
+| 0 | 500 | 0 |
+| 1 | 500 | 2 |
+| 3 | 500 | 6 |
 
 The report header MUST print the resolved commit range. [R-history-range-printed]
 
@@ -346,125 +328,199 @@ quality 0.1  roots: .  history: 1a2b3c4..9f8e7d6 (2026-03-01..HEAD)
 ? 0
 ```
 
-### Test reachability and testing density
+### Reachability
 
 Test roots are the top-level expressions of files under `apps/*/tests/` and
-the Odin procedures carrying `@(test)`.
+the Odin procedures marked `@(test)`. Production roots are exported Odin
+procedures of `mica/*` packages that another package calls, `main`
+procedures, verbs a grant names, and top-level expressions outside test
+files.
 
-The tool MUST derive `quality/Reached` with stratified rules equivalent to:
+The tool MUST derive `quality/Reached(subject, from)` with stratified rules
+equivalent to:
 
 ```
-Reached(r)  :- TestRoot(r).
-Reached(g)  :- Reached(f), Calls(f, g).
-Reached(rl) :- Reached(f), Reads(f, rel), RuleHead(rl, rel).
-Reached(g)  :- Reached(rl), RuleBodyReads(rl, rel), Deriving(g, rel).
+Reached(r, k)  :- Root(r, k).
+Reached(g, k)  :- Reached(f, k), Calls(f, g).
+Reached(rl, k) :- Reached(f, k), Reads(f, rel), RuleHead(rl, rel).
+Reached(g, k)  :- Reached(rl, k), RuleBodyReads(rl, rel), Deriving(g, rel).
 ```
 
-The rules MUST NOT allocate identities, and an `Unresolved` callee MUST NOT
-count as reached. [R-reachability-rules]
-An unresolved edge is reported, not guessed; guessing would inflate coverage.
+where `k` is `:test` or `:production`. The rules MUST NOT allocate
+identities, and an `Unresolved` callee MUST NOT count as reached. [R-reachability-rules]
+Guessing unresolved edges would inflate coverage and hide dead code.
 
 <!-- evidence: @R-reachability-rules -->
-| fixture | subject | reached |
-|---|---|---|
-| `reach` | `helper`, called from a test | yes |
-| `reach` | `unused`, called by nothing | no |
-| `reach` | `callback`, called only through a proc value | no |
-| `reach` | the rule deriving `Path`, read by a tested verb | yes |
-
-Coverage MUST be the reached routines and rules divided by all routines and
-rules, per language. [R-coverage]
-
-<!-- evidence: @R-coverage -->
-| routines and rules | reached | coverage % |
-|---|---|---|
-| 4 | 2 | 50 |
-| 10 | 10 | 100 |
-
-Testing density MUST be assertion calls per thousand non-blank lines, where
-an assertion is a call to a verb whose name starts with `test/assert` (Mica)
-or to `testing.expect`, `testing.expectf` or `testing.expect_value` (Odin). [R-testing-density]
-
-<!-- evidence: @R-testing-density -->
-| assertion calls | non-blank lines | assertions per KLOC | term score |
+| fixture | subject | reached from test | reached from production |
 |---|---|---|---|
-| 0 | 1000 | 0 | 0 |
-| 10 | 1000 | 10 | 50 |
-| 40 | 1000 | 40 | 100 |
+| `reach` | `helper`, called from a test and from `main` | yes | yes |
+| `reach` | `only_tested`, called only from a test | yes | no |
+| `reach` | `unused`, called by nothing | no | no |
+| `reach` | `callback`, called only through a proc value | no | no |
+
+### Terms
+
+Every term MUST lie in [0, 1], with 0 as the best value, and MUST be
+reported to three decimal places. [R-terms-bounded]
+
+```transcript @R-terms-bounded
+$ tools/quality --format mica tests/quality/fixtures/mixed | grep -c -E ':value -> (0\.[0-9]{3}|1\.000|none)'
+7
+? 0
+```
+
+**Erosion** follows [SCB] section 2.3, equations 2 and 3:
+
+```
+mass(f)  = CC(f) * sqrt(SLOC(f))
+erosion  = sum of mass(f) over callables with CC(f) > 10
+           / sum of mass(f) over all callables
+```
+
+The comparison is strict: a callable with CC exactly 10 carries no erosion. [R-erosion]
+
+<!-- evidence: @R-erosion -->
+| callables (CC, SLOC) | masses | erosion |
+|---|---|---|
+| (11, 4), (10, 9), (2, 1) | 22, 30, 2 | 0.407 |
+| (10, 9), (2, 1) | 30, 2 | 0.000 |
+| (40, 25), (5, 25) | 200, 25 | 0.889 |
+
+**Verbosity** follows [SCB] equation 4: the flagged lines of
+[R-verbose-rules] united with clone lines, divided by SLOC. A line that is
+both flagged and cloned counts once. [R-verbosity]
+
+<!-- evidence: @R-verbosity -->
+| SLOC | clone lines | flagged lines | verbosity |
+|---|---|---|---|
+| 100 | 10–19 | 15–24 | 0.150 |
+| 100 | none | 1–5 | 0.050 |
+
+**Uncovered** is 1 minus the share of callables and rules reached from a test root. [R-uncovered]
+
+<!-- evidence: @R-uncovered -->
+| callables and rules | reached from a test | uncovered |
+|---|---|---|
+| 4 | 2 | 0.500 |
+| 10 | 10 | 0.000 |
+
+**Dead** is the SLOC of callables that no root reaches, divided by the SLOC
+of all callables. Callables reached only from test roots count as dead
+production code and are listed separately. [R-dead]
+
+<!-- evidence: @R-dead -->
+| callables (SLOC, reached from) | dead |
+|---|---|
+| (100, production), (50, test only), (50, none) | 0.500 |
+| (100, production), (100, production) | 0.000 |
+
+**Defects** and **testing** are rates, shaped by `squash(v, k) = v / (v + k)`,
+which is 0 at 0, strictly increasing, and below 1. `k` sits where a rate
+turns bad, so that rate maps to exactly 0.5. Defects use the defect rate with
+k = 5 per KSLOC. Testing uses the shortfall below 20 assertions per KSLOC
+with k = 10, so meeting 20 scores 0. An assertion is a call to a verb whose
+name starts with `test/assert`, or to `testing.expect`, `testing.expectf` or
+`testing.expect_value`. [R-squash]
+
+<!-- evidence: @R-squash -->
+| term | rate | shaped value |
+|---|---|---|
+| defects | 0 per KSLOC | 0.000 |
+| defects | 5 per KSLOC | 0.500 |
+| defects | 15 per KSLOC | 0.750 |
+| testing | 20 assertions per KSLOC | 0.000 |
+| testing | 10 assertions per KSLOC | 0.500 |
+| testing | 0 assertions per KSLOC | 0.667 |
+
+The composite MUST be the weighted mean of the present terms, with weights
+renormalized over the terms whose inputs exist. [R-composite]
+A missing input, such as history outside a repository, drops its term; it never counts as a perfect score.
+
+| Term | Weight | Source |
+|---|---|---|
+| erosion | 0.25 | [SCB] |
+| verbosity | 0.20 | [SCB] |
+| uncovered | 0.20 | this document |
+| dead | 0.10 | this document |
+| defects | 0.10 | this document |
+| testing | 0.15 | this document |
+
+<!-- evidence: @R-composite -->
+| erosion | verbosity | uncovered | dead | defects | testing | composite |
+|---|---|---|---|---|---|---|
+| 0.4 | 0.2 | 0.5 | 0.1 | 0.2 | 0.0 | 0.270 |
+| 0.4 | 0.2 | 0.5 | 0.1 | missing | 0.0 | 0.278 |
+
+The tool MUST compute every term for each file, each language and the whole
+corpus. Erosion, verbosity and dead are shares, so a wider scope takes the
+same ratio over its callables and lines rather than averaging narrower scores. [R-scopes]
+
+<!-- evidence: @R-scopes -->
+| file | erosion mass above threshold | total mass | file erosion |
+|---|---|---|---|
+| a.odin | 200 | 225 | 0.889 |
+| b.odin | 0 | 775 | 0.000 |
+| corpus (a + b) | 200 | 1000 | 0.200 |
+
+The `text` report MUST print [SCB]'s published baselines next to the
+corpus erosion and verbosity: human-written code 0.34 and 0.19,
+agent-written code 0.68 and 0.44. [R-baselines]
+A number without its reference point cannot be read.
+
+```transcript @R-baselines
+$ tools/quality tests/quality/fixtures/mixed | grep -c 'human 0.34, agent 0.68'
+1
+? 0
+```
+
+Maintainability index, cognitive complexity, nesting, SLOC, parameters,
+fan-in, fan-out and rule complexity do not enter the composite. They yield
+`WARNING` diagnostics above these thresholds: maintainability below 65,
+cognitive 15, nesting 4, SLOC 60, parameters 5, fan-out 15, fan-in 20,
+rule complexity 6. Erosion already carries complexity weighted by size, and
+scoring these as well would count one problem several times.
+
+Ranked issues MUST be ordered by how much fixing each would lower the
+composite, largest first, with ties broken by file path and then line. [R-ranking]
+
+<!-- evidence: @R-ranking -->
+| issue | composite reduction | file | line | rank |
+|---|---|---|---|---|
+| CC 74 proc | 0.018 | mica/kernel/b.odin | 40 | 1 |
+| clone pair | 0.009 | mica/kernel/a.odin | 10 | 2 |
+| verbose return | 0.009 | mica/kernel/a.odin | 90 | 3 |
 
 ### Rule and relation health
 
-Each of the following MUST produce one diagnostic per subject, with the listed
-code and severity. [R-health]
+Each condition below MUST yield one diagnostic per subject. [R-health]
 
 <!-- evidence: @R-health -->
 | code | severity | condition |
 |---|---|---|
-| `Q_DEAD_RELATION` | WARNING | a declared relation that no routine or rule body reads |
-| `Q_EMPTY_RELATION` | WARNING | a relation that is read, but is never asserted, is no rule's head, has no loaded facts, and is neither computed nor host-provided |
-| `Q_MIXED_DERIVATION` | ERROR | a relation that is both some rule's head and the target of a direct `assert` |
+| `Q_DEAD_RELATION` | WARNING | a declared relation that no callable or rule body reads |
+| `Q_EMPTY_RELATION` | WARNING | a relation that is read but never asserted, derived or loaded, and is neither computed nor host-provided |
+| `Q_MIXED_DERIVATION` | ERROR | a relation that is both a rule head and the target of a direct `assert` |
 | `Q_INACTIVE_RULE` | NOTE | a rule whose `ActiveRule` value is false |
-| `Q_RULE_COMPLEXITY` | WARNING | rule complexity above its threshold |
+| `Q_RULE_COMPLEXITY` | WARNING | rule complexity above 6 |
 
 ### Authority and grants
 
-Each of the following MUST produce one diagnostic per grant row or verb. [R-grants]
+Each condition below MUST yield one diagnostic per grant row or verb. [R-grants]
 
 <!-- evidence: @R-grants -->
 | code | severity | condition |
 |---|---|---|
 | `Q_DANGLING_GRANT` | ERROR | a `CanRead`, `CanWrite`, `CanInvoke` or `CanEffect` row naming an undeclared relation, verb or identity |
 | `Q_SYSTEM_GRANT` | ERROR | a grant on a catalogue relation to a subject other than root |
-| `Q_DERIVED_WRITE_GRANT` | WARNING | a `CanWrite` grant on a relation that is a rule head |
+| `Q_DERIVED_WRITE_GRANT` | WARNING | a `CanWrite` grant on a rule head |
 | `Q_UNGRANTED_TOOL` | WARNING | a `tool/*` verb that no `CanInvoke` row covers |
-
-### Scoring
-
-| Term | 100 at | 0 at | Between | Weight |
-|---|---|---|---|---|
-| Cyclomatic (routine max per file) | ≤ 10 | ≥ 30 | linear | 15 |
-| Cognitive (routine max per file) | ≤ 15 | ≥ 50 | linear | 15 |
-| Maintainability index | 100 | 0 | identity | 15 |
-| Duplication % | 0 | ≥ 50 | `100 − 2·dup%` | 15 |
-| Defects per KLOC | 0 | ≥ 5 | `100 − 20·d` | 10 |
-| Coverage % | 100 | 0 | identity | 20 |
-| Testing density (assertions per KLOC) | ≥ 20 | 0 | linear | 10 |
-
-Nesting depth, length, parameter count and fan-in/fan-out are reported as
-`WARNING` diagnostics above these thresholds and do not enter the score: nesting 4,
-length 60 lines, parameters 5, fan-out 15, fan-in 20, rule complexity 6.
-Scoring them as well would count the same complexity twice.
-
-The tool MUST compute a score per file, per language (weighted by file
-non-blank lines), and for the corpus (the two language scores weighted by
-their non-blank lines). [R-score-aggregation]
-Weighting by lines keeps 89,000 lines of Odin from being outvoted by a few
-small Mica files, and the reverse.
-
-<!-- evidence: @R-score-aggregation -->
-| mica score | mica lines | odin score | odin lines | corpus score |
-|---|---|---|---|---|
-| 60 | 1000 | 80 | 3000 | 75 |
-| 90 | 25500 | 70 | 89000 | 74.45 |
-
-Ranked issues MUST be ordered by the corpus-score gain from bringing the
-subject to its threshold, largest first, with ties broken by file path and
-then line. [R-ranking]
-
-<!-- evidence: @R-ranking -->
-| issue | score gain | file | line | rank |
-|---|---|---|---|---|
-| deep proc | 1.8 | mica/kernel/b.odin | 40 | 1 |
-| duplicate | 0.9 | mica/kernel/a.odin | 10 | 2 |
-| long verb | 0.9 | mica/kernel/a.odin | 90 | 3 |
 
 ### Determinism
 
-Two runs over the same corpus, the same history range and the same options
-MUST produce byte-identical reports, regardless of file system enumeration
-order, symbol interning order or fact insertion order. [R-deterministic]
-Reports that shift between identical runs cannot be compared, and an agent
-optimizing the score would chase noise.
+Two runs over the same corpus, history range and options MUST produce
+byte-identical reports, whatever the file-system order, symbol interning
+order or fact insertion order. [R-deterministic]
+An agent tuning code against a score that shifts between identical runs chases noise.
 
 ```transcript @R-deterministic
 $ tools/quality --format mica tests/quality/fixtures/mixed > /tmp/q1
@@ -476,10 +532,9 @@ same
 
 ### Surfaces
 
-The command-line tool MUST exit 0 when it completes, whatever the score, and
-MUST exit 1 only when it cannot complete (unreadable root, failed world
-start). [R-exit-status]
-The tool reports; gating on the score is a policy choice for CI, not for the tool.
+The command-line tool MUST exit 0 when it finishes, whatever the scores, and
+exit 1 only when it cannot finish. [R-exit-status]
+The tool measures; gating on a score is CI policy.
 
 ```transcript @R-exit-status
 $ tools/quality --root /nonexistent
@@ -487,13 +542,23 @@ quality: root /nonexistent does not exist
 ? 1
 ```
 
-The `text` report MUST begin with a header (tool version, corpus roots,
-resolved history range), then the corpus and per-language scores, then the
-top `--top` ranked issues, each as `path:line code severity message`. [R-text-report]
+The `text` report MUST open with a header (tool version, corpus roots,
+history range), then the composite and terms for the corpus and each
+language, then the top `--top` issues, one per line as
+`path:line code severity message`. [R-text-report]
 
-The `mica` report MUST be a single Mica map value with the keys `:header`,
-`:scores`, `:terms` and `:diagnostics`. Its content MUST equal the
-`quality/Term` and `quality/Diagnostic` relations of the run. [R-mica-report]
+```transcript @R-text-report
+$ tools/quality tests/quality/fixtures/mixed
+quality 0.1  roots: tests/quality/fixtures/mixed  history: none (not a repository)
+composite 0.312  erosion 0.407 (human 0.34, agent 0.68)  verbosity 0.150 (human 0.19, agent 0.44)
+tests/quality/fixtures/mixed/deep.odin:3 Q_COMPLEXITY WARNING cyclomatic complexity 22 exceeds 10
+tests/quality/fixtures/mixed/rules.mica:4 Q_MIXED_DERIVATION ERROR Seen is a rule head and is asserted directly
+? 0
+```
+
+The `mica` report MUST be one Mica map value with the keys `:header`,
+`:terms` and `:diagnostics`, and its content MUST equal the run's
+`quality/Term` and `quality/Diagnostic` relations. [R-mica-report]
 
 ```transcript @R-mica-report
 $ tools/quality --format mica tests/quality/fixtures/mixed | head -c 25
@@ -501,34 +566,35 @@ $ tools/quality --format mica tests/quality/fixtures/mixed | head -c 25
 ? 0
 ```
 
-The verb `tool/quality(agent, arguments)` MUST return the same map the `mica`
-report prints, for the paths in `arguments[:paths]`. It MUST be callable only
-by subjects that hold a `CanInvoke` grant on it. [R-tool-verb]
+The verb `tool/quality(agent, arguments)` MUST return the map the `mica`
+report prints, for the paths in `arguments[:paths]`, and MUST be callable
+only by subjects holding a `CanInvoke` grant on it. [R-tool-verb]
 
 ```transcript @R-tool-verb
-$ tools/filein apps/quality/*.mica --eval 'return tool/quality(#agent, {:paths -> ["tests/quality/fixtures/mixed"]})[:scores][:corpus]'
-71.4
+$ tools/filein apps/quality/*.mica --eval 'return tool/quality(#agent, {:paths -> ["tests/quality/fixtures/mixed"]})[:terms][:corpus][:composite]'
+0.312
 ? 0
 ```
 
-```transcript @R-text-report
-$ tools/quality tests/quality/fixtures/mixed
-quality 0.1  roots: tests/quality/fixtures/mixed  history: none (not a repository)
-score corpus 71.4  mica 68.0  odin 73.9
-tests/quality/fixtures/mixed/deep.odin:3 Q_COGNITIVE WARNING cognitive complexity 22 exceeds 15
-tests/quality/fixtures/mixed/rules.mica:4 Q_MIXED_DERIVATION ERROR Seen is a rule head and is asserted directly
-? 0
-```
+### Deviations from SlopCodeBench
+
+The numbers compare with [SCB]'s baselines only if the departures are known.
+
+- **Callables.** [SCB] defines erosion over "all callables" without saying how nesting counts. Here nested function literals fold into the enclosing callable, whose branches they are. Mica rules are not callables; they have their own complexity measure.
+- **Verbosity is a lower bound.** The flagged-line rules number a handful, not 137, so verbosity understates what [SCB]'s rules would find.
+- **Dead, uncovered, defects and testing are this document's,** not the paper's.
+- **Dead is an upper bound.** Reachability follows resolved calls only, so code reached through proc values or dynamic dispatch looks dead.
+- **Languages differ.** [SCB] measures Python. Mica and Odin differ in what a line and a branch are, so cross-language comparison is indicative, not exact.
 
 ### Errors
 
 | Error | Example | Recovery |
 |---|---|---|
-| `Q_PARSE` (diagnostic) | a `.mica` file with a syntax error | Record the diagnostic, skip the file's measures, continue |
-| `Q_LOAD` (diagnostic) | a filein expression aborts while the corpus loads | Record it with the unit name; keep what loaded; continue |
-| `Q_NO_HISTORY` (diagnostic, NOTE) | the root is not a git repository | Skip defect density; its term weight moves to the others in proportion |
-| `Q_UNRESOLVED_CALL` (diagnostic, NOTE) | an Odin call through a proc value | Keep the edge as unresolved; never count it as reached |
-| exit 1 | `--root` does not exist | Print the reason to stderr and exit 1 |
+| `Q_PARSE` (diagnostic) | a `.mica` file with a syntax error | Record it, skip the file's measures, continue |
+| `Q_LOAD` (diagnostic) | a filein expression aborts while the corpus loads | Record it with the unit name, keep what loaded, continue |
+| `Q_NO_HISTORY` (diagnostic, NOTE) | the root is not a git repository | Drop the defects term; the others renormalize |
+| `Q_UNRESOLVED_CALL` (diagnostic, NOTE) | an Odin call through a proc value | Keep the edge unresolved; never count it as reached |
+| exit 1 | `--root` does not exist | Print the reason on stderr and exit 1 |
 
 ## Formal Grammar
 
@@ -550,100 +616,92 @@ message     = 1*( %x20-7E )
 
 ## Out of Scope
 
-**Pull-request delta.** Scoring only the files and routines a change touches,
-against a base revision. It is excluded until the git relations exist and the
-full-corpus report has been used for a while. Extension point: a `--base
-<commit>` option that restricts the subjects to those `source/ChangedFiles`
-reports, reusing [R-ranking].
+**Change delta.** [SCB] tracks erosion and verbosity across checkpoints of
+one task, and a pull request is the same idea: terms at a base and a head
+revision, and the signed difference. It is excluded until the git relations
+exist. Extension point: a `--base <commit>` option that runs both revisions
+and reports each term's delta, per file, using `source/ChangedFiles` to list
+touched files.
 
-**Dynamic coverage.** Branch coverage from running the tests. Excluded
-because omica's VM has no hit counters today. Extension point: a
-`quality/Hit(file, node)` relation filled by an instrumented test run, which
-replaces `Reached` in [R-coverage].
+**Dynamic coverage.** Branch coverage from running the tests needs VM hit
+counters that omica lacks. Extension point: a `quality/Hit(file, node)`
+relation filled by an instrumented run, replacing `Reached` in [R-uncovered].
 
-**Ratchet baseline.** Failing CI when the score drops. Excluded because it is
-a CI policy, not a measurement (see [R-exit-status]). Extension point: a
-script that compares two `mica` reports.
+**Ratchet.** Failing CI when a term rises is policy, not measurement
+([R-exit-status]). Extension point: a script that compares two `mica` reports.
 
-**Auto-fixing.** Out of scope; the tool only reports.
+**Auto-fixing.** The tool only reports.
 
 ## Alternatives Considered
 
-**Why not extend omica's Odin compiler to emit structure facts?** That changes
+**Why not clamped linear scores?** A clamped scale saturates: CC 30 and CC
+200 score the same, so fixing the worst callable in the corpus does not move
+the number. Shares and squashed rates always move.
+
+**Why not score maintainability index?** It is built from complexity,
+volume and lines, which erosion already weighs. It stays a diagnostic.
+
+**Why not extend the Odin compiler to emit structure facts?** That changes
 the compiler for a tool's benefit. `parse.mica` already produces the facts,
 and the self-differential tool checks them against the Odin parser.
 
 **Why not write an Odin parser in Mica?** It would duplicate
-`core:odin/parser`, which is exact, maintained with the language, and already
-on every machine that builds omica.
+`core:odin/parser`, which tracks the language and ships with every Odin
+install.
 
-**Why not compute reachability and health with hand-written tree walks?**
-They are transitive queries over relations. Rules state them in a few lines,
-are stratified by construction, and follow the idiom [BOOTSTRAP] sets for
-generator analyses. Walks would re-implement joins by hand.
+**Why not hand-written tree walks for reachability and health?** They are
+transitive queries. Rules state them in a few lines, stratify by
+construction, and match the analysis idiom of [BOOTSTRAP].
 
-**Why not emit plain text only?** Agents and tools would have to scrape the
-text, and findings could not be queried or joined with other facts, such as
-"which dead relations were added in the last month".
+**Why not a plain text report?** Agents would scrape it, and findings could
+not be joined with other facts, such as the dead relations added last month.
 
-**Why not run let-go's tool?** It runs on let-go and understands only let-go
-and Go. Its metric definitions are reused here; its code cannot be.
-
-**Why not score nesting, length, parameters and fan-in/fan-out?** Each
-correlates strongly with cyclomatic or cognitive complexity; scoring them
-too would penalize one long proc several times over.
-
-**Why not shell out to `git` for history?** Parsing command output is
-fragile. Relations in the source host make history queryable by the same
-rules as everything else, and the host already bounds file access to the
-repository root.
+**Why not run `git` for history?** Parsing command output is fragile.
+Relations make history queryable by the same rules as everything else.
 
 ## Security Considerations
 
-Loading a corpus runs its top-level Mica expressions. A hostile or broken
-corpus can therefore run arbitrary Mica during a run. [R-sandboxed-world]
-bounds this: the run world has no store, so nothing persists, and it has no
-network, external-request, subscription or other host-effect capability.
-What remains is CPU and memory use. A run SHOULD be started under a memory
-limit and a time limit when the corpus is not trusted.
+Loading a corpus runs its top-level Mica expressions, so a hostile or broken
+corpus runs code during a run. [R-sandboxed-world] bounds it: with no store
+nothing persists, and with no host-effect capability nothing leaves the
+process. CPU and memory remain, so an untrusted corpus SHOULD run under
+memory and time limits.
 
 The Odin helper parses files and never executes them.
 
-Git relations are read-only and confined to `--root`. The history walk is
-bounded (at most 512 commits per walk, as in the Rust source provider) so a
-large repository cannot stall a run.
+The git relations are read-only, confined to `--root`, and walk at most 512
+commits, so a large repository cannot stall a run.
 
-Reports contain paths relative to `--root` and short messages. They never
-contain file contents beyond the identifiers named in a message, so a report
-does not leak more source than the reader of the repository already has.
+Reports hold paths relative to `--root` and short messages. They reveal no
+source beyond the identifiers a message names.
 
-The `tool/quality` verb requires a `CanInvoke` grant [R-tool-verb], so an
-agent without that grant cannot make the host parse arbitrary paths.
+`tool/quality` requires a `CanInvoke` grant ([R-tool-verb]), so an agent
+without one cannot make the host parse arbitrary paths.
 
 ## Compatibility
 
-The tool adds files and changes no existing behavior. It requires three
-additions outside `apps/quality/`:
+The tool adds files and changes no existing behavior. Beyond `apps/quality/`
+it needs:
 
-1. `tools/quality-facts` (Odin), which writes Odin syntax facts and tokens.
-2. Git relations in the source host (`host/source/`), read-only:
+1. `tools/quality-facts`, an Odin helper that writes Odin syntax facts and tokens.
+2. Read-only git relations in `host/source/`:
    `source/CommitLog(repository, commit, parent, subject, author, time)` and
-   `source/ChangedFiles(repository, from, to, path, change)`, modeled on the
-   Rust source provider's relations of the same names ([RUST-SOURCE]).
+   `source/ChangedFiles(repository, from, to, path, change)`, modelled on the
+   relations of the same names in the Rust source provider [RUST-SOURCE].
 3. `tools/quality`, a thin Odin entry point that starts a run world, loads
    `apps/quality/`, and prints the report.
 
-Until item 2 lands, runs emit `Q_NO_HISTORY` and score without defect density.
+Until item 2 lands, runs report `Q_NO_HISTORY` and score without defects.
 
 ## References
 
+- [SCB] G. Orlanski, D. Roy, A. Yun, C. Shin, A. Gu, A. Ge, D. Adila, et al., "SlopCodeBench: Benchmarking How Coding Agents Degrade Over Long-Horizon Iterative Tasks", arXiv:2603.24755, https://arxiv.org/abs/2603.24755
 - [BOOTSTRAP] R. Daum, "A runtime generated by Mica", draft for discussion, 2026-09-26, https://gist.github.com/rdaum/566a6d0afe1358742b40e5728b7893a3
 - [COGNITIVE] G. A. Campbell, "Cognitive Complexity: A new way of measuring understandability", SonarSource, 2018, https://www.sonarsource.com/docs/CognitiveComplexity.pdf
 - [WINNOW] S. Schleimer, D. Wilkerson, A. Aiken, "Winnowing: Local Algorithms for Document Fingerprinting", SIGMOD 2003, https://doi.org/10.1145/872757.872770
-- [MI] P. Oman, J. Hagemeister, "Metrics for assessing a software system's maintainability", ICSM 1992, https://doi.org/10.1109/ICSM.1992.242525
-- [RUST-SOURCE] timbran-project/mica, `crates/source-provider/src/relations.rs` (commit 2bbceb0): `CommitLog`, `ChangedFiles`, `FileHistory`.
-- Reference project: let-go, `scripts/quality.lg` and `scripts/quality/*.lg`, Go/let-go. It is the source of the metric definitions, the scoring table shape, and the ranked-issue report worth studying.
-- omica code this document builds on: `apps/compiler/parse.mica`, `apps/compiler/lex.mica`, `mica/kernel/dispatch.odin` (catalogue relations), `mica/kernel/authority.odin` (grant minting), `host/source/index.odin` (source relations), `apps/agent/tools.mica` (`tool/*` verbs).
+- [RUST-SOURCE] timbran-project/mica, `crates/source-provider/src/relations.rs` (commit 2bbceb0).
+- Reference project: let-go, `scripts/quality.lg`, a SlopCodeBench-aligned quality score for a Lisp and Go codebase.
+- omica code this document builds on: `apps/compiler/parse.mica`, `apps/compiler/lex.mica`, `mica/kernel/dispatch.odin`, `mica/kernel/authority.odin`, `host/source/index.odin`, `apps/agent/tools.mica`.
 
 ## Appendix A. Diagnostic codes
 
@@ -651,25 +709,32 @@ Until item 2 lands, runs emit `Q_NO_HISTORY` and score without defect density.
 |---|---|---|
 | `Q_PARSE` | ERROR | the file does not parse |
 | `Q_LOAD` | ERROR | a filein expression aborted while the corpus loaded |
-| `Q_COMPLEXITY` | WARNING | cyclomatic complexity above 10 |
+| `Q_COMPLEXITY` | WARNING | CC above 10 (the erosion threshold) |
 | `Q_COGNITIVE` | WARNING | cognitive complexity above 15 |
 | `Q_NESTING` | WARNING | nesting depth above 4 |
-| `Q_LENGTH` | WARNING | routine longer than 60 lines |
+| `Q_LENGTH` | WARNING | more than 60 SLOC |
 | `Q_PARAMETERS` | WARNING | more than 5 parameters |
 | `Q_FAN_OUT` | WARNING | more than 15 distinct callees |
 | `Q_FAN_IN` | WARNING | more than 20 distinct callers |
 | `Q_RULE_COMPLEXITY` | WARNING | rule complexity above 6 |
 | `Q_MAINTAINABILITY` | WARNING | file maintainability index below 65 |
-| `Q_DUP` | WARNING | a near-duplicate region pair |
-| `Q_DEFECTS` | NOTE | file defect density above 2 per KLOC |
-| `Q_UNREACHED` | NOTE | a routine or rule no test reaches |
+| `Q_DUP` | WARNING | a clone pair |
+| `Q_VERBOSE` | WARNING | a line a verbose-code rule flags |
+| `Q_DEFECTS` | NOTE | defect rate above 2 per KSLOC |
+| `Q_UNREACHED` | NOTE | a callable or rule no test reaches |
+| `Q_DEAD` | WARNING | a callable no root reaches |
 | `Q_UNRESOLVED_CALL` | NOTE | a call edge the tool cannot resolve |
 | `Q_NO_HISTORY` | NOTE | no git history is available |
-| `Q_DEAD_RELATION` | WARNING | see Rule and relation health |
-| `Q_EMPTY_RELATION` | WARNING | see Rule and relation health |
-| `Q_MIXED_DERIVATION` | ERROR | see Rule and relation health |
-| `Q_INACTIVE_RULE` | NOTE | see Rule and relation health |
-| `Q_DANGLING_GRANT` | ERROR | see Authority and grants |
-| `Q_SYSTEM_GRANT` | ERROR | see Authority and grants |
-| `Q_DERIVED_WRITE_GRANT` | WARNING | see Authority and grants |
-| `Q_UNGRANTED_TOOL` | WARNING | see Authority and grants |
+| `Q_DEAD_RELATION` | WARNING | see "Rule and relation health" |
+| `Q_EMPTY_RELATION` | WARNING | see "Rule and relation health" |
+| `Q_MIXED_DERIVATION` | ERROR | see "Rule and relation health" |
+| `Q_INACTIVE_RULE` | NOTE | see "Rule and relation health" |
+| `Q_DANGLING_GRANT` | ERROR | see "Authority and grants" |
+| `Q_SYSTEM_GRANT` | ERROR | see "Authority and grants" |
+| `Q_DERIVED_WRITE_GRANT` | WARNING | see "Authority and grants" |
+| `Q_UNGRANTED_TOOL` | WARNING | see "Authority and grants" |
+
+The maintainability index, reported per file, is
+`clamp(171 − 5.2·ln(V) − 0.23·CC_total − 16.2·ln(SLOC) + 50·sin(√(2.4·CR)), 0, 100)`,
+where `V` is Halstead volume from the file's syntax facts, `CC_total` sums
+the file's callable CC, and `CR` is the share of comment lines.
