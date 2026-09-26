@@ -508,3 +508,42 @@ test_nearest_matrix_resident_copy_not_released_while_in_use :: proc(t: ^testing.
 	nearest_matrix_release_use(&dm)
 	accel.release_prepared(dm.strategy, &dm.prepared)
 }
+
+// Members derived by a rule change without any backing relation's block
+// changing: a derived VectorIndexContains row added through Staged must be
+// visible to the next batched scan, not hidden by a cached member list.
+@(test)
+test_nearest_cache_sees_derived_members :: proc(t: ^testing.T) {
+	sync.mutex_lock(&nearest_cache_tests_lock)
+	defer sync.mutex_unlock(&nearest_cache_tests_lock)
+	defer free_all(context.temp_allocator)
+	f: Retrieval_Fixture
+	retrieval_fixture(t, &f)
+	defer k.kernel_destroy(&f.kernel)
+	staged := retrieval_relation(&f.kernel, 5, "Staged", 2)
+	i, e := v.symbol_intern("i"), v.symbol_intern("e")
+	rule := k.rule_new(f.contains, []k.Term{k.term_var(i), k.term_var(e)}, []k.Rule_Body_Item{k.body_atom(k.atom_positive(staged, []k.Term{k.term_var(i), k.term_var(e)}))})
+	installed, install_error := k.kernel_install_rule(&f.kernel, v.Identity(970), rule, "derived members")
+	testing.expect_value(t, install_error, k.Kernel_Error.None)
+	k.snapshot_release(installed)
+
+	// The member's embedding and vector exist up front (pointing exactly along
+	// the query), so the later commit changes only Staged: no backing block.
+	query := v.value_list(context.temp_allocator, []v.Value{must_float(1), must_float(0.5)})
+	embedding := v.value_symbol(v.symbol_intern("derived_member"))
+	tx := k.kernel_begin(&f.kernel)
+	k.transaction_assert(&tx, f.embedding_of, v.tuple_new(context.temp_allocator, []v.Value{embedding, v.value_symbol(v.symbol_intern("derived_subject"))}))
+	k.transaction_assert(&tx, f.vector, v.tuple_new(context.temp_allocator, []v.Value{embedding, query}))
+	_, _ = k.transaction_commit(&tx)
+	k.transaction_destroy(&tx)
+	source := k.Relation_Source{kernel = &f.kernel, snapshot = f.kernel.current, use_stored_derived = true}
+	expect_batch_equals_rows(t, &source, f.index, query, 3)
+
+	// Staged makes it a member through the rule.
+	tx = k.kernel_begin(&f.kernel)
+	k.transaction_assert(&tx, staged, v.tuple_new(context.temp_allocator, []v.Value{f.index, embedding}))
+	_, _ = k.transaction_commit(&tx)
+	k.transaction_destroy(&tx)
+	source = k.Relation_Source{kernel = &f.kernel, snapshot = f.kernel.current, use_stored_derived = true}
+	expect_batch_equals_rows(t, &source, f.index, query, 3)
+}

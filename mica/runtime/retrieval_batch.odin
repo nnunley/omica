@@ -502,6 +502,17 @@ nearest_cache_builds_this_thread :: proc() -> int {
 	return nearest_builds
 }
 
+// Whether an active rule of `snapshot` derives rows of `relation`.
+@(private)
+nearest_relation_is_derived :: proc(snapshot: ^k.Snapshot, relation: k.Relation_ID) -> bool {
+	for definition in snapshot.rules {
+		if definition.active && definition.rule.head_relation == relation {
+			return true
+		}
+	}
+	return false
+}
+
 // The index's members, from the cache when possible. `pin` (possibly nil)
 // must be passed to nearest_cache_unpin once the members are no longer used.
 @(private)
@@ -519,6 +530,13 @@ nearest_members_cached :: proc(
 	if cacheable {
 		for id, i in ids {
 			if !k.authority_can_read(source.authority, id) {
+				cacheable = false
+				break
+			}
+			// The key covers only extensional blocks: rows a rule derives, or a
+			// computed relation supplies, can change while every serial stays
+			// the same, so such indexes are read fresh.
+			if (source.kernel != nil && k.kernel_relation_is_computed(source.kernel, id)) || nearest_relation_is_derived(source.snapshot, id) {
 				cacheable = false
 				break
 			}
