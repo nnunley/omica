@@ -2,6 +2,16 @@
 
 Status: design, approved for implementation 2026-09-26.
 
+## What this serves
+
+Mica is a database, a programming language and a runtime at once. A world is
+live: its identities, facts, rules, verbs, authority, effects and tasks all
+change while it runs, and behavior is installed into the world beside the
+facts it reads and writes. The world, not any source file, is the source of
+truth. Installing new behavior into a running world is therefore a core
+operation of the runtime, not a convenience, and a compiled program is data
+the world stores and serves like any other fact.
+
 ## Problem
 
 A world compiles every loaded file into one `vm.Program`. A method is a
@@ -102,6 +112,17 @@ matches Rust's `run_filein_with_unit` and `FileinMode`:
 
 `tools/filein` on a booted store files the given paths in with `Add`, or
 `Replace` under `--replace`, as the Rust CLI does.
+
+**Units are namespaces with persistent state (decided 2026-09-26).** Rust
+mica runs each top-level statement of a filein as its own task, so a `let`
+in one statement is not visible to the next, and a unit only groups what it
+owns (`crates/runtime/src/lib.rs:418-537`; mdbook
+`runtime/filein-fileout.md`). omica departs from this deliberately: a filein
+is composed of verbs and the unit's own state. Top-level bindings become that
+unit's state, stored as facts, readable by the unit's verbs, and kept across
+reboot and `Replace`. Until the units RFC specifies that state, a filein's
+top-level statements keep today's behavior (one root task sharing one scope),
+and verbs cannot yet read it.
 
 ## What does not change
 
