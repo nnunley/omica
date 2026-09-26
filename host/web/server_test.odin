@@ -20,14 +20,24 @@ server_run_worker :: proc(data: rawptr) {
 
 @(private)
 start_server :: proc(t: ^testing.T, server: ^Web_Server, routes: ^Routes) -> ^thread.Thread {
+	return start_server_with(t, server, routes_handle, routes)
+}
+
+@(private)
+start_server_with :: proc(
+	t: ^testing.T,
+	server: ^Web_Server,
+	handler: Web_Handler,
+	user: rawptr,
+) -> ^thread.Thread {
 	// Cross-thread state: the acceptor appends to `server.connections` while
 	// connection threads grow response builders from `server.allocator`, so
 	// it must be the thread-safe heap, not the test's rollback allocator.
 	ok, message := web_server_init(
 		server,
 		"127.0.0.1:0",
-		routes_handle,
-		routes,
+		handler,
+		user,
 		allocator = runtime.default_allocator(),
 	)
 	if !ok {
@@ -359,18 +369,10 @@ arena_probe_handler :: proc(user: rawptr, request: ^Http_Request, response: ^Htt
 test_server_request_gets_fresh_temp_arena :: proc(t: ^testing.T) {
 	probe: Arena_Probe
 	server: Web_Server
-	ok, message := web_server_init(
-		&server,
-		"127.0.0.1:0",
-		arena_probe_handler,
-		&probe,
-		allocator = runtime.default_allocator(),
-	)
-	if !ok {
-		testing.expectf(t, false, "server init failed: %s", message)
+	run_thread := start_server_with(t, &server, arena_probe_handler, &probe)
+	if run_thread == nil {
 		return
 	}
-	run_thread := thread.create_and_start_with_data(&server, server_run_worker)
 
 	client := dial_server(t, &server)
 	for _ in 0 ..< 2 {

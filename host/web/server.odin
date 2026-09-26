@@ -233,6 +233,15 @@ web_connection_worker :: proc(data: rawptr) {
 
 // Serves requests on one connection until it closes or faults.
 web_connection_serve :: proc(connection: ^Web_Connection) {
+	// One scratch arena per connection, installed here so it covers the
+	// whole loop, and emptied after every request.
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	context.temp_allocator = virtual.arena_allocator(&arena)
+
 	server := connection.server
 	parser: Http_Parser
 	http_parser_init(&parser, server.limits)
@@ -250,6 +259,7 @@ web_connection_serve :: proc(connection: ^Web_Connection) {
 			keep_alive := web_connection_respond(connection, &request, &response_builder)
 			http_parser_consume(&parser, parser.last_total)
 			strings.builder_reset(&response_builder)
+			free_all(context.temp_allocator)
 			if !keep_alive {
 				return
 			}
@@ -266,23 +276,15 @@ web_connection_serve :: proc(connection: ^Web_Connection) {
 	}
 }
 
-// Handles one request in its own arena, installed as `context.temp_allocator`
-// and destroyed when the response has been sent or the stream has ended.
-// Anything kept after the request must be copied into its owner's allocator.
-// Reports whether the connection stays open for another request.
+// Handles one request. `context.temp_allocator` is emptied after the request,
+// so anything kept longer must be copied into its owner's allocator. Reports
+// whether the connection stays open for another request.
 @(private)
 web_connection_respond :: proc(
 	connection: ^Web_Connection,
 	request: ^Http_Request,
 	builder: ^strings.Builder,
 ) -> bool {
-	arena: virtual.Arena
-	if virtual.arena_init_growing(&arena) != nil {
-		return false
-	}
-	defer virtual.arena_destroy(&arena)
-	context.temp_allocator = virtual.arena_allocator(&arena)
-
 	server := connection.server
 	if server.stream_handler != nil && server.stream_handler(server.user, request, connection.socket) {
 		return false
