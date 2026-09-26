@@ -547,3 +547,38 @@ test_nearest_cache_sees_derived_members :: proc(t: ^testing.T) {
 	source = k.Relation_Source{kernel = &f.kernel, snapshot = f.kernel.current, use_stored_derived = true}
 	expect_batch_equals_rows(t, &source, f.index, query, 3)
 }
+
+// Cosine does not depend on magnitude, so a tiny vector pointing exactly along
+// the query must win even when 33 others fill the approximate window: an
+// epsilon added to the f32 denominator used to score [1e-12, 0] at ~0.001 and
+// drop it before the exact re-score (Ryan's review of #108).
+@(test)
+test_nearest_batch_keeps_small_magnitude_winner :: proc(t: ^testing.T) {
+	sync.mutex_lock(&nearest_cache_tests_lock)
+	defer sync.mutex_unlock(&nearest_cache_tests_lock)
+	defer free_all(context.temp_allocator)
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	contains := retrieval_relation(&kernel, 1, "VectorIndexContains", 2)
+	embedding_of := retrieval_relation(&kernel, 2, "EmbeddingOf", 2)
+	vector := retrieval_relation(&kernel, 3, "EmbeddingVector", 2)
+	index := v.value_symbol(v.symbol_intern("tiny_docs"))
+	tx := k.kernel_begin(&kernel)
+	add :: proc(tx: ^k.Transaction, contains, embedding_of, vector: k.Relation_ID, index: v.Value, n: int, x, y: f32) {
+		embedding := v.value_symbol(v.symbol_intern(fmt.tprintf("te%d", n)))
+		k.transaction_assert(tx, contains, v.tuple_new(context.temp_allocator, []v.Value{index, embedding}))
+		k.transaction_assert(tx, embedding_of, v.tuple_new(context.temp_allocator, []v.Value{embedding, v.value_symbol(v.symbol_intern(fmt.tprintf("ts%d", n)))}))
+		k.transaction_assert(tx, vector, v.tuple_new(context.temp_allocator, []v.Value{embedding, v.value_list(context.temp_allocator, []v.Value{must_float(x), must_float(y)})}))
+	}
+	add(&tx, contains, embedding_of, vector, index, 0, 1e-12, 0)
+	for n in 1 ..= 33 {
+		add(&tx, contains, embedding_of, vector, index, n, 0.5, 1)
+	}
+	_, err := k.transaction_commit(&tx)
+	testing.expect_value(t, err, k.Kernel_Error.None)
+	k.transaction_destroy(&tx)
+	query := v.value_list(context.temp_allocator, []v.Value{must_float(1), must_float(0)})
+	source := k.Relation_Source{kernel = &kernel, snapshot = kernel.current}
+	expect_batch_equals_rows(t, &source, index, query, 1)
+}

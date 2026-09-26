@@ -7,6 +7,8 @@
 // the 32nd extra candidate.
 package mica_runtime
 
+import "core:math"
+
 import "base:runtime"
 import "core:mem/virtual"
 import "core:slice"
@@ -50,24 +52,41 @@ nearest_index_members :: proc(source: ^k.Relation_Source, index: v.Value, contai
 		if !ok || len(values) == 0 {
 			continue
 		}
-		vector := make([]f32, len(values), context.temp_allocator)
-		norm := f64(0)
-		numeric := true
-		for value, i in values {
-			x, x_ok := numeric_value(value)
-			if !x_ok {
-				numeric = false
-				break
-			}
-			vector[i] = f32(x)
-			norm += x * x
-		}
-		if !numeric || norm == 0 {
+		vector, usable := nearest_unit_vector(values)
+		if !usable {
 			continue
 		}
 		append(&out, Nearest_Member{subject = v.tuple_values(subject_rows[0])[1], values = values, vector = vector})
 	}
 	return out[:]
+}
+
+// `values` scaled to unit length, in f32 for the approximate scorer. Cosine
+// does not depend on magnitude, so scoring unit vectors ranks by direction
+// alone: an unnormalized tiny vector (1e-12) scored near zero against the
+// scorer's denominator epsilon and fell out of the window the exact f64
+// re-score reads, and a huge one would overflow f32. The norm is computed in
+// f64. Returns false for non-numeric or zero vectors, which cannot match.
+@(private)
+nearest_unit_vector :: proc(values: []v.Value) -> ([]f32, bool) {
+	norm := f64(0)
+	for value in values {
+		x, x_ok := numeric_value(value)
+		if !x_ok {
+			return nil, false
+		}
+		norm += x * x
+	}
+	if norm == 0 {
+		return nil, false
+	}
+	scale := 1 / math.sqrt(norm)
+	vector := make([]f32, len(values), context.temp_allocator)
+	for value, i in values {
+		x, _ := numeric_value(value)
+		vector[i] = f32(x * scale)
+	}
+	return vector, true
 }
 
 @(private)
@@ -128,19 +147,8 @@ nearest_embedding_batch_scan :: proc(
 			if limit == 0 || len(values) == 0 {
 				continue
 			}
-			vector := make([]f32, len(values), context.temp_allocator)
-			norm := f64(0)
-			numeric := true
-			for value, j in values {
-				x, x_ok := numeric_value(value)
-				if !x_ok {
-					numeric = false
-					break
-				}
-				vector[j] = f32(x)
-				norm += x * x
-			}
-			if !numeric || norm == 0 {
+			vector, usable := nearest_unit_vector(values)
+			if !usable {
 				continue
 			}
 			queries := by_dim[len(values)]
