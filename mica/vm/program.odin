@@ -135,6 +135,10 @@ Op :: enum u8 {
 	// Call_Value_Splice: a = dst, b = function value register, c = argument
 	// list register.
 	Call_Value_Splice,
+	// Positional_Dispatch_Splice: a = dst, b = selector register, c = argument
+	// list register. Dispatches like Positional_Dispatch with the list's items
+	// as the positional arguments.
+	Positional_Dispatch_Splice,
 }
 
 // A cell in a relation scan pattern.
@@ -575,6 +579,18 @@ program_share_callables :: proc(program: ^Program, registry: ^Callable_Registry)
 program_destroy :: proc(program: ^Program, alloc: mem.Allocator) {
 	if program.owns_callables {
 		callable_registry_destroy(program.callables)
+	} else if program.callables != nil {
+		// Function values made by this program outlive it in a shared
+		// registry; mark them dead so a later call fails instead of reading
+		// freed code.
+		registry := program.callables
+		sync.mutex_lock(&registry.mutex)
+		for &callable in registry.items {
+			if callable.program == program {
+				callable.program = nil
+			}
+		}
+		sync.mutex_unlock(&registry.mutex)
 	}
 	free(raw_data(program.code), alloc)
 	free(raw_data(program.constants), alloc)
@@ -949,7 +965,7 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if instr.b < 0 || int(instr.b) >= len(program.builtins) {
 					return .Bad_Function
 				}
-			case .Call_Value_Splice:
+			case .Call_Value_Splice, .Positional_Dispatch_Splice:
 				if !valid_register(instr.a, register_count) ||
 				   !valid_register(instr.b, register_count) ||
 				   !valid_register(instr.c, register_count) {
@@ -1099,7 +1115,7 @@ program_disassemble :: proc(program: ^Program, alloc := context.allocator) -> st
 				fmt.sbprintf(&builder, " r%d fn%d args@r%d", instr.a, instr.b, instr.c)
 			case .Builtin_Call_Splice:
 				fmt.sbprintf(&builder, " r%d builtin%d args@r%d", instr.a, instr.b, instr.c)
-			case .Call_Value_Splice:
+			case .Call_Value_Splice, .Positional_Dispatch_Splice:
 				fmt.sbprintf(&builder, " r%d r%d args@r%d", instr.a, instr.b, instr.c)
 			}
 			strings.write_byte(&builder, '\n')
@@ -1203,6 +1219,8 @@ op_name :: proc(op: Op) -> string {
 		return "builtin_call_splice"
 	case .Call_Value_Splice:
 		return "call_value_splice"
+	case .Positional_Dispatch_Splice:
+		return "positional_dispatch_splice"
 	}
 	return "?"
 }
