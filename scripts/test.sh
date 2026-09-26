@@ -360,17 +360,26 @@ run_integration() {
     problem "integration:filein-eval: expected a boolean, got '${out}'"
   fi
 
-  # A filein given to a store that already holds a world is not loaded (the
-  # world boots from the store); filein must say so and fail rather than print
-  # "loaded" for a file it never ran.
-  printf 'make_relation(:Extra, 1)\n' > "${tmp}/extra.mica"
+  # A filein given to a store that already holds a world files into the booted
+  # world, as `mica filein` does in Rust: the new relation and verb are usable
+  # in the same process and after a restart.
+  printf 'make_relation(:Extra, 1)\nassert Extra(:filed)\nverb extra_count()\n  return 1\nend\n' > "${tmp}/extra.mica"
   if capture "${tmp}/extra.log" "${test_timeout}" "${filein}" --store "${tmp}/db" \
-    "${tmp}/extra.mica"; then
-    problem "integration:filein-booted-store-rejects-files: exited 0"
-  elif grep -q "was not loaded" "${tmp}/extra.log" && ! grep -q "^loaded" "${tmp}/extra.log"; then
-    pass "integration:filein-booted-store-rejects-files"
+    "${tmp}/extra.mica" --eval 'return Extra(:filed)'; then
+    if grep -q "^true" "${tmp}/extra.log" && grep -q "^loaded" "${tmp}/extra.log"; then
+      pass "integration:filein-into-booted-store"
+    else
+      problem "integration:filein-into-booted-store: $(tr '\n' ' ' < "${tmp}/extra.log")"
+    fi
   else
-    problem "integration:filein-booted-store-rejects-files: $(tr '\n' ' ' < "${tmp}/extra.log")"
+    problem "integration:filein-into-booted-store: $(tr '\n' ' ' < "${tmp}/extra.log")"
+  fi
+  capture "${tmp}/extra-reboot.log" "${test_timeout}" "${filein}" --store "${tmp}/db" \
+    --eval 'return [Extra(:filed), extra_count()]' || true
+  if grep -q '^\[true, 1\]' "${tmp}/extra-reboot.log"; then
+    pass "integration:filein-into-booted-store-persists"
+  else
+    problem "integration:filein-into-booted-store-persists: $(tr '\n' ' ' < "${tmp}/extra-reboot.log")"
   fi
 
   # A checkpoint after a store boot must complete (regression: reconstruction

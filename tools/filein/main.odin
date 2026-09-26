@@ -148,18 +148,15 @@ main :: proc() {
 		fmt.eprintf("failed: %s\n", start.message)
 		os.exit(1)
 	}
-	// A store that already holds a world boots from it and ignores the given
-	// files. Say so and fail, rather than report a file as loaded that never ran.
+	// A store that already holds a world boots from it and did not load the
+	// given files; file them into the booted world, as Rust mica's filein does.
 	if world.booted && len(paths) > 0 {
-		for path in paths {
-			fmt.eprintf(
-				"failed: %s was not loaded: the store at %s already holds a world, which boots from the store and ignores new fileins\n",
-				path,
-				store_path,
-			)
+		filed := r.world_filein(world, paths[:], unit)
+		if filed.kind != .Complete {
+			print_outcome(world, filed)
+			r.world_destroy(world)
+			os.exit(1)
 		}
-		r.world_destroy(world)
-		os.exit(1)
 	}
 	ok := true
 	if world.entry != 0 {
