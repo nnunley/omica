@@ -22,7 +22,9 @@ holds exactly one `ProgramBytes` row, and a verb that calls another verb
 compiles to a direct `.Call <index>`. A running world therefore cannot take a
 new filein without recompiling every source and keeping every existing index
 stable. `tools/filein` into a booted store silently ignored new files for
-this reason (fixed to fail loudly in 516f580).
+this reason. In a live, image-based system, filing into a running world is
+the normal way to extend it, so `tools/filein` now files into the booted
+world (`world_filein`, below).
 
 Rust mica compiles each method to its own program, identified by a program
 identity. `MethodProgram(method, program)` names it, `ProgramBytes` holds one
