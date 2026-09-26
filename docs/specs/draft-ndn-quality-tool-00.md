@@ -8,20 +8,27 @@
 
 ## Abstract
 
-This document specifies `apps/quality`, a Mica application that measures
-omica's own Mica and Odin source. It scores the corpus with the erosion and
-verbosity metrics of SlopCodeBench [SCB], adds dead-code, coverage, defect
-and testing terms, and checks rule, relation and grant health. Every finding
-is a fact in a Mica relation, so the command-line report, the agent tool and
-ad hoc queries all read the same data.
+This document specifies `apps/quality`, a Mica application that measures a
+Mica world: the verbs, rules, relations and grants installed in it, whether
+the world is running, stored, or built from source for the run. It also
+measures omica's Odin source. It scores with the erosion and verbosity
+metrics of SlopCodeBench [SCB], adds dead-code, coverage, defect and testing
+terms, and checks rule, relation and grant health. Every finding is a fact in
+a Mica relation, so the command-line report, the agent tool and ad hoc
+queries all read the same data.
 
 ## Motivation
 
-omica has no measure of which code is hard to change, which code the tests
-never reach, or which relations and grants are broken. In a relational
-system the last two fail silently: a query over a missing fact returns an
-empty result, not an error. The parser, compiler and catalogue already hold
-most of what a measuring tool needs; this document specifies that tool.
+Mica is a database, a programming language and a runtime at once: behavior
+is installed into a live world beside its facts, and the world, not any
+source file, is the source of truth. A verb can be filed in, replaced or
+edited while the world runs, so a tool that reads only files measures what
+the world was built from, not what it is. omica has no measure of which
+installed code is hard to change, which code the tests never reach, or which
+relations and grants are broken. In a relational system the last two fail
+silently: a query over a missing fact returns an empty result, not an error.
+The world's catalogue already describes its code; this document specifies a
+tool that measures the world through it.
 
 ## Terminology
 
@@ -30,7 +37,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 document are to be interpreted as described in BCP 14 (RFC 2119, RFC 8174)
 when, and only when, they appear in all capitals, as shown here.
 
-- **corpus** — the `.mica` and `.odin` files one run analyses.
+- **measured world** — the Mica world whose installed code a run measures.
+- **corpus** — the Odin files a run measures, and the Mica files a run files into a fresh measured world when it is not given one.
 - **run world** — the disposable Mica world one run creates, analyses and discards.
 - **syntax fact** — a row `(node, role, target, ordinal)` describing one edge of a syntax tree, in the shape `parse_rows` produces.
 - **callable** — a Mica verb, a top-level Mica `fn`, or an Odin procedure. Nested function literals are part of their enclosing callable.
@@ -50,9 +58,14 @@ command-line report and an agent tool verb. It does NOT define the source
 host's git relations beyond the columns the tool reads; the source host owns
 them.
 
-**One disposable world per run.** Each run loads the corpus into a fresh run
-world without a store, analyses it, and discards it. Results depend only on
-the inputs. This follows [BOOTSTRAP] section 5.2.
+**The world is the subject.** Mica code is measured as the world holds it:
+methods and their `MethodSource`, rules and their `RuleSource`, relations,
+grants, units and what each unit owns. Source files are one way to build a
+world to measure, not the thing measured.
+
+**Measuring changes nothing.** A run never writes to the measured world's
+durable state. Results live in volatile relations or in a disposable run
+world. This follows [BOOTSTRAP] section 5.2.
 
 **Facts in, facts out.** Every input and every finding is a relation in the
 run world. Reports render those relations; nothing bypasses them.
@@ -68,7 +81,7 @@ worst code, which is where improvement matters most.
 
 ### Data model
 
-Inputs, loaded into the run world:
+Inputs, read from the measured world:
 
 ```
 -- Catalogue relations the compiler already writes (mica/kernel/dispatch.odin):
@@ -143,7 +156,8 @@ absolute paths or timestamps.
 | `--format` | `text` \| `mica` | `text` | `mica` prints the report as one Mica map value |
 | `--top` | Integer | `25` | Ranked issues shown in `text` format |
 | `--root` | Path | current directory | Repository root; corpus paths are relative to it |
-| paths | Path list | `apps`, `mica`, `host`, `tools` | Corpus roots, walked for `.mica` and `.odin` files |
+| `--store` | Path | none | A stored world to measure. Without it, the Mica files under the corpus roots are filed into a fresh world |
+| paths | Path list | `apps`, `mica`, `host`, `tools` | Corpus roots, walked for `.odin` files, and for `.mica` files when `--store` is absent |
 
 All thresholds, squash constants and weights live in one table in
 `apps/quality/`; no other code holds a number. Their defaults appear under
@@ -155,20 +169,46 @@ All thresholds, squash constants and weights live in one table in
 2. Argument passed to `tool/quality`
 3. Default from the table above
 
-### Loading
+### The measured world
 
-The tool MUST load the corpus's `.mica` files through the ordinary filein
-path, so the catalogue relations hold exactly what the compiler records. [R-load-via-filein]
+A run measures one of three worlds (**precedence**, highest first):
 
-```transcript @R-load-via-filein
-$ tools/quality --format mica tests/quality/fixtures/decls | grep -c ':relation :Seen'
+1. **The running world**, when `tool/quality` is called inside it. The tool
+   reads that world's own catalogue.
+2. **A stored world**, given with `--store`. The tool copies the store into a
+   temporary directory and boots the copy, so the stored world and its lock
+   are untouched.
+3. **A fresh world** built by filing the corpus's `.mica` files into an empty
+   run world through the ordinary filein path.
+
+The tool MUST read Mica code from the measured world's catalogue, so a verb
+edited or filed in while the world runs is measured as it now is. [R-world-subject]
+
+```transcript @R-world-subject
+$ tools/filein --store /tmp/qw tests/quality/fixtures/decls/decls.mica > /dev/null
+$ tools/filein --store /tmp/qw tests/quality/fixtures/decls/extra-verb.mica > /dev/null
+$ tools/quality --store /tmp/qw --format mica | grep -c ':verb :extra'
 1
 ? 0
 ```
 
-The run world MUST have no store and MUST NOT give the corpus any host
+A run MUST NOT change the durable state of the world it measures. In the
+running world, the tool's own relations are volatile; for a stored world, the
+tool boots a copy. [R-measure-without-writing]
+
+```transcript @R-measure-without-writing
+$ tools/filein --store /tmp/qw2 tests/quality/fixtures/decls/decls.mica > /dev/null
+$ find /tmp/qw2 -type f -exec cksum {} + | sort > /tmp/before
+$ tools/quality --store /tmp/qw2 > /dev/null
+$ find /tmp/qw2 -type f -exec cksum {} + | sort > /tmp/after
+$ cmp /tmp/before /tmp/after && echo unchanged
+unchanged
+? 0
+```
+
+A fresh run world MUST have no store and MUST NOT give the corpus any host
 effect: no network, external-request or subscription capability. [R-sandboxed-world]
-Loading runs the corpus's top-level expressions, so this rule bounds what a
+Filing in runs the corpus's top-level expressions, so this rule bounds what a
 hostile or broken corpus can do.
 
 ```transcript @R-sandboxed-world
@@ -178,7 +218,9 @@ tests/quality/fixtures/effects/fetch.mica:1 Q_LOAD ERROR external_request is not
 ```
 
 The tool MUST take Mica syntax facts from `parse_rows` in
-`apps/compiler/parse.mica`, applied to each `UnitSource` text. [R-mica-syntax-from-parser]
+`apps/compiler/parse.mica`, applied to each method's `MethodSource` and each
+rule's `RuleSource` in the measured world. Line numbers map back to a file
+through the owning unit's `UnitSource` when the world has one. [R-mica-syntax-from-parser]
 
 ```transcript @R-mica-syntax-from-parser
 $ tools/quality --format mica tests/quality/fixtures/one-verb | grep -c ':kind :VerbItem'
@@ -600,11 +642,12 @@ The numbers compare with [SCB]'s baselines only if the departures are known.
 
 ```abnf
 command     = "tools/quality" *( SP option ) *( SP path )
-option      = since / format / top / root
+option      = since / format / top / root / store
 since       = "--since" SP ( date / commit )
 format      = "--format" SP ( %s"text" / %s"mica" )
 top         = "--top" SP 1*DIGIT
 root        = "--root" SP path
+store       = "--store" SP path
 date        = 4DIGIT "-" 2DIGIT "-" 2DIGIT
 commit      = 7*40HEXDIG
 path        = 1*( ALPHA / DIGIT / "/" / "." / "_" / "-" )
@@ -633,6 +676,12 @@ relation filled by an instrumented run, replacing `Reached` in [R-uncovered].
 **Auto-fixing.** The tool only reports.
 
 ## Alternatives Considered
+
+**Why not measure source files?** In Mica the world is the source of truth.
+Verbs are filed in, replaced and edited while it runs, and nothing requires a
+world's current code to match any file. Reading files measures what a world
+was built from, which can differ from what it runs. Files remain one way to
+build the measured world.
 
 **Why not clamped linear scores?** A clamped scale saturates: CC 30 and CC
 200 score the same, so fixing the worst callable in the corpus does not move
@@ -676,7 +725,13 @@ Reports hold paths relative to `--root` and short messages. They reveal no
 source beyond the identifiers a message names.
 
 `tool/quality` requires a `CanInvoke` grant ([R-tool-verb]), so an agent
-without one cannot make the host parse arbitrary paths.
+without one cannot make the host parse arbitrary paths. Inside a running
+world the tool reads the catalogue, including every method's source; the
+same grant decides who may read that through the tool. It writes only
+volatile relations there ([R-measure-without-writing]).
+
+A stored world is measured through a temporary copy, so the tool never takes
+the store's lock or writes to it, and a crash mid-run cannot damage it.
 
 ## Compatibility
 
