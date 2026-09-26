@@ -223,16 +223,6 @@ web_server_destroy :: proc(server: ^Web_Server) {
 @(private)
 web_connection_worker :: proc(data: rawptr) {
 	context = runtime.default_context()
-	// Give this connection its own temporary scratch arena. Request parsing,
-	// response building, and SSE framing allocate heavily from
-	// `context.temp_allocator`; a private arena keeps each connection's
-	// scratch independent of every other thread and releases it when the
-	// connection ends.
-	temp_arena: virtual.Arena
-	if err := virtual.arena_init_growing(&temp_arena); err == nil {
-		context.temp_allocator = virtual.arena_allocator(&temp_arena)
-		defer virtual.arena_destroy(&temp_arena)
-	}
 	connection := (^Web_Connection)(data)
 	web_connection_serve(connection)
 	sync.mutex_lock(&connection.server.lock)
@@ -257,20 +247,10 @@ web_connection_serve :: proc(connection: ^Web_Connection) {
 		request, state, parse_error := http_parser_next(&parser)
 		switch state {
 		case .Ready:
-			if server.stream_handler != nil {
-				if server.stream_handler(server.user, &request, connection.socket) {
-					http_parser_consume(&parser, parser.last_total)
-					return
-				}
-			}
-			response: Http_Response
-			response.close = request.close
-			server.handler(server.user, &request, &response)
-			http_encode_response(&response, &response_builder)
-			sent := web_send_all(connection.socket, transmute([]byte)strings.to_string(response_builder))
+			keep_alive := web_connection_respond(connection, &request, &response_builder)
 			http_parser_consume(&parser, parser.last_total)
 			strings.builder_reset(&response_builder)
-			if !sent || request.close {
+			if !keep_alive {
 				return
 			}
 		case .Incomplete:
@@ -284,6 +264,36 @@ web_connection_serve :: proc(connection: ^Web_Connection) {
 			return
 		}
 	}
+}
+
+// Handles one request in its own arena, installed as `context.temp_allocator`
+// and destroyed when the response has been sent or the stream has ended.
+// Anything kept after the request must be copied into its owner's allocator.
+// Reports whether the connection stays open for another request.
+@(private)
+web_connection_respond :: proc(
+	connection: ^Web_Connection,
+	request: ^Http_Request,
+	builder: ^strings.Builder,
+) -> bool {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&arena)
+	context.temp_allocator = virtual.arena_allocator(&arena)
+
+	server := connection.server
+	if server.stream_handler != nil && server.stream_handler(server.user, request, connection.socket) {
+		return false
+	}
+	response := Http_Response {
+		close = request.close,
+	}
+	server.handler(server.user, request, &response)
+	http_encode_response(&response, builder)
+	sent := web_send_all(connection.socket, transmute([]byte)strings.to_string(builder^))
+	return sent && !request.close
 }
 
 @(private)
