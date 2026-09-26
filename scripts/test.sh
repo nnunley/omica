@@ -270,7 +270,7 @@ run_tsan() {
 build_tools() {
   note "build tools"
   local tool
-  for tool in filein repl webhost parse_corpus owlstream; do
+  for tool in filein repl webhost parse_corpus owlstream cycl-load cycl-load-sample cycl-parse-test; do
     if run_timeout "${test_timeout}" "${odin_bin}" build "tools/${tool}" \
       -out:"${bin_dir}/${tool}"; then
       pass "build:${tool}"

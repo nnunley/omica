@@ -109,14 +109,15 @@ DentistInPeopleData(Person) :-
 odin build tools/cycl-parse-test -out:test-cycl
 ./test-cycl /path/to/kb5022.cycl
 
-# Load sample into Mica (POC)
-odin run tools/cycl-load-sample -- apps/bycycle/00_schema.mica
+# Load the schema and 7 Mt-scoped sample facts (in memory, or --store DIR)
+odin run tools/cycl-load-sample -- --store /tmp/bycycle-sample apps/bycycle/00_schema.mica
+odin run tools/filein -- --store /tmp/bycycle-sample --eval 'return len(Isa(?s, ?c, ?mt))'
 
-# (Future) Load full dump
-odin run tools/cycl-load -- \
-  --store /path/to/store \
-  apps/bycycle/00_schema.mica \
-  /path/to/kb5022.cycl
+# Read the full dump against the schema: parses every assertion and counts
+# them per predicate. Routing into relations is not implemented yet, so
+# nothing from the dump is asserted.
+odin run tools/cycl-load -o:speed -- [--store DIR] [--limit N] \
+  apps/bycycle/00_schema.mica /path/to/kb5022.cycl
 ```
 
 ## Analysis: Is This Feasible?

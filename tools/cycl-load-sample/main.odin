@@ -1,98 +1,101 @@
-// Load a sample of OpenCyc KB5022 into Mica for testing
+// Loads the bycycle CycL schema into a Mica world with a few Mt-scoped sample
+// facts, to try queries before the full KB5022 loader routes the dump.
 //
 // Usage:
-//   odin run tools/cycl-load-sample -- --store /tmp/bycycle-sample apps/bycycle/00_schema.mica
+//   odin run tools/cycl-load-sample -- [--store DIR] apps/bycycle/00_schema.mica
+//
+// Without --store the world is in memory; with it the world (and the facts)
+// persist in DIR, which then opens with tools/filein or tools/repl.
 
 package main
 
 import "core:fmt"
 import "core:os"
-import "core:strings"
-import "core:mem"
+import "core:path/filepath"
 
+import k "../../mica/kernel"
 import r "../../mica/runtime"
-import s "../../mica/store"
-import cyc "../../mica/cycl"
+
+USAGE :: "usage: cycl-load-sample [--store DIR] <schema.mica>\n"
+
+// Sample facts in Mica syntax: identities first, then Mt-scoped assertions
+// (the schema's relations take the microtheory as their last column).
+SAMPLE :: `make_identity(:fido)
+make_identity(:alice)
+make_identity(:bob)
+make_identity(:charlie)
+make_identity(:dog)
+make_identity(:animal)
+make_identity(:dentist)
+make_identity(:person)
+make_identity(:base_kb)
+make_identity(:people_data_mt)
+
+assert Isa(#fido, #dog, #base_kb)
+assert Isa(#fido, #animal, #base_kb)
+assert Isa(#alice, #dentist, #people_data_mt)
+assert Isa(#bob, #dentist, #people_data_mt)
+assert Isa(#charlie, #person, #people_data_mt)
+assert Genls(#dentist, #person, #people_data_mt)
+assert Genls(#person, #animal, #base_kb)
+`
 
 main :: proc() {
-	allocator := context.allocator
-	
-	// Parse arguments
 	store_path := ""
 	schema_file := ""
-	
-	i := 1
-	for i < len(os.args) {
-		arg := os.args[i]
-		switch arg {
+	for i := 1; i < len(os.args); i += 1 {
+		switch arg := os.args[i]; arg {
 		case "--store":
 			i += 1
 			if i < len(os.args) {
 				store_path = os.args[i]
 			}
+		case "--help", "-h":
+			fmt.print(USAGE)
+			return
 		case:
-			if schema_file == "" {
-				schema_file = arg
-			}
+			schema_file = arg
 		}
-		i += 1
 	}
-	
 	if schema_file == "" {
-		fmt.printf("usage: cycl-load-sample --store DIR <schema.mica>\n")
+		fmt.eprint(USAGE)
 		os.exit(1)
 	}
-	
-	// Create store
-	world := s.create_temporary()
-	defer s.close(world)
-	
-	// Load schema
-	fmt.printf("Loading schema from %s...\n", schema_file)
-	schema_data, err := os.read_entire_file_from_path(schema_file, allocator)
-	if err != nil {
-		fmt.printf("Failed to read schema: %v\n", err)
+
+	// The sample facts go through the ordinary filein path after the schema.
+	directory, directory_error := os.temp_dir(context.allocator)
+	if directory_error != nil {
+		fmt.eprintln("cannot resolve a temporary directory")
 		os.exit(1)
 	}
-	defer delete(schema_data)
-	
-	tx := r.transaction_create(world)
-	result := r.execute(tx, string(schema_data), {.trace_execution = false})
-	if result.error != nil {
-		fmt.printf("Schema error: %s\n", result.error)
+	sample_path, _ := filepath.join([]string{directory, "cycl-load-sample.mica"}, context.allocator)
+	if err := os.write_entire_file(sample_path, transmute([]u8)string(SAMPLE)); err != nil {
+		fmt.eprintf("cannot write %s\n", sample_path)
 		os.exit(1)
 	}
-	r.transaction_commit(tx) or_else {
-		fmt.printf("Commit error: %v\n", _)
+	defer os.remove(sample_path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := r.world_start(
+		&kernel,
+		[]string{schema_file, sample_path},
+		context.allocator,
+		r.World_Config{store_path = store_path},
+	)
+	if !start.ok {
+		fmt.eprintf("load failed: %s\n", start.message)
 		os.exit(1)
 	}
-	
-	fmt.printf("Schema loaded successfully\n")
-	
-	// Generate sample Mica code that asserts some test facts
-	mica_code := `
-// Sample assertions for testing Mt-scoped queries
-Isa(#$Fido, #$Dog, #$BaseKB)
-Isa(#$Fido, #$Animal, #$BaseKB)
-Isa(#$Alice, #$Dentist, #$PeopleDataMt)
-Isa(#$Bob, #$Dentist, #$PeopleDataMt)
-Isa(#$Charlie, #$Person, #$PeopleDataMt)
-Genls(#$Dentist, #$Person, #$PeopleDataMt)
-Genls(#$Person, #$Animal, #$BaseKB)
-GenlMt(#$PeopleDataMt, #$BaseKB, #$BaseKB)
-`
-	
-	fmt.printf("\nLoading sample assertions...\n")
-	tx = r.transaction_create(world)
-	result = r.execute(tx, mica_code, {.trace_execution = false})
-	if result.error != nil {
-		fmt.printf("Assertion error: %s\n", result.error)
-	}
-	r.transaction_commit(tx) or_else {
-		fmt.printf("Commit error: %v\n", _)
+	defer r.world_destroy(world)
+	if entry := r.world_wait(world, world.entry); entry.kind != .Complete {
+		fmt.eprintf("sample facts failed: %s\n", entry.message)
 		os.exit(1)
 	}
-	
-	fmt.printf("Sample loaded. Schema ready for CycL dump loading.\n")
-	fmt.printf("Next: parse kb5022.cycl and route assertions to relations.\n")
+	if store_path != "" && !r.world_checkpoint(world) {
+		fmt.eprintf("checkpoint of %s failed\n", store_path)
+		os.exit(1)
+	}
+	fmt.printf("schema %s and 7 sample facts loaded%s\n", schema_file, store_path == "" ? "" : fmt.tprintf(" into %s", store_path))
 }

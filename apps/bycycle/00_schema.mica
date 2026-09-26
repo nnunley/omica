@@ -50,7 +50,7 @@ make_relation(:QuotedArgument, 3)               // QuotedArgument(predicate, arg
 make_relation(:ArgQuotedIsa, 3)                 // ArgQuotedIsa(predicate, argNum, Mt)
 
 // Display relations (not Mt-scoped, used for UI)
-make_functional_relation(:PrettyString-Canonical, 2, [0])
+make_functional_relation(:PrettyStringCanonical, 2, [0])
 make_functional_relation(:Label, 2, [0])
 make_functional_relation(:CycLabel, 2, [0])
 make_functional_relation(:WikiName, 2, [0])
