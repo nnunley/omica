@@ -5,6 +5,7 @@ package source
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import "core:testing"
 import "core:time"
 
@@ -57,6 +58,46 @@ test_index_workspace_symlink_root :: proc(t: ^testing.T) {
 @(test)
 test_index_workspace_relative_root :: proc(t: ^testing.T) {
 	test_index_workspace_tree_with_root(t, "relative")
+}
+
+@(test)
+test_index_workspace_relative_symlink_root :: proc(t: ^testing.T) {
+	test_index_workspace_tree_with_root(t, "relative_symlink")
+}
+
+@(test)
+test_index_rejects_file_root :: proc(t: ^testing.T) {
+	test_index_workspace_tree_with_root(t, "file")
+}
+
+@(test)
+test_index_rejects_missing_root :: proc(t: ^testing.T) {
+	test_index_workspace_tree_with_root(t, "missing")
+}
+
+@(test)
+test_index_reports_unreadable_child :: proc(t: ^testing.T) {
+	// Root bypasses Unix directory permissions.
+	if os.get_euid() == 0 {return}
+	test_index_workspace_tree_with_root(t, "unreadable_child")
+}
+
+@(test)
+test_relative_path_requires_root_boundary :: proc(t: ^testing.T) {
+	cases := []struct{root, path, want: string, ok: bool}{
+		{"/workspace", "/workspace/src/main.mica", "src/main.mica", true},
+		{"/workspace", "/workspace", "", true},
+		{"/", "/src/main.mica", "src/main.mica", true},
+		{"/", "//src/main.mica", "src/main.mica", true},
+		{"/workspace", "/workspace-other/file", "", false},
+		{"/workspace", "/other/file", "", false},
+		{"/workspace", "", "", false},
+	}
+	for c in cases {
+		relative, ok := relative_to(c.root, c.path)
+		testing.expect_value(t, ok, c.ok)
+		testing.expect_value(t, relative, c.want)
+	}
 }
 
 @(private)
@@ -128,23 +169,51 @@ test_index_workspace_tree_with_root :: proc(t: ^testing.T, root_kind: string) {
 	switch root_kind {
 	case "normalized":
 		indexed_root = fmt.aprintf("%s//.", root, allocator = context.temp_allocator)
-	case "symlink":
+	case "symlink", "relative_symlink":
 		indexed_root = fmt.aprintf("%s-link", root, allocator = context.temp_allocator)
 		err := os.symlink(root, indexed_root)
 		testing.expectf(t, err == nil, "cannot create root alias: %v", err)
 		if err != nil {return}
-	case "relative":
+	case "file":
+		indexed_root = fmt.aprintf("%s/README.md", root, allocator = context.temp_allocator)
+	case "missing":
+		indexed_root = fmt.aprintf("%s/missing", root, allocator = context.temp_allocator)
+	}
+	child := fmt.aprintf("%s/src", root, allocator = context.temp_allocator)
+	if root_kind == "unreadable_child" {
+		if !testing.expect(t, os.chmod(child, {}) == nil) {return}
+	}
+	defer if root_kind == "unreadable_child" {os.chmod(child, os.Permissions_Default_Directory)}
+	alias := indexed_root
+	defer if root_kind == "symlink" || root_kind == "relative_symlink" {os.remove(alias)}
+	if root_kind == "relative" || root_kind == "relative_symlink" {
 		cwd, cwd_err := os.getwd(context.temp_allocator)
 		testing.expect(t, cwd_err == nil)
 		if cwd_err != nil {return}
-		relative, rel_err := filepath.rel(cwd, root, context.temp_allocator)
+		relative, rel_err := filepath.rel(cwd, indexed_root, context.temp_allocator)
 		testing.expect(t, rel_err == .None)
 		if rel_err != .None {return}
 		indexed_root = relative
 	}
-	defer if root_kind == "symlink" {os.remove(indexed_root)}
 	result := index_world(world, Options{root = indexed_root})
-	testing.expectf(t, result.ok, "index failed: %s", result.message)
+	if root_kind == "unreadable_child" {
+		testing.expect(t, !result.ok, "failed traversal reported a successful index")
+		testing.expectf(t, strings.contains(result.message, "cannot walk") && strings.contains(result.message, child), "missing traversal error: %s", result.message)
+		entries, entries_ok := relation_rows(world, "source/RepositoryEntry")
+		defer delete(entries)
+		testing.expect(t, entries_ok)
+		testing.expect_value(t, len(entries), 0) // Do not publish the unfinished batch.
+		return
+	}
+	if root_kind == "file" || root_kind == "missing" {
+		testing.expect(t, !result.ok, "invalid root reported a successful index")
+		testing.expectf(t, strings.contains(result.message, indexed_root), "error omitted root %q: %s", indexed_root, result.message)
+		return
+	}
+	if !testing.expectf(t, result.ok, "index failed for %q (%s): %s", indexed_root, root_kind, result.message) {
+		return
+	}
+	testing.expectf(t, result.files == 2 && result.directories == 1, "root %q (%s): %v", indexed_root, root_kind, result)
 	testing.expect_value(t, result.files, 2)
 	testing.expect_value(t, result.directories, 1)
 

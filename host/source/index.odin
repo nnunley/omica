@@ -95,6 +95,8 @@ index_from_env :: proc(world: ^r.World) -> (Index_Result, bool) {
 // Indexes `options.root` into the world's `source/*` relations. Returns a
 // result with `ok = false` when the world does not declare the source schema,
 // so callers can skip indexing worlds that do not use it.
+// Root and traversal failures also return an error. Earlier committed batches
+// can remain; an unfinished batch is not published after a traversal failure.
 index_world :: proc(world: ^r.World, options: Options) -> Index_Result {
 	root := options.root
 	if root == "" {
@@ -119,20 +121,29 @@ index_world :: proc(world: ^r.World, options: Options) -> Index_Result {
 	   !has_index {
 		return Index_Result{message = "world does not declare the source relations"}
 	}
-	// The walker reports canonical absolute paths. Normalize the root to the
-	// same form before removing its prefix, including macOS temporary aliases.
-	canonical_root, root_error := filepath.abs(root, context.temp_allocator)
+	// Use the opened directory's name, just as the walker does. On macOS,
+	// os.open obtains it through F_GETPATH; filepath.abs uses realpath instead.
+	// Mixing those representations can make prefix removal depend on aliases.
+	root_file, root_error := os.open(root)
 	if root_error != nil {
 		return Index_Result {
 			message = fmt.aprintf(
-				"cannot resolve source root %s: %v",
+				"cannot open source root %s: %s",
 				root,
-				root_error,
+				os.error_string(root_error),
 				allocator = context.temp_allocator,
 			),
 		}
 	}
-	root = canonical_root
+	defer os.close(root_file)
+	root_info, stat_error := os.fstat(root_file, context.temp_allocator)
+	if stat_error != nil {
+		return Index_Result{message = fmt.aprintf("cannot inspect source root %s: %s", root, os.error_string(stat_error), allocator = context.temp_allocator)}
+	}
+	if root_info.type != .Directory {
+		return Index_Result{message = fmt.aprintf("source root %s is not a directory", root, allocator = context.temp_allocator)}
+	}
+	root = os.name(root_file)
 	repository_name := options.repository_name
 	if repository_name == "" {
 		repository_name = "default"
@@ -157,8 +168,8 @@ index_world :: proc(world: ^r.World, options: Options) -> Index_Result {
 	scratch := context.temp_allocator
 	if has_scratch {
 		scratch = virtual.arena_allocator(&scratch_arena)
-		defer virtual.arena_destroy(&scratch_arena)
 	}
+	defer if has_scratch {virtual.arena_destroy(&scratch_arena)}
 
 	walker: os.Walker
 	os.walker_init(&walker, root)
@@ -166,10 +177,22 @@ index_world :: proc(world: ^r.World, options: Options) -> Index_Result {
 
 	for {
 		info, has_entry_info := os.walker_walk(&walker)
+		// A failed walk can return empty info with ok=true, or fail at EOF.
+		// Check before consuming the entry or accepting the end of the walk.
+		if path, err := os.walker_error(&walker); err != nil {
+			result.ok = false
+			result.message = fmt.aprintf("cannot walk source root %q (resolved %q), at %q: %s", options.root, root, path, os.error_string(err), allocator = context.temp_allocator)
+			return result
+		}
 		if !has_entry_info {
 			break
 		}
-		relative := relative_to(root, info.fullpath)
+		relative, within_root := relative_to(root, info.fullpath)
+		if !within_root {
+			result.ok = false
+			result.message = fmt.aprintf("source entry %q is outside root %q (resolved %q)", info.fullpath, options.root, root, allocator = context.temp_allocator)
+			return result
+		}
 		if relative == "" {
 			continue
 		}
@@ -406,12 +429,17 @@ indexed_file_fact :: proc(
 }
 
 @(private)
-relative_to :: proc(root: string, fullpath: string) -> string {
-	relative := fullpath
-	if strings.has_prefix(relative, root) {
-		relative = relative[len(root):]
+relative_to :: proc(root: string, fullpath: string) -> (relative: string, within_root: bool) {
+	if fullpath == root {
+		return "", true
 	}
-	return strings.trim_left(relative, "/")
+	if root == "/" && strings.has_prefix(fullpath, "/") {
+		return strings.trim_left(fullpath, "/"), true
+	}
+	if strings.has_prefix(fullpath, root) && len(fullpath) > len(root) && fullpath[len(root)] == '/' {
+		return fullpath[len(root)+1:], true
+	}
+	return "", false
 }
 
 @(private)
