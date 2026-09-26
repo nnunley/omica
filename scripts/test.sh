@@ -463,6 +463,29 @@ run_owlstream_checks() {
   fi
 }
 
+# bycycle-load.sh must not break another process's store lock: a command on
+# a locked store fails and leaves LOCK in place, and only the explicit
+# `unlock` subcommand removes a stale one.
+run_bycycle_lock_checks() {
+  local tmp="$1" store="$1/bycycle-locked" out
+  mkdir -p "${store}"
+  : > "${store}/LOCK"
+  if out="$(scripts/bycycle-load.sh query "${store}" 'return 1' 2>&1)"; then
+    problem "integration:bycycle-lock: query on a locked store succeeded"
+  elif [[ ! -e "${store}/LOCK" ]]; then
+    problem "integration:bycycle-lock: query removed another process's LOCK"
+  elif [[ "${out}" != *"unlock"* ]]; then
+    problem "integration:bycycle-lock: locked-store message does not name the unlock command: ${out}"
+  else
+    pass "integration:bycycle-lock"
+  fi
+  if scripts/bycycle-load.sh unlock "${store}" >/dev/null 2>&1 && [[ ! -e "${store}/LOCK" ]]; then
+    pass "integration:bycycle-unlock"
+  else
+    problem "integration:bycycle-unlock: unlock did not remove a stale LOCK"
+  fi
+}
+
 run_integration() {
   build_tools
   note "integration"
@@ -543,6 +566,7 @@ run_integration() {
   fi
 
   run_owlstream_checks "${filein}" "${bin_dir}/owlstream" "${tmp}"
+  run_bycycle_lock_checks "${tmp}"
 
   # REPL evaluates a line.
   printf '1 + 1\n' > "${tmp}/repl.in"
