@@ -59,10 +59,20 @@ command-line report and an agent tool verb. It does NOT define the source
 host's git relations beyond the columns the tool reads; the source host owns
 them.
 
-**The world is the subject.** Mica code is measured as the world holds it:
-methods and their `MethodSource`, rules and their `RuleSource`, relations,
-grants, units and what each unit owns. Source files are one way to build a
-world to measure, not the thing measured.
+**Two subjects, measured side by side.** Mica code exists in two states, and
+the tool measures both:
+
+- **World state**: the code installed in the world, as the world holds it:
+  methods and their `MethodSource`, rules and their `RuleSource`, relations,
+  grants, and what each unit owns. This is what runs.
+- **Unit and file state**: the text a unit was filed in from (its
+  `UnitSource`), or the files on disk. This is what a fileout, a review or a
+  version-control history sees.
+
+They agree right after a filein and diverge as soon as a verb is edited in
+the running world and not filed out, as in a Smalltalk image with unsaved
+changes. The tool reports each subject in its own scope and reports where
+they differ.
 
 **Measuring changes nothing.** A run never writes to the measured world's
 durable state. Results live in volatile relations or in a disposable run
@@ -134,7 +144,7 @@ RECORD Evidence:                        -- relation quality/Evidence
     detail      : Value                 -- a call-path step, a clone region, a commit id
 
 RECORD Term:                            -- relation quality/Term
-    scope       : String                -- a file path, "mica", "odin", or "corpus"
+    scope       : String                -- "world", "world/<unit>", "unit/<unit>", "file/<path>", "mica", "odin", or "corpus"
     name        : Symbol                -- :erosion, :verbosity, :uncovered, :dead, :defects, :testing
     raw         : Float                 -- the measured input before shaping
     value       : Float | None          -- in [0, 1]; None when the input is missing
@@ -190,6 +200,31 @@ $ tools/filein --store /tmp/qw tests/quality/fixtures/decls/decls.mica > /dev/nu
 $ tools/filein --store /tmp/qw tests/quality/fixtures/decls/extra-verb.mica > /dev/null
 $ tools/quality --store /tmp/qw --format mica | grep -c ':verb :extra'
 1
+? 0
+```
+
+The tool MUST measure complexity, duplication and verbosity for both
+subjects: installed code in the `world` and `world/<unit>` scopes, and unit
+text or files in the `unit/<unit>` and `file/<path>` scopes. [R-both-subjects]
+
+```transcript @R-both-subjects
+$ tools/filein --store /tmp/qw3 tests/quality/fixtures/decls/decls.mica > /dev/null
+$ tools/quality --store /tmp/qw3 --format mica | grep -o -E ':scope -> "(world/decls|unit/decls)"' | sort -u
+:scope -> "unit/decls"
+:scope -> "world/decls"
+? 0
+```
+
+When a unit's installed code differs from its unit text (a method or rule
+the unit owns has no matching definition in the text, or the text defines
+one the world lacks), the tool MUST yield one `Q_DRIFT` diagnostic per such
+method or rule, naming both sides. [R-drift]
+
+```transcript @R-drift
+$ tools/filein --store /tmp/qw4 --unit decls tests/quality/fixtures/decls/decls.mica > /dev/null
+$ tools/filein --store /tmp/qw4 --eval 'install_source(:decls, "verb hello() return 2 end")' > /dev/null
+$ tools/quality --store /tmp/qw4 | grep Q_DRIFT
+unit/decls Q_DRIFT NOTE verb hello is installed with a body that differs from unit decls
 ? 0
 ```
 
@@ -749,6 +784,11 @@ it needs:
 
 Until item 2 lands, runs report `Q_NO_HISTORY` and score without defects.
 
+Drift ([R-drift]) appears only once code can change in a running world
+without a filein of the whole unit: an in-place install such as #78's
+`install_source`, or `world_filein` into a running world (rdaum/omica#117).
+Until then the two subjects always agree, and drift is reported as zero.
+
 ## References
 
 - [SCB] G. Orlanski, D. Roy, A. Yun, C. Shin, A. Gu, A. Ge, D. Adila, et al., "SlopCodeBench: Benchmarking How Coding Agents Degrade Over Long-Horizon Iterative Tasks", arXiv:2603.24755, https://arxiv.org/abs/2603.24755
@@ -780,6 +820,7 @@ Until item 2 lands, runs report `Q_NO_HISTORY` and score without defects.
 | `Q_UNREACHED` | NOTE | a callable or rule no test reaches |
 | `Q_DEAD` | WARNING | a callable no root reaches |
 | `Q_UNRESOLVED_CALL` | NOTE | a call edge the tool cannot resolve |
+| `Q_DRIFT` | NOTE | a unit's installed code differs from its unit text |
 | `Q_NO_HISTORY` | NOTE | no git history is available |
 | `Q_DEAD_RELATION` | WARNING | see "Rule and relation health" |
 | `Q_EMPTY_RELATION` | WARNING | see "Rule and relation health" |
