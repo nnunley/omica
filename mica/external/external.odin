@@ -324,7 +324,7 @@ handle_embedding :: proc(ctx: r.External_Context, payload: v.Value) -> v.Value {
 
 	result, curl_message := curl_perform(
 		Request {
-			url = join_url_path(base_url, path),
+			url = join_url_path(base_url, path, context.temp_allocator),
 			headers = request_headers[:],
 			body = transmute([]byte)body_text,
 			timeout_seconds = openai_timeout_seconds(),
@@ -398,12 +398,12 @@ embedding_values :: proc(ctx: r.External_Context, response: v.Value) -> v.Value 
 // --- Shared configuration --------------------------------------------------
 
 @(private)
-join_url_path :: proc(base_url, path: string) -> string {
+join_url_path :: proc(base_url, path: string, allocator: mem.Allocator) -> string {
 	return fmt.aprintf(
 		"%s/%s",
 		strings.trim_right(base_url, "/"),
 		strings.trim_left(path, "/"),
-		allocator = context.temp_allocator,
+		allocator = allocator,
 	)
 }
 

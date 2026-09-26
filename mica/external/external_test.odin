@@ -5,6 +5,7 @@ package mica_external
 
 import "base:runtime"
 import "core:mem"
+import "core:mem/virtual"
 import "core:net"
 import "core:os"
 import "core:strconv"
@@ -981,4 +982,34 @@ test_live_chat_stream :: proc(t: ^testing.T) {
 		"request body: %s",
 		received,
 	)
+}
+
+// A stream job outlives the request that built it, so everything in its
+// spec must come from the allocator build_spec was given, not the caller's
+// scratch memory.
+@(test)
+test_build_spec_owns_url :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	payload := test_payload(
+		test_map_entry("model", test_string("test-model")),
+		test_map_entry("messages", v.value_list(context.temp_allocator, []v.Value{})),
+		test_map_entry("base_url", test_string("http://127.0.0.1:9/v1")),
+	)
+	owner: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&owner)
+	defer mem.dynamic_arena_destroy(&owner)
+
+	scratch: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&scratch) == nil)
+	defer virtual.arena_destroy(&scratch)
+	spec: Request_Spec
+	{
+		context.temp_allocator = virtual.arena_allocator(&scratch)
+		message_text: string
+		ok: bool
+		spec, message_text, ok = build_spec(payload, .Chat_Completions, true, mem.dynamic_arena_allocator(&owner))
+		testing.expectf(t, ok, "build_spec failed: %s", message_text)
+	}
+	virtual.arena_free_all(&scratch)
+	testing.expect_value(t, spec.request.url, "http://127.0.0.1:9/v1/chat/completions")
 }
