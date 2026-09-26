@@ -19,9 +19,10 @@ queries all read the same data.
 
 ## Motivation
 
-Mica is a database, a programming language and a runtime at once: behavior
-is installed into a live world beside its facts, and the world, not any
-source file, is the source of truth. A verb can be filed in, replaced or
+Mica is a database, a programming language and a runtime at once, a blend
+of Smalltalk's live image, Self's prototypes and a Datalog database:
+behavior is installed into a live world beside its facts, and the world,
+not any source file, is the source of truth. A verb can be filed in, replaced or
 edited while the world runs, so a tool that reads only files measures what
 the world was built from, not what it is. omica has no measure of which
 installed code is hard to change, which code the tests never reach, or which
