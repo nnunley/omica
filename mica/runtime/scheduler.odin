@@ -12,7 +12,7 @@ package mica_runtime
 import "base:runtime"
 import "core:fmt"
 import "core:mem"
-import "core:mem/virtual"
+import "../scratch"
 import "core:slice"
 import "core:sync"
 import "core:thread"
@@ -1171,95 +1171,92 @@ scheduler_worker_proc :: proc(data: rawptr) {
 	// creating thread's context allocator, which need not be thread-safe (a
 	// test runner's or an arena). World threads allocate concurrently.
 	context.allocator = runtime.heap_allocator()
-	// A private temporary scratch arena for this worker. Task execution
-	// allocates temporaries through `context.temp_allocator`; a dedicated
-	// arena keeps each worker's scratch independent and releases it when the
-	// worker stops.
-	temp_arena: virtual.Arena
-	if err := virtual.arena_init_growing(&temp_arena); err == nil {
-		context.temp_allocator = virtual.arena_allocator(&temp_arena)
-		defer virtual.arena_destroy(&temp_arena)
-	}
+	scratch.loop(scheduler_worker_step, data)
+}
+
+// Runs one ready task until it finishes or parks. Reports false once the
+// scheduler is stopping.
+@(private)
+scheduler_worker_step :: proc(data: rawptr) -> bool {
 	scheduler := (^Scheduler)(data)
-	for {
-		sync.mutex_lock(&scheduler.lock)
-		for len(scheduler.ready) == 0 && !scheduler.stop {
-			sync.cond_wait(&scheduler.cond, &scheduler.lock)
-		}
-		if scheduler.stop {
-			sync.mutex_unlock(&scheduler.lock)
-			return
-		}
-		id := pop(&scheduler.ready)
-		entry, found := scheduler.entries[id]
-		if !found || entry.done || entry.running {
-			// A stale or duplicate wakeup; skip it.
-			sync.mutex_unlock(&scheduler.lock)
-			continue
-		}
-		// Claim the entry and snapshot its resume mode under the lock. The
-		// pending value, started flag, and generation belong to the scheduler
-		// state machine; nothing here may be touched again after unlocking.
-		// Drop its mailbox waiters: it is no longer parked, so no send may
-		// wake it through a stale waiter after this point.
-		entry.running = true
-		scheduler_remove_mailbox_waiter_locked(scheduler, id)
-		task := entry.task
-		pending := entry.pending_value
-		consume_pending := entry.has_pending
-		already_started := entry.started
-		entry.has_pending = false
-		entry.started = true
-		sync.mutex_unlock(&scheduler.lock)
-
-		outcome: Task_Outcome
-		if consume_pending {
-			outcome = task_resume_with(task, pending)
-		} else if already_started {
-			outcome = task_resume(task)
-		} else {
-			outcome = task_run(task)
-		}
-
-		// Spawns resume the parent immediately with the child id; the child
-		// runs on another worker.
-		outcome = scheduler_run_spawns(scheduler, task, outcome)
-
-		// Mailbox receives with queued messages resume without parking.
-		for outcome.kind == .Pending && outcome.suspend == .Mailbox_Recv {
-			take := scheduler_mailbox_take(scheduler, task)
-			switch take.kind {
-			case .Ready:
-				outcome = task_resume_with(task, take.value)
-				continue
-			case .No_Receivers:
-				outcome = task_fail(
-					task,
-					"E_INVARG",
-					"mailbox has no live receivers",
-				)
-			case .Empty:
-				if outcome.millis == 0 {
-					empty := v.value_list(scheduler.allocator, nil)
-					outcome = task_resume_with(task, empty)
-					continue
-				}
-			}
-			break
-		}
-
-		sync.mutex_lock(&scheduler.lock)
-		entry.running = false
-		if entry.cancelled && outcome.kind == .Pending {
-			outcome = task_cancel(task)
-		}
-		scheduler_finish_locked(scheduler, id, entry, outcome)
-		// Task completion makes a worker idle or a task runnable, so both
-		// kinds of waiter (completion and quiescence) must be woken.
-		sync.cond_broadcast(&scheduler.done_cond)
-		sync.cond_signal(&scheduler.cond)
-		sync.mutex_unlock(&scheduler.lock)
+	sync.mutex_lock(&scheduler.lock)
+	for len(scheduler.ready) == 0 && !scheduler.stop {
+		sync.cond_wait(&scheduler.cond, &scheduler.lock)
 	}
+	if scheduler.stop {
+		sync.mutex_unlock(&scheduler.lock)
+		return false
+	}
+	id := pop(&scheduler.ready)
+	entry, found := scheduler.entries[id]
+	if !found || entry.done || entry.running {
+		// A stale or duplicate wakeup; skip it.
+		sync.mutex_unlock(&scheduler.lock)
+		return true
+	}
+	// Claim the entry and snapshot its resume mode under the lock. The
+	// pending value, started flag, and generation belong to the scheduler
+	// state machine; nothing here may be touched again after unlocking.
+	// Drop its mailbox waiters: it is no longer parked, so no send may
+	// wake it through a stale waiter after this point.
+	entry.running = true
+	scheduler_remove_mailbox_waiter_locked(scheduler, id)
+	task := entry.task
+	pending := entry.pending_value
+	consume_pending := entry.has_pending
+	already_started := entry.started
+	entry.has_pending = false
+	entry.started = true
+	sync.mutex_unlock(&scheduler.lock)
+
+	outcome: Task_Outcome
+	if consume_pending {
+		outcome = task_resume_with(task, pending)
+	} else if already_started {
+		outcome = task_resume(task)
+	} else {
+		outcome = task_run(task)
+	}
+
+	// Spawns resume the parent immediately with the child id; the child
+	// runs on another worker.
+	outcome = scheduler_run_spawns(scheduler, task, outcome)
+
+	// Mailbox receives with queued messages resume without parking.
+	for outcome.kind == .Pending && outcome.suspend == .Mailbox_Recv {
+		take := scheduler_mailbox_take(scheduler, task)
+		switch take.kind {
+		case .Ready:
+			outcome = task_resume_with(task, take.value)
+			continue
+		case .No_Receivers:
+			outcome = task_fail(
+				task,
+				"E_INVARG",
+				"mailbox has no live receivers",
+			)
+		case .Empty:
+			if outcome.millis == 0 {
+				empty := v.value_list(scheduler.allocator, nil)
+				outcome = task_resume_with(task, empty)
+				continue
+			}
+		}
+		break
+	}
+
+	sync.mutex_lock(&scheduler.lock)
+	entry.running = false
+	if entry.cancelled && outcome.kind == .Pending {
+		outcome = task_cancel(task)
+	}
+	scheduler_finish_locked(scheduler, id, entry, outcome)
+	// Task completion makes a worker idle or a task runnable, so both
+	// kinds of waiter (completion and quiescence) must be woken.
+	sync.cond_broadcast(&scheduler.done_cond)
+	sync.cond_signal(&scheduler.cond)
+	sync.mutex_unlock(&scheduler.lock)
+	return true
 }
 
 @(private)
@@ -1268,45 +1265,45 @@ scheduler_timer_proc :: proc(data: rawptr) {
 	// creating thread's context allocator, which need not be thread-safe (a
 	// test runner's or an arena). World threads allocate concurrently.
 	context.allocator = runtime.heap_allocator()
-	// Private temporary scratch arena; see `scheduler_worker_proc`.
-	temp_arena: virtual.Arena
-	if err := virtual.arena_init_growing(&temp_arena); err == nil {
-		context.temp_allocator = virtual.arena_allocator(&temp_arena)
-		defer virtual.arena_destroy(&temp_arena)
-	}
+	scratch.loop(scheduler_timer_step, data)
+}
+
+// Waits for the next timer and fires it. Reports false once the scheduler is
+// stopping.
+@(private)
+scheduler_timer_step :: proc(data: rawptr) -> bool {
 	scheduler := (^Scheduler)(data)
-	for {
-		sync.mutex_lock(&scheduler.lock)
-		if scheduler.stop {
-			sync.mutex_unlock(&scheduler.lock)
-			return
-		}
-
-		now := time.tick_now()
-		if len(scheduler.timers) == 0 {
-			sync.cond_wait(&scheduler.timer_cond, &scheduler.lock)
-			sync.mutex_unlock(&scheduler.lock)
-			continue
-		}
-
-		next := scheduler.timers[0]
-		if time.tick_diff(now, next.deadline) > 0 {
-			sync.cond_wait_with_timeout(
-				&scheduler.timer_cond,
-				&scheduler.lock,
-				time.tick_diff(now, next.deadline),
-			)
-			sync.mutex_unlock(&scheduler.lock)
-			continue
-		}
-
-		// Remove the timer we selected, not the last (unsorted pop) entry.
-		ordered_remove(&scheduler.timers, 0)
-		scheduler_timer_fire_locked(scheduler, next)
-		sync.cond_signal(&scheduler.cond)
-		sync.cond_broadcast(&scheduler.done_cond)
+	sync.mutex_lock(&scheduler.lock)
+	if scheduler.stop {
 		sync.mutex_unlock(&scheduler.lock)
+		return false
 	}
+
+	now := time.tick_now()
+	if len(scheduler.timers) == 0 {
+		sync.cond_wait(&scheduler.timer_cond, &scheduler.lock)
+		sync.mutex_unlock(&scheduler.lock)
+		return true
+	}
+
+	next := scheduler.timers[0]
+	if time.tick_diff(now, next.deadline) > 0 {
+		sync.cond_wait_with_timeout(
+			&scheduler.timer_cond,
+			&scheduler.lock,
+			time.tick_diff(now, next.deadline),
+		)
+		sync.mutex_unlock(&scheduler.lock)
+		return true
+	}
+
+	// Remove the timer we selected, not the last (unsorted pop) entry.
+	ordered_remove(&scheduler.timers, 0)
+	scheduler_timer_fire_locked(scheduler, next)
+	sync.cond_signal(&scheduler.cond)
+	sync.cond_broadcast(&scheduler.done_cond)
+	sync.mutex_unlock(&scheduler.lock)
+	return true
 }
 
 // Wakes the task named by an expired timer. The caller holds the scheduler

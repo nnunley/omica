@@ -14,7 +14,7 @@ package mica_runtime
 
 import "base:runtime"
 import "core:mem"
-import "core:mem/virtual"
+import "../scratch"
 import "core:sync"
 import "core:thread"
 import v "../var"
@@ -61,33 +61,31 @@ external_worker_proc :: proc(data: rawptr) {
 	// creating thread's context allocator, which need not be thread-safe (a
 	// test runner's or an arena). World threads allocate concurrently.
 	context.allocator = runtime.heap_allocator()
-	// A private temporary scratch arena, like a scheduler worker. Handlers may
-	// use `context.temp_allocator` for short-lived strings; it is reset after
-	// every request.
-	temp_arena: virtual.Arena
-	has_temp_arena := virtual.arena_init_growing(&temp_arena) == nil
-	if has_temp_arena {
-		context.temp_allocator = virtual.arena_allocator(&temp_arena)
-		defer virtual.arena_destroy(&temp_arena)
-	}
+	scratch.loop(external_worker_step, data)
+}
+
+// Runs one external request. Handlers may use `context.temp_allocator` for
+// short-lived strings; it is emptied after the request. Reports false once no
+// more requests will come.
+@(private)
+external_worker_step :: proc(data: rawptr) -> bool {
 	world := (^World)(data)
 	job: External_Job
-	for scheduler_take_external(&world.scheduler, &job) {
-		ctx := External_Context {
-			task      = job.task_id,
-			allocator = world.allocator,
-			host_data = world.external_data,
-			deliver   = world_external_deliver,
-			user      = world,
-			spawn     = world_external_spawn,
-			stopping  = world_external_stopping,
-		}
-		result := world.external_handler(ctx, job.service, job.payload)
-		scheduler_resume(&world.scheduler, job.task_id, result)
-		if has_temp_arena {
-			virtual.arena_free_all(&temp_arena)
-		}
+	if !scheduler_take_external(&world.scheduler, &job) {
+		return false
 	}
+	ctx := External_Context {
+		task      = job.task_id,
+		allocator = world.allocator,
+		host_data = world.external_data,
+		deliver   = world_external_deliver,
+		user      = world,
+		spawn     = world_external_spawn,
+		stopping  = world_external_stopping,
+	}
+	result := world.external_handler(ctx, job.service, job.payload)
+	scheduler_resume(&world.scheduler, job.task_id, result)
+	return true
 }
 
 @(private)
@@ -96,16 +94,17 @@ external_stream_proc :: proc(data: rawptr) {
 	// creating thread's context allocator, which need not be thread-safe (a
 	// test runner's or an arena). World threads allocate concurrently.
 	context.allocator = runtime.heap_allocator()
-	// Stream workers get their own scratch arena too; it lives for the stream
-	// and is released when the worker returns.
-	temp_arena: virtual.Arena
-	if err := virtual.arena_init_growing(&temp_arena); err == nil {
-		context.temp_allocator = virtual.arena_allocator(&temp_arena)
-		defer virtual.arena_destroy(&temp_arena)
-	}
+	scratch.loop(external_stream_step, data)
+}
+
+// Runs a stream worker to completion, in one scratch arena that lives for the
+// stream. Always reports false: a stream runs once.
+@(private)
+external_stream_step :: proc(data: rawptr) -> bool {
 	entry := (^External_Stream)(data)
 	entry.worker(entry.data)
 	sync.atomic_store(&entry.done, 1)
+	return false
 }
 
 // Delivers a value through a mailbox sender handle. Safe to call from an

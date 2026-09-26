@@ -12,6 +12,7 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 import k "../kernel"
+import "../scratch"
 import v "../var"
 
 Store_Mode :: enum {
@@ -806,95 +807,93 @@ store_durable_version_hook :: proc(user: rawptr) -> u64 {
 
 @(private)
 store_writer_proc :: proc(data: rawptr) {
-	// Private temporary scratch arena; keeps the writer's temporaries off
-	// every other thread's temporary state.
-	temp_arena: virtual.Arena
-	if err := virtual.arena_init_growing(&temp_arena); err == nil {
-		context.temp_allocator = virtual.arena_allocator(&temp_arena)
-		defer virtual.arena_destroy(&temp_arena)
-	}
+	scratch.loop(store_writer_step, data)
+}
+
+// Writes one batch of queued commits, then checkpoints if due. Reports false
+// once the store is stopping and its queue is empty.
+@(private)
+store_writer_step :: proc(data: rawptr) -> bool {
 	store := (^Store)(data)
 	batch: [dynamic]Queue_Entry
 	batch = make([dynamic]Queue_Entry, store.allocator)
 	defer delete(batch)
-	for {
-		sync.mutex_lock(&store.lock)
-		for len(store.queue) == 0 && !store.stop {
-			sync.cond_wait(&store.cond, &store.lock)
-		}
-		if len(store.queue) == 0 && store.stop {
-			sync.mutex_unlock(&store.lock)
-			return
-		}
-		append(&batch, ..store.queue[:])
-		clear(&store.queue)
-		store.writer_busy = true
+	sync.mutex_lock(&store.lock)
+	for len(store.queue) == 0 && !store.stop {
+		sync.cond_wait(&store.cond, &store.lock)
+	}
+	if len(store.queue) == 0 && store.stop {
 		sync.mutex_unlock(&store.lock)
+		return false
+	}
+	append(&batch, ..store.queue[:])
+	clear(&store.queue)
+	store.writer_busy = true
+	sync.mutex_unlock(&store.lock)
 
-		// I/O runs outside the store lock: commits hand off, they do not wait.
-		durable := true
-		if store.mode == .File {
-			sync.mutex_lock(&store.lock)
-			failed := store.failed
-			sync.mutex_unlock(&store.lock)
-			if !failed {
-				sync.mutex_lock(&store.wal_lock)
-				durable = store_wal_append_batch(store, batch[:])
-				sync.mutex_unlock(&store.wal_lock)
-			}
-		}
-
+	// I/O runs outside the store lock: commits hand off, they do not wait.
+	durable := true
+	if store.mode == .File {
 		sync.mutex_lock(&store.lock)
-		if !durable {
-			store.failed = true
+		failed := store.failed
+		sync.mutex_unlock(&store.lock)
+		if !failed {
+			sync.mutex_lock(&store.wal_lock)
+			durable = store_wal_append_batch(store, batch[:])
+			sync.mutex_unlock(&store.wal_lock)
 		}
-		if durable {
-			for entry in batch {
-				append(&store.records, Wal_Record {
-					version = entry.version,
-					writes  = entry.writes,
-					catalog = entry.catalog,
-					buffers = entry.buffers,
-				})
-				if entry.version > store.durable {
-					store.durable = entry.version
-				}
-			}
-		}
+	}
+
+	sync.mutex_lock(&store.lock)
+	if !durable {
+		store.failed = true
+	}
+	if durable {
 		for entry in batch {
-			store.reserved_bytes -= entry.bytes
-		}
-		if durable {
-			store_update_covered_locked(store)
-		}
-		store.writer_busy = false
-		sync.cond_broadcast(&store.cond)
-		sync.mutex_unlock(&store.lock)
-		clear(&batch)
-
-		if durable && store.mode == .File && store.kernel != nil &&
-		   store.checkpoint_bytes > 0 &&
-		   sync.atomic_load(&store.wal_bytes_since_checkpoint) >= store.checkpoint_bytes {
-			// Serialize with manual checkpoints without blocking: if a manual
-			// checkpoint holds the lock, skip this automatic one and retry on
-			// the next batch. Blocking here could deadlock a manual checkpoint
-			// that is waiting for the writer to advance durability.
-			if sync.mutex_try_lock(&store.checkpoint_lock) {
-				ok := store_checkpoint_internal(store, store.kernel, false)
-				sync.mutex_unlock(&store.checkpoint_lock)
-				if !ok {
-					// Do not silently continue after a failed automatic
-					// checkpoint: mark the store failed so later commits are
-					// refused and `.Strict` cannot report success.
-					sync.mutex_lock(&store.lock)
-					store.failed = true
-					store.last_error = "automatic checkpoint failed"
-					sync.cond_broadcast(&store.cond)
-					sync.mutex_unlock(&store.lock)
-				}
+			append(&store.records, Wal_Record {
+				version = entry.version,
+				writes  = entry.writes,
+				catalog = entry.catalog,
+				buffers = entry.buffers,
+			})
+			if entry.version > store.durable {
+				store.durable = entry.version
 			}
 		}
 	}
+	for entry in batch {
+		store.reserved_bytes -= entry.bytes
+	}
+	if durable {
+		store_update_covered_locked(store)
+	}
+	store.writer_busy = false
+	sync.cond_broadcast(&store.cond)
+	sync.mutex_unlock(&store.lock)
+
+	if durable && store.mode == .File && store.kernel != nil &&
+	   store.checkpoint_bytes > 0 &&
+	   sync.atomic_load(&store.wal_bytes_since_checkpoint) >= store.checkpoint_bytes {
+		// Serialize with manual checkpoints without blocking: if a manual
+		// checkpoint holds the lock, skip this automatic one and retry on
+		// the next batch. Blocking here could deadlock a manual checkpoint
+		// that is waiting for the writer to advance durability.
+		if sync.mutex_try_lock(&store.checkpoint_lock) {
+			ok := store_checkpoint_internal(store, store.kernel, false)
+			sync.mutex_unlock(&store.checkpoint_lock)
+			if !ok {
+				// Do not silently continue after a failed automatic
+				// checkpoint: mark the store failed so later commits are
+				// refused and `.Strict` cannot report success.
+				sync.mutex_lock(&store.lock)
+				store.failed = true
+				store.last_error = "automatic checkpoint failed"
+				sync.cond_broadcast(&store.cond)
+				sync.mutex_unlock(&store.lock)
+			}
+		}
+	}
+	return true
 }
 
 store_sync_count :: proc(store: ^Store) -> u64 {

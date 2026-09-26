@@ -5,6 +5,8 @@ package mica_runtime
 import "base:runtime"
 import "core:fmt"
 import "core:os"
+import "core:mem/virtual"
+import "core:sync"
 import "core:testing"
 import c "../compiler"
 import k "../kernel"
@@ -257,4 +259,55 @@ test_host_request_argument_count :: proc(t: ^testing.T) {
 	testing.expectf(t, len(parse_errors) == 0, "parse errors: %v", parse_errors)
 	compiled := c.compile_program(ast, &ctx, context.temp_allocator)
 	testing.expect(t, len(compiled.errors) > 0)
+}
+
+// What the arena probe handler saw, per request. Only
+// `test_external_worker_scratch_arena` uses it.
+@(private = "file")
+arena_probe: struct {
+	lock:     sync.Mutex,
+	requests: int,
+	arena:    [2]bool, // the handler's temp allocator was an arena
+	empty:    [2]bool, // and nothing was allocated in it yet
+}
+
+@(private = "file")
+arena_probe_handler :: proc(ctx: External_Context, service: v.Value, payload: v.Value) -> v.Value {
+	is_arena := context.temp_allocator.procedure == virtual.arena_allocator_proc
+	empty := is_arena && (^virtual.Arena)(context.temp_allocator.data).total_used == 0
+	// Scratch the next request must not see.
+	_ = make([]u8, 1024, context.temp_allocator)
+	sync.mutex_lock(&arena_probe.lock)
+	if arena_probe.requests < len(arena_probe.arena) {
+		arena_probe.arena[arena_probe.requests] = is_arena
+		arena_probe.empty[arena_probe.requests] = empty
+	}
+	arena_probe.requests += 1
+	sync.mutex_unlock(&arena_probe.lock)
+	return v.value_string(ctx.allocator, "ok")
+}
+
+// Every request on an external worker runs in an arena emptied after the
+// request before.
+@(test)
+test_external_worker_scratch_arena :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `openai_chat_completion("m", [{:role -> "user", :content -> "a"}])
+openai_chat_completion("m", [{:role -> "user", :content -> "b"}])
+`
+	kernel: k.Kernel
+	world, ok := external_world(t, &kernel, source, arena_probe_handler, "mica_external_arena_test.mica")
+	if !ok {
+		return
+	}
+	defer k.kernel_destroy(&kernel)
+	defer world_destroy(world)
+
+	outcome := world_wait(world, world.entry)
+	testing.expectf(t, outcome.kind == .Complete, "entry outcome: %v %s", outcome.kind, outcome.message)
+	testing.expect_value(t, arena_probe.requests, 2)
+	for i in 0 ..< 2 {
+		testing.expectf(t, arena_probe.arena[i], "request %d: temp allocator is not an arena", i)
+		testing.expectf(t, arena_probe.empty[i], "request %d: temp arena already held data", i)
+	}
 }
