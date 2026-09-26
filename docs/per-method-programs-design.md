@@ -8,7 +8,9 @@ Mica is a database, a programming language and a runtime at once. A world is
 live: its identities, facts, rules, verbs, authority, effects and tasks all
 change while it runs, and behavior is installed into the world beside the
 facts it reads and writes. The world, not any source file, is the source of
-truth. Installing new behavior into a running world is therefore a core
+truth. It blends Smalltalk (a live image authored in place, with filein and
+fileout), Self (prototypes, delegation and slots) and a Datalog database
+(facts and derived relations). Installing new behavior into a running world is therefore a core
 operation of the runtime, not a convenience, and a compiled program is data
 the world stores and serves like any other fact.
 
@@ -122,7 +124,10 @@ is composed of verbs and the unit's own state. Top-level bindings become that
 unit's state, stored as facts, readable by the unit's verbs, and kept across
 reboot and `Replace`. Until the units RFC specifies that state, a filein's
 top-level statements keep today's behavior (one root task sharing one scope),
-and verbs cannot yet read it.
+and verbs cannot yet read it. In Smalltalk terms a unit is a package with
+its own variables; in Self terms it is an object whose slots hold its state
+and whose verbs are its methods. Either reading keeps the state in the world
+as facts, where fileout, replacement and queries see it.
 
 ## What does not change
 
