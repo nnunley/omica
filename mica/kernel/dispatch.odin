@@ -409,19 +409,25 @@ prune_dominated_methods :: proc(
 	methods: [dynamic]Applicable_Method,
 	allocator: mem.Allocator,
 ) -> [dynamic]Applicable_Method {
-	pruned := make([dynamic]Applicable_Method, 0, len(methods), allocator)
-	for candidate in methods {
-		dominated := false
+	// Decide every candidate before freeing any: a dominated candidate is
+	// still the `other` side of later comparisons, so freeing its params
+	// inside the loop would let those comparisons read freed memory.
+	dominated := make([]bool, len(methods), allocator)
+	defer delete(dominated, allocator)
+	for candidate, index in methods {
 		for other in methods {
 			if v.value_eq(candidate.method, other.method) {
 				continue
 			}
 			if method_more_specific(source, delegates, other, candidate) {
-				dominated = true
+				dominated[index] = true
 				break
 			}
 		}
-		if dominated {
+	}
+	pruned := make([dynamic]Applicable_Method, 0, len(methods), allocator)
+	for candidate, index in methods {
+		if dominated[index] {
 			delete(candidate.params, allocator)
 			continue
 		}
