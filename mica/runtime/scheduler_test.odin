@@ -1,5 +1,6 @@
 package mica_runtime
 
+import "base:runtime"
 import "core:fmt"
 import "core:sync"
 import "core:testing"
@@ -54,6 +55,8 @@ flag_program :: proc(
 
 @(test)
 test_scheduler_runs_task_to_completion :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -81,6 +84,8 @@ test_scheduler_runs_task_to_completion :: proc(t: ^testing.T) {
 
 @(test)
 test_scheduler_yields_requeue :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -109,6 +114,8 @@ test_scheduler_yields_requeue :: proc(t: ^testing.T) {
 
 @(test)
 test_scheduler_sleep_wakes :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -137,6 +144,8 @@ test_scheduler_sleep_wakes :: proc(t: ^testing.T) {
 
 @(test)
 test_scheduler_parallel_tasks :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -213,6 +222,8 @@ scheduler_wait_suspended :: proc(
 
 @(test)
 test_scheduler_resume_with_value :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -247,6 +258,8 @@ test_scheduler_resume_with_value :: proc(t: ^testing.T) {
 // and stale-timer races.
 @(test)
 test_scheduler_resume_invalidates_timer :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -306,6 +319,8 @@ test_scheduler_resume_invalidates_timer :: proc(t: ^testing.T) {
 // terminal, running, already-woken, or re-parked entries are left alone.
 @(test)
 test_scheduler_timer_fire_guards :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -381,6 +396,8 @@ test_scheduler_timer_fire_guards :: proc(t: ^testing.T) {
 // wake the entry through a stale waiter once it has moved on.
 @(test)
 test_scheduler_resume_removes_mailbox_waiters :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -449,6 +466,8 @@ test_scheduler_resume_removes_mailbox_waiters :: proc(t: ^testing.T) {
 // first waiter was gone, terminal, or already woken.
 @(test)
 test_scheduler_wake_skips_dead_waiters :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -501,6 +520,8 @@ test_scheduler_wake_skips_dead_waiters :: proc(t: ^testing.T) {
 
 @(test)
 test_scheduler_cancel_parked :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -528,6 +549,8 @@ test_scheduler_cancel_parked :: proc(t: ^testing.T) {
 
 @(test)
 test_scheduler_spawn_child :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -629,6 +652,8 @@ test_scheduler_spawn_child :: proc(t: ^testing.T) {
 
 @(test)
 test_scheduler_external_request :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -678,6 +703,8 @@ test_scheduler_external_request :: proc(t: ^testing.T) {
 // resumes with an `ExternalUnavailable` error value and never parks.
 @(test)
 test_scheduler_external_unavailable_without_handler :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -717,6 +744,8 @@ test_scheduler_external_unavailable_without_handler :: proc(t: ^testing.T) {
 // selected, not the last entry.
 @(test)
 test_scheduler_multiple_timers :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -797,6 +826,8 @@ flaky_thread_start :: proc(data: rawptr, entry: proc(data: rawptr)) -> ^thread.T
 // run, and a task completes.
 @(test)
 test_scheduler_retries_failed_thread_starts :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
@@ -827,6 +858,8 @@ test_scheduler_retries_failed_thread_starts :: proc(t: ^testing.T) {
 // destroy never joins a nil thread.
 @(test)
 test_scheduler_init_fails_cleanly_without_timer :: proc(t: ^testing.T) {
+	// Scheduler workers share task and queue allocations with this thread.
+	context.allocator = runtime.heap_allocator()
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
