@@ -156,10 +156,13 @@ run_timeout() {
   if [[ "${have_stdin}" == "1" ]]; then
     { exec 9<&-; } 2>/dev/null || true
   fi
+  # Silence the watchdog: when kill_tree ends its `sleep` before the subshell,
+  # bash reports "Terminated: 15" on the subshell's stderr, which lands in the
+  # caller's captured log and corrupts outputs that are compared exactly.
   (
     sleep "${secs}"
     stop_process "${pid}"
-  ) &
+  ) 2>/dev/null &
   local watchdog=$!
   local rc=0
   wait "${pid}" || rc=$?
