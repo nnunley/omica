@@ -389,5 +389,8 @@ install_runtime_computed_relations :: proc(env: ^Builtin_Env) -> Run_Result {
 			return Run_Result{ok = false, message = "cannot register buffer computed relation"}
 		}
 	}
+	if installed := install_neighbourhood_computed_relations(env); !installed.ok {
+		return installed
+	}
 	return install_retrieval_computed_relation(env)
 }
