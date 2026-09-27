@@ -174,6 +174,7 @@ file system through builtins inherit whatever those providers allow.
 
 ## References
 
+- R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
 - draft-ndn-snippet-attributes-00 (llm-rfc-skill) — info strings, sidecars, templates, `when=`.
 - rdaum/omica#127 — `tools/bookcheck` and the synced language chapters.
 - Rust mica `crates/runtime/tests/book_examples.rs` — the book harness this profile extends.
