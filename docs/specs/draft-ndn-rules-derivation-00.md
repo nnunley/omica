@@ -11,14 +11,14 @@
 
 ## Abstract
 
-This RFC specifies rule safety validation, installation mechanics, evaluation strategies (stratified and semi-naive), visibility guarantees, and activation modes (eager vs demand).
+This RFC specifies rule safety validation, installation mechanics, evaluation strategies (stratified and semi-naive), visibility guarantees, and that no relation declares how it is evaluated.
 
 
 ## Motivation
 
 Mica is a database, a programming language, and a runtime; the live world is the source of truth. Rules transform this world by deriving new facts.
 
-Rust mica defers safety checks until first read, failing on queries that looked safe. omica validates at install and rejects unsafe rules immediately. This RFC settles safety timing, visibility, and activation modes.
+Rust mica defers safety checks until first read, failing on queries that looked safe. omica validates at install and rejects unsafe rules immediately. This RFC settles safety timing, visibility, and the evaluation-strategy boundary.
 
 
 ## Terminology
@@ -35,7 +35,7 @@ when, and only when, they appear in all capitals, as shown here.
 - **stratum** — A level in the rule dependency graph; stratification ensures negation depends only on lower strata, preventing circular negation.
 - **semi-naive evaluation** — Fixpoint evaluation that re-evaluates only rules affected by newly derived tuples (delta), not all rules with all tuples.
 - **snapshot** — An immutable point-in-time view of the relation state, including both extensional and derived facts.
-- **activation mode** — The evaluation strategy for a relation: eager (all rules evaluated at every commit) or demand (rules evaluated only when queried).
+- **evaluation strategy** — how an engine computes a derived relation (materialized, maintained, or on demand); it never changes the answer.
 
 
 ## Specification
@@ -235,31 +235,13 @@ Implementations MAY re-derive eagerly, maintain incrementally, or hybrid; reader
 | Reader at v after on-demand computation | Sees complete fixpoint of queried rules; uncomputed rules' derivations not visible unless queried |
 
 
-### Activation Mode: Eager vs Demand
+### Evaluation strategy
 
-Each relation MUST declare an activation mode: eager or demand. [R-activation-declared]
-
-- **eager**: Evaluated at every snapshot, fully materialized.
-- **demand**: Evaluated only when queried (backward chaining).
-
-Stage 1 evaluates all relations eagerly; backward-chaining RFC will add demand mode with SLG tabling.
-
-```transcript @R-activation-declared
-$ make_relation :Source 1
-$ make_relation :Result 1 :eager
-$ Result(?x) :- Source(?x)
-$ make_relation :OnDemand 1 :demand
-$ OnDemand(?x) :- Result(?x)
-loaded
-```
-
-```
-ENUM Activation_Mode:
-    EAGER       -- relation is kept current at every snapshot
-    DEMAND      -- relation is computed when queried
-```
-
-Demand relations are evaluated on query. A rule that negates a demand relation is rejected at install (draft-ndn-demand-evaluation-00, R-negation-demand-rejected).
+A relation carries no declaration of how it is evaluated. Whether an
+engine keeps a derived relation materialized, maintains it
+incrementally, or computes it on demand with tabling is its choice, and
+the answer is the same least fixpoint either way; draft-ndn-demand-evaluation-00
+states that contract.
 
 
 ## Out of Scope
@@ -291,7 +273,7 @@ Mica is a live database. Every world starts fresh; rules are installed live with
 - Datalog semantics: Ullman, "Database and Knowledge-Base Systems" (foundational reference for stratified Datalog)
 - Incremental maintenance: omica `docs/incremental-maintenance-design.md`; stage 1 in rdaum/omica#125
 - Rule authority and program installation: rdaum/omica#118
-- Backward chaining: draft-ndn-demand-evaluation-00, which uses this RFC's activation mode interface
+- Evaluation strategy, including demand evaluation with tabling: draft-ndn-demand-evaluation-00 (rdaum/omica#136)
 
 
 ## Appendix A: Relation to Rust mica
@@ -311,7 +293,7 @@ Mica is a live database. Every world starts fresh; rules are installed live with
 | Incremental maintenance | Lazy differential: weighted deltas, maintained after first read | Full fixpoint recompute on every commit (Stage 1: blocks + COW) | Observable guarantee only; algorithm deferred to incremental-maintenance design | Gap → Scheduled |
 | Derived state persistence | Separate from extensional; fingerprint-based recovery (planned) | Separate from extensional; always re-derived | Never persist derived facts; re-derive on restart (no change) | Parity |
 | Rule enable/disable | Supported; recomputes derived relations | Supported; recomputes derived relations | Supported (no change) | Parity |
-| Activation mode (eager/demand) | All eager (lazy differential is an implementation detail) | All eager | Declared per relation; demand mode in draft-ndn-demand-evaluation-00 | Extension |
+| Evaluation strategy | lazy differential maintenance after first read | full recompute per commit | undeclared; any strategy, same answer (draft-ndn-demand-evaluation-00) | Parity (answers) |
 | Cache invalidation strategy | Explicit on rule install | Implicit (no persistent cache) | Not specified; implementations may vary | Implementation-defined |
 
 
