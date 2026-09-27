@@ -110,7 +110,7 @@ IEEE 754 binary32, excluding NaN, Infinity, subnormals; -0.0 canonicalized to +0
 
 ### Identity Values
 
-56-bit stable entity reference, created via `make_identity` builtin, persisted in `named_identity(name, id)`. Identity 0 is reserved. [R-identity-stable]
+A 56-bit durable reference value (a handle), created via the `make_identity` builtin and persisted in `named_identity(name, id)`. Like an RM/T surrogate, a handle identifies without describing: what the referenced thing is, and what it is equivalent to, are facts in relations. Identity 0 is reserved. [R-identity-stable]
 
 <!-- evidence: @R-identity-stable -->
 | Scenario | Result |
@@ -119,7 +119,7 @@ IEEE 754 binary32, excluding NaN, Infinity, subnormals; -0.0 canonicalized to +0
 | Persists to `named_identity` | Durable |
 | Process restart | Restored unchanged |
 
-**Stability:** Identity returned for a name is stable across restarts (if `named_identity` is durable); identities are fixed points for long-lived entities. [R-identity-persistent]
+**Stability:** The handle returned for a name is stable across restarts (if `named_identity` is durable), so facts, rules, grants and histories can keep coordinating on it. [R-identity-persistent]
 
 <!-- evidence: @R-identity-persistent -->
 | Scenario | Result |
@@ -127,7 +127,7 @@ IEEE 754 binary32, excluding NaN, Infinity, subnormals; -0.0 canonicalized to +0
 | Store + restart | Same identity |
 | Multiple calls, same name | Identical |
 
-**Uniqueness:** `make_identity(:name)` returns same identity on repeated calls; each name is unique. [R-identity-unique]
+**Uniqueness:** `make_identity(:name)` returns the same handle on repeated calls, and different names give different handles. Distinct handles are distinct references, not a claim that the referenced things differ: as in OWL, there is no unique-name assumption about things, and sameness is stated with relations. [R-identity-unique]
 
 <!-- evidence: @R-identity-unique -->
 | Scenario | Result |
@@ -424,6 +424,10 @@ RFC formalizes current behavior; Rust and omica implementations already match (d
 ## References
 
 - R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- E. F. Codd, "Extending the Database Relational Model to Capture More Meaning" (RM/T), ACM TODS 4(4), 1979: surrogates.
+- H. G. Baker, "Equal Rights for Functional Objects," 1993: equality of immutable values.
+- C. J. Date and H. Darwen, The Third Manifesto, 3rd ed., 2006: equality within a type.
+- W3C, RDF 1.1 Concepts (2014) and OWL 2 Primer (2012): names, blank nodes, `owl:sameAs`, no unique-name assumption.
 - RFC 2119, RFC 8174: BCP 14 keywords
 - Differential D-006: Int vs float parity (Rust and omica dual-equality model)
 - RFC-03: Rules and Derivation
