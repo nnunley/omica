@@ -7266,7 +7266,7 @@ test_run_store_boot_derives_once :: proc(t: ^testing.T) {
 		world, start := world_start(
 			&kernel,
 			[]string{path},
-			context.temp_allocator,
+			runtime.heap_allocator(),
 			World_Config{store_path = store_path},
 		)
 		testing.expectf(t, start.ok, "load failed: %s", start.message)
@@ -7285,7 +7285,7 @@ test_run_store_boot_derives_once :: proc(t: ^testing.T) {
 	world, start := world_start(
 		&kernel,
 		nil,
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config{store_path = store_path},
 	)
 	testing.expectf(t, start.ok, "boot failed: %s", start.message)
@@ -7331,7 +7331,7 @@ end
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -7379,7 +7379,7 @@ assert Note(5, "note-text")
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
