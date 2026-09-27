@@ -1,7 +1,7 @@
 # draft-ndn-error-hierarchy-00: Error Hierarchy — Error Codes Related by Facts
 
 **Status:** DRAFT
-**Corpus:** red (spec-first: no implementation relates error codes yet)
+**Corpus:** red (passes with the omica implementation in rdaum/omica#142; red until it merges)
 **Category:** Standards-Track
 **Authors:** Norman Nunley, Jr <nnunley@gmail.com>, Claude (drafting agent)
 
