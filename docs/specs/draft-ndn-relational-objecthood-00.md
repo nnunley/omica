@@ -2,7 +2,7 @@
 
 **Status:** DRAFT
 **Category:** Standards-Track
-**Corpus:** red (claim history and unnamed handles exist in no implementation yet)
+**Corpus:** red (claim history and unnamed handles are not yet specified in the Mica book or implemented)
 **Authors:** Norman Nunley, Jr <nnunley@gmail.com>, Claude (drafting agent)
 
 ## Abstract
@@ -282,16 +282,20 @@ belong to the authority model.
 - draft-ndn-language-00, draft-ndn-authority-00, draft-ndn-values-equality-00, draft-ndn-casts-and-literals-00.
 - draft-ndn-mica-snippets-00 — the evidence format used here.
 
-## Appendix A: Implementation status (non-normative)
+## Appendix A: Coverage and gaps (non-normative)
 
-Differential runs on omica 5a22a77 and Rust mica a433170.
+A gap belongs to the Mica specification (the mdbook and these drafts)
+when the book does not define the behaviour; it belongs to an
+implementation only when the book, or Rust mica as the reference
+implementation, already covers it. Differential runs: omica 5a22a77,
+Rust mica a433170.
 
-| Requirement | omica | Rust mica |
-|---|---|---|
-| R-handle-poor | meets (empty `SubjectFact`) | meets |
-| R-handle-equality | meets | meets |
-| R-equivalence-claims | meets with user relations and rules; no built-in equivalence vocabulary | same |
-| R-delegation-explicit | meets: no implicit lookup; dot read on the child raises `E_KEY` | meets; dot read raises `E_CARDINALITY` (error codes differ) |
-| R-objecthood-views | on main the three relations return no rows; rdaum/omica#134 computes them under read authority | meets: `SubjectFact` and `MentionedFact` return the facts, including `NamedIdentity` |
-| R-claim-history | missing: the change log records commits but has no fact-origin query | missing |
-| R-unnamed-handles | missing: only `make_identity(:name)` | missing |
+| Requirement | Mica book | Rust mica | omica | Gap |
+|---|---|---|---|---|
+| R-handle-poor | defined (`values.md`, identities) | meets | meets | none |
+| R-handle-equality | defined (`values.md`: equivalence is a modelled relationship) | meets | meets | none |
+| R-equivalence-claims | not defined: the book shows a domain claim but not purpose- or authority-bound equivalence or its closure | expressible with user relations and rules | same | **spec**: the book should define equivalence claims |
+| R-delegation-explicit | partly: `Delegates` feeds dispatch matching (`frobs.md`, `verbs-roles-dispatch.md`); that reads never follow it, and that defaults are named rules, is unwritten | behaves so; dot read raises `E_CARDINALITY` | behaves so; dot read raises `E_KEY` | **spec**: write the rule down; the dot-read error code differs between implementations |
+| R-objecthood-views | defined (`runtime/catalogue-and-introspection.md`) | meets | returns no rows on main | **omica**: fixed by rdaum/omica#134 |
+| R-claim-history | not defined (buffer text provenance only) | absent | absent | **spec**: needs design (interface, retention, authority) |
+| R-unnamed-handles | not defined: the numeric `#12345` literal form exists, but no way to make such a handle | absent | absent | **spec**: needs design |
