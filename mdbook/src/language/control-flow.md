@@ -88,40 +88,16 @@ for key, value in properties
 end
 ```
 
-`for` evaluates its iterable expression once. A header can also destructure
-each item with a list, map, or wildcard pattern:
-
-```mica
-for [a, b] in pairs
-  emit(a, b)
-end
-
-for {work} in AssignedTo(?work, actor)
-  emit(actor, work)
-end
-```
-
-Patterns bind against the same item the single-name form would receive, so
-`for {work} in ...` is shorthand for binding the row map and projecting its
-columns. Map entries also accept literals, which filter: only items whose
-column equals every literal are visited.
-
-```mica
-for {node -> 1, role -> r} in rows
-  emit(r)
-end
-```
-
-Anything but a name or a literal in a `for` map pattern is a compile error.
-The number and shape of the bindings determine what
+`for` evaluates its iterable expression once. The number and shape of the bindings determine what
 each iteration receives:
 
-| Iterable             | One binding | Two bindings                  |
-| -------------------- | ----------- | ----------------------------- |
-| list                 | element     | zero-based index, element     |
-| map                  | value       | key, value                    |
-| relation value       | row map     | zero-based row index, row map |
-| closed integer range | integer     | zero-based offset, integer    |
+| Iterable             | One binding            | Two bindings                    |
+| -------------------- | ---------------------- | ------------------------------- |
+| string               | Unicode scalar integer | scalar position, scalar integer |
+| list                 | element                | zero-based index, element       |
+| map                  | value                  | key, value                      |
+| relation value       | row map                | zero-based row index, row map   |
+| closed integer range | integer                | zero-based offset, integer      |
 
 Maps and relation values use canonical order. Lists and ranges have their natural sequence order.
 Use a list when iteration order carries application meaning.
@@ -132,6 +108,29 @@ for index, label in ["inspect", "repair"]
   numbered = [@numbered, [index, label]]
 end
 require numbered == [[0, "inspect"], [1, "repair"]]
+```
+
+List patterns use the same bindings as scatter assignment. They support annotations, optional
+values, rest bindings, and `_` for ignored elements. A single `_` ignores the whole iteration value.
+
+```mica,eval
+let total = 0
+for [left: int, right: int] in [[1, 2], [3, 4]]
+  total = total + left + right
+end
+require total == 10
+```
+
+Row patterns also bind fields from maps. A map can contain additional fields. A relation row must
+have the pattern's exact heading. Missing map fields or mismatched relation headings raise
+`E_MATCH`.
+
+```mica,eval
+let total = 0
+for {count} in [{:count -> 2}, {:count -> 3, :label -> "three"}]
+  total = total + count
+end
+require total == 5
 ```
 
 Loop bindings are local to the loop. Bind a mutable accumulator before the loop when the result must
@@ -152,11 +151,14 @@ require visited == [1, 2]
 require pending == [3, 4]
 ```
 
-Queries with named variables are iterable because they return relation values:
+Queries with named variables are iterable because they return relation values. A structural row
+pattern binds the projected cells directly:
 
 ```mica
-for row in AssignedTo(?work, actor)
-  emit(actor, row[:work])
+for {work} in AssignedTo(?work, actor)
+  if let {label} = Label(work, ?label)
+    emit(actor, label)
+  end
 end
 ```
 
@@ -173,6 +175,33 @@ Calibrated(instrument) || return false
 
 Use this style for preconditions that stop the body. Prefer a full `if` when there is meaningful
 alternative work to perform.
+
+## List Comprehensions
+
+A comprehension builds a list from an iterable. It accepts the same bindings and destructuring
+patterns as `for`. The iterable is evaluated once. Without sorting, retained values keep their
+iteration order.
+
+```mica,eval
+require [n + 1 for n in [1, 2, 3]] == [2, 3, 4]
+require [n for n in [1, 2, 3, 4] if n > 2] == [3, 4]
+require [left + right for [left, right] in [[1, 2], [3, 4]]] == [3, 7]
+```
+
+The optional `if` clause runs before the produced value. Rejected items do not evaluate that value
+or a sorting key. Bindings remain local to the comprehension.
+
+A bare `sort` orders the produced values. An expression after `sort` supplies a key for each
+retained item. Keys are evaluated once, before their corresponding values. Equal keys use the
+produced values as tie breakers. Sorting uses Mica's canonical value order.
+
+```mica,eval
+require [n for n in [3, 1, 2] sort] == [1, 2, 3]
+require [pair[1] for pair in [[1, "b"], [0, "a"]] sort pair[0]] == ["a", "b"]
+```
+
+Comprehensions can nest. A `break` or `continue` inside a comprehension clause targets that
+comprehension's loop.
 
 ## Blocks and Ranges
 
@@ -193,7 +222,7 @@ items[2.._]
 ```
 
 An underscore endpoint means an open-ended range. Range indexing applies to lists; integer indexing
-also applies to lists and relation rows, while maps use value keys.
+also applies to strings, lists, and relation rows, while maps use value keys.
 
 A closed integer range includes both endpoints. Ascending ranges iterate in steps of one; a range
 whose end is below its start has no iterations:
