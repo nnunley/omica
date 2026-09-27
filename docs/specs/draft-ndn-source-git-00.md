@@ -144,6 +144,7 @@ This RFC adds new computed relations; existing eager relations (`source/FileText
 
 ## References
 
+- R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
 - RFC 2119, 8174 — BCP 14 requirement keywords
 - Rust mica source-provider: [crates/source-provider/src/vcs.rs](https://github.com/timbran-project/mica/blob/2bbceb0113b0/crates/source-provider/src/vcs.rs) (L16, L403-L427, L337-L371, L474-L517)
 - rdaum/omica#109 — quality-tool RFC

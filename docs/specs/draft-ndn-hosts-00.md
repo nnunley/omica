@@ -130,7 +130,8 @@ This RFC formalizes existing host semantics. Remote SubmitSource and Telnet supp
 
 ## References
 
-- **Rust mica host protocol**: https://github.com/rdaum/mica/tree/main/crates/host-protocol
+- R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- **Rust mica host protocol**: https://github.com/timbran-project/mica/tree/2bbceb0113b0/crates/host-protocol
 - **omica host/web**: https://github.com/rdaum/omica/tree/5a22a77cc245/host/web ([host/web/sync_protocol.odin:1-97](https://github.com/rdaum/omica/blob/5a22a77cc245/host/web/sync_protocol.odin#L1-L97))
 - **PR #117**: https://github.com/rdaum/omica/pull/117 (per-method programs; filein into a running world)
 - **PR #119**: https://github.com/rdaum/omica/pull/119 (thread-safe allocation in everything a world shares)
