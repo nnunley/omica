@@ -91,7 +91,7 @@ build_spec :: proc(
 
 	spec := Request_Spec {
 		request = Request {
-			url = join_url_path(base_url, path),
+			url = join_url_path(base_url, path, allocator),
 			headers = headers[:],
 			timeout_seconds = openai_timeout_seconds(),
 		},
