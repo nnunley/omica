@@ -183,9 +183,12 @@ VM :: struct {
 vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.program = program
 	state.allocator = allocator
-	state.registers = make([dynamic]v.Value)
-	state.frames = make([dynamic]Frame)
-	state.builtins = make([dynamic]VM_Builtin)
+	// Every container uses the task's allocator, not the context allocator of
+	// the thread that creates the VM: a host thread creates a task that a
+	// scheduler worker then runs and grows.
+	state.registers = make([dynamic]v.Value, allocator)
+	state.frames = make([dynamic]Frame, allocator)
+	state.builtins = make([dynamic]VM_Builtin, allocator)
 	state.request = .None
 	state.request_spec = -1
 	state.request_value = v.Value(0)
@@ -193,9 +196,9 @@ vm_init :: proc(state: ^VM, program: ^Program, allocator := context.allocator) {
 	state.pending_resume = -1
 	state.max_call_depth = DEFAULT_MAX_CALL_DEPTH
 	state.entry_function = -1
-	state.handlers = make([dynamic]Handler)
-	state.pending_returns = make([dynamic]Pending_Return)
-	state.pending_raises = make([dynamic]Pending_Raise)
+	state.handlers = make([dynamic]Handler, allocator)
+	state.pending_returns = make([dynamic]Pending_Return, allocator)
+	state.pending_raises = make([dynamic]Pending_Raise, allocator)
 	state.result = v.value_empty_relation()
 	state.error = v.value_empty_relation()
 	state.status = .Ready
@@ -1822,6 +1825,11 @@ vm_scan_collect :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	if !vm_scan_rows(state, base, pattern, &rows) {
 		return false
 	}
+	// The result relation keeps its rows past this transaction, whose snapshot
+	// storage the scanned rows point into: copy them into the task's memory.
+	for &row in rows {
+		row = v.tuple_deep_copy(state.allocator, row)
+	}
 	// Only named query variables are result columns; bound values and
 	// wildcards participate in matching but do not appear in the heading.
 	output_count := 0
@@ -1877,7 +1885,7 @@ first_binding_visit :: proc(user: rawptr, row: v.Tuple) -> bool {
 	ctx := (^First_Binding_Context)(user)
 	for cell, index in ctx.pattern.cells {
 		if cell.kind == .Output {
-			ctx.vm.registers[ctx.base + int(cell.operand)] = v.tuple_values(row)[index]
+			ctx.vm.registers[ctx.base + int(cell.operand)] = v.value_deep_copy(ctx.vm.allocator, v.tuple_values(row)[index])
 		}
 	}
 	ctx.found = true
@@ -1941,7 +1949,9 @@ vm_scan_one :: proc(state: ^VM, base: int, instr: Instruction) -> bool {
 	}
 	for cell, index in pattern.cells {
 		if cell.kind == .Output {
-			state.registers[base + int(cell.operand)] = v.tuple_values(rows[0])[index]
+			// Scanned rows point into snapshot storage, which is freed once the
+			// transaction ends; the task keeps its own copy.
+			state.registers[base + int(cell.operand)] = v.value_deep_copy(state.allocator, v.tuple_values(rows[0])[index])
 		}
 	}
 	state.registers[base + int(instr.a)] = v.value_bool(true)

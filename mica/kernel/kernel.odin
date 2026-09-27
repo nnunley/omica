@@ -246,7 +246,7 @@ arena_pool_shard :: proc(pool: ^Arena_Pool) -> ^Arena_Pool_Shard {
 
 arena_pool_init :: proc(pool: ^Arena_Pool) {
 	for index in 0 ..< ARENA_POOL_SHARDS {
-		pool.shards[index].arenas = make([dynamic]^Frame_Arena)
+		pool.shards[index].arenas = make([dynamic]^Frame_Arena, runtime.default_allocator())
 	}
 }
 
@@ -328,10 +328,13 @@ kernel_init :: proc(kernel: ^Kernel) {
 	kernel.world_allocator = virtual.arena_allocator(kernel.world)
 	kernel.arena_pool = new(Arena_Pool, runtime.default_allocator())
 	arena_pool_init(kernel.arena_pool)
-	kernel.retired = make([dynamic]^Snapshot)
-	kernel.pending_commits = make([dynamic]^Commit_Entry)
-	capability_store_init(&kernel.capabilities)
-	changes_init(&kernel.changes)
+	// Every thread of a world shares the kernel, so its containers use the
+	// process heap, never the context allocator of the thread that calls
+	// kernel_init (which need not be thread-safe).
+	kernel.retired = make([dynamic]^Snapshot, runtime.default_allocator())
+	kernel.pending_commits = make([dynamic]^Commit_Entry, runtime.default_allocator())
+	capability_store_init(&kernel.capabilities, runtime.default_allocator())
+	changes_init(&kernel.changes, allocator = runtime.default_allocator())
 	buf.store_init(&kernel.buffer_store, runtime.default_allocator())
 	buffer_history_init(&kernel.buffer_history, runtime.default_allocator())
 	buffer_result_ring_init(&kernel.buffer_results, runtime.default_allocator())
@@ -778,7 +781,7 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 				}
 			}
 		}
-		kernel_compute_derived(kernel, merged)
+		kernel_compute_derived(kernel, merged, base)
 
 		previous, published := kernel_try_publish(kernel, base, merged)
 		if published {
@@ -905,7 +908,7 @@ kernel_create_relation :: proc(
 			block := buffer_block_create(&kernel.buffer_store, metadata.id, nil, 0, 0)
 			snapshot_set_buffer(next, block)
 		}
-		kernel_compute_derived(kernel, next)
+		kernel_compute_derived(kernel, next, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -939,7 +942,7 @@ kernel_advance_version :: proc(kernel: ^Kernel, minimum: u64) -> bool {
 		}
 		next := snapshot_fork(kernel, current)
 		next.version = minimum
-		kernel_compute_derived(kernel, next)
+		kernel_compute_derived(kernel, next, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -965,12 +968,14 @@ kernel_derivation_count :: proc(kernel: ^Kernel) -> u64 {
 }
 
 // Recomputes a snapshot's derived relations unless maintenance is suspended.
+// `base` is the snapshot `snapshot` was forked from, still held by the
+// caller: derived relations whose rows did not change share its blocks.
 @(private)
-kernel_compute_derived :: proc(kernel: ^Kernel, snapshot: ^Snapshot) {
+kernel_compute_derived :: proc(kernel: ^Kernel, snapshot: ^Snapshot, base: ^Snapshot = nil) {
 	if kernel_derivation_suspended(kernel) {
 		return
 	}
-	snapshot_compute_derived(snapshot, kernel)
+	snapshot_compute_derived(snapshot, kernel, base)
 }
 
 // Enables or suspends derived-relation maintenance. While suspended, commits
@@ -991,7 +996,7 @@ kernel_set_derivation :: proc(kernel: ^Kernel, enabled: bool) -> bool {
 	for {
 		current := kernel_snapshot(kernel)
 		next := snapshot_fork(kernel, current)
-		snapshot_compute_derived(next, kernel)
+		snapshot_compute_derived(next, kernel, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -1052,7 +1057,7 @@ kernel_install_rule :: proc(
 			return nil, .Unstratified_Negation
 		}
 
-		kernel_compute_derived(kernel, next)
+		kernel_compute_derived(kernel, next, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -1110,7 +1115,7 @@ kernel_set_rule_active :: proc(
 				definition.active = active
 			}
 		}
-		kernel_compute_derived(kernel, next)
+		kernel_compute_derived(kernel, next, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -1175,12 +1180,19 @@ kernel_scan_into :: proc(
 	current := kernel_snapshot(kernel)
 	defer snapshot_release(current)
 
+	start := len(out)
 	relation_source_scan_into(
 		&Relation_Source{kernel = kernel, snapshot = current, use_stored_derived = true},
 		relation,
 		bindings,
 		out,
 	)
+	// The rows point into `current`'s chunks, which a concurrent commit can
+	// free once it is released on return: hand back copies (in the temporary
+	// allocator; callers copy whatever they keep).
+	for &row in out[start:] {
+		row = v.tuple_deep_copy(context.temp_allocator, row)
+	}
 }
 
 // Reports whether a relation tuple is visible in the current snapshot.

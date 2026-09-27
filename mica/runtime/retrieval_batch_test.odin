@@ -189,6 +189,32 @@ expect_batch_equals_rows :: proc(t: ^testing.T, source: ^k.Relation_Source, inde
 	return batch.count
 }
 
+// Limits larger than the index must not cause limit-sized allocations.
+@(test)
+test_nearest_batch_large_limit_returns_available_subjects :: proc(t: ^testing.T) {
+	sync.mutex_lock(&nearest_cache_tests_lock)
+	defer sync.mutex_unlock(&nearest_cache_tests_lock)
+	defer free_all(context.temp_allocator)
+	f: Retrieval_Fixture
+	retrieval_fixture(t, &f)
+	defer k.kernel_destroy(&f.kernel)
+	query := v.value_list(context.temp_allocator, []v.Value{must_float(1), must_float(0.5)})
+	source := k.Relation_Source{kernel = &f.kernel, snapshot = f.kernel.current}
+	evaluation: virtual.Arena
+	if !testing.expect(t, virtual.arena_init_growing(&evaluation) == nil) {
+		return
+	}
+	defer virtual.arena_destroy(&evaluation)
+	{
+		context.allocator = virtual.arena_allocator(&evaluation)
+		available := expect_batch_equals_rows(t, &source, f.index, query, 40)
+		testing.expect(t, available > 0)
+		// The largest Mica integer still returns only this small index's subjects.
+		got := expect_batch_equals_rows(t, &source, f.index, query, int(v.INT_MAX))
+		testing.expect_value(t, got, available)
+	}
+}
+
 // The packed index is built once and reused across calls and across commits
 // that leave its relations alone; a changed vector rebuilds it.
 @(test)
@@ -292,10 +318,11 @@ test_nearest_cache_outlives_evaluation_arena :: proc(t: ^testing.T) {
 // under .Cosine. 1,600 documents clear the GPU thresholds.
 @(test)
 test_nearest_embedding_batch_on_every_strategy :: proc(t: ^testing.T) {
-	sync.mutex_lock(&nearest_cache_tests_lock)
-	defer sync.mutex_unlock(&nearest_cache_tests_lock)
+	// Tests that need both locks always acquire the strategy lock first.
 	sync.mutex_lock(&strategy_tests_lock)
 	defer sync.mutex_unlock(&strategy_tests_lock)
+	sync.mutex_lock(&nearest_cache_tests_lock)
+	defer sync.mutex_unlock(&nearest_cache_tests_lock)
 	defer accel.use_cpu()
 	defer free_all(context.temp_allocator)
 	kernel: k.Kernel

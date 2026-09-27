@@ -14,6 +14,7 @@ import "core:sys/posix"
 import "core:thread"
 import "core:time"
 import k "../kernel"
+import "../scratch"
 import v "../var"
 
 Store_Mode :: enum {
@@ -162,6 +163,8 @@ Store :: struct {
 	wal_path:   string,
 	lock_path:  string,
 	lock_acquired: bool,
+	// Held until LOCK is removed and all store files are closed.
+	lock_guard: ^os.File,
 	last_error: string,
 	file:       ^os.File,
 	wal_end:    i64,
@@ -492,6 +495,8 @@ Lock_Owner :: struct {
 Unlock_Result :: enum {
 	Not_Locked,
 	Removed,
+	// A writer or another recovery operation holds the OS lock.
+	Busy,
 	// The recorded owner is a running process on this host.
 	Owner_Running,
 	// The owner is on another host, whose processes cannot be checked.
@@ -539,31 +544,48 @@ lock_owner_running :: proc(owner: Lock_Owner) -> bool {
 }
 
 // Removes `path`'s LOCK when its recorded owner is on this host and no longer
-// running (a crash left it behind). A live owner, an owner on another host
-// and a lock without an owner are left in place unless `force` is set.
-store_unlock :: proc(path: string, force := false) -> Unlock_Result {
+// running (a crash left it behind). Force bypasses owner metadata checks but
+// never an active OS lock. The result is valid only when error is nil.
+store_unlock :: proc(path: string, force := false) -> (result: Unlock_Result, error: os.Error) {
+	guard, busy, guard_error := lock_guard_acquire(path)
+	if guard_error == .Not_Exist {
+		return .Not_Locked, nil
+	}
+	if guard_error != nil {
+		return {}, guard_error
+	}
+	if busy {
+		return .Busy, nil
+	}
+	defer os.close(guard)
 	lock_path, _ := filepath.join([]string{path, "LOCK"}, context.temp_allocator)
-	if !os.exists(lock_path) {
-		return .Not_Locked
+	_, stat_error := os.stat(lock_path, context.temp_allocator)
+	if stat_error == .Not_Exist {
+		return .Not_Locked, nil
+	}
+	if stat_error != nil {
+		return {}, stat_error
 	}
 	if !force {
 		owner, known := lock_read_owner(path)
 		switch {
 		case !known:
-			return .Owner_Unknown
+			return .Owner_Unknown, nil
 		case owner.host != lock_this_host():
-			return .Owner_Elsewhere
+			return .Owner_Elsewhere, nil
 		case lock_owner_running(owner):
-			return .Owner_Running
+			return .Owner_Running, nil
 		}
 	}
-	os.remove(lock_path)
-	return .Removed
+	if remove_error := os.remove(lock_path); remove_error != nil {
+		return {}, remove_error
+	}
+	return .Removed, nil
 }
 
-// Creates the exclusive `LOCK` file, recording this process as its owner. A
-// second process on the same store fails with a message naming the owner and
-// whether it still runs; `store_unlock` removes a lock whose owner is gone.
+// Holds the OS guard and creates LOCK exclusively, recording this process as
+// its owner. Existing metadata still requires explicit recovery, including
+// locks left by older writers that did not acquire the guard.
 @(private)
 store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
 	if directory_error := os.make_directory_all(path, os.Permissions_Default); directory_error != nil {
@@ -576,6 +598,16 @@ store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
 			return false
 		}
 	}
+	guard, busy, guard_error := lock_guard_acquire(path)
+	if guard_error != nil {
+		store.last_error = fmt.aprintf("cannot acquire store lock: %s", os.error_string(guard_error), allocator = store.allocator)
+		return false
+	}
+	if busy {
+		store.last_error = "store is locked by an active writer or recovery operation"
+		return false
+	}
+	store.lock_guard = guard
 	lock_path, join_error := filepath.join(
 		[]string{path, "LOCK"},
 		store.allocator,
@@ -608,11 +640,15 @@ store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
 		delete(lock_path, store.allocator)
 		return false
 	}
-	owner_text := fmt.tprintf("pid %d\nhost %s\n", os.get_pid(), lock_this_host())
-	os.write(file, transmute([]u8)owner_text)
-	os.close(file)
+	defer os.close(file)
 	store.lock_path = lock_path
 	store.lock_acquired = true
+	owner_text := fmt.tprintf("pid %d\nhost %s\n", os.get_pid(), lock_this_host())
+	written, write_error := os.write(file, transmute([]u8)owner_text)
+	if write_error != nil || written != len(owner_text) {
+		store.last_error = "cannot record store lock owner"
+		return false
+	}
 	return true
 }
 
@@ -625,6 +661,10 @@ store_lock_release :: proc(store: ^Store) {
 	if store.lock_path != "" {
 		delete(store.lock_path, store.allocator)
 		store.lock_path = ""
+	}
+	if store.lock_guard != nil {
+		os.close(store.lock_guard)
+		store.lock_guard = nil
 	}
 }
 
@@ -900,95 +940,93 @@ store_durable_version_hook :: proc(user: rawptr) -> u64 {
 
 @(private)
 store_writer_proc :: proc(data: rawptr) {
-	// Private temporary scratch arena; keeps the writer's temporaries off
-	// every other thread's temporary state.
-	temp_arena: virtual.Arena
-	if err := virtual.arena_init_growing(&temp_arena); err == nil {
-		context.temp_allocator = virtual.arena_allocator(&temp_arena)
-		defer virtual.arena_destroy(&temp_arena)
-	}
+	scratch.loop(store_writer_step, data)
+}
+
+// Writes one batch of queued commits, then checkpoints if due. Reports false
+// once the store is stopping and its queue is empty.
+@(private)
+store_writer_step :: proc(data: rawptr) -> bool {
 	store := (^Store)(data)
 	batch: [dynamic]Queue_Entry
 	batch = make([dynamic]Queue_Entry, store.allocator)
 	defer delete(batch)
-	for {
-		sync.mutex_lock(&store.lock)
-		for len(store.queue) == 0 && !store.stop {
-			sync.cond_wait(&store.cond, &store.lock)
-		}
-		if len(store.queue) == 0 && store.stop {
-			sync.mutex_unlock(&store.lock)
-			return
-		}
-		append(&batch, ..store.queue[:])
-		clear(&store.queue)
-		store.writer_busy = true
+	sync.mutex_lock(&store.lock)
+	for len(store.queue) == 0 && !store.stop {
+		sync.cond_wait(&store.cond, &store.lock)
+	}
+	if len(store.queue) == 0 && store.stop {
 		sync.mutex_unlock(&store.lock)
+		return false
+	}
+	append(&batch, ..store.queue[:])
+	clear(&store.queue)
+	store.writer_busy = true
+	sync.mutex_unlock(&store.lock)
 
-		// I/O runs outside the store lock: commits hand off, they do not wait.
-		durable := true
-		if store.mode == .File {
-			sync.mutex_lock(&store.lock)
-			failed := store.failed
-			sync.mutex_unlock(&store.lock)
-			if !failed {
-				sync.mutex_lock(&store.wal_lock)
-				durable = store_wal_append_batch(store, batch[:])
-				sync.mutex_unlock(&store.wal_lock)
-			}
-		}
-
+	// I/O runs outside the store lock: commits hand off, they do not wait.
+	durable := true
+	if store.mode == .File {
 		sync.mutex_lock(&store.lock)
-		if !durable {
-			store.failed = true
+		failed := store.failed
+		sync.mutex_unlock(&store.lock)
+		if !failed {
+			sync.mutex_lock(&store.wal_lock)
+			durable = store_wal_append_batch(store, batch[:])
+			sync.mutex_unlock(&store.wal_lock)
 		}
-		if durable {
-			for entry in batch {
-				append(&store.records, Wal_Record {
-					version = entry.version,
-					writes  = entry.writes,
-					catalog = entry.catalog,
-					buffers = entry.buffers,
-				})
-				if entry.version > store.durable {
-					store.durable = entry.version
-				}
-			}
-		}
+	}
+
+	sync.mutex_lock(&store.lock)
+	if !durable {
+		store.failed = true
+	}
+	if durable {
 		for entry in batch {
-			store.reserved_bytes -= entry.bytes
-		}
-		if durable {
-			store_update_covered_locked(store)
-		}
-		store.writer_busy = false
-		sync.cond_broadcast(&store.cond)
-		sync.mutex_unlock(&store.lock)
-		clear(&batch)
-
-		if durable && store.mode == .File && store.kernel != nil &&
-		   store.checkpoint_bytes > 0 &&
-		   sync.atomic_load(&store.wal_bytes_since_checkpoint) >= store.checkpoint_bytes {
-			// Serialize with manual checkpoints without blocking: if a manual
-			// checkpoint holds the lock, skip this automatic one and retry on
-			// the next batch. Blocking here could deadlock a manual checkpoint
-			// that is waiting for the writer to advance durability.
-			if sync.mutex_try_lock(&store.checkpoint_lock) {
-				ok := store_checkpoint_internal(store, store.kernel, false)
-				sync.mutex_unlock(&store.checkpoint_lock)
-				if !ok {
-					// Do not silently continue after a failed automatic
-					// checkpoint: mark the store failed so later commits are
-					// refused and `.Strict` cannot report success.
-					sync.mutex_lock(&store.lock)
-					store.failed = true
-					store.last_error = "automatic checkpoint failed"
-					sync.cond_broadcast(&store.cond)
-					sync.mutex_unlock(&store.lock)
-				}
+			append(&store.records, Wal_Record {
+				version = entry.version,
+				writes  = entry.writes,
+				catalog = entry.catalog,
+				buffers = entry.buffers,
+			})
+			if entry.version > store.durable {
+				store.durable = entry.version
 			}
 		}
 	}
+	for entry in batch {
+		store.reserved_bytes -= entry.bytes
+	}
+	if durable {
+		store_update_covered_locked(store)
+	}
+	store.writer_busy = false
+	sync.cond_broadcast(&store.cond)
+	sync.mutex_unlock(&store.lock)
+
+	if durable && store.mode == .File && store.kernel != nil &&
+	   store.checkpoint_bytes > 0 &&
+	   sync.atomic_load(&store.wal_bytes_since_checkpoint) >= store.checkpoint_bytes {
+		// Serialize with manual checkpoints without blocking: if a manual
+		// checkpoint holds the lock, skip this automatic one and retry on
+		// the next batch. Blocking here could deadlock a manual checkpoint
+		// that is waiting for the writer to advance durability.
+		if sync.mutex_try_lock(&store.checkpoint_lock) {
+			ok := store_checkpoint_internal(store, store.kernel, false)
+			sync.mutex_unlock(&store.checkpoint_lock)
+			if !ok {
+				// Do not silently continue after a failed automatic
+				// checkpoint: mark the store failed so later commits are
+				// refused and `.Strict` cannot report success.
+				sync.mutex_lock(&store.lock)
+				store.failed = true
+				store.last_error = "automatic checkpoint failed"
+				sync.cond_broadcast(&store.cond)
+				sync.mutex_unlock(&store.lock)
+			}
+		}
+	}
+	return true
 }
 
 store_sync_count :: proc(store: ^Store) -> u64 {

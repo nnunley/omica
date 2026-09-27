@@ -23,14 +23,19 @@ USAGE :: "usage: filein [--unit NAME] [--store DIR] [--durability none|group|str
 	"[--actor NAME] [--checkpoint] [--eval SOURCE]... <path>...\n" +
 	"       filein --store DIR --unlock [--force]\n" +
 	"  --unlock: remove DIR's lock when its recorded owner is no longer running;\n" +
-	"            --force also removes a lock with no owner or one from another host\n"
+	"            --force bypasses owner metadata checks, never an active OS lock\n"
 
 // Removes a store's stale lock and reports what happened; the exit status is 0
 // when the store is no longer locked.
 @(private)
 unlock_store :: proc(path: string, force: bool) -> int {
 	owner, known := s.lock_read_owner(path)
-	switch s.store_unlock(path, force) {
+	result, err := s.store_unlock(path, force)
+	if err != nil {
+		fmt.eprintf("cannot unlock %s: %s\n", path, os.error_string(err))
+		return 1
+	}
+	switch result {
 	case .Not_Locked:
 		fmt.printf("%s is not locked\n", path)
 		return 0
@@ -41,6 +46,8 @@ unlock_store :: proc(path: string, force: bool) -> int {
 			fmt.printf("removed %s's lock\n", path)
 		}
 		return 0
+	case .Busy:
+		fmt.eprintf("%s is locked by an active writer or recovery operation; not removing its lock\n", path)
 	case .Owner_Running:
 		fmt.eprintf("%s is locked by pid %d, which is still running; not removing its lock\n", path, owner.pid)
 	case .Owner_Elsewhere:

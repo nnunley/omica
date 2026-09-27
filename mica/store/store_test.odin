@@ -649,6 +649,14 @@ test_checkpoint_round_trip :: proc(t: ^testing.T) {
 		store_attach(&store, &kernel)
 		create_named_relation(t, &kernel, 1, "Kept", 1, .Durable)
 		create_named_relation(t, &kernel, 2, "Gone", 1, .Volatile)
+		// Copy is derived from Kept by a rule: its rows are derived blocks and
+		// must never be written to the checkpoint as facts.
+		create_named_relation(t, &kernel, 3, "Copy", 1, .Durable)
+		x := v.symbol_intern("x")
+		rule := k.rule_new(3, []k.Term{k.term_var(x)}, []k.Rule_Body_Item{k.body_atom(k.atom_positive(1, []k.Term{k.term_var(x)}))})
+		installed, install_error := k.kernel_install_rule(&kernel, v.Identity(960), rule, "checkpoint test")
+		testing.expect_value(t, install_error, k.Kernel_Error.None)
+		k.snapshot_release(installed)
 
 		tx := k.kernel_begin(&kernel)
 		for index in 0 ..< 300 {
@@ -673,6 +681,8 @@ test_checkpoint_round_trip :: proc(t: ^testing.T) {
 			k.kernel_destroy(&kernel)
 			return
 		}
+		derived, has_derived := k.snapshot_derived_block(committed, 3)
+		testing.expect(t, has_derived && k.relation_block_len(derived) == 300)
 		k.snapshot_release(committed)
 
 		testing.expect(t, store_checkpoint(&store, &kernel))
@@ -723,6 +733,9 @@ test_checkpoint_round_trip :: proc(t: ^testing.T) {
 	testing.expect(t, store_restore(&store, &kernel))
 	testing.expect_value(t, file_relation_rows(t, &kernel, "Kept"), 301)
 	testing.expect_value(t, file_relation_rows(t, &kernel, "Gone"), 0)
+	// No rule is installed after a store-level restore, so any Copy row here
+	// would be a derived row that was persisted as a fact.
+	testing.expect_value(t, file_relation_rows(t, &kernel, "Copy"), 0)
 }
 
 @(private)
@@ -1769,6 +1782,13 @@ lock_exists :: proc(path: string) -> bool {
 	return os.exists(lock_path)
 }
 
+@(private = "file")
+expect_unlock :: proc(t: ^testing.T, path: string, want: Unlock_Result, force := false, loc := #caller_location) {
+	result, err := store_unlock(path, force)
+	testing.expectf(t, err == nil, "unlock failed: %v", err, loc = loc)
+	testing.expect_value(t, result, want, loc = loc)
+}
+
 // A lock whose owner is recorded on this host and no longer running is
 // stale: opening names it as stale, and unlock removes it.
 @(test)
@@ -1787,7 +1807,7 @@ test_unlock_removes_stale_lock :: proc(t: ^testing.T) {
 	testing.expectf(t, strings.contains(store.last_error, "stale"), "open error: %s", store.last_error)
 	store_destroy(&store)
 
-	testing.expect_value(t, store_unlock(path), Unlock_Result.Removed)
+	expect_unlock(t, path, .Removed)
 	testing.expect(t, !lock_exists(path))
 	reopened: Store
 	testing.expect(t, store_open(&reopened, Store_Options{mode = .File, path = path, durability = .Group}))
@@ -1807,18 +1827,102 @@ test_unlock_refuses_live_or_unknown_owner :: proc(t: ^testing.T) {
 	defer os.remove_all(path)
 
 	write_lock(t, path, fmt.tprintf("pid %d\nhost %s\n", os.get_pid(), lock_this_host()))
-	testing.expect_value(t, store_unlock(path), Unlock_Result.Owner_Running)
+	expect_unlock(t, path, .Owner_Running)
 	testing.expect(t, lock_exists(path))
 
 	write_lock(t, path, "")
-	testing.expect_value(t, store_unlock(path), Unlock_Result.Owner_Unknown)
+	expect_unlock(t, path, .Owner_Unknown)
 	testing.expect(t, lock_exists(path))
 
 	write_lock(t, path, "pid 999999\nhost some-other-host\n")
-	testing.expect_value(t, store_unlock(path), Unlock_Result.Owner_Elsewhere)
+	expect_unlock(t, path, .Owner_Elsewhere)
 	testing.expect(t, lock_exists(path))
 
-	testing.expect_value(t, store_unlock(path, force = true), Unlock_Result.Removed)
+	expect_unlock(t, path, .Removed, force = true)
 	testing.expect(t, !lock_exists(path))
-	testing.expect_value(t, store_unlock(path), Unlock_Result.Not_Locked)
+	expect_unlock(t, path, .Not_Locked)
+}
+
+// Recovery must consult the OS lock even when the owner metadata is stale or
+// missing. A second open in this process must contend just like another process.
+@(test)
+test_unlock_cannot_remove_active_writer_lock :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_unlock_writer")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+	store: Store
+	if !testing.expect(t, store_open(&store, Store_Options{mode = .File, path = path})) {
+		return
+	}
+	write_lock(t, path, fmt.tprintf("pid 999999\nhost %s\n", lock_this_host()))
+	expect_unlock(t, path, .Busy)
+	expect_unlock(t, path, .Busy, force = true)
+	testing.expect(t, lock_exists(path))
+
+	lock_path, _ := filepath.join([]string{path, "LOCK"}, context.temp_allocator)
+	testing.expect(t, os.remove(lock_path) == nil)
+	expect_unlock(t, path, .Busy, force = true)
+	second: Store
+	testing.expect(t, !store_open(&second, Store_Options{mode = .File, path = path}))
+	store_destroy(&second)
+	store_destroy(&store)
+	reopened: Store
+	testing.expect(t, store_open(&reopened, Store_Options{mode = .File, path = path}))
+	store_destroy(&reopened)
+}
+
+// An unlock operation holds this same guard until it finishes inspecting and
+// removing LOCK. Another recovery or writer cannot replace the checked inode.
+@(test)
+test_recovery_guard_excludes_unlock_and_writer :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_unlock_guard")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+	write_lock(t, path, fmt.tprintf("pid 999999\nhost %s\n", lock_this_host()))
+	guard, busy, err := lock_guard_acquire(path)
+	if !testing.expect(t, err == nil && !busy && guard != nil) {
+		return
+	}
+	expect_unlock(t, path, .Busy)
+	store: Store
+	testing.expect(t, !store_open(&store, Store_Options{mode = .File, path = path}))
+	store_destroy(&store)
+	testing.expect(t, lock_exists(path))
+	os.close(guard)
+	expect_unlock(t, path, .Removed)
+	reopened: Store
+	testing.expect(t, store_open(&reopened, Store_Options{mode = .File, path = path}))
+	store_destroy(&reopened)
+}
+
+// A nonempty directory cannot be unlinked, including by root. This exercises
+// the real filesystem error without depending on the test user's permissions.
+@(test)
+test_unlock_reports_removal_error :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := temp_store_path(t, "mica_store_unlock_error")
+	if path == "" {
+		return
+	}
+	os.remove_all(path)
+	defer os.remove_all(path)
+	lock_path, _ := filepath.join([]string{path, "LOCK"}, context.temp_allocator)
+	testing.expect(t, os.make_directory_all(lock_path) == nil)
+	child, _ := filepath.join([]string{lock_path, "child"}, context.temp_allocator)
+	testing.expect(t, os.write_entire_file(child, []u8{1}) == nil)
+	_, err := store_unlock(path, force = true)
+	testing.expect(t, err != nil)
+	testing.expect(t, lock_exists(path))
+	// The failed operation must release its guard so recovery can be retried.
+	testing.expect(t, os.remove_all(lock_path) == nil)
+	write_lock(t, path, "")
+	expect_unlock(t, path, .Removed, force = true)
 }

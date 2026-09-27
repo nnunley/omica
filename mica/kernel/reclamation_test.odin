@@ -6,6 +6,7 @@ import "base:runtime"
 import "core:sync"
 import "core:testing"
 import "core:thread"
+import "core:time"
 import v "../var"
 
 @(test)
@@ -381,7 +382,9 @@ storm_reader :: proc(data: rawptr) {
 	worker := (^Storm_Reader)(data)
 	sync.atomic_add(worker.ready, 1)
 	for sync.atomic_load(worker.start) == 0 {
-		sync.cpu_relax()
+		// Yield while the test thread releases the start gate. Busy polling
+		// can starve ThreadSanitizer's atomic bookkeeping on many-core hosts.
+		time.sleep(time.Millisecond)
 	}
 	worker.monotonic = true
 	worker.found = true
@@ -449,7 +452,7 @@ test_snapshot_hazard_borrow_many_threads :: proc(t: ^testing.T) {
 
 	// Let every reader arrive so the borrows overlap, then release them.
 	for sync.atomic_load(&ready) < READERS {
-		sync.cpu_relax()
+		time.sleep(time.Millisecond)
 	}
 	sync.atomic_store(&start, 1)
 
