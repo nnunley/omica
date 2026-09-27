@@ -8,41 +8,40 @@ expected failure as ordinary values.
 
 ## Scalar and Collection Functions
 
-| Function                                   | Result                                               |
-| ------------------------------------------ | ---------------------------------------------------- |
-| `string_len(text)`                         | number of Unicode scalar values                      |
-| `len(text)`                                | number of Unicode scalar values                      |
-| `text[i]`                                  | Unicode scalar value at position `i`, as an integer  |
-| `for ch in text`                           | iterates Unicode scalar values                       |
-| `string_span(text, start, set)`            | end position of the run of `set` bytes from `start` |
-| `string_find_any(text, start, stop)`       | position of the first `stop` byte from `start`      |
-| `string_chars(text)`                       | list of one-character strings                        |
-| `string_slice(text, start, end)`           | end-exclusive character slice                        |
-| `string_from_chars(chars)`                 | string assembled from character strings              |
-| `string_concat(@parts)`                    | concatenated strings; accepts zero or more arguments |
-| `string_join(parts, separator)`            | joined list of strings                               |
-| `string_starts_with(text, prefix)`         | boolean prefix test                                  |
-| `string_contains(text, subject)`           | boolean substring test                               |
-| `string_equal_fold(left, right)`           | equality after Unicode lowercasing                   |
-| `lower(text)`                              | lowercase string                                     |
-| `words(text)`                              | parsed word list                                     |
-| `edit_distance(left, right)`               | character edit distance                              |
-| `parse_ordinal(text)`                      | `result<int>`                                        |
-| `url_encode_component(text)`               | percent-encoded URL component                        |
-| `url_decode_component(text)`               | decoded URL component                                |
-| `sort(list)`                               | canonically sorted list                              |
-| `to_symbol(text)`                          | named symbol                                         |
-| `to_float(number)`                         | explicit numeric conversion to float                 |
-| `to_int(number)`                           | explicit numeric conversion to an integral int       |
-| `error_code(symbol)`                       | error code with the symbol's name                    |
-| `error(code[, message[, payload]])`        | structured error value                               |
-| `to_literal(value)`                        | parseable Mica value text                            |
-| `from_literal(text)`                       | `result<dynamic>`                                    |
-| `map_pairs(map)`                           | list of two-item key/value lists                     |
-| `index_or(collection, index, default)`     | list, map, or relation lookup with a default         |
-| `json_encode(value)` / `json_decode(text)` | JSON conversion                                      |
-| `json_null()`                              | explicit JSON null value                             |
-| `os_getenv(name)`                          | `option<string>`                                     |
+| Function                                   | Result                                                            |
+| ------------------------------------------ | ----------------------------------------------------------------- |
+| `len(collection)`                          | string scalar count, list length, map size, or relation row count |
+| `string_append(text, suffix)`              | concatenated string; preserves both inputs                        |
+| `string_span(text, start, members)`        | end of an ASCII member run                                        |
+| `string_find_any(text, start, members)`    | first ASCII member position, or string length                     |
+| `string_len(text)`                         | number of Unicode scalar values                                   |
+| `string_chars(text)`                       | list of one-character strings                                     |
+| `string_slice(text, start, end)`           | end-exclusive character slice                                     |
+| `string_from_chars(chars)`                 | string assembled from character strings                           |
+| `string_concat(@parts)`                    | concatenated strings; accepts zero or more arguments              |
+| `string_join(parts, separator)`            | joined list of strings                                            |
+| `string_starts_with(text, prefix)`         | boolean prefix test                                               |
+| `string_contains(text, subject)`           | boolean substring test                                            |
+| `string_equal_fold(left, right)`           | equality after Unicode lowercasing                                |
+| `lower(text)`                              | lowercase string                                                  |
+| `words(text)`                              | parsed word list                                                  |
+| `edit_distance(left, right)`               | character edit distance                                           |
+| `parse_ordinal(text)`                      | `result<int>`                                                     |
+| `url_encode_component(text)`               | percent-encoded URL component                                     |
+| `url_decode_component(text)`               | decoded URL component                                             |
+| `sort(list)`                               | canonically sorted list                                           |
+| `to_symbol(text)`                          | named symbol                                                      |
+| `to_float(number)`                         | explicit numeric conversion to float                              |
+| `to_int(number)`                           | explicit numeric conversion to an integral int                    |
+| `error_code(symbol)`                       | error code with the symbol's name                                 |
+| `error(code[, message[, payload]])`        | structured error value                                            |
+| `to_literal(value)`                        | parseable Mica value text                                         |
+| `from_literal(text)`                       | `result<dynamic>`                                                 |
+| `map_pairs(map)`                           | list of two-item key/value lists                                  |
+| `index_or(collection, index, default)`     | string, list, map, or relation lookup with a default              |
+| `json_encode(value)` / `json_decode(text)` | JSON conversion                                                   |
+| `json_null()`                              | explicit JSON null value                                          |
+| `os_getenv(name)`                          | `option<string>`                                                  |
 
 `os_getenv` requires root authority or an invoke grant for `:os_getenv`, such as
 `CanInvoke(#reader, :os_getenv)` or a matching `RoleCanInvoke` grant. This grants access to the host
@@ -56,16 +55,32 @@ position regardless of its UTF-8 byte length. A letter followed by a combining a
 positions. Use these operations for character-based text processing; a host that lays out text may
 group several scalars into one displayed character.
 
-Indexing, `len`, and `for` treat a string as a sequence of scalars. The value at a position is the
-scalar as an integer, which is what a scanner or parser compares and classifies; `string_chars` is
-the one-character-string form and `string_slice` materializes text:
+Indexing a string returns the integer Unicode scalar value at that position. A `for` loop over a
+string yields those integers. Two loop bindings receive the scalar position and value.
+`string_chars` returns one-scalar strings instead.
 
 ```mica,eval
-require "AéB"[0] == 65
 require "AéB"[1] == 233
-require len("AéB") == 3
-require string_slice("AéB", 1, 2) == "é"
+let sum = 0
+for scalar in "AB"
+  sum = sum + scalar
+end
+require sum == 131
 ```
+
+`string_span` advances while scalars belong to its ASCII member set. `string_find_any` advances
+until a scalar belongs to that set. Both return scalar positions and clamp starts beyond the string
+to its length. A negative start raises `E_INDEX`. Non-ASCII scalars never belong to the member set.
+
+```mica,eval
+require string_span("éabc!", 1, "abc") == 4
+require string_find_any("éabc!", 1, "!") == 4
+require string_find_any("éabc", 0, "!") == 4
+require string_append("é", "abc") == "éabc"
+```
+
+Append operations preserve all earlier values, including values captured by closures or retained
+across suspension.
 
 `string_slice` uses an exclusive end position and accepts an empty interval. A list range such as
 `items[1..3]` includes position 3. Write the bounds for the operation being called:
@@ -80,22 +95,6 @@ require string_from_chars(["A", "é", "B"]) == "AéB"
 
 Bounds must satisfy `0 <= start <= end <= string_len(text)`. A slice outside the string raises
 `E_INDEX`. `string_from_chars` accepts strings containing exactly one scalar each.
-
-`string_span` and `string_find_any` scan runs of ASCII bytes in one call, which is how a scanner
-avoids an interpreted loop per character. `string_span` returns the scalar position where the run of
-bytes drawn from `set` ends; `string_find_any` returns the position of the first byte drawn from
-`stop`:
-
-```mica,eval
-require string_span("abc123", 0, "abcdefghijklmnopqrstuvwxyz") == 3
-require string_find_any("abc 123", 0, " ") == 3
-require string_find_any("no-break", 0, " ") == 8
-```
-
-`set` and `stop` are sets of ASCII bytes. A scalar at or above `U+0080` is never a member, so a run
-stops there; put another way, these operations cannot draw a non-ASCII scalar into or out of a set.
-Positions are scalar positions, and a `start` at or beyond the end returns the scalar count. Use
-them for syntax scanning; use `string_slice` and the scalar operations for general text.
 
 Use `string_concat` for a fixed set of pieces and `string_join` for a list separated by punctuation:
 
@@ -196,6 +195,9 @@ Encoding accepts booleans, numbers, strings, symbols, lists, maps, and the null 
 must be strings or symbols. Symbols become JSON strings, so decoding an encoded symbol returns a
 string. Decoded object keys are always symbols, even when the original Mica map used string keys.
 
+Malformed JSON, out-of-range numbers, and values that cannot be encoded raise catchable `E_INVARG`
+errors. Passing a non-string value to `json_decode` raises `E_TYPE`.
+
 Project identities, relations, errors, and other application values to a deliberate wire shape
 before encoding them. For example, encode a query as a list of maps with fields your protocol
 defines. JSON conversion does not choose whether an empty relation means an empty collection,
@@ -204,14 +206,19 @@ builtin call.
 
 ## Relation Algebra
 
-| Function                          | Result                                        |
-| --------------------------------- | --------------------------------------------- |
-| `project(relation, :column, ...)` | selected heading columns                      |
-| `union(left, right)`              | rows present in either equal-heading relation |
-| `difference(left, right)`         | left rows absent from the right relation      |
-| `natural_join(left, right)`       | natural join over shared heading names        |
+| Function                            | Result                                                  |
+| ----------------------------------- | ------------------------------------------------------- |
+| `relation_from_rows(heading, rows)` | relation value from a symbol heading and lists of cells |
+| `project(relation, :column, ...)`   | selected heading columns                                |
+| `union(left, right)`                | rows present in either equal-heading relation           |
+| `difference(left, right)`           | left rows absent from the right relation                |
+| `natural_join(left, right)`         | natural join over shared heading names                  |
 
 See [Relations](./relations.md#relation-value-algebra) for heading and duplicate semantics.
+
+`relation_from_rows` preserves column meaning when it canonicalizes the heading. It sorts and
+deduplicates rows without changing either input. Invalid argument kinds raise `E_TYPE`; duplicate
+columns and row arity mismatches raise `E_INVARG`.
 
 ## World Definition and Introspection
 
@@ -224,13 +231,12 @@ See [Relations](./relations.md#relation-value-algebra) for heading and duplicate
 | `rules(:Relation)`                                           | active rule identities for a head relation |
 | `describe_rule(#rule)`                                       | installed rule source                      |
 | `disable_rule(#rule)`                                        | `()`                                       |
-| `fileout(:unit)`                                             | loaded source for a filein unit            |
+| `fileout(:unit)`                                             | source owned by a filein unit              |
 | `fileout_rules([:Relation])`                                 | active rule source                         |
 | `tasks()`                                                    | current task snapshots                     |
 
 The optional durability symbol is `:durable` or `:volatile`. Definition, destruction, and
-rule-disabling operations require administrative authority. `destroy_identity` also removes the
-identity's `NamedIdentity` name binding.
+rule-disabling operations require administrative authority.
 
 ## Runtime Context, Effects, and Coordination
 
@@ -267,9 +273,8 @@ published at commit. Subscriptions are specified in [Subscriptions](../runtime/s
 | `sync_signature(revision, payload)`          | synchronization signature   |
 | `embed_text(model, text)`                    | embedding vector            |
 
-The DOM helpers underlie [DOM Markup](./dom-markup.md). Where a host has no embedding provider,
-`embed_text` returns a deterministic hash-based vector so retrieval plans stay reproducible; see
-[Retrieval and Embeddings](../runtime/retrieval-and-embeddings.md).
+The DOM helpers underlie [DOM Markup](./dom-markup.md). Embedding availability depends on the
+configured provider; see [Retrieval and Embeddings](../runtime/retrieval-and-embeddings.md).
 
 ## Compiler-Recognized Runtime Forms
 
@@ -284,9 +289,17 @@ These calls resemble built-ins but compile directly to task operations:
 | `external_request(service, payload[, timeout])` | request a host service                             |
 | `invoke(selector, roles)`                       | dynamic named-role dispatch                        |
 
-`read` suspends the task until the host supplies input; the value delivered on resume becomes the
-form's value. See [Task Control](../runtime/task-control.md).
-
 `spawn` is a language form rather than a function. See [Task Control](../runtime/task-control.md).
 Hosts may register additional request functions. Those are deployment APIs, not part of this core
 catalogue.
+
+## Program assembly
+
+`assemble(description)` returns a validated Rust program artifact as bytes.
+`map_contains_key(map, key)` returns whether a map contains the key, including keys whose values are
+`none`. `is_kind(value, kind)` checks an exact value kind such as `:list`, `:map`, or `:relation`
+without raising on a mismatch.
+
+`is_builtin(name)` checks a symbol against the executing task's builtin registry. See
+[Program Assembly](assembly.md) for the description format, instruction forms, limits, and execution
+authority.
