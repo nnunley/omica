@@ -7,9 +7,9 @@
 #   scripts/bycycle-load.sh repl   STORE            # interactive REPL
 #   scripts/bycycle-load.sh unlock STORE [--force]  # remove a stale LOCK
 #
-# A store's LOCK file is its exclusive lock (the store creates it with
-# O_CREAT|O_EXCL and records its owner's pid and host). Commands refuse a
-# locked store; `unlock` removes a lock whose owner is no longer running.
+# A store holds an OS lock on LOCK.guard and records its pid and host in LOCK.
+# Commands refuse a locked store; `unlock` removes stale owner metadata after
+# acquiring the same guard. Never remove LOCK.guard from a store in use.
 #
 # The OWL dump is opencyc-latest.owl.gz from asanchez75/opencyc (Git LFS —
 # fetch via the media.githubusercontent.com URL, not the raw one).
@@ -85,7 +85,7 @@ case "${cmd}" in
     ;;
   unlock)
     # Removes the lock only when its recorded owner is no longer running on
-    # this host; pass --force for a lock with no owner or from another host.
+    # this host; --force bypasses metadata checks, never an active OS lock.
     store="${1:?usage: bycycle-load.sh unlock STORE [--force]}"
     if [[ -n "${FILEIN_BIN:-}" ]]; then
       "${FILEIN_BIN}" --store "${store}" --unlock ${2:+"$2"}

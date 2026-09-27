@@ -162,6 +162,8 @@ Store :: struct {
 	wal_path:   string,
 	lock_path:  string,
 	lock_acquired: bool,
+	// Held until LOCK is removed and all store files are closed.
+	lock_guard: ^os.File,
 	last_error: string,
 	file:       ^os.File,
 	wal_end:    i64,
@@ -492,6 +494,8 @@ Lock_Owner :: struct {
 Unlock_Result :: enum {
 	Not_Locked,
 	Removed,
+	// A writer or another recovery operation holds the OS lock.
+	Busy,
 	// The recorded owner is a running process on this host.
 	Owner_Running,
 	// The owner is on another host, whose processes cannot be checked.
@@ -539,31 +543,48 @@ lock_owner_running :: proc(owner: Lock_Owner) -> bool {
 }
 
 // Removes `path`'s LOCK when its recorded owner is on this host and no longer
-// running (a crash left it behind). A live owner, an owner on another host
-// and a lock without an owner are left in place unless `force` is set.
-store_unlock :: proc(path: string, force := false) -> Unlock_Result {
+// running (a crash left it behind). Force bypasses owner metadata checks but
+// never an active OS lock. The result is valid only when error is nil.
+store_unlock :: proc(path: string, force := false) -> (result: Unlock_Result, error: os.Error) {
+	guard, busy, guard_error := lock_guard_acquire(path)
+	if guard_error == .Not_Exist {
+		return .Not_Locked, nil
+	}
+	if guard_error != nil {
+		return {}, guard_error
+	}
+	if busy {
+		return .Busy, nil
+	}
+	defer os.close(guard)
 	lock_path, _ := filepath.join([]string{path, "LOCK"}, context.temp_allocator)
-	if !os.exists(lock_path) {
-		return .Not_Locked
+	_, stat_error := os.stat(lock_path, context.temp_allocator)
+	if stat_error == .Not_Exist {
+		return .Not_Locked, nil
+	}
+	if stat_error != nil {
+		return {}, stat_error
 	}
 	if !force {
 		owner, known := lock_read_owner(path)
 		switch {
 		case !known:
-			return .Owner_Unknown
+			return .Owner_Unknown, nil
 		case owner.host != lock_this_host():
-			return .Owner_Elsewhere
+			return .Owner_Elsewhere, nil
 		case lock_owner_running(owner):
-			return .Owner_Running
+			return .Owner_Running, nil
 		}
 	}
-	os.remove(lock_path)
-	return .Removed
+	if remove_error := os.remove(lock_path); remove_error != nil {
+		return {}, remove_error
+	}
+	return .Removed, nil
 }
 
-// Creates the exclusive `LOCK` file, recording this process as its owner. A
-// second process on the same store fails with a message naming the owner and
-// whether it still runs; `store_unlock` removes a lock whose owner is gone.
+// Holds the OS guard and creates LOCK exclusively, recording this process as
+// its owner. Existing metadata still requires explicit recovery, including
+// locks left by older writers that did not acquire the guard.
 @(private)
 store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
 	if directory_error := os.make_directory_all(path, os.Permissions_Default); directory_error != nil {
@@ -576,6 +597,16 @@ store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
 			return false
 		}
 	}
+	guard, busy, guard_error := lock_guard_acquire(path)
+	if guard_error != nil {
+		store.last_error = fmt.aprintf("cannot acquire store lock: %s", os.error_string(guard_error), allocator = store.allocator)
+		return false
+	}
+	if busy {
+		store.last_error = "store is locked by an active writer or recovery operation"
+		return false
+	}
+	store.lock_guard = guard
 	lock_path, join_error := filepath.join(
 		[]string{path, "LOCK"},
 		store.allocator,
@@ -608,11 +639,15 @@ store_lock_acquire :: proc(store: ^Store, path: string) -> bool {
 		delete(lock_path, store.allocator)
 		return false
 	}
-	owner_text := fmt.tprintf("pid %d\nhost %s\n", os.get_pid(), lock_this_host())
-	os.write(file, transmute([]u8)owner_text)
-	os.close(file)
+	defer os.close(file)
 	store.lock_path = lock_path
 	store.lock_acquired = true
+	owner_text := fmt.tprintf("pid %d\nhost %s\n", os.get_pid(), lock_this_host())
+	written, write_error := os.write(file, transmute([]u8)owner_text)
+	if write_error != nil || written != len(owner_text) {
+		store.last_error = "cannot record store lock owner"
+		return false
+	}
 	return true
 }
 
@@ -625,6 +660,10 @@ store_lock_release :: proc(store: ^Store) {
 	if store.lock_path != "" {
 		delete(store.lock_path, store.allocator)
 		store.lock_path = ""
+	}
+	if store.lock_guard != nil {
+		os.close(store.lock_guard)
+		store.lock_guard = nil
 	}
 }
 

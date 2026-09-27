@@ -501,6 +501,16 @@ run_bycycle_lock_checks() {
   else
     problem "integration:bycycle-unlock-force: an ownerless lock needs --force, and --force removes it"
   fi
+  # A failed unlink must be a CLI failure, including when run as root.
+  mkdir "${store}/LOCK"
+  : > "${store}/LOCK/child"
+  if out="$(FILEIN_BIN="${filein}" scripts/bycycle-load.sh unlock "${store}" --force 2>&1)"; then
+    problem "integration:bycycle-unlock-error: failed removal reported success"
+  elif [[ "${out}" != *"cannot unlock"* || ! -e "${store}/LOCK/child" ]]; then
+    problem "integration:bycycle-unlock-error: missing error or damaged lock: ${out}"
+  else
+    pass "integration:bycycle-unlock-error"
+  fi
 }
 
 run_integration() {
