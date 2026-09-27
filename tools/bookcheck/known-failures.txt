@@ -1,0 +1,38 @@
+# Book examples omica does not pass yet, as path:line relative to mdbook/src.
+# tools/bookcheck fails when an example outside this list fails, and when a
+# listed example starts passing, so remove an entry in the change that fixes it.
+language/builtins.md:140
+language/control-flow.md:116
+language/control-flow.md:230
+language/errors-and-recovery.md:30
+language/errors-and-recovery.md:94
+language/errors-and-recovery.md:141
+language/operators-and-calls.md:73
+language/relations.md:196
+language/rules.md:69
+language/structural-relation-types.md:7
+language/structural-relation-types.md:23
+language/structural-relation-types.md:37
+language/structural-relation-types.md:59
+language/structural-relation-types.md:74
+language/structural-relation-types.md:96
+language/syntax.md:50
+language/syntax.md:94
+language/syntax.md:188
+language/value-kind-annotations.md:7
+language/value-kind-annotations.md:64
+language/value-kind-annotations.md:82
+language/value-kind-annotations.md:109
+language/value-kind-annotations.md:131
+language/value-kind-annotations.md:199
+language/values.md:98
+language/values.md:132
+language/values.md:145
+language/values.md:167
+language/values.md:177
+language/values.md:308
+language/verbs-roles-dispatch.md:122
+language/verbs-roles-dispatch.md:177
+runtime/catalogue-and-introspection.md:78
+runtime/catalogue-and-introspection.md:120
+tutorial/behaviour.md:82

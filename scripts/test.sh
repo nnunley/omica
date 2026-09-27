@@ -46,7 +46,7 @@ if [[ ! -f "${repo_root}/vendor/micromeasure/micromeasure-odin/micromeasure.odin
   exit 1
 fi
 
-packages=(vendor/micromeasure/micromeasure-odin mica/var mica/buffer mica/kernel mica/kernel/accel mica/vm mica/compiler mica/runtime mica/external mica/dom mica/cycl mica/store host/source host/web)
+packages=(vendor/micromeasure/micromeasure-odin mica/var mica/buffer mica/kernel mica/kernel/accel mica/vm mica/compiler mica/runtime mica/external mica/dom mica/cycl mica/store host/source host/web tools/bookcheck)
 bin_dir="${repo_root}/.cache/test-bin"
 log_dir="${repo_root}/.cache/test-logs"
 strict_leaks="${STRICT_LEAKS:-0}"
@@ -270,7 +270,7 @@ run_tsan() {
 build_tools() {
   note "build tools"
   local tool
-  for tool in filein repl webhost parse_corpus owlstream cycl-load cycl-load-sample cycl-parse-test; do
+  for tool in filein repl webhost parse_corpus owlstream cycl-load cycl-load-sample cycl-parse-test bookcheck; do
     if run_timeout "${test_timeout}" "${odin_bin}" build "tools/${tool}" \
       -out:"${bin_dir}/${tool}"; then
       pass "build:${tool}"
@@ -510,6 +510,15 @@ run_integration() {
   local tmp
   tmp="$(mktemp -d)"
   cleanup_paths+=("${tmp}")
+
+  # The book's Mica examples: every block parses, and eval/filein blocks run
+  # to completion. Known failures are listed and may only shrink.
+  if capture "${tmp}/bookcheck.log" "${test_timeout}" "${bin_dir}/bookcheck" \
+    --known tools/bookcheck/known-failures.txt mdbook/src; then
+    pass "integration:bookcheck"
+  else
+    problem "integration:bookcheck: $(grep -E '^(FAIL|STALE)|bookcheck:' "${tmp}/bookcheck.log" | head -5)"
+  fi
 
   # filein: load and query a checkpointed store.
   if run_timeout "${test_timeout}" "${filein}" --store "${tmp}/db" --unit equipment \
