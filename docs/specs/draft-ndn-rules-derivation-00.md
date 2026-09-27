@@ -45,50 +45,76 @@ when, and only when, they appear in all capitals, as shown here.
 
 ### Rule Validation at Installation
 
-The system MUST reject any rule at installation time if it violates safety constraints. [R-install-time-safety]
+The system MUST reject any rule that violates safety constraints when the rule is installed, before any read, by raising `E_RULE` in the installing task. (`E_RULE` is a proposed code; the book says such rules are rejected but names no error.) [R-install-time-safety]
 
-```transcript @R-install-time-safety
-$ make_identity :alice
-$ make_relation :Person 1
-$ make_relation :Out 1
-$ assert Person(#alice)
-$ Out(?x) :- Person(#alice)
-ERROR: rule install failed: Unbound_Head_Variable
+```mica mode=eval @R-install-time-safety
+make_relation(:Person, 1)
+make_relation(:Out, 1)
+assert Person(:alice)
+Out(x) :- Person(:alice)
+return Out(?x)
+```
+
+```expect-error
+E_RULE
 ```
 
 The system MUST reject a rule if any variable appears in its head but is not bound by any body atom. [R-unbound-head-reject]
 
-```transcript @R-unbound-head-reject
-$ Out(?x) :- Person(#alice)
-ERROR: rule install failed: Unbound_Head_Variable
+```mica mode=eval @R-unbound-head-reject
+make_relation(:Person, 1)
+make_relation(:Named, 2)
+Named(x, y) :- Person(x)
+return Named(?x, ?y)
+```
+
+```expect-error
+E_RULE
 ```
 
 The system MUST reject a rule if a negated atom contains an unbound variable or if a comparison guard references an unbound operand. [R-unsafe-negation-guard]
 
-```transcript @R-unsafe-negation-guard
-$ make_relation :P 1
-$ make_relation :Q 1
-$ Q(?x) :- not P(?y)
-ERROR: rule install failed: Unsafe_Negation
+```mica mode=eval @R-unsafe-negation-guard
+make_relation(:Item, 1)
+make_relation(:Reserved, 1)
+make_relation(:Free, 1)
+Free(y) :- Item(y), not Reserved(x)
+return Free(?y)
+```
+
+```expect-error
+E_RULE
 ```
 
 The system MUST reject a rule set if negation over a relation R would create a cycle in the rule dependency graph (stratification failure). [R-stratification]
 
-```transcript @R-stratification
-$ make_relation :P 1
-$ make_relation :Q 1
-$ P(?x) :- Q(?x)
-$ Q(?x) :- not P(?x)
-ERROR: rule install failed: Unstratified_Negation
+```mica mode=eval @R-stratification
+make_relation(:P, 1)
+make_relation(:Q, 1)
+P(x) :- Q(x)
+Q(x) :- P(x), not P(x)
+return P(?x)
+```
+
+```expect-error
+E_RULE
 ```
 
 
 **Holes in rule bodies.** Each `_` in a positive body atom MUST act as its own anonymous variable, matching any value independently of every other `_`. [R-rule-body-hole]
 
-<!-- evidence: @R-rule-body-hole -->
-| Rule, over `R(#a, 1, 2)` and `R(#b, 3, 3)` | omica | Rust 2bbceb0 |
-|---|---|---|
-| `P(?x) :- R(?x, _, _)`, then `P(?x)` | `{[#a], [#b]}` | rejected at parse: holes are not valid here |
+```mica mode=eval @R-rule-body-hole
+make_relation(:R, 3)
+make_relation(:P, 1)
+assert R(:a, 1, 2)
+assert R(:b, 3, 3)
+P(x) :- R(x, _, _)
+return P(?x)
+```
+
+```expect
+[:x] {[:a], [:b]}
+```
 
 ### Rule Installation and Lifecycle
 
@@ -96,83 +122,117 @@ When a rule is installed, the system MUST atomically publish a new snapshot cont
 
 Validate, acquire lock, fork snapshot, add rule, compute relations, CAS new snapshot as current. Readers at earlier snapshots continue uninterrupted.
 
-```transcript @R-atomic-install
-$ make_identity :a :b
-$ make_relation :E 2
-$ make_relation :P 2
-$ assert E(#a, #b)
-$ P(?x, ?y) :- E(?x, ?y)
-loaded
-$ return P(?x, ?y)
-[:x, :y] {[#a, #b]}
+```mica mode=eval @R-atomic-install
+make_relation(:E, 2)
+make_relation(:P, 2)
+assert E(:a, :b)
+P(x, y) :- E(x, y)
+return P(?x, ?y)
 ```
 
-A disabled rule can later be re-enabled, triggering the same atomic recomputation. [R-enable-disable-retrigger]
-
-```transcript @R-enable-disable-retrigger
-$ disable_rule
-$ return P(?x, ?y)
-[:x, :y] {}
-$ enable_rule
-$ return P(?x, ?y)
-[:x, :y] {[#a, #b]}
+```expect
+[:x, :y] {[:a, :b]}
 ```
 
-The system MUST support disabling a rule (setting its active flag to false) without removing it from the catalog. [R-disable-without-removal]
+A disabled rule MUST be able to be enabled again with `enable_rule(rule)`, restoring its derivations atomically. (`enable_rule` is proposed; the book defines only `disable_rule`.) [R-enable-disable-retrigger]
+
+```mica mode=eval @R-enable-disable-retrigger
+make_relation(:E, 2)
+make_relation(:P, 2)
+assert E(:a, :b)
+P(x, y) :- E(x, y)
+let exactly {p} = RelationName(?p, :P)
+let exactly {rule} = RuleHead(?rule, p)
+disable_rule(rule)
+commit()
+require P(?x, ?y) == [:x, :y] {}
+enable_rule(rule)
+commit()
+return P(?x, ?y)
+```
+
+```expect
+[:x, :y] {[:a, :b]}
+```
+
+The system MUST support disabling a rule (setting its active flag to false) without removing it from the catalog. Disabling and enabling take effect when the task commits; before that, the task's reads MUST NOT mix the old and new state (omica today reports `ActiveRule` as false while still deriving from the rule; Rust mica shows both unchanged until commit). [R-disable-without-removal]
 
 Disabled rule facts are removed; rule definition persists.
 
-```transcript @R-disable-without-removal
-$ make_relation :Active 1
-$ make_relation :P 1
-$ P(?x) :- Active(?x)
-$ assert Active(#a)
-$ return P(?x)
-[:x] {[#a]}
-$ disable_rule
-$ return P(?x)
-[:x] {}
-$ enable_rule
-$ return P(?x)
-[:x] {[#a]}
+```mica mode=eval @R-disable-without-removal
+make_relation(:Active, 1)
+make_relation(:P, 1)
+assert Active(:a)
+P(x) :- Active(x)
+let exactly {p} = RelationName(?p, :P)
+let exactly {rule} = RuleHead(?rule, p)
+disable_rule(rule)
+commit()
+require RuleHead(rule, p)
+require P(?x) == [:x] {}
+return ActiveRule(rule, ?active)
+```
+
+```expect
+[:active] {[false]}
 ```
 
 Facts derived only through disabled rules MUST no longer appear; facts still derived by active rules MUST remain. [R-disable-removes-facts]
 
-```transcript @R-disable-removes-facts
-$ disable_rule
-$ return P(?x, ?y)
-[:x, :y] {}
+```mica mode=eval @R-disable-removes-facts
+make_relation(:A, 1)
+make_relation(:B, 1)
+make_relation(:P, 1)
+assert A(:from_a)
+assert B(:from_b)
+P(x) :- A(x)
+P(x) :- B(x)
+let exactly {p} = RelationName(?p, :P)
+let exactly {rule} = natural_join(RuleHead(?rule, p), RuleSource(?rule, "P(x) :- A(x)"))
+disable_rule(rule)
+commit()
+return P(?x)
+```
+
+```expect
+[:x] {[:from_b]}
 ```
 
 
 
 ### Evaluation Strategies
 
-Non-recursive rules (no cycles) evaluate in a single stratified pass. [R-stratified-eval]
+Rules MUST be evaluated in stratum order: a relation that another rule negates is complete before that negation is checked, and a later assertion can remove a conclusion. [R-stratified-eval]
 
-```transcript @R-stratified-eval
-$ make_identity :a
-$ make_relation :Base 1
-$ make_relation :Derived 1
-$ assert Base(#a)
-$ Derived(?x) :- Base(?x)
-$ return Derived(?x)
-[:x] {[#a]}
+```mica mode=eval @R-stratified-eval
+make_relation(:Base, 1)
+make_relation(:Derived, 1)
+make_relation(:Missing, 1)
+assert Base(:a)
+assert Base(:b)
+Derived(x) :- Base(x), not Missing(x)
+assert Missing(:b)
+return Derived(?x)
 ```
 
-Recursive rules use semi-naive evaluation: seed phase (evaluate non-recursive rules), delta phases (re-evaluate affected rules with deltas until convergence). [R-semi-naive]
+```expect
+[:x] {[:a]}
+```
 
-```transcript @R-semi-naive
-$ make_relation :E 2
-$ make_relation :P 2
-$ assert E(#a, #b)
-$ assert E(#b, #c)
-$ P(?x, ?y) :- E(?x, ?y)
-$ P(?x, ?z) :- E(?x, ?y), P(?y, ?z)
-loaded
-$ return P(?x, ?y)
-[:x, :y] {[#a, #b], [#a, #c], [#b, #c]}
+Recursive rules MUST yield their least fixpoint; how an engine reaches it (semi-naive iteration, incremental maintenance, tabling) is its choice (draft-ndn-demand-evaluation-00). [R-semi-naive]
+
+```mica mode=eval @R-semi-naive
+make_relation(:E, 2)
+make_relation(:P, 2)
+assert E(:a, :b)
+assert E(:b, :c)
+P(x, y) :- E(x, y)
+P(x, z) :- E(x, y), P(y, z)
+return P(?x, ?y)
+```
+
+```expect
+[:x, :y] {[:a, :b], [:a, :c], [:b, :c]}
 ```
 
 
@@ -182,28 +242,33 @@ Every reader (query, transaction, rule evaluation) MUST see a consistent union o
 
 No duplicates; no partial derivation states visible.
 
-```transcript @R-consistent-union
-$ make_identity :a
-$ make_relation :Base 1
-$ make_relation :Der 1
-$ Base(?x) :- true
-$ Der(?x) :- Base(?x)
-$ assert Base(#a)
-$ return [Base(?x), Der(?x)]
-[[:x] {[#a]}, [:x] {[#a]}]
+```mica mode=eval @R-consistent-union
+make_relation(:Base, 1)
+make_relation(:Der, 1)
+assert Base(:a)
+Der(x) :- Base(x)
+assert Base(:b)
+return [Base(?x), Der(?x)]
 ```
 
-When a transaction reads a derived relation after writing to relations that the rule depends on, the system MUST evaluate the rule against the transaction's combined view (base snapshot plus transaction writes). Results are cached within the transaction; subsequent writes invalidate and re-evaluate. [R-txn-read-derived]
+```expect
+[[:x] {[:a], [:b]}, [:x] {[:a], [:b]}]
+```
 
-```transcript @R-txn-read-derived
-$ make_relation :R 1
-$ make_relation :D 1
-$ D(?x) :- R(?x)
-$ begin_txn
-$ assert R(#a)
-$ return D(?x)
-[:x] {[#a]}
-$ end_txn
+When a task reads a derived relation after writing to relations its rules depend on, the system MUST answer from the task's combined view (base snapshot plus its writes), and a later write in the same task MUST be reflected in the next read. [R-txn-read-derived]
+
+```mica mode=eval @R-txn-read-derived
+make_relation(:R, 1)
+make_relation(:D, 1)
+D(x) :- R(x)
+assert R(:a)
+require D(?x) == [:x] {[:a]}
+assert R(:b)
+return D(?x)
+```
+
+```expect
+[:x] {[:a], [:b]}
 ```
 
 
@@ -281,7 +346,7 @@ Mica is a live database. Every world starts fresh; rules are installed live with
 | Behavior | Rust | omica today | This RFC | Class |
 |----------|------|-------------|----------|-------|
 | Unbound head variable validation | Lazy: install succeeds, first read fails with `UnboundHeadVariable` error | Eager: install fails with `Unbound_Head_Variable` error | Eager validation at install time (Rust behavior changes to match omica) | Improvement |
-| `_` holes in positive rule bodies | Rejected at parse | Independent anonymous variables | omica behavior (differential run D-020) | Improvement |
+| `_` holes in positive rule bodies | rejected at parse at 2bbceb0; independent anonymous variables at a433170 | independent anonymous variables | independent anonymous variables | Parity (at a433170) |
 | Stratification validation | At install time, rejects unstratified rules | At install time, rejects unstratified rules | At install time (no change) | Parity |
 | Negation and guard safety (unbound terms) | Unsafe negation installs, then the first read fails with `E_DB UnsafeNegation`; a comparison on a query variable is rejected at parse | Rejected at install: `Unsafe_Negation`, `Unsafe_Guard` | Rejected at install ([R-unsafe-negation-guard]) | Improvement (differential run D-022) |
 | Guard safety check (unbound operands) | At evaluation time, fails | At evaluation time, fails | At evaluation time (no change) | Parity |
@@ -295,5 +360,8 @@ Mica is a live database. Every world starts fresh; rules are installed live with
 | Rule enable/disable | Supported; recomputes derived relations | Supported; recomputes derived relations | Supported (no change) | Parity |
 | Evaluation strategy | lazy differential maintenance after first read | full recompute per commit | undeclared; any strategy, same answer (draft-ndn-demand-evaluation-00) | Parity (answers) |
 | Cache invalidation strategy | Explicit on rule install | Implicit (no persistent cache) | Not specified; implementations may vary | Implementation-defined |
+| Rejection error code (`E_RULE`, proposed) | unsafe rules fail on first read with `E_DB` | rejected at load with a message, no code | raised in the installing task | **spec**: the book says rejected but names no code |
+| `enable_rule` (proposed) | only `disable_rule` | has `enable_rule` | defined | **spec**: the book defines only `disable_rule` |
+| Rule toggles before commit | both `ActiveRule` and answers unchanged until commit | `ActiveRule` changes, answers do not | no mixed state before commit | **omica**: reads disagree within the task |
 
 
