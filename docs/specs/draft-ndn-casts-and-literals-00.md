@@ -241,6 +241,9 @@ and joins.
 ## References
 
 - R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- H. G. Baker, "Equal Rights for Functional Objects or, The More Things Change, The More They Are the Same," 1993: one equality for immutable values.
+- C. J. Date and H. Darwen, The Third Manifesto, 3rd ed., 2006: equality within a type, no implicit coercion.
+- C. J. Date, SQL and Relational Theory, O'Reilly, 2009: implicit conversion as a source of error in SQL.
 - `mdbook/src/language/values.md` — numeric kinds, conversion functions, escapes.
 - draft-ndn-mica-snippets-00 — the `mica` evidence and `expect` rules used here.
 - rdaum/omica#127 — the book harness; the book's cast examples are listed as known failures until an implementation supports them.
