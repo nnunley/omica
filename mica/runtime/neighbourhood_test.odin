@@ -4,6 +4,7 @@ package mica_runtime
 
 import "core:os"
 import "core:testing"
+import "base:runtime"
 import k "../kernel"
 
 @(test)
@@ -39,7 +40,7 @@ assert Done(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Done", 1)
 }
@@ -90,7 +91,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
