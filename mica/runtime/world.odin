@@ -11,8 +11,10 @@ import k "../kernel"
 import s "../store"
 import v "../var"
 import vm "../vm"
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
+import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -124,6 +126,11 @@ World :: struct {
 
 // Loads a world and starts its scheduler. The entry task is submitted but not
 // awaited; use `world_wait(world, world.entry)`.
+//
+// `allocator` must be thread-safe: the world's scheduler threads, tasks and
+// mailboxes allocate from it concurrently. The process heap is. An arena, a
+// temporary allocator or a test runner's rollback stack is not, and is
+// refused.
 world_start :: proc(
 	kernel: ^k.Kernel,
 	paths: []string,
@@ -133,6 +140,12 @@ world_start :: proc(
 	^World,
 	Run_Result,
 ) {
+	if !allocator_is_thread_safe(allocator) {
+		return nil, Run_Result {
+			ok = false,
+			message = "the world allocator must be thread-safe (use the process heap, not an arena or temporary allocator)",
+		}
+	}
 	if installed := world_install_accel(config.accel, config.accel_workers); !installed.ok {
 		return nil, installed
 	}
@@ -403,17 +416,20 @@ world_eval_submit :: proc(
 	program_ast := c.Program_AST {
 		items = items[:],
 	}
-	compiled := c.compile_program(&program_ast, &world.ctx, allocator)
+	// The scheduler owns the task and its program and frees both with the
+	// world's allocator, so both come from it; `allocator` holds only the
+	// parse, which compilation copies.
+	compiled := c.compile_program(&program_ast, &world.ctx, world.allocator)
 	if len(compiled.errors) > 0 {
 		return 0, Task_Outcome{kind = .Aborted, message = compiled.errors[0].message}, false
 	}
-	task := new(Task, allocator)
-	task_init(task, 0, world.kernel, compiled.program, &world.env, allocator)
+	task := new(Task, world.allocator)
+	task_init(task, 0, world.kernel, compiled.program, &world.env, world.allocator)
 	id := scheduler_submit_owned(&world.scheduler, task)
 	if id == 0 {
 		task_destroy(task)
-		free(task, allocator)
-		vm.program_destroy(compiled.program, allocator)
+		free(task, world.allocator)
+		vm.program_destroy(compiled.program, world.allocator)
 		return 0, Task_Outcome{kind = .Aborted, message = "cannot submit eval task"}, false
 	}
 	return id, {}, true
@@ -1158,4 +1174,18 @@ max_stored_identity :: proc(kernel: ^k.Kernel) -> u64 {
 		}
 	}
 	return maximum
+}
+
+// Reports false for allocators known to be unsafe to share between threads.
+// Unknown allocators are trusted, since a host may wrap its own.
+@(private)
+allocator_is_thread_safe :: proc(allocator: mem.Allocator) -> bool {
+	switch allocator.procedure {
+	case mem.rollback_stack_allocator_proc,
+	     mem.arena_allocator_proc,
+	     virtual.arena_allocator_proc,
+	     runtime.default_temp_allocator_proc:
+		return false
+	}
+	return true
 }

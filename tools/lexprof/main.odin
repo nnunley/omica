@@ -54,7 +54,7 @@ main :: proc() {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := r.world_start(&kernel, []string{lexer_path}, context.temp_allocator)
+	world, start := r.world_start(&kernel, []string{lexer_path}, context.allocator)
 	if !start.ok {
 		fmt.eprintln("load failed:", start.message)
 		os.exit(1)

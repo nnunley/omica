@@ -12,6 +12,7 @@
 // worker thread; the world joins tracked streams before it is torn down.
 package mica_runtime
 
+import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:sync"
@@ -56,6 +57,10 @@ External_Stream :: struct {
 
 @(private)
 external_worker_proc :: proc(data: rawptr) {
+	// Implicit allocations on this thread use the process heap, never the
+	// creating thread's context allocator, which need not be thread-safe (a
+	// test runner's or an arena). World threads allocate concurrently.
+	context.allocator = runtime.heap_allocator()
 	// A private temporary scratch arena, like a scheduler worker. Handlers may
 	// use `context.temp_allocator` for short-lived strings; it is reset after
 	// every request.
@@ -87,6 +92,10 @@ external_worker_proc :: proc(data: rawptr) {
 
 @(private)
 external_stream_proc :: proc(data: rawptr) {
+	// Implicit allocations on this thread use the process heap, never the
+	// creating thread's context allocator, which need not be thread-safe (a
+	// test runner's or an arena). World threads allocate concurrently.
+	context.allocator = runtime.heap_allocator()
 	// Stream workers get their own scratch arena too; it lives for the stream
 	// and is released when the worker returns.
 	temp_arena: virtual.Arena

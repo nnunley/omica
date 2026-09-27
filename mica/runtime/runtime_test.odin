@@ -1,5 +1,6 @@
 package mica_runtime
 
+import "base:runtime"
 import c "../compiler"
 import k "../kernel"
 import s "../store"
@@ -62,7 +63,7 @@ test_run_capabilities_filein :: proc(t: ^testing.T) {
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_filein(&kernel, path, context.temp_allocator)
+	result := run_filein(&kernel, path, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 
 	expect_relation_rows(t, &kernel, "Delegates", 3)
@@ -427,7 +428,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 
 	expect_relation_rows(t, &kernel, "Taken", 1)
@@ -457,7 +458,7 @@ test_run_dispatch_without_method_fails :: proc(t: ^testing.T) {
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expect(t, !result.ok)
 }
 
@@ -498,7 +499,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{library_path, caller_path}, context.temp_allocator)
+	result := run_files(&kernel, []string{library_path, caller_path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Shared", 1)
 }
@@ -529,7 +530,7 @@ suspend()
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 
 	expect_relation_rows(t, &kernel, "Done", 1)
@@ -556,7 +557,7 @@ test_run_raise_reports_error :: proc(t: ^testing.T) {
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expect(t, !result.ok)
 	testing.expectf(
 		t,
@@ -594,7 +595,7 @@ invoke(:take, {:actor -> #alice})
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 
 	expect_relation_rows(t, &kernel, "Taken", 1)
@@ -634,7 +635,7 @@ assert Failed(classify("banana"))
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 
 	expect_relation_rows(t, &kernel, "Score", 1)
@@ -678,7 +679,7 @@ assert Markup(to_xml(dom <p class="note">hi</p>))
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 
 	expect_relation_rows(t, &kernel, "Entity", 1)
@@ -726,7 +727,7 @@ test_run_mud_app_world :: proc(t: ^testing.T) {
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, paths, context.temp_allocator)
+	result := run_files(&kernel, paths, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "mud world failed: %s", result.message)
 }
 
@@ -754,7 +755,7 @@ Parent(child, parent) :-
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 
 	widget, widget_found := k.snapshot_relation_metadata_named(
@@ -845,7 +846,7 @@ assert Matched(probe(0), 7)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Matched", 3)
 }
@@ -885,7 +886,7 @@ assert Caught(indexed())
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Caught", 2)
 }
@@ -954,7 +955,7 @@ require classify(0) == 0
 	defer k.kernel_destroy(&kernel)
 
 	// No E_ARITHMETIC arm exists, so a stray E_ARITHMETIC aborts the filein.
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
 
@@ -999,7 +1000,7 @@ require convert(3) == -1
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
 
@@ -1053,7 +1054,7 @@ require probe(0) == 0
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
 
@@ -1105,7 +1106,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Cleanup", 3)
 }
@@ -1143,7 +1144,7 @@ probe()
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expect(t, !result.ok)
 }
 
@@ -1183,7 +1184,7 @@ mailbox_close(receiver)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Got", 1)
 }
@@ -1211,7 +1212,7 @@ assert Got(first)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Got", 1)
 }
@@ -1235,7 +1236,7 @@ assert TimedOut(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "TimedOut", 1)
 }
@@ -1268,7 +1269,7 @@ assert Result(4, nested(14))
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Result", 4)
 }
@@ -1309,7 +1310,7 @@ assert Result(7, [{:f -> add}][0][:f](5))
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Result", 7)
 }
@@ -1332,7 +1333,7 @@ assert Payload(b"3q2-7w==")
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Payload", 1)
 }
@@ -1365,7 +1366,7 @@ assert Result(sum3(@xs))
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Result", 1)
 }
@@ -1402,7 +1403,7 @@ assert Out(classify([1, 2]))
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -1431,7 +1432,7 @@ assert Out(a)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -1502,7 +1503,7 @@ require(loop_return() == 2)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Cleanup", 5)
 }
@@ -1540,7 +1541,7 @@ assert Cleanup(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Cleanup", 1)
 }
@@ -1585,7 +1586,7 @@ assert Out(fact(5))
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -1627,7 +1628,7 @@ assert Out(greet("z", "bonjour"))
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -1667,7 +1668,7 @@ assert Taken(#alice, #coin)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Taken", 2)
 }
@@ -1715,7 +1716,7 @@ require(pick("plain", #alice) == :any)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
 
@@ -1763,7 +1764,7 @@ require(nested() == 5)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Ran", 2)
 }
@@ -1791,7 +1792,7 @@ assert Out(conf(1))
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -1819,7 +1820,7 @@ suspend()
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -1849,7 +1850,7 @@ assert Out(#bob:act())
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -1893,7 +1894,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -1962,7 +1963,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -2006,7 +2007,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -2062,7 +2063,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -2127,7 +2128,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -2247,7 +2248,7 @@ require(len(mailbox_recv([receiver], 2000)) == 1)
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -2296,7 +2297,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 3)
 }
@@ -2333,7 +2334,7 @@ require(len(remaining) == 0)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Note", 4)
 }
@@ -2374,7 +2375,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "CloseFailed", 1)
 }
@@ -2417,7 +2418,7 @@ assert Seen(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Seen", 1)
 }
@@ -2450,7 +2451,7 @@ assert Seen(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Seen", 1)
 }
@@ -2496,7 +2497,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -2557,7 +2558,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -2603,7 +2604,7 @@ assert Out(decoded)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 3)
 }
@@ -2644,7 +2645,7 @@ assert Out(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -2710,7 +2711,7 @@ assert Out(2)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -2756,7 +2757,7 @@ assert Out(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -2800,7 +2801,7 @@ assert Out(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -2841,7 +2842,7 @@ assert Out(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -2874,7 +2875,7 @@ assert Out(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -2905,7 +2906,7 @@ end
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -2979,7 +2980,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -3033,7 +3034,7 @@ probe()
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 7)
 }
@@ -3087,7 +3088,7 @@ require len(natural_join(people, Color(?color))) == 6
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
 
@@ -3120,7 +3121,7 @@ assert Caught(probe())
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Caught", 1)
 }
@@ -3177,7 +3178,7 @@ require deep_path[1] == 1
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
 
@@ -3209,7 +3210,7 @@ assert Caught(probe())
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Caught", 1)
 }
@@ -3245,7 +3246,7 @@ require len(rules(:DependsOn)) == 1
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
 
@@ -3290,7 +3291,7 @@ assert Caught(probe())
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Caught", 1)
 }
@@ -3336,7 +3337,7 @@ assert Caught(probe())
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Caught", 1)
 }
@@ -3375,7 +3376,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -3445,7 +3446,7 @@ require !LocatedIn(#thing, #room)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Destroyed", 1)
 	expect_relation_rows(t, &kernel, "Object", 1)
@@ -3495,7 +3496,7 @@ require fileout_rules(:DependsOn) == ""
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
 
@@ -3529,7 +3530,7 @@ assert Caught(probe())
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{unit = "example"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -3575,7 +3576,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -3679,7 +3680,7 @@ assert Marker(#alice, :seed)
 		world, start := world_start(
 			&kernel,
 			[]string{path},
-			context.temp_allocator,
+			runtime.heap_allocator(),
 			World_Config{store_path = store_path},
 		)
 		testing.expectf(t, start.ok, "load failed: %s", start.message)
@@ -3706,7 +3707,7 @@ assert Marker(#alice, :seed)
 	world, start := world_start(
 		&kernel,
 		nil,
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config{store_path = store_path},
 	)
 	testing.expectf(t, start.ok, "boot failed: %s", start.message)
@@ -3778,7 +3779,7 @@ assert Marker(#alice, :seed)
 	world, start := world_start(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config{store_path = store_path},
 	)
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
@@ -3866,7 +3867,7 @@ assert Marker(#alice, :seed)
 		world, start := world_start(
 			&kernel,
 			[]string{path},
-			context.temp_allocator,
+			runtime.heap_allocator(),
 			World_Config{store_path = store_path},
 		)
 		testing.expectf(t, start.ok, "load failed: %s", start.message)
@@ -3910,7 +3911,7 @@ assert Marker(#alice, :seed)
 	world, start := world_start(
 		&kernel,
 		nil,
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config{store_path = store_path},
 	)
 	testing.expectf(t, start.ok, "boot failed: %s", start.message)
@@ -4062,7 +4063,7 @@ boot_equivalence_load :: proc(t: ^testing.T, path, store_path: string, strip: bo
 	world, start := world_start(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config{store_path = store_path},
 	)
 	if !start.ok {
@@ -4100,7 +4101,7 @@ boot_equivalence_boot :: proc(t: ^testing.T, store_path: string) -> ([3]v.Value,
 	world, start := world_start(
 		&kernel,
 		nil,
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config{store_path = store_path},
 	)
 	if !start.ok {
@@ -4155,7 +4156,7 @@ end
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -4245,7 +4246,7 @@ end
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -4319,7 +4320,7 @@ assert Result(16, [row[:k] for row in __relation_literal([:k], [[1], [2]])] == [
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{library, path}, context.temp_allocator)
+	result := run_files(&kernel, []string{library, path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Result", 16)
 }
@@ -4363,7 +4364,7 @@ end
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -4401,7 +4402,7 @@ test_mica_emitter_matches_odin :: proc(t: ^testing.T) {
 	world, start := world_start(
 		&kernel,
 		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 	)
 	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
 	if !start.ok {
@@ -4611,7 +4612,7 @@ test_mica_emitter_relation_write :: proc(t: ^testing.T) {
 			"apps/compiler/emit.mica",
 			declaration_path,
 		},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 	)
 	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
 	if !start.ok {
@@ -4725,7 +4726,7 @@ assert Point(2, 20)
 			"apps/compiler/emit.mica",
 			declaration_path,
 		},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 	)
 	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
 	if !start.ok {
@@ -4812,7 +4813,7 @@ test_mica_emitter_rejects_const_assignment :: proc(t: ^testing.T) {
 	world, start := world_start(
 		&kernel,
 		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 	)
 	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
 	if !start.ok {
@@ -4879,7 +4880,7 @@ test_mica_emitter_compiles_compiler :: proc(t: ^testing.T) {
 	world, start := world_start(
 		&kernel,
 		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 	)
 	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
 	if !start.ok {
@@ -5078,7 +5079,7 @@ app_conformance_emit :: proc(
 	world, start := world_start(
 		&kernel,
 		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 	)
 	if !start.ok {
 		return nil, false
@@ -5146,7 +5147,7 @@ app_conformance_run :: proc(
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, paths, context.temp_allocator, HARNESS_CONFIG)
+	world, start := world_start(&kernel, paths, runtime.heap_allocator(), HARNESS_CONFIG)
 	if !start.ok {
 		return v.Value(0), false
 	}
@@ -5156,7 +5157,7 @@ app_conformance_run :: proc(
 		return v.Value(0), false
 	}
 	if artifact != nil {
-		program, decode_error := vm.program_from_bytes(artifact, alloc)
+		program, decode_error := vm.program_from_bytes(artifact, world.allocator)
 		if decode_error != .None {
 			return v.Value(0), false
 		}
@@ -5213,7 +5214,7 @@ test_mica_emitter_execution_conformance :: proc(t: ^testing.T) {
 	world, start := world_start(
 		&kernel,
 		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 	)
 	testing.expectf(t, start.ok, "compiler load failed: %s", start.message)
 	if !start.ok {
@@ -5332,7 +5333,7 @@ end
 		world, start := world_start(
 			&kernel,
 			[]string{path},
-			context.temp_allocator,
+			runtime.heap_allocator(),
 			World_Config{instruction_budget = HARNESS_INSTRUCTION_BUDGET, time_limit = limit},
 		)
 		testing.expectf(t, start.ok, "world start failed: %s", start.message)
@@ -5380,7 +5381,7 @@ conformance_run :: proc(
 	defer k.kernel_destroy(&kernel)
 	// Budget the file under test so a mis-emitted loop fails here instead of
 	// hanging the suite. The compiler world in the caller is left unlimited.
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator, HARNESS_CONFIG)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator(), HARNESS_CONFIG)
 	if !start.ok {
 		return v.Value(0), false
 	}
@@ -5390,7 +5391,7 @@ conformance_run :: proc(
 		return v.Value(0), false
 	}
 	if artifact != nil {
-		program, decode_error := vm.program_from_bytes(artifact, alloc)
+		program, decode_error := vm.program_from_bytes(artifact, world.allocator)
 		if decode_error != .None {
 			return v.Value(0), false
 		}
@@ -5525,7 +5526,7 @@ compiler_emit :: proc(
 	world, start := world_start(
 		&kernel,
 		[]string{"apps/compiler/lex.mica", "apps/compiler/parse.mica", "apps/compiler/emit.mica"},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 	)
 	if !start.ok {
 		testing.expectf(t, false, "compiler load failed: %s", start.message)
@@ -5537,7 +5538,7 @@ compiler_emit :: proc(
 		return nil, false
 	}
 	if replace != nil {
-		program, decode_error := vm.program_from_bytes(replace, alloc)
+		program, decode_error := vm.program_from_bytes(replace, world.allocator)
 		if decode_error != .None {
 			return nil, false
 		}
@@ -5597,7 +5598,7 @@ run_target :: proc(
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator, HARNESS_CONFIG)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator(), HARNESS_CONFIG)
 	if !start.ok {
 		testing.expectf(t, false, "target load failed: %s", start.message)
 		return v.Value(0), false
@@ -5607,7 +5608,7 @@ run_target :: proc(
 	if entry.kind != .Complete {
 		return v.Value(0), false
 	}
-	program, decode_error := vm.program_from_bytes(artifact, alloc)
+	program, decode_error := vm.program_from_bytes(artifact, world.allocator)
 	if decode_error != .None {
 		return v.Value(0), false
 	}
@@ -5658,7 +5659,7 @@ assert Kept(1)
 		world, start := world_start(
 			&kernel,
 			[]string{path},
-			context.temp_allocator,
+			runtime.heap_allocator(),
 			World_Config{store_path = store_path},
 		)
 		testing.expectf(t, start.ok, "load failed: %s", start.message)
@@ -5676,7 +5677,7 @@ assert Kept(1)
 	world, start := world_start(
 		&kernel,
 		nil,
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config{store_path = store_path},
 	)
 	testing.expectf(t, start.ok, "boot failed: %s", start.message)
@@ -5721,7 +5722,7 @@ assert Out(guarded(), projected())
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -5758,7 +5759,7 @@ require project([:person, :team] {}) == [] {}
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 }
 
@@ -5783,7 +5784,7 @@ assert Loaded(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -5814,7 +5815,7 @@ end
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, []string{path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
 	if !start.ok {
 		return
@@ -5927,7 +5928,7 @@ test_read_only_store_boot_has_no_pending_writes :: proc(t: ^testing.T) {
 		world, start := world_start(
 			&kernel,
 			[]string{path},
-			context.temp_allocator,
+			runtime.heap_allocator(),
 			World_Config{store_path = store_path},
 		)
 		testing.expectf(t, start.ok, "load failed: %s", start.message)
@@ -5947,7 +5948,7 @@ test_read_only_store_boot_has_no_pending_writes :: proc(t: ^testing.T) {
 		world, start := world_start(
 			&kernel,
 			nil,
-			context.temp_allocator,
+			runtime.heap_allocator(),
 			World_Config{store_path = store_path},
 		)
 		testing.expectf(t, start.ok, "boot failed: %s", start.message)
@@ -6089,7 +6090,7 @@ suspend()
 	result := run_files(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		Run_Options{actor = "alice"},
 	)
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
@@ -6148,7 +6149,7 @@ end
 	world, start := world_start(
 		&kernel,
 		[]string{path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		World_Config{actor = "alice"},
 	)
 	testing.expectf(t, start.ok, "world start failed: %s", start.message)
@@ -6217,7 +6218,7 @@ require(len(ready_two) > 0)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -6332,7 +6333,7 @@ assert Out(1)
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	result := run_files(&kernel, []string{path}, context.temp_allocator)
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
 	testing.expectf(t, result.ok, "filein failed: %s", result.message)
 	expect_relation_rows(t, &kernel, "Out", 1)
 }
@@ -6377,7 +6378,7 @@ test_mica_lexer_matches_odin :: proc(t: ^testing.T) {
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, []string{lexer_path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{lexer_path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "lexer load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -6424,7 +6425,7 @@ test_mica_lexer_matches_odin_edge_cases :: proc(t: ^testing.T) {
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, []string{lexer_path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{lexer_path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "lexer load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -6739,7 +6740,7 @@ test_mica_parser_matches_odin :: proc(t: ^testing.T) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{lexer_path, parser_path}, context.temp_allocator)
+	world, start := world_start(&kernel, []string{lexer_path, parser_path}, runtime.heap_allocator())
 	testing.expectf(t, start.ok, "parser load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -6904,19 +6905,11 @@ test_buffer_builtins_mica_scenarios :: proc(t: ^testing.T) {
 		return
 	}
 
-	arena: virtual.Arena
-	if err := virtual.arena_init_growing(&arena); err != nil {
-		testing.expect(t, false, "cannot initialize test arena")
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	alloc := virtual.arena_allocator(&arena)
-
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, []string{path}, alloc)
+	world, start := world_start(&kernel, []string{path}, runtime.heap_allocator())
 	if !start.ok {
 		testing.expectf(t, false, "buffer scenarios failed to load: %s", start.message)
 		return
@@ -7018,19 +7011,11 @@ test_editor_mica_scenarios :: proc(t: ^testing.T) {
 		}
 	}
 
-	arena: virtual.Arena
-	if err := virtual.arena_init_growing(&arena); err != nil {
-		testing.expect(t, false, "cannot initialize test arena")
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	alloc := virtual.arena_allocator(&arena)
-
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, files, alloc)
+	world, start := world_start(&kernel, files, runtime.heap_allocator())
 	if !start.ok {
 		testing.expectf(t, false, "editor scenarios failed to load: %s", start.message)
 		return
@@ -7142,19 +7127,11 @@ test_marker_builtins_mica_scenarios :: proc(t: ^testing.T) {
 		return
 	}
 
-	arena: virtual.Arena
-	if err := virtual.arena_init_growing(&arena); err != nil {
-		testing.expect(t, false, "cannot initialize test arena")
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	alloc := virtual.arena_allocator(&arena)
-
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
 
-	world, start := world_start(&kernel, []string{library, scenarios}, alloc)
+	world, start := world_start(&kernel, []string{library, scenarios}, runtime.heap_allocator())
 	if !start.ok {
 		testing.expectf(t, false, "marker scenarios failed to load: %s", start.message)
 		return
@@ -7222,7 +7199,7 @@ test_retrieval_computed_relation_scenarios :: proc(t: ^testing.T) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{library, scenarios}, alloc)
+	world, start := world_start(&kernel, []string{library, scenarios}, runtime.heap_allocator())
 	if !start.ok {
 		testing.expectf(t, false, "retrieval scenarios failed to load: %s", start.message)
 		return

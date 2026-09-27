@@ -868,7 +868,7 @@ test_example_filein_streams_against_stub :: proc(t: ^testing.T) {
 	world, start := r.world_start(
 		&kernel,
 		[]string{demo_path},
-		context.temp_allocator,
+		runtime.heap_allocator(),
 		r.World_Config {
 			workers          = 1,
 			external_handler = handle_request,
