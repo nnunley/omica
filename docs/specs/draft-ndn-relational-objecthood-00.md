@@ -292,6 +292,6 @@ Differential runs on omica 5a22a77 and Rust mica a433170.
 | R-handle-equality | meets | meets |
 | R-equivalence-claims | meets with user relations and rules; no built-in equivalence vocabulary | same |
 | R-delegation-explicit | meets: no implicit lookup; dot read on the child raises `E_KEY` | meets; dot read raises `E_CARDINALITY` (error codes differ) |
-| R-objecthood-views | the three relations exist but return no rows (the book's own example, `runtime/catalogue-and-introspection.md:120`, is a known failure) | meets: `SubjectFact` and `MentionedFact` return the facts, including `NamedIdentity` |
+| R-objecthood-views | on main the three relations return no rows; rdaum/omica#134 computes them under read authority | meets: `SubjectFact` and `MentionedFact` return the facts, including `NamedIdentity` |
 | R-claim-history | missing: the change log records commits but has no fact-origin query | missing |
 | R-unnamed-handles | missing: only `make_identity(:name)` | missing |
