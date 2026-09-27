@@ -1477,3 +1477,39 @@ test_program_validation_rejects_bad_handler_target :: proc(t: ^testing.T) {
 	program2 := builder_build(&builder2, alloc)
 	testing.expect_value(t, program_validate(program2), Program_Error.Bad_Jump)
 }
+
+// Durations for suspend, spawn delays and mailbox_recv timeouts are seconds,
+// integer or float, rounded to whole milliseconds.
+@(test)
+test_vm_duration_millis :: proc(t: ^testing.T) {
+	two, _ := v.value_int(2)
+	millis, ok := vm_duration_millis(two)
+	testing.expect(t, ok)
+	testing.expect_value(t, millis, i64(2000))
+
+	half, _ := v.value_float(0.5)
+	millis, ok = vm_duration_millis(half)
+	testing.expect(t, ok)
+	testing.expect_value(t, millis, i64(500))
+
+	quarter, _ := v.value_float(0.25)
+	millis, ok = vm_duration_millis(quarter)
+	testing.expect(t, ok)
+	testing.expect_value(t, millis, i64(250))
+
+	tiny, _ := v.value_float(0.0004)
+	millis, ok = vm_duration_millis(tiny)
+	testing.expect(t, ok)
+	testing.expect_value(t, millis, i64(0))
+
+	negative, _ := v.value_int(-1)
+	_, ok = vm_duration_millis(negative)
+	testing.expect(t, !ok)
+
+	negative_float, _ := v.value_float(-0.5)
+	_, ok = vm_duration_millis(negative_float)
+	testing.expect(t, !ok)
+
+	_, ok = vm_duration_millis(v.value_bool(true))
+	testing.expect(t, !ok)
+}

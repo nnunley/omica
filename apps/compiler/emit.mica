@@ -3311,7 +3311,7 @@ verb emit_mailbox_recv(rows, args, state)
   return [dst, state]
 end
 
-// `spawn :verb(role: value, ...) [after millis]` starts the selected verb in
+// `spawn :verb(role: value, ...) [after seconds]` starts the selected verb in
 // a new task. Arguments must be named by role, since dispatch selects the
 // method by selector and role set. Lowers to a Spawn instruction carrying a
 // dispatch spec index.

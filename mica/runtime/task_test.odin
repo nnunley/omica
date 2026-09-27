@@ -70,7 +70,7 @@ test_task_sleep_and_resume :: proc(t: ^testing.T) {
 	outcome := task_run(&task)
 	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Pending)
 	testing.expect_value(t, outcome.suspend, Task_Suspend.Sleep)
-	testing.expect_value(t, outcome.millis, i64(5))
+	testing.expect_value(t, outcome.millis, i64(5000))
 
 	outcome = task_resume(&task)
 	testing.expect_value(t, outcome.kind, Task_Outcome_Kind.Complete)

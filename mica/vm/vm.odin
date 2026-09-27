@@ -961,9 +961,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			return .Boundary
 
 		case .Sleep:
-			millis, is_int := v.value_as_int(state.registers[base + int(instr.b)])
-			if !is_int || millis < 0 {
-				vm_fail(state, "E_TYPE", "sleep duration must be a non-negative integer")
+			millis, is_duration := vm_duration_millis(state.registers[base + int(instr.b)])
+			if !is_duration {
+				vm_fail(state, "E_TYPE", "sleep duration must be a non-negative number of seconds")
 				break
 			}
 			state.pending_resume = instr.a
@@ -991,9 +991,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 		case .Spawn:
 			delay_millis := i64(0)
 			if instr.flags & 1 != 0 {
-				millis, is_int := v.value_as_int(state.registers[base + int(instr.c)])
-				if !is_int || millis < 0 {
-					vm_fail(state, "E_TYPE", "spawn delay must be a non-negative integer")
+				millis, is_duration := vm_duration_millis(state.registers[base + int(instr.c)])
+				if !is_duration {
+					vm_fail(state, "E_TYPE", "spawn delay must be a non-negative number of seconds")
 					break
 				}
 				delay_millis = millis
@@ -1019,9 +1019,9 @@ vm_run :: proc(state: ^VM) -> VM_Status {
 			}
 			timeout_millis := i64(-1)
 			if instr.flags & 1 != 0 {
-				millis, is_int := v.value_as_int(state.registers[base + int(instr.c)])
-				if !is_int || millis < 0 {
-					vm_fail(state, "E_TYPE", "mailbox_recv timeout must be a non-negative integer")
+				millis, is_duration := vm_duration_millis(state.registers[base + int(instr.c)])
+				if !is_duration {
+					vm_fail(state, "E_TYPE", "mailbox_recv timeout must be a non-negative number of seconds")
 					break
 				}
 				timeout_millis = millis
@@ -2680,4 +2680,23 @@ vm_set_error :: proc(state: ^VM, code: string, message: string) {
 @(private)
 vm_fail :: proc(state: ^VM, code: string, message: string) {
 	vm_set_error(state, code, message)
+}
+
+// Converts a duration in seconds, integer or float, to whole milliseconds,
+// rounding to the nearest. Reports false for other kinds and for negative,
+// non-finite or out-of-range durations.
+vm_duration_millis :: proc(value: v.Value) -> (i64, bool) {
+	seconds: f64
+	if n, is_int := v.value_as_int(value); is_int {
+		seconds = f64(n)
+	} else if f, is_float := v.value_as_float(value); is_float {
+		seconds = f64(f)
+	} else {
+		return 0, false
+	}
+	millis := math.round(seconds * 1000)
+	if math.is_nan(millis) || math.is_inf(millis) || millis < 0 || millis >= f64(max(i64)) {
+		return 0, false
+	}
+	return i64(millis), true
 }

@@ -121,7 +121,7 @@ test_scheduler_sleep_wakes :: proc(t: ^testing.T) {
 	defer k.kernel_destroy(&kernel)
 
 	program := compile_task_program(t, proc(builder: ^vm.Builder) {
-		delay := vm.builder_add_constant(builder, value_int_must(15))
+		delay := vm.builder_add_constant(builder, seconds_value(0.015))
 		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
 		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
 		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
@@ -229,7 +229,7 @@ test_scheduler_resume_with_value :: proc(t: ^testing.T) {
 	defer k.kernel_destroy(&kernel)
 
 	program := compile_task_program(t, proc(builder: ^vm.Builder) {
-		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		delay := vm.builder_add_constant(builder, value_int_must(60))
 		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
 		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
 		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
@@ -265,7 +265,7 @@ test_scheduler_resume_invalidates_timer :: proc(t: ^testing.T) {
 	defer k.kernel_destroy(&kernel)
 
 	program := compile_task_program(t, proc(builder: ^vm.Builder) {
-		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		delay := vm.builder_add_constant(builder, value_int_must(60))
 		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
 		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
 		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
@@ -326,7 +326,7 @@ test_scheduler_timer_fire_guards :: proc(t: ^testing.T) {
 	defer k.kernel_destroy(&kernel)
 
 	program := compile_task_program(t, proc(builder: ^vm.Builder) {
-		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		delay := vm.builder_add_constant(builder, value_int_must(60))
 		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
 		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
 		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
@@ -403,7 +403,7 @@ test_scheduler_resume_removes_mailbox_waiters :: proc(t: ^testing.T) {
 	defer k.kernel_destroy(&kernel)
 
 	program := compile_task_program(t, proc(builder: ^vm.Builder) {
-		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		delay := vm.builder_add_constant(builder, value_int_must(60))
 		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
 		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
 		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
@@ -527,7 +527,7 @@ test_scheduler_cancel_parked :: proc(t: ^testing.T) {
 	defer k.kernel_destroy(&kernel)
 
 	program := compile_task_program(t, proc(builder: ^vm.Builder) {
-		delay := vm.builder_add_constant(builder, value_int_must(60_000))
+		delay := vm.builder_add_constant(builder, value_int_must(60))
 		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
 		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
 		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
@@ -751,7 +751,7 @@ test_scheduler_multiple_timers :: proc(t: ^testing.T) {
 	defer k.kernel_destroy(&kernel)
 
 	program_a := compile_task_program(t, proc(builder: ^vm.Builder) {
-		delay := vm.builder_add_constant(builder, value_int_must(50))
+		delay := vm.builder_add_constant(builder, seconds_value(0.05))
 		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
 		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
 		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
@@ -759,7 +759,7 @@ test_scheduler_multiple_timers :: proc(t: ^testing.T) {
 		vm.builder_end_function(builder)
 	})
 	program_b := compile_task_program(t, proc(builder: ^vm.Builder) {
-		delay := vm.builder_add_constant(builder, value_int_must(100))
+		delay := vm.builder_add_constant(builder, seconds_value(0.1))
 		vm.builder_begin_function(builder, v.symbol_intern("main"), 0, 2, true)
 		vm.builder_emit(builder, .Load_Const, 0, 0, i32(delay), 0)
 		vm.builder_emit(builder, .Sleep, 0, 0, 0, 0)
@@ -872,4 +872,12 @@ test_scheduler_init_fails_cleanly_without_timer :: proc(t: ^testing.T) {
 	testing.expect(t, !scheduler.started)
 	testing.expect_value(t, len(scheduler.threads), 0)
 	scheduler_destroy(&scheduler)
+}
+
+// A duration constant in seconds, as suspend and spawn delays take it.
+@(private = "file")
+seconds_value :: proc(seconds: f32) -> v.Value {
+	value, ok := v.value_float(seconds)
+	assert(ok)
+	return value
 }
