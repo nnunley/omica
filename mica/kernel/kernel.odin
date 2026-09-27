@@ -781,7 +781,7 @@ kernel_publish_group :: proc(kernel: ^Kernel, batch: []^Commit_Entry) {
 				}
 			}
 		}
-		kernel_compute_derived(kernel, merged)
+		kernel_compute_derived(kernel, merged, base)
 
 		previous, published := kernel_try_publish(kernel, base, merged)
 		if published {
@@ -908,7 +908,7 @@ kernel_create_relation :: proc(
 			block := buffer_block_create(&kernel.buffer_store, metadata.id, nil, 0, 0)
 			snapshot_set_buffer(next, block)
 		}
-		kernel_compute_derived(kernel, next)
+		kernel_compute_derived(kernel, next, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -942,7 +942,7 @@ kernel_advance_version :: proc(kernel: ^Kernel, minimum: u64) -> bool {
 		}
 		next := snapshot_fork(kernel, current)
 		next.version = minimum
-		kernel_compute_derived(kernel, next)
+		kernel_compute_derived(kernel, next, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -968,12 +968,14 @@ kernel_derivation_count :: proc(kernel: ^Kernel) -> u64 {
 }
 
 // Recomputes a snapshot's derived relations unless maintenance is suspended.
+// `base` is the snapshot `snapshot` was forked from, still held by the
+// caller: derived relations whose rows did not change share its blocks.
 @(private)
-kernel_compute_derived :: proc(kernel: ^Kernel, snapshot: ^Snapshot) {
+kernel_compute_derived :: proc(kernel: ^Kernel, snapshot: ^Snapshot, base: ^Snapshot = nil) {
 	if kernel_derivation_suspended(kernel) {
 		return
 	}
-	snapshot_compute_derived(snapshot, kernel)
+	snapshot_compute_derived(snapshot, kernel, base)
 }
 
 // Enables or suspends derived-relation maintenance. While suspended, commits
@@ -994,7 +996,7 @@ kernel_set_derivation :: proc(kernel: ^Kernel, enabled: bool) -> bool {
 	for {
 		current := kernel_snapshot(kernel)
 		next := snapshot_fork(kernel, current)
-		snapshot_compute_derived(next, kernel)
+		snapshot_compute_derived(next, kernel, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -1055,7 +1057,7 @@ kernel_install_rule :: proc(
 			return nil, .Unstratified_Negation
 		}
 
-		kernel_compute_derived(kernel, next)
+		kernel_compute_derived(kernel, next, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -1113,7 +1115,7 @@ kernel_set_rule_active :: proc(
 				definition.active = active
 			}
 		}
-		kernel_compute_derived(kernel, next)
+		kernel_compute_derived(kernel, next, current)
 		previous, published := kernel_try_publish(kernel, current, next)
 		if published {
 			kernel_retire(kernel, previous)
@@ -1178,12 +1180,19 @@ kernel_scan_into :: proc(
 	current := kernel_snapshot(kernel)
 	defer snapshot_release(current)
 
+	start := len(out)
 	relation_source_scan_into(
 		&Relation_Source{kernel = kernel, snapshot = current, use_stored_derived = true},
 		relation,
 		bindings,
 		out,
 	)
+	// The rows point into `current`'s chunks, which a concurrent commit can
+	// free once it is released on return: hand back copies (in the temporary
+	// allocator; callers copy whatever they keep).
+	for &row in out[start:] {
+		row = v.tuple_deep_copy(context.temp_allocator, row)
+	}
 }
 
 // Reports whether a relation tuple is visible in the current snapshot.
