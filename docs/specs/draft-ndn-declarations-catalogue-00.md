@@ -245,6 +245,7 @@ Code that expects return values to be relation content (iterating over facts ret
 
 ## References
 
+- R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
 - rdaum/omica#110: Runtime relation creation contract
 - rdaum/omica#111: Runtime identity creation contract
 - rdaum/omica#117: Filein into running world and atomic replace mode

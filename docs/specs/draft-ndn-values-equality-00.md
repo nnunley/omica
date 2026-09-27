@@ -28,6 +28,7 @@ Mica is a database, a programming language and a runtime, and values cross all t
 Key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHOULD", "MAY", "OPTIONAL" per BCP 14 (RFC 2119).
 
 - **value**: data unit (int, float, identity, symbol, string, bytes, list, map, range, error, relation, capability, function, frob)
+- **identity (handle)**: a durable reference value (`#name`); in the series' framing a *handle*. Canonical equality of identities is handle equality: two mentions use the same reference. It does not say two things are the same; sameness and equivalence are relations (for example `SameAs(a, b)`), never collapsed into identity equality.
 - **canonical equality**: strict kind+payload equality (storage, joins, deduplication); int(1) ≠ float(1.0)
 - **language equality**: numeric equality (`==`); 1 == 1.0 is true
 - **persistent**: eligible for serialization; recursively persistent if all cells are
@@ -422,6 +423,7 @@ RFC formalizes current behavior; Rust and omica implementations already match (d
 
 ## References
 
+- R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
 - RFC 2119, RFC 8174: BCP 14 keywords
 - Differential D-006: Int vs float parity (Rust and omica dual-equality model)
 - RFC-03: Rules and Derivation
