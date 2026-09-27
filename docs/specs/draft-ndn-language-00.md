@@ -259,6 +259,9 @@ Existing code continues to work. Try/catch with static codes remains valid; dyna
 ## References
 
 - R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- D. Ungar and R. B. Smith, "Self: The Power of Simplicity," OOPSLA 1987: prototype delegation.
+- C. Chambers, "Object-Oriented Multi-Methods in Cecil," ECOOP 1992; M. Ernst, C. Kaplan, C. Chambers, "Predicate Dispatching," ECOOP 1998.
+- A. Kay, "Clarification of 'object-oriented'," 2003: late binding.
 - CHUNK-007b/007c — Rust test vectors
 - rdaum/omica#117 — per-method programs
 - rdaum/omica#118 — runtime compile builtin

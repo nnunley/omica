@@ -285,6 +285,8 @@ Mica is a live database. Every world starts fresh; rules are installed live with
 ## References
 
 - R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- S. Ceri, G. Gottlob, L. Tanca, "What You Always Wanted to Know About Datalog," IEEE TKDE 1(1), 1989.
+- B. Moseley and P. Marks, "Out of the Tar Pit," 2006: derived data is not state.
 - RFC 2119, RFC 8174: BCP 14 keywords
 - Datalog semantics: Ullman, "Database and Knowledge-Base Systems" (foundational reference for stratified Datalog)
 - Incremental maintenance: omica `docs/incremental-maintenance-design.md`; stage 1 in rdaum/omica#125

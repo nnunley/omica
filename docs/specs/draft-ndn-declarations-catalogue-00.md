@@ -246,6 +246,9 @@ Code that expects return values to be relation content (iterating over facts ret
 ## References
 
 - R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- E. F. Codd, "A Relational Model of Data for Large Shared Data Banks," CACM 13(6), 1970.
+- E. F. Codd, RM/T, ACM TODS 4(4), 1979: surrogates and catalogued relations.
+- M. Aref et al., "Rel: A Programming Language for Relational Data," arXiv:2504.10323, 2025.
 - rdaum/omica#110: Runtime relation creation contract
 - rdaum/omica#111: Runtime identity creation contract
 - rdaum/omica#117: Filein into running world and atomic replace mode

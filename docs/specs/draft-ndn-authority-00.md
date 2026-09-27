@@ -290,6 +290,7 @@ For systems migrating from earlier versions: tasks must adopt assume-actor or ca
 ## References
 
 - R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- R. B. Smith and D. Ungar, "A Simple and Unifying Approach to Subjective Objects," TAPOS 2(3), 1996: perspective-dependent views.
 - rdaum/omica#117 (per-method programs)
 - rdaum/omica#118 (install authority gate)
 - omica/mica/kernel/authority.odin (implementation)
