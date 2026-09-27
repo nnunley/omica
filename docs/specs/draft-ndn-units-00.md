@@ -139,7 +139,7 @@ UnitSlot(:web, "counter", V) -> V
 ```transcript @R-slot-assign
 $ tools/filein --unit=:web --eval '
 let counter = 0
-let increment = verb() { 
+let increment = verb() {
   UnitSlot(:web, "counter", X) -> assign :web "counter" (X + 1)
 }
 increment()

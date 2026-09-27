@@ -314,4 +314,3 @@ test_rules_derived_heap_storage_frees_growth :: proc(t: ^testing.T) {
 	rules_derived_destroy(&d)
 	testing.expect_value(t, tracking.current_memory_allocated, i64(0))
 }
-

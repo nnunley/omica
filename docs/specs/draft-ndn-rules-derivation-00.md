@@ -310,5 +310,3 @@ Mica is a live database. Every world starts fresh; rules are installed live with
 | Rule enable/disable | Supported; recomputes derived relations | Supported; recomputes derived relations | Supported (no change) | Parity |
 | Activation mode (eager/demand) | All eager (lazy differential is an implementation detail) | All eager | Declared per relation; demand mode in draft-ndn-demand-evaluation-00 | Extension |
 | Cache invalidation strategy | Explicit on rule install | Implicit (no persistent cache) | Not specified; implementations may vary | Implementation-defined |
-
-

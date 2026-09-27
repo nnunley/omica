@@ -315,4 +315,3 @@ mode-declaration = %s"@mode" "(" relation-mode ")"
 | Subscriptions on demand relations | N/A (no demand) | N/A (no demand) | Must be explicitly supported; strategy (eager promotion or per-query) chosen by implementation | Improvement |
 | Rule installation invalidates caches | N/A (caches external to runtime) | N/A (no caching) | Invalidates demand tables; eager relations use existing maintenance | Improvement |
 | Snapshot isolation for queries | Supported (implicit in immutable snapshots) | Supported (implicit in incremental maintenance) | Tables keyed by snapshot version; invalidated at commit | Parity |
-
