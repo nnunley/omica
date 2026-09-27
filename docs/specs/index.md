@@ -23,6 +23,11 @@ specifications:
 3. **Objecthood**: a computed view or neighbourhood around a reference.
 4. **Identity**: a defended claim of continuity or sameness, not the mere existence of a handle.
 
+The outline's model is stated as requirements in
+draft-ndn-relational-objecthood-00 (rdaum/omica#133), which also records
+which semantics from each source Mica adopts or excludes, and why. The
+series is not limited to what current implementations do.
+
 How the series carries that out:
 
 | Outline theme | Where it is specified |
@@ -95,3 +100,6 @@ table below, and the entry is added in the publishing commit.
 | [draft-ndn-source-git-00](draft-ndn-source-git-00.md) | Source Host Git Relations | Standards-Track |
 | [draft-ndn-hosts-00](draft-ndn-hosts-00.md) | Hosts and the Host Protocol | Informational |
 | [draft-ndn-quality-tool-00](draft-ndn-quality-tool-00.md) | A Relational Code-Quality Tool for Omica | Experimental |
+| [draft-ndn-relational-objecthood-00](draft-ndn-relational-objecthood-00.md) (rdaum/omica#133) | Relational Objecthood: Handles, Equivalence, Objects as Views, and Claims with History | Standards-Track |
+| [draft-ndn-mica-snippets-00](draft-ndn-mica-snippets-00.md) | Mica Snippets: Modes, Expected Values and Errors, Implementation Variants | Standards-Track |
+| [draft-ndn-casts-and-literals-00](draft-ndn-casts-and-literals-00.md) (rdaum/omica#130) | Explicit Casts, Strict Comparison, and the Normative Literal Form | Standards-Track |
