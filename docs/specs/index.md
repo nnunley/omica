@@ -33,7 +33,7 @@ How the series carries that out:
 | Outline theme | Where it is specified |
 |---|---|
 | handles as reference values; state as propositions | Values and Equality; Declarations and the Catalogue |
-| knowledge derived and reformulated by query | Rules and Derivation; Demand-Driven Evaluation |
+| knowledge derived and reformulated by query | Rules and Derivation; Evaluation Strategy |
 | delegation and role-based behaviour, not owned methods | Language (verbs, dispatch) |
 | encapsulation as query and write policy | Authority and Grants |
 | live revision made coherent by transactions | Transactions, Persistence, and the Change Log; Units |
@@ -92,7 +92,7 @@ table below, and the entry is added in the publishing commit.
 | [draft-ndn-values-equality-00](draft-ndn-values-equality-00.md) | Values and Equality | Standards-Track |
 | [draft-ndn-declarations-catalogue-00](draft-ndn-declarations-catalogue-00.md) | Declarations and the Catalogue | Standards-Track |
 | [draft-ndn-rules-derivation-00](draft-ndn-rules-derivation-00.md) | Rules and Derivation | Standards-Track |
-| [draft-ndn-demand-evaluation-00](draft-ndn-demand-evaluation-00.md) | Demand-Driven Evaluation (Backward Chaining) | Experimental |
+| [draft-ndn-demand-evaluation-00](draft-ndn-demand-evaluation-00.md) (rdaum/omica#136) | Evaluation Strategy: Eager, On Demand, and Tabled | Standards-Track |
 | [draft-ndn-transactions-changelog-00](draft-ndn-transactions-changelog-00.md) | Transactions, Persistence, and the Change Log | Standards-Track |
 | [draft-ndn-units-00](draft-ndn-units-00.md) | Units: Filein, Fileout and Unit State | Standards-Track |
 | [draft-ndn-language-00](draft-ndn-language-00.md) | Language: Recover, Exhaustive Match, Catch Patterns and Dispatch | Standards-Track |
