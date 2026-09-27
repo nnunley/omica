@@ -155,7 +155,9 @@ return P(?x, ?y)
 [:x, :y] {[:a, :b]}
 ```
 
-The system MUST support disabling a rule (setting its active flag to false) without removing it from the catalog. Disabling and enabling take effect when the task commits; before that, the task's reads MUST NOT mix the old and new state (omica today reports `ActiveRule` as false while still deriving from the rule; Rust mica shows both unchanged until commit). [R-disable-without-removal]
+The system MUST support disabling a rule (setting its active flag to false) without removing it from the catalog. Disabling and enabling take effect for other tasks when the task commits. Within the task, `ActiveRule` and the head relation's answers MUST agree: a read MUST NOT report the new activation state while answers still follow the old one. [R-disable-without-removal]
+
+Open decision: whether the toggling task sees the change before it commits. Read-your-writes would match facts and `Delegates`, which a task sees as soon as it writes them; Rust mica instead leaves both unchanged until commit. Either choice satisfies the requirement above. omica satisfies neither today: `ActiveRule` changes at once, while answers wait for commit.
 
 Disabled rule facts are removed; rule definition persists.
 
@@ -362,6 +364,6 @@ Mica is a live database. Every world starts fresh; rules are installed live with
 | Cache invalidation strategy | Explicit on rule install | Implicit (no persistent cache) | Not specified; implementations may vary | Implementation-defined |
 | Rejection error code (`E_RULE`, proposed) | unsafe rules fail on first read with `E_DB` | rejected at load with a message, no code | raised in the installing task | **spec**: the book says rejected but names no code |
 | `enable_rule` (proposed) | only `disable_rule` | has `enable_rule` | defined | **spec**: the book defines only `disable_rule` |
-| Rule toggles before commit | both `ActiveRule` and answers unchanged until commit | `ActiveRule` changes, answers do not | no mixed state before commit | **omica**: reads disagree within the task |
+| Rule toggles before commit | both `ActiveRule` and answers unchanged until commit | `ActiveRule` changes, answers do not | activation and answers agree within the task; read-your-writes vs at-commit is open | **omica**: reads disagree within the task |
 
 
