@@ -240,6 +240,7 @@ and joins.
 
 ## References
 
+- R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
 - `mdbook/src/language/values.md` — numeric kinds, conversion functions, escapes.
 - draft-ndn-mica-snippets-00 — the `mica` evidence and `expect` rules used here.
 - rdaum/omica#127 — the book harness; the book's cast examples are listed as known failures until an implementation supports them.
