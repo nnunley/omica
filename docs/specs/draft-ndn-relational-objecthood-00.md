@@ -294,8 +294,8 @@ Rust mica a433170.
 |---|---|---|---|---|
 | R-handle-poor | defined (`values.md`, identities) | meets | meets | none |
 | R-handle-equality | defined (`values.md`: equivalence is a modelled relationship) | meets | meets | none |
-| R-equivalence-claims | not defined: the book shows a domain claim but not purpose- or authority-bound equivalence or its closure | expressible with user relations and rules | same | **spec**: the book should define equivalence claims |
-| R-delegation-explicit | partly: `Delegates` feeds dispatch matching (`frobs.md`, `verbs-roles-dispatch.md`); that reads never follow it, and that defaults are named rules, is unwritten | behaves so; dot read raises `E_CARDINALITY` | behaves so; dot read raises `E_KEY` | **spec**: write the rule down; the dot-read error code differs between implementations |
+| R-equivalence-claims | not defined: the book shows a domain claim but not purpose- or authority-bound equivalence or its closure | expressible with user relations and rules | same | **spec**: defined by rdaum/omica#135 (`values.md`) |
+| R-delegation-explicit | partly: `Delegates` feeds dispatch matching (`frobs.md`, `verbs-roles-dispatch.md`); that reads never follow it, and that defaults are named rules, is unwritten | behaves so; dot read raises `E_CARDINALITY` | behaves so; dot read raises `E_KEY` | **spec**: defined by rdaum/omica#135 (`verbs-roles-dispatch.md`); **omica**: dot read should raise `E_CARDINALITY` as the book says (`keyed-relations.md`), not `E_KEY` |
 | R-objecthood-views | defined (`runtime/catalogue-and-introspection.md`) | meets | returns no rows on main | **omica**: fixed by rdaum/omica#134 |
 | R-claim-history | not defined (buffer text provenance only) | absent | absent | **spec**: needs design (interface, retention, authority) |
 | R-unnamed-handles | not defined: the numeric `#12345` literal form exists, but no way to make such a handle | absent | absent | **spec**: needs design |
