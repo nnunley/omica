@@ -288,6 +288,8 @@ mode-declaration = %s"@mode" "(" relation-mode ")"
 
 ## References
 
+- R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- W. Chen and D. S. Warren, "Tabled Evaluation with Delaying for General Logic Programs," JACM 43(1), 1996: SLG resolution.
 - Chen, W. and Warren, D.S., 1996. **Tabled evaluation with delaying for general logic programs.** *Journal of the ACM*, 43(1), pp.20-74. https://dl.acm.org/doi/10.1145/227595.227597 — Foundational SLG resolution and tabling mechanism.
 
 - Bancilhon, F., Maier, D., Sagiv, Y. and Ullman, J.D., 1986. **Magic sets and other strange ways to implement logic programs.** *Proceedings of the Fifth ACM SIGMOD-SIGACT Symposium on Principles of Database Systems*. ACM, pp.1-15. https://dl.acm.org/doi/10.1145/235809.235814 — Compile-time optimization for forward-chaining Datalog; used to prune irrelevant facts.

@@ -437,6 +437,9 @@ ENUM FileinMode:
 
 ## References
 
+- R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- A. Goldberg and D. Robson, Smalltalk-80: The Language and its Implementation, 1983: the image and live revision.
+- P. Curtis, LambdaMOO Programmer's Manual; R. Daum, mooR: online extension of a shared world.
 - PR rdaum/omica#117: [Filing into a running world](https://github.com/rdaum/omica/pull/117) — per-method programs and world_filein primitives
 - PR rdaum/omica#118: [Install authority and source registry](https://github.com/rdaum/omica/pull/118) — make_identity, make_relation, compile, install_source, program registry, and install gate
 - draft-ndn-quality-tool-00 (PR rdaum/omica#109): Quality tool and diagnostics — drift detection, schema validation, and consistency auditing

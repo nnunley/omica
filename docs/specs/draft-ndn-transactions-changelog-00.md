@@ -371,6 +371,9 @@ This RFC is normative for new implementations. Existing systems lack change log 
 
 ## References
 
+- R. Daum, *A Relational Theory of Objecthood and Identity* (outline), [revision de5bc29](https://gist.github.com/rdaum/fdfb78358b0d76f778f52adadedcdece/de5bc29005582355ce79f17201fdb8bd0bda4dc2): the series' framing: handles, equivalence, objecthood and identity claims.
+- B. Moseley and P. Marks, "Out of the Tar Pit," 2006: essential state.
+- D. Gelernter, "Generative Communication in Linda," ACM TOPLAS 7(1), 1985: shared facts as coordination.
 - **RFC 2119, RFC 8174** — BCP 14, Key words for use in RFCs to Indicate Requirement Levels
 - **Smalltalk-80: The Interactive Programming Environment** — Adele Goldberg, David Robson, 1983. Chapters on the changes file and live image model.
 - **Rust Mica, [crates/relation-kernel/src/transaction.rs](https://github.com/timbran-project/mica/blob/2bbceb0113b0/crates/relation-kernel/src/transaction.rs)** — https://github.com/rdaum/mica (reference implementation)
