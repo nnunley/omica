@@ -345,7 +345,8 @@ nearest_rank :: proc(q: Nearest_Query, members: []Nearest_Member, grouped: ^Near
 		}
 		return v.value_cmp(grouped.subjects[a], grouped.subjects[b]) == .Less
 	}
-	window := q.limit + NEAREST_RESCORE_MARGIN
+	// A large limit means all available subjects, not a limit-sized allocation.
+	window := min(q.limit + NEAREST_RESCORE_MARGIN, n_subjects)
 	top := make([dynamic]int, 0, window + 1, context.temp_allocator)
 	for id in 0 ..< n_subjects {
 		if !seen[id] {
