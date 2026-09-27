@@ -123,11 +123,11 @@ return Unreached(?n)
 
 ### Answers reflect the reader's current view
 
-A query MUST see the facts and rules of the reader's view, including
-writes earlier in the same task: an engine that keeps tables or
-materialized answers MUST NOT return one computed before a write,
-retraction, rule change, or authority change that affects it.
-[R-current-view]
+A query MUST see the facts of the reader's view, including writes and
+retractions earlier in the same task, and every committed rule or
+authority change: an engine that keeps tables or materialized answers
+MUST NOT return one computed before such a change. Rule changes take
+effect at commit (draft-ndn-rules-derivation-00). [R-current-view]
 
 ```mica mode=eval @R-current-view
 make_relation(:Parent, 2)
