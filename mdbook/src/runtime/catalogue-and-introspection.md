@@ -96,7 +96,8 @@ return natural_join(natural_join(enabled, heads), sources)
 ```
 
 `enable_rule` restores a disabled rule. Its `ActiveRule` row changes back to `true`, and the head
-relation again derives from it. Both calls take effect when the task commits:
+relation again derives from it. This example checks both changes after each commit.
+Visibility within the same task remains an open specification question.
 
 ```mica,eval
 make_relation(:Lamp, 1)
