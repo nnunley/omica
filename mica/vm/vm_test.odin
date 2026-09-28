@@ -1509,6 +1509,11 @@ test_vm_duration_millis :: proc(t: ^testing.T) {
 	_, ok = vm_duration_millis(negative_float)
 	testing.expect(t, !ok)
 
+	// Reject negatives even when millisecond rounding would produce zero.
+	negative_tiny, _ := v.value_float(-0.0001)
+	_, ok = vm_duration_millis(negative_tiny)
+	testing.expect(t, !ok)
+
 	_, ok = vm_duration_millis(v.value_bool(true))
 	testing.expect(t, !ok)
 }

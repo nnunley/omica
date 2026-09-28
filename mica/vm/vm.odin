@@ -2693,6 +2693,9 @@ vm_duration_millis :: proc(value: v.Value) -> (i64, bool) {
 	} else {
 		return 0, false
 	}
+	if seconds < 0 {
+		return 0, false
+	}
 	millis := math.round(seconds * 1000)
 	if math.is_nan(millis) || math.is_inf(millis) || millis < 0 || millis >= f64(max(i64)) {
 		return 0, false
