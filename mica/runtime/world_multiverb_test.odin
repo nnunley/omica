@@ -4,6 +4,7 @@
 // in its own program, and the second unit is filed into the running world.
 package mica_runtime
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
@@ -135,7 +136,7 @@ test_world_multiverb_across_units :: proc(t: ^testing.T) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{units.things}, context.temp_allocator, World_Config{workers = 4})
+	world, start := world_start(&kernel, []string{units.things}, runtime.heap_allocator(), World_Config{workers = 4})
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -192,7 +193,7 @@ test_world_multiverb_survives_reboot :: proc(t: ^testing.T) {
 		kernel: k.Kernel
 		k.kernel_init(&kernel)
 		paths := []string{units.things} if step == 0 else nil
-		world, start := world_start(&kernel, paths, context.temp_allocator, World_Config{store_path = store_path})
+		world, start := world_start(&kernel, paths, runtime.heap_allocator(), World_Config{store_path = store_path})
 		testing.expectf(t, start.ok, "start %d failed: %s", step, start.message)
 		if start.ok {
 			if step == 0 {
@@ -211,7 +212,7 @@ test_world_multiverb_survives_reboot :: proc(t: ^testing.T) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, nil, context.temp_allocator, World_Config{store_path = store_path})
+	world, start := world_start(&kernel, nil, runtime.heap_allocator(), World_Config{store_path = store_path})
 	testing.expectf(t, start.ok, "reboot failed: %s", start.message)
 	if !start.ok {
 		return
