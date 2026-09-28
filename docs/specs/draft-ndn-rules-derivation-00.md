@@ -155,7 +155,7 @@ return P(?x, ?y)
 [:x, :y] {[:a, :b]}
 ```
 
-The system MUST support disabling a rule (setting its active flag to false) without removing it from the catalog. Disabling and enabling take effect for other tasks when the task commits. Within the task, `ActiveRule` and the head relation's answers MUST agree: a read MUST NOT report the new activation state while answers still follow the old one. [R-disable-without-removal]
+The system MUST support disabling a rule (setting its active flag to false) without removing it from the catalog. Other tasks see a toggle once it is committed, in the first transaction whose snapshot is taken after that commit. Within the task, `ActiveRule` and the head relation's answers MUST agree: a read MUST NOT report the new activation state while answers still follow the old one. [R-disable-without-removal]
 
 Open decision: whether the toggling task sees the change before it commits. Read-your-writes would match facts and `Delegates`, which a task sees as soon as it writes them; Rust mica instead leaves both unchanged until commit. Either choice satisfies the requirement above. omica satisfies neither today: `ActiveRule` changes at once, while answers wait for commit.
 
