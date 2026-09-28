@@ -36,7 +36,7 @@ main :: proc() {
 			continue
 		}
 		
-		node, ok := cyc.parse(line, allocator)
+		_, ok := cyc.parse(line, allocator)
 		if !ok {
 			fail_count += 1
 			if fail_count <= 20 {

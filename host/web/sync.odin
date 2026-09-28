@@ -4,12 +4,10 @@
 // queues a snapshot. The stream writes SSE chunks from the session queue.
 package web
 
-import "core:fmt"
 import "core:net"
 import "core:strings"
 import "core:sync"
 import "core:time"
-import dom "../../mica/dom"
 import k "../../mica/kernel"
 import r "../../mica/runtime"
 import v "../../mica/var"

@@ -585,7 +585,7 @@ float_rem :: proc(x, y: f32) -> f32 {
 // Negates a numeric value with checked overflow.
 value_checked_neg :: proc(a: Value) -> (Value, bool) {
 	if n, ok := value_as_int(a); ok {
-		if negated, ok := value_int(-n); ok {
+		if negated, negated_ok := value_int(-n); negated_ok {
 			return negated, true
 		}
 		return Value(0), false

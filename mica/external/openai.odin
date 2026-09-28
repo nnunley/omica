@@ -159,7 +159,7 @@ wire_body :: proc(
 			return "", "missing \"messages\"", false
 		}
 		append(&entries, symbol_entry("messages", messages))
-		if tools, found := lookup(payload, "tools"); found {
+		if tools, has_tools := lookup(payload, "tools"); has_tools {
 			append(&entries, symbol_entry("tools", tools))
 		}
 		append(&entries, symbol_entry("stream", v.value_bool(streaming)))
@@ -178,10 +178,10 @@ wire_body :: proc(
 			})
 			append(&entries, symbol_entry("include", include))
 		}
-		if instructions, found := lookup(payload, "instructions"); found {
+		if instructions, has_instructions := lookup(payload, "instructions"); has_instructions {
 			append(&entries, symbol_entry("instructions", instructions))
 		}
-		if tools, found := lookup(payload, "tools"); found {
+		if tools, has_tools := lookup(payload, "tools"); has_tools {
 			append(&entries, symbol_entry("tools", tools))
 		}
 	}

@@ -16,7 +16,7 @@ package accel
 
 import "base:intrinsics"
 import "core:simd"
-import "core:sys/info"
+@(require) import "core:sys/info"
 
 Cpu_Dot_Kernel :: enum u8 {
 	Portable,
