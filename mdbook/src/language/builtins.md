@@ -231,6 +231,7 @@ columns and row arity mismatches raise `E_INVARG`.
 | `rules(:Relation)`                                           | active rule identities for a head relation |
 | `describe_rule(#rule)`                                       | installed rule source                      |
 | `disable_rule(#rule)`                                        | `()`                                       |
+| `enable_rule(#rule)`                                         | `()`                                       |
 | `fileout(:unit)`                                             | source owned by a filein unit              |
 | `fileout_rules([:Relation])`                                 | active rule source                         |
 | `tasks()`                                                    | current task snapshots                     |

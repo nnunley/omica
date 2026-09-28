@@ -41,7 +41,7 @@ let active = rules(:Requires)
 let source = describe_rule(active[0])
 ```
 
-`disable_rule` changes catalogue state and requires administrative authority.
+`disable_rule` and `enable_rule` change catalogue state and require administrative authority.
 
 ### Following Identities Through the Catalogue
 
@@ -93,6 +93,27 @@ let enabled = ActiveRule(?rule, true)
 let heads = RuleHead(?rule, ?relation)
 let sources = RuleSource(?rule, ?source)
 return natural_join(natural_join(enabled, heads), sources)
+```
+
+`enable_rule` restores a disabled rule. Its `ActiveRule` row changes back to `true`, and the head
+relation again derives from it. This example checks both changes after each commit.
+Visibility within the same task remains an open specification question.
+
+```mica,eval
+make_relation(:Lamp, 1)
+make_relation(:Lit, 1)
+assert Lamp(1)
+Lit(x) :- Lamp(x)
+commit()
+let rule = rules(:Lit)[0]
+disable_rule(rule)
+commit()
+require !Lit(1)
+require ActiveRule(rule, false)
+enable_rule(rule)
+commit()
+require Lit(1)
+require ActiveRule(rule, true)
 ```
 
 Several rules can have the same head relation. Inspecting all of them explains the possible sources
