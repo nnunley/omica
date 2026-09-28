@@ -6,7 +6,6 @@
 package web
 
 import "core:fmt"
-import "core:mem"
 import "core:strings"
 
 // Server limits. Requests beyond these are rejected with a 4xx response.
