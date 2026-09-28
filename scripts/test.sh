@@ -226,8 +226,11 @@ run_unit() {
     log="${log_dir}/$(slugify "unit:${pkg}").log"
     rc=0
     # -vet makes unused declarations, shadowing and needless transmutes
-    # errors, so a new one cannot hide among old ones.
-    capture "${log}" "${test_timeout}" "${odin_bin}" test "${pkg}" -vet || rc=$?
+    # errors, so a new one cannot hide among old ones. Vendored packages
+    # follow their upstream's lint, not ours.
+    vet=(-vet)
+    [[ "${pkg}" == vendor/* ]] && vet=()
+    capture "${log}" "${test_timeout}" "${odin_bin}" test "${pkg}" ${vet[@]+"${vet[@]}"} || rc=$?
     inspect "unit:${pkg}" "${log}" "${rc}"
   done
   if command -v node >/dev/null 2>&1 && [[ -f "${repo_root}/host/web/sync-client.test.mjs" ]]; then
