@@ -123,11 +123,15 @@ return Unreached(?n)
 
 ### Answers reflect the reader's current view
 
-A query MUST see the facts of the reader's view, including writes and
-retractions earlier in the same task, and every committed rule or
-authority change: an engine that keeps tables or materialized answers
-MUST NOT return one computed before such a change. Rule changes take
-effect at commit (draft-ndn-rules-derivation-00). [R-current-view]
+A query MUST see the reader's view: the snapshot its current transaction
+began from, plus the task's own writes and retractions since then. A task
+begins a new transaction at each commit boundary. The snapshot holds every
+fact, rule and authority change committed before it was taken; changes
+committed after it are not visible until the task's next transaction. An engine that
+keeps tables or materialized answers MUST NOT return one computed from a
+different view. Whether a task sees its own uncommitted rule toggles is
+an open decision (draft-ndn-rules-derivation-00, R-disable-without-removal);
+this requirement holds either way. [R-current-view]
 
 ```mica mode=eval @R-current-view
 make_relation(:Parent, 2)
