@@ -7189,13 +7189,6 @@ test_retrieval_computed_relation_scenarios :: proc(t: ^testing.T) {
 		return
 	}
 
-	arena: virtual.Arena
-	if err := virtual.arena_init_growing(&arena); err != nil {
-		testing.expect(t, false, "cannot initialize test arena")
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	alloc := virtual.arena_allocator(&arena)
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)

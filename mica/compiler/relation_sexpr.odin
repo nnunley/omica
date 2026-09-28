@@ -11,7 +11,6 @@
 // an edge, or a scalar attribute otherwise. Repeated roles carry an ordinal.
 package compiler
 
-import "base:runtime"
 import "core:slice"
 import "core:strings"
 import v "../var"

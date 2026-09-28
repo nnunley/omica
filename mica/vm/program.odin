@@ -571,7 +571,7 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 	if program.entry < 0 || program.entry >= len(program.functions) {
 		return .No_Entry
 	}
-	for function, function_index in program.functions {
+	for function in program.functions {
 		if function.code_offset < 0 ||
 		   function.code_len < 0 ||
 		   function.code_offset + function.code_len > len(program.code) {
@@ -862,8 +862,8 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if instr.b < 0 || int(instr.b) >= len(program.functions) {
 					return .Bad_Function
 				}
-				for offset in 0 ..< int(instr.flags) {
-					if !valid_register(instr.c + i32(offset), register_count) {
+				for slot in 0 ..< int(instr.flags) {
+					if !valid_register(instr.c + i32(slot), register_count) {
 						return .Bad_Register
 					}
 				}
@@ -877,8 +877,8 @@ program_validate :: proc(program: ^Program) -> Program_Error {
 				if instr.b < 0 || int(instr.b) >= len(program.functions) {
 					return .Bad_Function
 				}
-				for offset in 0 ..< int(instr.flags) {
-					if !valid_register(instr.c + i32(offset), register_count) {
+				for slot in 0 ..< int(instr.flags) {
+					if !valid_register(instr.c + i32(slot), register_count) {
 						return .Bad_Register
 					}
 				}

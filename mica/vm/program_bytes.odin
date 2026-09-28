@@ -100,9 +100,9 @@ program_to_bytes :: proc(program: ^Program, out: ^[dynamic]u8) -> Artifact_Error
 	}
 	for instr in program.code {
 		append(out, u8(instr.op), instr.flags)
-		ab_u32(out, transmute(u32)instr.a)
-		ab_u32(out, transmute(u32)instr.b)
-		ab_u32(out, transmute(u32)instr.c)
+		ab_u32(out, cast(u32)instr.a)
+		ab_u32(out, cast(u32)instr.b)
+		ab_u32(out, cast(u32)instr.c)
 	}
 
 	if error := ab_count(out, len(program.constants)); error != .None {
@@ -134,7 +134,7 @@ program_to_bytes :: proc(program: ^Program, out: ^[dynamic]u8) -> Artifact_Error
 			return error
 		}
 		for default in function.defaults {
-			ab_u32(out, transmute(u32)default)
+			ab_u32(out, cast(u32)default)
 		}
 	}
 
@@ -158,7 +158,7 @@ program_to_bytes :: proc(program: ^Program, out: ^[dynamic]u8) -> Artifact_Error
 		}
 		for cell in pattern.cells {
 			append(out, u8(cell.kind))
-			ab_u32(out, transmute(u32)cell.operand)
+			ab_u32(out, cast(u32)cell.operand)
 		}
 	}
 
@@ -185,7 +185,7 @@ program_to_bytes :: proc(program: ^Program, out: ^[dynamic]u8) -> Artifact_Error
 			if error := ab_symbol(out, role.role); error != .None {
 				return error
 			}
-			ab_u32(out, transmute(u32)role.register)
+			ab_u32(out, cast(u32)role.register)
 		}
 	}
 
@@ -579,13 +579,13 @@ ar_u64 :: proc(reader: ^Artifact_Reader) -> (u64, bool) {
 @(private)
 ar_i32 :: proc(reader: ^Artifact_Reader) -> (i32, bool) {
 	raw, ok := ar_u32(reader)
-	return transmute(i32)raw, ok
+	return cast(i32)raw, ok
 }
 
 @(private)
 ar_i64 :: proc(reader: ^Artifact_Reader) -> (i64, bool) {
 	raw, ok := ar_u64(reader)
-	return transmute(i64)raw, ok
+	return cast(i64)raw, ok
 }
 
 // Reads a count prefix guarded against the bytes remaining: each element

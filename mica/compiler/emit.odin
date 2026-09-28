@@ -347,22 +347,22 @@ compile_program :: proc(
 			preload_constants(&emitter, pending.fn.body)
 		}
 		scope_enter(&emitter)
-		return_register := -1
+		function_return := -1
 		if pending.fn.has_expression_body {
 			register, has_value := emit_expr(&emitter, pending.fn.expression_body)
 			if has_value {
-				return_register = register
+				function_return = register
 			}
 		} else {
 			register, has_value := emit_block(&emitter, pending.fn.body)
 			if has_value {
-				return_register = register
+				function_return = register
 			}
 		}
-		if return_register < 0 {
-			return_register = emit_constant(&emitter, v.value_empty_relation())
+		if function_return < 0 {
+			function_return = emit_constant(&emitter, v.value_empty_relation())
 		}
-		vm.builder_emit(&builder, .Return, 0, i32(return_register), 0, 0)
+		vm.builder_emit(&builder, .Return, 0, i32(function_return), 0, 0)
 		scope_leave(&emitter)
 		builder.functions[pending.index].register_count = emitter.max_register
 		vm.builder_end_function(&builder)
