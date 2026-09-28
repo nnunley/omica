@@ -66,7 +66,7 @@ verb llm/demo_run(prompt @ #string)
   let failed = false
   let done = false
   while done == false
-    let ready = mailbox_recv([receiver], 500)
+    let ready = mailbox_recv([receiver], 0.5)
     if ready == []
       // No events for half a second: the stream is over or stalled.
       done = true

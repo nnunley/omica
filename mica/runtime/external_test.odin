@@ -178,7 +178,7 @@ test_run_external_stream_to_mailbox :: proc(t: ^testing.T) {
 	source := `make_relation(:Got, 1)
 let [receiver, sender] = mailbox()
 llm_chat_stream_to("stream-model", [{:role -> "user", :content -> "ping"}], {:stream -> true}, [], sender)
-let ready = mailbox_recv([receiver], 200)
+let ready = mailbox_recv([receiver], 0.2)
 if ready != []
   let first = ready[0][1][0]
   assert Got(first)

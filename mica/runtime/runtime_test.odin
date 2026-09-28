@@ -1222,7 +1222,7 @@ test_run_mailbox_timeout :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	source := `make_relation(:TimedOut, 1)
 let [receiver, sender] = mailbox()
-let ready = mailbox_recv([receiver], 1)
+let ready = mailbox_recv([receiver], 0.001)
 require(ready == [])
 assert TimedOut(1)
 `
@@ -2216,7 +2216,7 @@ verb work(read_two, rw, vault, short, write_denied, write_expired, write_allowed
     catch err
       assert Denied(2)
     end
-    suspend(150)
+    suspend(0.15)
     try
       let rows = Ephemeral(3)
       assert Allowed(2)
@@ -2231,9 +2231,9 @@ end
 let [receiver, sender] = mailbox()
 let child_id = spawn :work(read_two: read_two, rw: rw, vault: vault, short: short, write_denied: write_denied, write_expired: write_expired, write_allowed: write_allowed, write_boom: write_boom, call_cap: call_cap, sender_cap: sender)
 require(child_id != 0)
-let started = mailbox_recv([receiver], 2000)
+let started = mailbox_recv([receiver], 2)
 require(len(started) == 1)
-require(len(mailbox_recv([receiver], 2000)) == 1)
+require(len(mailbox_recv([receiver], 2)) == 1)
 `
 	path, path_ok := write_temp_source(t, "mica_capability_full_test.mica", source)
 	if !path_ok {
@@ -3351,7 +3351,7 @@ make_relation(:ObservedSuspended, 1)
 
 verb sleeper()
   assert Slept(1)
-  suspend(10000)
+  suspend(10)
 end
 
 verb observer()
@@ -6205,7 +6205,7 @@ commit()
 let sub_two = subscribe_changes(sender, :relation, some(:Derived), [none], :changes, some(cursor))
 assert Out(1)
 commit()
-let ready_two = mailbox_recv([receiver], 500)
+let ready_two = mailbox_recv([receiver], 0.5)
 require(len(ready_two) > 0)
 `
 	path, path_ok := write_temp_source(t, "mica_subscription_resume_test.mica", source)
@@ -6319,7 +6319,7 @@ let id = spawn :work(sender: sender)
 suspend()
 assert Note(1)
 commit()
-let messages = mailbox_recv([receiver], 200)
+let messages = mailbox_recv([receiver], 0.2)
 require(len(messages) == 0)
 assert Out(1)
 `
@@ -7406,4 +7406,32 @@ assert Note(5, "note-text")
 	text, _ := v.value_as_string(items[1])
 	testing.expect(t, text == "note-text")
 	testing.expect(t, raw_data(text) != raw_data(scanned))
+}
+
+@(test)
+test_run_fractional_second_durations :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	source := `make_relation(:Ran, 1)
+verb mark()
+  assert Ran(1)
+end
+spawn :mark() after 0.01
+let [receiver, sender] = mailbox()
+require(mailbox_recv([receiver], 0.01) == [])
+suspend(0.05)
+require(Ran(1))
+`
+	path, path_ok := write_temp_source(t, "mica_fractional_durations_test.mica", source)
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+
+	result := run_files(&kernel, []string{path}, runtime.heap_allocator())
+	testing.expectf(t, result.ok, "filein failed: %s", result.message)
+	expect_relation_rows(t, &kernel, "Ran", 1)
 }
