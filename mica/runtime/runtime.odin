@@ -377,6 +377,20 @@ run_files :: proc(
 	}
 	defer world_destroy(world)
 
+	// A store that already holds a world boots from it without loading the
+	// given files; file them into the booted world, as tools/filein does.
+	if world.booted {
+		if len(paths) == 0 {
+			return Run_Result{ok = true, message = "loaded"}
+		}
+		filed := world_filein(world, paths, options.unit)
+		scheduler_wait_quiescent(&world.scheduler)
+		if filed.kind != .Complete {
+			return Run_Result{ok = false, message = filed.message}
+		}
+		return Run_Result{ok = true, message = "loaded"}
+	}
+
 	outcome := world_wait(world, world.entry)
 	// Let any children the entry spawned finish before the world is torn
 	// down; otherwise a still-ready child can be dropped at shutdown.

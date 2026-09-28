@@ -1,6 +1,7 @@
 // Tests for filing new sources into a running world.
 package mica_runtime
 
+import "base:runtime"
 import "core:os"
 import "core:path/filepath"
 import "core:testing"
@@ -72,7 +73,7 @@ test_world_filein_adds_to_running_world :: proc(t: ^testing.T) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{base}, context.temp_allocator, World_Config{})
+	world, start := world_start(&kernel, []string{base}, runtime.heap_allocator(), World_Config{})
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -125,7 +126,7 @@ test_world_filein_into_booted_store_persists :: proc(t: ^testing.T) {
 	{
 		kernel: k.Kernel
 		k.kernel_init(&kernel)
-		world, start := world_start(&kernel, []string{base}, context.temp_allocator, World_Config{store_path = store_path})
+		world, start := world_start(&kernel, []string{base}, runtime.heap_allocator(), World_Config{store_path = store_path})
 		testing.expectf(t, start.ok, "load failed: %s", start.message)
 		if start.ok {
 			testing.expect_value(t, world_wait(world, world.entry).kind, Task_Outcome_Kind.Complete)
@@ -138,7 +139,7 @@ test_world_filein_into_booted_store_persists :: proc(t: ^testing.T) {
 	{
 		kernel: k.Kernel
 		k.kernel_init(&kernel)
-		world, start := world_start(&kernel, nil, context.temp_allocator, World_Config{store_path = store_path})
+		world, start := world_start(&kernel, nil, runtime.heap_allocator(), World_Config{store_path = store_path})
 		testing.expectf(t, start.ok, "boot failed: %s", start.message)
 		if start.ok {
 			testing.expect(t, world.booted)
@@ -154,7 +155,7 @@ test_world_filein_into_booted_store_persists :: proc(t: ^testing.T) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, nil, context.temp_allocator, World_Config{store_path = store_path})
+	world, start := world_start(&kernel, nil, runtime.heap_allocator(), World_Config{store_path = store_path})
 	testing.expectf(t, start.ok, "second boot failed: %s", start.message)
 	if !start.ok {
 		return
@@ -217,7 +218,7 @@ test_world_filein_verbs_call_across_programs :: proc(t: ^testing.T) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{base}, context.temp_allocator, World_Config{})
+	world, start := world_start(&kernel, []string{base}, runtime.heap_allocator(), World_Config{})
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -256,7 +257,7 @@ test_world_filein_add_runs_a_unit_again :: proc(t: ^testing.T) {
 	kernel: k.Kernel
 	k.kernel_init(&kernel)
 	defer k.kernel_destroy(&kernel)
-	world, start := world_start(&kernel, []string{base}, context.temp_allocator, World_Config{})
+	world, start := world_start(&kernel, []string{base}, runtime.heap_allocator(), World_Config{})
 	testing.expectf(t, start.ok, "load failed: %s", start.message)
 	if !start.ok {
 		return
@@ -280,4 +281,58 @@ test_world_filein_add_runs_a_unit_again :: proc(t: ^testing.T) {
 	defer delete(program_rows)
 	k.kernel_scan_into(&kernel, k.SYSTEM_PROGRAM_BYTES_ID, []v.Binding{{}, {}}, &program_rows)
 	testing.expect_value(t, len(program_rows), 1)
+}
+
+// run_files against a store that already holds a world files the given
+// sources into it, in the same process, and reports their outcome.
+@(test)
+test_run_files_into_booted_store :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	directory, directory_error := os.temp_dir(context.temp_allocator)
+	if directory_error != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	store_path, join_error := filepath.join(
+		[]string{directory, "mica_run_files_booted_store"},
+		context.temp_allocator,
+	)
+	if join_error != nil {
+		return
+	}
+	os.remove_all(store_path)
+	defer os.remove_all(store_path)
+	options := Run_Options{store_path = store_path}
+
+	sources := [3]string {
+		"make_relation(:First, 1)\nassert First(1)\n",
+		"make_relation(:Second, 1)\nassert Second(1)\n",
+		"require false\n",
+	}
+	names := [3]string {
+		"mica_run_files_first.mica",
+		"mica_run_files_second.mica",
+		"mica_run_files_failing.mica",
+	}
+	for source, run in sources {
+		path, path_ok := write_temp_source(t, names[run], source)
+		if !path_ok {
+			return
+		}
+		defer os.remove(path)
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		defer k.kernel_destroy(&kernel)
+		result := run_files(&kernel, []string{path}, runtime.heap_allocator(), options)
+		switch run {
+		case 0:
+			testing.expectf(t, result.ok, "first run failed: %s", result.message)
+		case 1:
+			testing.expectf(t, result.ok, "second run failed: %s", result.message)
+			expect_relation_rows(t, &kernel, "First", 1)
+			expect_relation_rows(t, &kernel, "Second", 1)
+		case 2:
+			testing.expect(t, !result.ok, "a failing file into a booted store must fail")
+		}
+	}
 }
