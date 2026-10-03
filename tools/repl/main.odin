@@ -20,6 +20,7 @@ import v "../../mica/var"
 
 @(private)
 USAGE :: "usage: repl [--store DIR] [--durability none|group|strict] " +
+	"[--accel " + r.ACCEL_MODE_NAMES + "] " +
 	"[--actor NAME] [--checkpoint] <path>...\n"
 
 @(private)
@@ -125,6 +126,7 @@ main :: proc() {
 	actor := ""
 	checkpoint := false
 	durability := s.Durability.Group
+	accel_mode := r.Accel_Mode.Unchanged
 	paths: [dynamic]string
 	defer delete(paths)
 
@@ -152,6 +154,18 @@ main :: proc() {
 			}
 			index += 1
 			actor = arguments[index]
+		case "--accel":
+			if index + 1 >= len(arguments) {
+				fmt.eprintf(USAGE)
+				os.exit(1)
+			}
+			index += 1
+			mode, ok := r.accel_mode_parse(arguments[index])
+			if !ok {
+				fmt.eprintf("--accel: expected %s, got %q\n%s", r.ACCEL_MODE_NAMES, arguments[index], USAGE)
+				os.exit(1)
+			}
+			accel_mode = mode
 		case "--checkpoint":
 			checkpoint = true
 		case "--help", "-h":
@@ -176,6 +190,7 @@ main :: proc() {
 			durability       = durability,
 			external_handler = ext.handle_request,
 			external_workers = 2,
+			accel            = accel_mode,
 		},
 	)
 	if !start.ok {

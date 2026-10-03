@@ -80,25 +80,73 @@ tuple_less_keyed :: proc(a, b: Tuple) -> (less: bool, ok: bool) {
 	return len(av) < len(bv), true
 }
 
-@(private)
-Key_Sort_Context :: struct {
-	keys:  []u64,
-	arity: int,
-}
-
-@(private)
-key_window_less :: proc(a, b: u32, user: rawptr) -> bool {
-	ctx := (^Key_Sort_Context)(user)
-	base_a := int(a) * ctx.arity
-	base_b := int(b) * ctx.arity
-	for column in 0 ..< ctx.arity {
-		ka := ctx.keys[base_a + column]
-		kb := ctx.keys[base_b + column]
-		if ka != kb {
-			return ka < kb
+// Sorts `order` (row numbers; row r's keys are keys[r*arity:(r+1)*arity])
+// lexicographically by the rows' keys: a stable LSD radix sort over 8-bit
+// digits, last column first. Digits equal across every row are skipped, which
+// drops most passes for identities that share their high bytes. Rows with
+// equal keys keep their relative order.
+key_order_sort :: proc(order: []u32, keys: []u64, arity: int, scratch: mem.Allocator) {
+	if len(order) < 2 {
+		return
+	}
+	other := make([]u32, len(order), scratch)
+	defer delete(other, scratch)
+	a, b := order, other
+	for c := arity - 1; c >= 0; c -= 1 {
+		all_or, all_and := u64(0), ~u64(0)
+		for row in a {
+			k := keys[int(row) * arity + c]
+			all_or |= k
+			all_and &= k
+		}
+		varying := all_or ~ all_and
+		for shift := uint(0); shift < 64; shift += 8 {
+			if (varying >> shift) & 0xff == 0 {
+				continue
+			}
+			counts: [256]int
+			for row in a {
+				counts[(keys[int(row) * arity + c] >> shift) & 0xff] += 1
+			}
+			total := 0
+			for d in 0 ..< 256 {
+				counts[d], total = total, total + counts[d]
+			}
+			for row in a {
+				d := (keys[int(row) * arity + c] >> shift) & 0xff
+				b[counts[d]] = row
+				counts[d] += 1
+			}
+			a, b = b, a
 		}
 	}
-	return false
+	if raw_data(a) != raw_data(order) {
+		copy(order, a)
+	}
+}
+
+// Compacts a key-sorted `order` in place to the first row of each run of
+// equal keys; returns how many rows remain.
+key_order_dedup :: proc(order: []u32, keys: []u64, arity: int) -> int {
+	count := 0
+	for row in order {
+		if count > 0 {
+			previous := order[count - 1]
+			equal := true
+			for c in 0 ..< arity {
+				if keys[int(row) * arity + c] != keys[int(previous) * arity + c] {
+					equal = false
+					break
+				}
+			}
+			if equal {
+				continue
+			}
+		}
+		order[count] = row
+		count += 1
+	}
+	return count
 }
 
 // Sorts and deduplicates `rows` into canonical order, allocating any scratch
@@ -148,30 +196,12 @@ canonicalize_tuples_keyed :: proc(
 	for i in 0 ..< count {
 		order[i] = u32(i)
 	}
-	context_data := Key_Sort_Context{keys = keys, arity = arity}
-	slice.sort_by_with_data(order, key_window_less, &context_data)
-
-	// Walk the sorted order, keeping the first row of each equal key run.
-	out := make([]Tuple, count, alloc)
-	write := 0
-	for index, position in order {
-		if write > 0 {
-			previous := order[position - 1]
-			equal := true
-			for column in 0 ..< arity {
-				if keys[int(index) * arity + column] != keys[int(previous) * arity + column] {
-					equal = false
-					break
-				}
-			}
-			if equal {
-				continue
-			}
-		}
-		out[write] = rows[index]
-		write += 1
+	key_order_sort(order, keys, arity, alloc)
+	out := make([]Tuple, key_order_dedup(order, keys, arity), alloc)
+	for &row, i in out {
+		row = rows[order[i]]
 	}
-	return out[:write]
+	return out
 }
 
 @(private)

@@ -508,3 +508,25 @@ test_snapshot_borrow_retains_when_slots_exhausted :: proc(t: ^testing.T) {
 		reader_slot_release(slot)
 	}
 }
+
+// An arena returned to the pool keeps at most a small budget of its blocks: a
+// snapshot arena that held a large derived copy must not stay that large while
+// pooled, or while a later small relation block holds it (full OpenCyc
+// rederive grew ~0.5 GB per commit this way).
+@(test)
+test_pool_trims_returned_arenas :: proc(t: ^testing.T) {
+	pool: Arena_Pool
+	defer arena_pool_destroy(&pool)
+	arena := arena_pool_take(&pool)
+	alloc := frame_arena_allocator(arena)
+	for _ in 0 ..< 64 {
+		_ = make([]byte, 1 << 20, alloc)
+	}
+	testing.expect(t, frame_arena_capacity(arena) >= 64 << 20)
+	arena_pool_return(&pool, arena)
+	again := arena_pool_take(&pool)
+	testing.expect(t, again == arena)
+	testing.expectf(t, frame_arena_capacity(again) <= FRAME_POOL_KEEP, "pooled arena keeps %d bytes", frame_arena_capacity(again))
+	_ = make([]byte, 4 << 20, frame_arena_allocator(again))
+	arena_pool_return(&pool, again)
+}

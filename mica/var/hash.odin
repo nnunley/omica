@@ -100,3 +100,25 @@ tuple_hash :: proc(t: Tuple) -> u64 {
 	}
 	return hash
 }
+
+// Row hashes of a column-major batch, equal to `tuple_hash` of each row:
+// out[i] hashes the row (columns[0][r], columns[1][r], ...) where r = rows[i],
+// or r = i when `rows` is nil. Computed one column at a time, the same left
+// fold as `tuple_hash`.
+tuple_hash_columns :: proc(columns: [][]Value, rows: []u32, out: []u64) {
+	seed := hash_mix(HASH_SEED, u64(len(columns)))
+	for i in 0 ..< len(out) {
+		out[i] = seed
+	}
+	for column in columns {
+		if rows == nil {
+			for i in 0 ..< len(out) {
+				out[i] = hash_mix(out[i], value_hash(column[i]))
+			}
+		} else {
+			for i in 0 ..< len(out) {
+				out[i] = hash_mix(out[i], value_hash(column[rows[i]]))
+			}
+		}
+	}
+}

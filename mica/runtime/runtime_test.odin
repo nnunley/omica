@@ -7245,3 +7245,80 @@ test_retrieval_computed_relation_scenarios :: proc(t: ^testing.T) {
 		)
 	}
 }
+
+// Booting from a store restores every stored rule; the fixpoint over the
+// stored facts runs once for the whole rule set, not once per rule.
+@(test)
+test_run_store_boot_derives_once :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	RULES :: 6
+	b: strings.Builder
+	strings.builder_init(&b, context.temp_allocator)
+	strings.write_string(&b, "make_relation(:Edge, 2)\n")
+	for i in 0 ..< RULES {
+		fmt.sbprintf(&b, "make_relation(:Reach%d, 2)\n", i)
+	}
+	for i in 0 ..< RULES {
+		fmt.sbprintf(&b, "\nReach%d(a, b) :-\n  Edge(a, b)\n", i)
+	}
+	strings.write_string(&b, "\nassert Edge(1, 2)\nassert Edge(2, 3)\n")
+	path, path_ok := write_temp_source(t, "mica_store_boot_derive_test.mica", strings.to_string(b))
+	if !path_ok {
+		return
+	}
+	defer os.remove(path)
+
+	directory, directory_error := os.temp_dir(context.temp_allocator)
+	if directory_error != nil {
+		testing.expect(t, false, "cannot resolve a temporary directory")
+		return
+	}
+	store_path, join_error := filepath.join(
+		[]string{directory, "mica_store_boot_derive"},
+		context.temp_allocator,
+	)
+	if join_error != nil {
+		return
+	}
+	os.remove_all(store_path)
+	defer os.remove_all(store_path)
+
+	{
+		kernel: k.Kernel
+		k.kernel_init(&kernel)
+		world, start := world_start(
+			&kernel,
+			[]string{path},
+			context.temp_allocator,
+			World_Config{store_path = store_path},
+		)
+		testing.expectf(t, start.ok, "load failed: %s", start.message)
+		if start.ok {
+			entry := world_wait(world, world.entry)
+			testing.expect_value(t, entry.kind, Task_Outcome_Kind.Complete)
+			testing.expect(t, world_checkpoint(world))
+			world_destroy(world)
+		}
+		k.kernel_destroy(&kernel)
+	}
+
+	kernel: k.Kernel
+	k.kernel_init(&kernel)
+	defer k.kernel_destroy(&kernel)
+	world, start := world_start(
+		&kernel,
+		nil,
+		context.temp_allocator,
+		World_Config{store_path = store_path},
+	)
+	testing.expectf(t, start.ok, "boot failed: %s", start.message)
+	if !start.ok {
+		return
+	}
+	defer world_destroy(world)
+	derivations := k.kernel_derivation_count(&kernel)
+	testing.expectf(t, derivations <= 2, "boot ran %d derivations for %d rules", derivations, RULES)
+	for i in 0 ..< RULES {
+		expect_relation_rows(t, &kernel, fmt.tprintf("Reach%d", i), 2)
+	}
+}

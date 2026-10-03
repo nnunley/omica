@@ -19,7 +19,37 @@ import v "../../mica/var"
 
 @(private)
 USAGE :: "usage: filein [--unit NAME] [--store DIR] [--durability none|group|strict] " +
-	"[--actor NAME] [--checkpoint] [--eval SOURCE]... <path>...\n"
+	"[--accel " + r.ACCEL_MODE_NAMES + "] " +
+	"[--actor NAME] [--checkpoint] [--eval SOURCE]... <path>...\n" +
+	"       filein --store DIR --unlock [--force]\n" +
+	"  --unlock: remove DIR's lock when its recorded owner is no longer running;\n" +
+	"            --force also removes a lock with no owner or one from another host\n"
+
+// Removes a store's stale lock and reports what happened; the exit status is 0
+// when the store is no longer locked.
+@(private)
+unlock_store :: proc(path: string, force: bool) -> int {
+	owner, known := s.lock_read_owner(path)
+	switch s.store_unlock(path, force) {
+	case .Not_Locked:
+		fmt.printf("%s is not locked\n", path)
+		return 0
+	case .Removed:
+		if known {
+			fmt.printf("removed %s's lock (pid %d on %s)\n", path, owner.pid, owner.host)
+		} else {
+			fmt.printf("removed %s's lock\n", path)
+		}
+		return 0
+	case .Owner_Running:
+		fmt.eprintf("%s is locked by pid %d, which is still running; not removing its lock\n", path, owner.pid)
+	case .Owner_Elsewhere:
+		fmt.eprintf("%s is locked by pid %d on host %s, which cannot be checked from here; use --force if it is gone\n", path, owner.pid, owner.host)
+	case .Owner_Unknown:
+		fmt.eprintf("%s's lock records no owner (an older version wrote it); use --force if nothing is using the store\n", path)
+	}
+	return 1
+}
 
 @(private)
 parse_durability :: proc(text: string) -> s.Durability {
@@ -69,7 +99,9 @@ main :: proc() {
 	store_path := ""
 	actor := ""
 	checkpoint := false
+	unlock, force := false, false
 	durability := s.Durability.Group
+	accel_mode := r.Accel_Mode.Unchanged
 	evals: [dynamic]string
 	defer delete(evals)
 	paths: [dynamic]string
@@ -113,14 +145,37 @@ main :: proc() {
 			}
 			index += 1
 			append(&evals, arguments[index])
+		case "--accel":
+			if index + 1 >= len(arguments) {
+				fmt.eprintf(USAGE)
+				os.exit(1)
+			}
+			index += 1
+			mode, ok := r.accel_mode_parse(arguments[index])
+			if !ok {
+				fmt.eprintf("--accel: expected %s, got %q\n%s", r.ACCEL_MODE_NAMES, arguments[index], USAGE)
+				os.exit(1)
+			}
+			accel_mode = mode
 		case "--checkpoint":
 			checkpoint = true
+		case "--unlock":
+			unlock = true
+		case "--force":
+			force = true
 		case "--help", "-h":
 			fmt.printf(USAGE)
 			return
 		case:
 			append(&paths, arguments[index])
 		}
+	}
+	if unlock {
+		if store_path == "" {
+			fmt.eprintf(USAGE)
+			os.exit(1)
+		}
+		os.exit(unlock_store(store_path, force))
 	}
 	if len(paths) == 0 && store_path == "" && len(evals) == 0 {
 		fmt.eprintf(USAGE)
@@ -142,6 +197,7 @@ main :: proc() {
 			durability       = durability,
 			external_handler = ext.handle_request,
 			external_workers = 2,
+			accel            = accel_mode,
 		},
 	)
 	if !start.ok {

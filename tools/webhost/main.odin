@@ -34,6 +34,7 @@ main :: proc() {
 	actor := ""
 	store_path := ""
 	durability_text := "group"
+	accel_mode := r.Accel_Mode.Unchanged
 	fileins: [dynamic]string
 	defer delete(fileins)
 	editor_roots: [dynamic]string
@@ -98,6 +99,19 @@ main :: proc() {
 			}
 			index += 1
 			durability_text = args[index]
+		case "--accel":
+			if index + 1 >= len(args) {
+				usage()
+				os.exit(1)
+			}
+			index += 1
+			mode, ok := r.accel_mode_parse(args[index])
+			if !ok {
+				fmt.eprintf("--accel: expected %s, got %q\n", r.ACCEL_MODE_NAMES, args[index])
+				usage()
+				os.exit(1)
+			}
+			accel_mode = mode
 		case "--help", "-h":
 			usage()
 			return
@@ -142,6 +156,7 @@ main :: proc() {
 				external_handler = webhost_external_request,
 				external_data    = &editor_files,
 				external_workers = 2,
+				accel            = accel_mode,
 			},
 		)
 		if !result.ok {
@@ -340,6 +355,7 @@ usage :: proc() {
 	fmt.eprintln(
 		"usage: webhost [--bind address:port] [--filein path]... " +
 		"[--sync-client path.js] [--editor-client path.js] [--actor name] " +
-		"[--editor-root dir]... [--store dir] [--durability none|group|strict]",
+		"[--editor-root dir]... [--store dir] [--durability none|group|strict] " +
+		"[--accel cpu|cpu-parallel|metal|cuda|auto]",
 	)
 }

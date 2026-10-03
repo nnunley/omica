@@ -41,14 +41,17 @@ main :: proc() {
 		register_vm_benches(&runner)
 	case "buffer":
 		register_buffer_benches(&runner)
+	case "accel":
+		register_accel_benches(&runner)
 	case "all":
 		register_var_benches(&runner)
 		register_kernel_benches(&runner)
 		register_task_benches(&runner)
 		register_vm_benches(&runner)
 		register_buffer_benches(&runner)
+		register_accel_benches(&runner)
 	case:
-		fmt.eprintf("unknown suite: %s (use all, var, kernel, tasks, vm, or buffer)\n", args.suite)
+		fmt.eprintf("unknown suite: %s (use all, var, kernel, tasks, vm, buffer, or accel)\n", args.suite)
 		os.exit(1)
 	}
 	runner.filter = args.filter

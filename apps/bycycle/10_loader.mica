@@ -1,0 +1,6 @@
+// Loader harness for CycL dump
+// This loads assertions from the CycL dump into Mt-scoped relations.
+// For now, a stub that demonstrates the schema.
+
+LoaderReady(stage) :-
+  stage = "schema_loaded"

@@ -654,8 +654,8 @@ bench_visible_items :: proc(user: rawptr, chunk: int, _: int) {
 		virtual.arena_free_all(&state.scratch)
 		derived, err := k.rules_evaluate(state.scratch_alloc, state.rules, state.snapshot)
 		if err == .None {
-			for relation in derived.relations {
-				accumulator += u64(len(k.rules_derived_rows(&derived, relation)))
+			for entry in derived.relations {
+				accumulator += u64(k.rules_derived_count(&derived, entry.relation))
 			}
 		}
 	}
